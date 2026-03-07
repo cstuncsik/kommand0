@@ -1,0 +1,8 @@
+[package]
+name = "kommand0-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap.workspace = true
+kommand0-core.workspace = true
