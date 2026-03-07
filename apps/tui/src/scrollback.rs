@@ -1,0 +1,212 @@
+use std::collections::VecDeque;
+
+#[allow(dead_code)]
+pub struct ScrollbackBuffer {
+    lines: VecDeque<String>,
+    capacity: usize,
+    scroll_offset: usize,
+    new_lines_since_scroll: usize,
+}
+
+#[allow(dead_code)]
+impl ScrollbackBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            lines: VecDeque::with_capacity(capacity.min(10_000)),
+            capacity,
+            scroll_offset: 0,
+            new_lines_since_scroll: 0,
+        }
+    }
+
+    pub fn push_line(&mut self, line: String) {
+        if self.lines.len() >= self.capacity {
+            self.lines.pop_front();
+            // Adjust scroll offset if we dropped a line above viewport
+            if self.scroll_offset > 0 {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
+        }
+        self.lines.push_back(line);
+        if self.scroll_offset > 0 {
+            self.new_lines_since_scroll += 1;
+        }
+    }
+
+    pub fn push_lines(&mut self, lines: impl IntoIterator<Item = String>) {
+        for line in lines {
+            self.push_line(line);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    pub fn is_at_bottom(&self) -> bool {
+        self.scroll_offset == 0
+    }
+
+    pub fn scroll_up(&mut self, n: usize) {
+        let max_offset = self.lines.len().saturating_sub(1);
+        self.scroll_offset = (self.scroll_offset + n).min(max_offset);
+    }
+
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+
+    pub fn reset_scroll(&mut self) {
+        self.scroll_offset = 0;
+        self.new_lines_since_scroll = 0;
+    }
+
+    pub fn new_lines_count(&self) -> usize {
+        self.new_lines_since_scroll
+    }
+
+    pub fn visible_lines(&self, height: usize) -> Vec<&str> {
+        if self.lines.is_empty() || height == 0 {
+            return Vec::new();
+        }
+        let end = self.lines.len().saturating_sub(self.scroll_offset);
+        let start = end.saturating_sub(height);
+        self.lines
+            .iter()
+            .skip(start)
+            .take(end - start)
+            .map(|s| s.as_str())
+            .collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.scroll_offset = 0;
+        self.new_lines_since_scroll = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_buffer_empty_and_at_bottom() {
+        let buf = ScrollbackBuffer::new(100);
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+        assert!(buf.is_at_bottom());
+    }
+
+    #[test]
+    fn push_line_increases_len() {
+        let mut buf = ScrollbackBuffer::new(100);
+        buf.push_line("hello".to_string());
+        assert_eq!(buf.len(), 1);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn push_line_beyond_capacity_drops_oldest() {
+        let mut buf = ScrollbackBuffer::new(3);
+        buf.push_line("a".to_string());
+        buf.push_line("b".to_string());
+        buf.push_line("c".to_string());
+        buf.push_line("d".to_string());
+        assert_eq!(buf.len(), 3);
+        let visible = buf.visible_lines(10);
+        assert_eq!(visible, vec!["b", "c", "d"]);
+    }
+
+    #[test]
+    fn scroll_up_increases_offset() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..20 {
+            buf.push_line(format!("line {}", i));
+        }
+        buf.scroll_up(5);
+        assert!(!buf.is_at_bottom());
+    }
+
+    #[test]
+    fn scroll_down_decreases_offset_to_bottom() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..20 {
+            buf.push_line(format!("line {}", i));
+        }
+        buf.scroll_up(5);
+        buf.scroll_down(5);
+        assert!(buf.is_at_bottom());
+    }
+
+    #[test]
+    fn push_line_while_scrolled_increments_new_lines() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..10 {
+            buf.push_line(format!("line {}", i));
+        }
+        buf.scroll_up(3);
+        assert_eq!(buf.new_lines_count(), 0);
+        buf.push_line("new1".to_string());
+        buf.push_line("new2".to_string());
+        assert_eq!(buf.new_lines_count(), 2);
+    }
+
+    #[test]
+    fn push_line_at_bottom_does_not_increment_new_lines() {
+        let mut buf = ScrollbackBuffer::new(100);
+        buf.push_line("a".to_string());
+        buf.push_line("b".to_string());
+        assert_eq!(buf.new_lines_count(), 0);
+    }
+
+    #[test]
+    fn reset_scroll_clears_offset_and_new_lines() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..10 {
+            buf.push_line(format!("line {}", i));
+        }
+        buf.scroll_up(3);
+        buf.push_line("extra".to_string());
+        buf.reset_scroll();
+        assert!(buf.is_at_bottom());
+        assert_eq!(buf.new_lines_count(), 0);
+    }
+
+    #[test]
+    fn visible_lines_returns_correct_slice() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..10 {
+            buf.push_line(format!("line {}", i));
+        }
+        let visible = buf.visible_lines(3);
+        assert_eq!(visible, vec!["line 7", "line 8", "line 9"]);
+    }
+
+    #[test]
+    fn visible_lines_with_scroll_offset() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..10 {
+            buf.push_line(format!("line {}", i));
+        }
+        buf.scroll_up(5);
+        let visible = buf.visible_lines(3);
+        assert_eq!(visible, vec!["line 2", "line 3", "line 4"]);
+    }
+
+    #[test]
+    fn capacity_50000_works() {
+        let mut buf = ScrollbackBuffer::new(50_000);
+        for i in 0..50_000 {
+            buf.push_line(format!("line {}", i));
+        }
+        assert_eq!(buf.len(), 50_000);
+        // Adding one more should drop oldest
+        buf.push_line("overflow".to_string());
+        assert_eq!(buf.len(), 50_000);
+    }
+}
