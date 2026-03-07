@@ -29,12 +29,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. If the app panics, the terminal is restored to normal state (raw mode disabled, alternate screen exited)
   4. README contains accurate build, run, and test instructions that a developer can follow from a fresh clone
   5. Naming across core/cli/tui is consistent -- no references to stale or misleading identifiers
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 01-01: TBD
-- [ ] 01-02: TBD
-- [ ] 01-03: TBD
+- [ ] 01-01-PLAN.md — Core testability, unit tests, naming review, edge case hardening, and README
+- [ ] 01-02-PLAN.md — Async TUI migration with ratatui::init panic safety
 
 ### Phase 2: Workspace Model
 **Goal**: Users can create logical workspaces from repos and navigate them in both CLI and TUI
@@ -90,7 +89,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Stabilization and Async Foundation | 0/3 | Not started | - |
+| 1. Stabilization and Async Foundation | 0/2 | Not started | - |
 | 2. Workspace Model | 0/2 | Not started | - |
 | 3. Session Execution | 0/3 | Not started | - |
 | 4. UX Polish | 0/2 | Not started | - |
