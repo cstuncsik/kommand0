@@ -1,3 +1,5 @@
+mod scrollback;
+
 use std::collections::HashSet;
 use std::time::Duration;
 
