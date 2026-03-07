@@ -273,6 +273,117 @@ impl AppState {
     pub fn activate_workspace(&mut self, name: &str) -> anyhow::Result<()> {
         self.activate_workspace_with_base(name, Self::state_dir().as_path())
     }
+
+    // --- Session methods ---
+
+    /// Create a session for a workspace, saving state to a custom base directory.
+    pub fn create_session_with_base(
+        &mut self,
+        workspace_id: &str,
+        base: &Path,
+    ) -> anyhow::Result<Session> {
+        // Validate workspace exists
+        if !self.workspaces.iter().any(|w| w.id == workspace_id) {
+            bail!("workspace not found: {}", workspace_id);
+        }
+
+        // Check no running session for this workspace
+        if self
+            .sessions
+            .iter()
+            .any(|s| s.workspace_id == workspace_id && s.status == SessionStatus::Running)
+        {
+            bail!(
+                "workspace {} already has a running session",
+                workspace_id
+            );
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_secs();
+
+        let session = Session {
+            log_file: format!(".kommand0-dev/sessions/{}.log", id),
+            id,
+            workspace_id: workspace_id.to_string(),
+            claude_session_id: None,
+            pid: None,
+            status: SessionStatus::Running,
+            created_at: now,
+            ended_at: None,
+        };
+
+        self.sessions.push(session.clone());
+        self.save_to(base)?;
+        Ok(session)
+    }
+
+    /// Create a session, saving state to the default state directory.
+    pub fn create_session(&mut self, workspace_id: &str) -> anyhow::Result<Session> {
+        self.create_session_with_base(workspace_id, Self::state_dir().as_path())
+    }
+
+    /// Find the most recent session for a workspace.
+    pub fn find_session_by_workspace(&self, workspace_id: &str) -> Option<&Session> {
+        self.sessions
+            .iter()
+            .rev()
+            .find(|s| s.workspace_id == workspace_id)
+    }
+
+    /// Find a session by ID (mutable).
+    pub fn find_session_mut(&mut self, session_id: &str) -> Option<&mut Session> {
+        self.sessions.iter_mut().find(|s| s.id == session_id)
+    }
+
+    /// Update session status, saving state to a custom base directory.
+    /// Sets ended_at for terminal states (Stopped, Failed, Exited).
+    pub fn update_session_status_with_base(
+        &mut self,
+        session_id: &str,
+        status: SessionStatus,
+        base: &Path,
+    ) -> anyhow::Result<()> {
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
+
+        session.status = status.clone();
+
+        match status {
+            SessionStatus::Stopped | SessionStatus::Failed | SessionStatus::Exited => {
+                session.ended_at = Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("time went backwards")
+                        .as_secs(),
+                );
+            }
+            SessionStatus::Running => {}
+        }
+
+        self.save_to(base)?;
+        Ok(())
+    }
+
+    /// Update session status, saving state to the default state directory.
+    pub fn update_session_status(
+        &mut self,
+        session_id: &str,
+        status: SessionStatus,
+    ) -> anyhow::Result<()> {
+        self.update_session_status_with_base(session_id, status, Self::state_dir().as_path())
+    }
+
+    /// List all sessions.
+    pub fn list_sessions(&self) -> &[Session] {
+        &self.sessions
+    }
 }
 
 #[cfg(test)]
