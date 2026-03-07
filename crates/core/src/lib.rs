@@ -1,13 +1,109 @@
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct AppState {
-    pub sessions: Vec<Session>,
-    pub running: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoEntry {
+    pub id: String,
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct Session {
-    pub id: u64,
-    pub name: String,
+pub struct AppState {
+    pub repos: Vec<RepoEntry>,
+}
+
+impl AppState {
+    const STATE_DIR: &str = ".kommand0-dev";
+    const STATE_FILE: &str = "state.json";
+
+    fn state_dir() -> PathBuf {
+        PathBuf::from(Self::STATE_DIR)
+    }
+
+    fn state_file() -> PathBuf {
+        Self::state_dir().join(Self::STATE_FILE)
+    }
+
+    pub fn load() -> anyhow::Result<Self> {
+        let path = Self::state_file();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let data = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let state: Self = serde_json::from_str(&data)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Ok(state)
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        let dir = Self::state_dir();
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        let path = Self::state_file();
+        let data = serde_json::to_string_pretty(self)?;
+        fs::write(&path, data)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn add_repo(&mut self, path: &str) -> anyhow::Result<RepoEntry> {
+        let dir = std::path::Path::new(path);
+        if !dir.is_dir() {
+            bail!("path does not exist or is not a directory: {}", path);
+        }
+
+        let canonical = fs::canonicalize(dir)
+            .with_context(|| format!("failed to canonicalize {}", path))?;
+        let canonical_str = canonical.to_string_lossy().to_string();
+
+        if self.repos.iter().any(|r| r.path == canonical_str) {
+            bail!("repo already tracked: {}", canonical_str);
+        }
+
+        let name = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| canonical_str.clone());
+
+        let id = generate_id();
+
+        let entry = RepoEntry {
+            id,
+            name,
+            path: canonical_str,
+        };
+
+        self.repos.push(entry.clone());
+        self.save()?;
+        Ok(entry)
+    }
+}
+
+fn generate_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_millis();
+    format!("{:x}", millis)
+}
+
+pub fn run_git_status(repo_path: &str) -> anyhow::Result<String> {
+    let output = Command::new("git")
+        .args(["-C", repo_path, "status", "--short", "--branch"])
+        .output()
+        .with_context(|| format!("failed to run git in {}", repo_path))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        bail!("git status failed: {}", stderr.trim())
+    }
 }
