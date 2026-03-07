@@ -16,6 +16,7 @@ use ratatui::{
 enum Status {
     Idle,
     Done,
+    #[allow(dead_code)]
     Error(String),
 }
 
@@ -24,6 +25,7 @@ enum TreeNode {
     Repo {
         id: String,
         name: String,
+        #[allow(dead_code)]
         workspace_count: usize,
     },
     Workspace {
