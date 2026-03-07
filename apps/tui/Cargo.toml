@@ -1,0 +1,9 @@
+[package]
+name = "kommand0-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ratatui.workspace = true
+crossterm.workspace = true
+kommand0-core.workspace = true
