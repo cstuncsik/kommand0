@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn resolve_repo_path_first_if_contains_slash() {
-        let tmp = TempDir::new().unwrap();
+        let _tmp = TempDir::new().unwrap();
         let mut state = AppState::default();
         // Add repo with path that also matches a name-like string
         state.repos.push(RepoEntry {
