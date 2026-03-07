@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in-progress
-stopped_at: Completed 03-01-PLAN.md
-last_updated: "2026-03-07T22:03:41Z"
-last_activity: 2026-03-07 -- Completed Plan 03-01
+stopped_at: Completed 03-02-PLAN.md
+last_updated: "2026-03-07T22:09:51.651Z"
+last_activity: 2026-03-07 -- Completed Plan 03-02
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 7
-  completed_plans: 5
-  percent: 71
+  completed_plans: 6
+  percent: 86
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-07)
 
 **Core value:** Reliable process lifecycle management for parallel coding sessions from a fast keyboard-driven TUI
-**Current focus:** Phase 3 - Session Execution (Plan 01 complete)
+**Current focus:** Phase 3 - Session Execution (Plan 02 complete)
 
 ## Current Position
 
 Phase: 3 of 4 (Session Execution)
-Plan: 1 of 3 in current phase
-Status: Plan 03-01 Complete
-Last activity: 2026-03-07 -- Completed Plan 03-01
+Plan: 2 of 3 in current phase
+Status: Plan 03-02 Complete
+Last activity: 2026-03-07 -- Completed Plan 03-02
 
-Progress: [███████...] 71%
+Progress: [█████████░] 86%
 
 ## Performance Metrics
 
@@ -53,6 +53,7 @@ Progress: [███████...] 71%
 | Phase 02 P01 | 3min | 2 tasks | 7 files |
 | Phase 02 P02 | 2min | 2 tasks | 1 files |
 | Phase 03 P01 | 3min | 2 tasks | 8 files |
+| Phase 03 P02 | 3min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -76,6 +77,9 @@ Recent decisions affecting current work:
 - [Phase 03]: 03-01: UUID v4 for session IDs (not generate_id hex-millis) for RFC 4122 compliance
 - [Phase 03]: 03-01: ScrollbackBuffer pre-alloc capped at 10K, full capacity enforced on push
 - [Phase 03]: 03-01: Session CRUD follows existing _with_base pattern from workspace methods
+- [Phase 03]: Exit detection via stdout pipe closure instead of PID-polling watcher
+- [Phase 03]: JSON content extraction cascade: result.content > content > content blocks > message.content > raw fallback
+- [Phase 03]: Composer uses static make_textarea helper to DRY config across new/clear/set_active
 
 ### Pending Todos
 
@@ -87,6 +91,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-07T22:03:41Z
-Stopped at: Completed 03-01-PLAN.md
-Resume file: .planning/phases/03-session-execution/03-01-SUMMARY.md
+Last session: 2026-03-07T22:09:51.648Z
+Stopped at: Completed 03-02-PLAN.md
+Resume file: .planning/phases/03-session-execution/03-02-SUMMARY.md
