@@ -1,21 +1,23 @@
+pub mod id;
+pub mod repo;
+pub mod workspace;
+
+pub use id::generate_id;
+pub use repo::{RepoEntry, run_git_status};
+pub use workspace::Workspace;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoEntry {
-    pub id: String,
-    pub name: String,
-    pub path: String,
-}
-
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AppState {
     pub repos: Vec<RepoEntry>,
+    #[serde(default)]
+    pub workspaces: Vec<Workspace>,
 }
 
 impl AppState {
@@ -97,35 +99,175 @@ impl AppState {
     pub fn add_repo(&mut self, path: &str) -> anyhow::Result<RepoEntry> {
         self.add_repo_with_base(path, Self::state_dir().as_path())
     }
-}
 
-fn generate_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_millis();
-    format!("{:x}", millis)
-}
+    // --- Workspace methods ---
 
-pub fn run_git_status(repo_path: &str) -> anyhow::Result<String> {
-    let p = std::path::Path::new(repo_path);
-    if !p.exists() {
-        bail!("path does not exist: {}", repo_path);
+    /// Resolve a repo reference by name, path, or ID.
+    pub fn resolve_repo(&self, reference: &str) -> anyhow::Result<&RepoEntry> {
+        // Path-first if input contains '/'
+        if reference.contains('/') {
+            // Try path match (canonicalize if possible)
+            let canonical = fs::canonicalize(reference)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| reference.to_string());
+            if let Some(repo) = self.repos.iter().find(|r| r.path == canonical || r.path == reference) {
+                return Ok(repo);
+            }
+            // Fall through to name/id
+        }
+
+        // Name match
+        if let Some(repo) = self.repos.iter().find(|r| r.name == reference) {
+            return Ok(repo);
+        }
+
+        // Path match (for non-slash inputs that happen to match)
+        if let Some(repo) = self.repos.iter().find(|r| r.path == reference) {
+            return Ok(repo);
+        }
+
+        // ID match
+        if let Some(repo) = self.repos.iter().find(|r| r.id == reference) {
+            return Ok(repo);
+        }
+
+        bail!(
+            "No repo found matching '{}'. Checked: name, path, id. Use `kmd repo list` to see tracked repos.",
+            reference
+        )
     }
-    if !p.is_dir() {
-        bail!("path is not a directory: {}", repo_path);
+
+    /// Create a workspace with a custom base directory for state persistence.
+    pub fn create_workspace_with_base(
+        &mut self,
+        name: Option<&str>,
+        repo_ref: &str,
+        base: &Path,
+    ) -> anyhow::Result<Workspace> {
+        let repo = self.resolve_repo(repo_ref)?.clone();
+
+        let ws_name = match name {
+            Some(n) => n.to_string(),
+            None => repo.name.clone(),
+        };
+
+        if self.workspaces.iter().any(|w| w.name == ws_name) {
+            bail!("workspace already exists: {}", ws_name);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_secs();
+
+        let ws = Workspace {
+            id: generate_id(),
+            name: ws_name,
+            repo_id: repo.id.clone(),
+            working_dir: repo.path.clone(),
+            active: true,
+            created_at: now,
+        };
+
+        self.workspaces.push(ws.clone());
+        self.save_to(base)?;
+        Ok(ws)
     }
 
-    let output = Command::new("git")
-        .args(["-C", repo_path, "status", "--short", "--branch"])
-        .output()
-        .with_context(|| format!("failed to run git in {}", repo_path))?;
+    /// Create a workspace, saving state to the default state directory.
+    pub fn create_workspace(
+        &mut self,
+        name: Option<&str>,
+        repo_ref: &str,
+    ) -> anyhow::Result<Workspace> {
+        self.create_workspace_with_base(name, repo_ref, Self::state_dir().as_path())
+    }
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        bail!("git status failed: {}", stderr.trim())
+    /// List workspaces, optionally showing all (including archived) and filtering by repo.
+    pub fn list_workspaces(
+        &self,
+        all: bool,
+        repo_ref: Option<&str>,
+    ) -> anyhow::Result<Vec<&Workspace>> {
+        let repo_id = match repo_ref {
+            Some(r) => Some(self.resolve_repo(r)?.id.clone()),
+            None => None,
+        };
+
+        let result: Vec<&Workspace> = self
+            .workspaces
+            .iter()
+            .filter(|w| all || w.active)
+            .filter(|w| match &repo_id {
+                Some(rid) => w.repo_id == *rid,
+                None => true,
+            })
+            .collect();
+
+        Ok(result)
+    }
+
+    /// Show a workspace by name.
+    pub fn show_workspace(&self, name: &str) -> anyhow::Result<&Workspace> {
+        self.workspaces
+            .iter()
+            .find(|w| w.name == name)
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {}", name))
+    }
+
+    /// Delete a workspace by name, saving to custom base directory.
+    pub fn delete_workspace_with_base(
+        &mut self,
+        name: &str,
+        base: &Path,
+    ) -> anyhow::Result<Workspace> {
+        let idx = self
+            .workspaces
+            .iter()
+            .position(|w| w.name == name)
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {}", name))?;
+        let removed = self.workspaces.remove(idx);
+        self.save_to(base)?;
+        Ok(removed)
+    }
+
+    /// Delete a workspace by name, saving to the default state directory.
+    pub fn delete_workspace(&mut self, name: &str) -> anyhow::Result<Workspace> {
+        self.delete_workspace_with_base(name, Self::state_dir().as_path())
+    }
+
+    /// Archive a workspace (set active=false) with custom base directory.
+    pub fn archive_workspace_with_base(&mut self, name: &str, base: &Path) -> anyhow::Result<()> {
+        let ws = self
+            .workspaces
+            .iter_mut()
+            .find(|w| w.name == name)
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {}", name))?;
+        ws.active = false;
+        self.save_to(base)?;
+        Ok(())
+    }
+
+    /// Archive a workspace (set active=false).
+    pub fn archive_workspace(&mut self, name: &str) -> anyhow::Result<()> {
+        self.archive_workspace_with_base(name, Self::state_dir().as_path())
+    }
+
+    /// Activate a workspace (set active=true) with custom base directory.
+    pub fn activate_workspace_with_base(&mut self, name: &str, base: &Path) -> anyhow::Result<()> {
+        let ws = self
+            .workspaces
+            .iter_mut()
+            .find(|w| w.name == name)
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {}", name))?;
+        ws.active = true;
+        self.save_to(base)?;
+        Ok(())
+    }
+
+    /// Activate a workspace (set active=true).
+    pub fn activate_workspace(&mut self, name: &str) -> anyhow::Result<()> {
+        self.activate_workspace_with_base(name, Self::state_dir().as_path())
     }
 }
 
@@ -133,7 +275,6 @@ pub fn run_git_status(repo_path: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use std::fs;
 
     #[test]
     fn load_from_returns_default_when_no_file() {
@@ -176,10 +317,8 @@ mod tests {
         let repo_dir = TempDir::new().unwrap();
         let mut state = AppState::default();
 
-        // First add should succeed
         state.add_repo_with_base(repo_dir.path().to_str().unwrap(), tmp.path()).unwrap();
 
-        // Second add of the same path should fail
         let result = state.add_repo_with_base(repo_dir.path().to_str().unwrap(), tmp.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already tracked"));
@@ -192,11 +331,8 @@ mod tests {
         let mut state = AppState::default();
         let entry = state.add_repo_with_base(repo_dir.path().to_str().unwrap(), tmp.path()).unwrap();
 
-        // Name should be derived from the directory name
         let expected_name = repo_dir.path().file_name().unwrap().to_string_lossy().to_string();
         assert_eq!(entry.name, expected_name);
-
-        // Path should be canonical (absolute)
         assert!(entry.path.starts_with('/'));
     }
 
@@ -220,7 +356,6 @@ mod tests {
     #[test]
     fn run_git_status_errors_on_non_git_directory() {
         let tmp = TempDir::new().unwrap();
-        // tmp is a directory but not a git repo
         let result = run_git_status(tmp.path().to_str().unwrap());
         assert!(result.is_err());
     }

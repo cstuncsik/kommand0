@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: Completed 01-02-PLAN.md (Phase 1 complete)
-last_updated: "2026-03-07T10:20:23.929Z"
-last_activity: 2026-03-07 -- Completed Plan 01-02
+stopped_at: Completed 02-02-PLAN.md
+last_updated: "2026-03-07T13:34:20.432Z"
+last_activity: 2026-03-07 -- Completed Plan 02-02
 progress:
   total_phases: 4
-  completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
-  percent: 25
+  completed_phases: 2
+  total_plans: 4
+  completed_plans: 4
+  percent: 100
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-07)
 
 **Core value:** Reliable process lifecycle management for parallel coding sessions from a fast keyboard-driven TUI
-**Current focus:** Phase 1 - Stabilization and Async Foundation
+**Current focus:** Phase 2 Complete - Ready for Phase 3
 
 ## Current Position
 
-Phase: 1 of 4 (Stabilization and Async Foundation) -- COMPLETE
+Phase: 2 of 4 (Workspace Model) -- COMPLETE
 Plan: 2 of 2 in current phase
-Status: Phase 1 Complete
-Last activity: 2026-03-07 -- Completed Plan 01-02
+Status: Phase 2 Complete
+Last activity: 2026-03-07 -- Completed Plan 02-02
 
-Progress: [██░░░░░░░░] 25%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -50,6 +50,8 @@ Progress: [██░░░░░░░░] 25%
 - Trend: improving
 
 *Updated after each plan completion*
+| Phase 02 P01 | 3min | 2 tasks | 7 files |
+| Phase 02 P02 | 2min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -65,6 +67,11 @@ Recent decisions affecting current work:
 - 01-01: Added futures and crossterm event-stream to workspace deps proactively for Plan 02
 - 01-02: Extracted UI rendering into standalone fn ui() for clarity
 - 01-02: Used ratatui::crossterm re-exports for Event/KeyCode to avoid version conflicts
+- [Phase 02]: 02-01: Split lib.rs into id/repo/workspace modules with pub re-exports
+- [Phase 02]: 02-01: Workspace methods follow with_base pattern for testability
+- [Phase 02]: 02-01: resolve_repo uses path-first heuristic when input contains '/'
+- [Phase 02]: 02-02: Flat Vec<TreeNode> rebuilt on expand/collapse for ratatui List widget compatibility
+- [Phase 02]: 02-02: Hint nodes skip during navigation, keeping render and nav logic separated
 
 ### Pending Todos
 
@@ -76,6 +83,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-07T10:17:19Z
-Stopped at: Completed 01-02-PLAN.md (Phase 1 complete)
-Resume file: .planning/phases/01-stabilization-and-async-foundation/01-02-SUMMARY.md
+Last session: 2026-03-07T13:31:06.598Z
+Stopped at: Completed 02-02-PLAN.md
+Resume file: None

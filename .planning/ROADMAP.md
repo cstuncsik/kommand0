@@ -44,11 +44,11 @@ Plans:
   2. User can see workspaces in the TUI, select one, and see which repo it belongs to
   3. Workspaces survive app restart (persisted in state.json, loadable on next launch)
   4. TUI shows the repo-to-workspace relationship (which workspaces belong to which repo)
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: TBD
-- [ ] 02-02: TBD
+- [ ] 02-01-PLAN.md — Core workspace model with CRUD, smart repo resolver, persistence, and CLI subcommands
+- [ ] 02-02-PLAN.md — TUI tree view with expand/collapse, status indicators, and context-sensitive right pane
 
 ### Phase 3: Session Execution
 **Goal**: Users can run commands in workspaces, see streaming output, and manage process lifecycle
