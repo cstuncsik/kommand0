@@ -27,12 +27,12 @@ Requirements for Milestone 1 (current). Each maps to roadmap phases.
 
 ### Session
 
-- [ ] **SESS-01**: User can run a command in a workspace and see streaming output
+- [x] **SESS-01**: User can run a command in a workspace and see streaming output
 - [ ] **SESS-02**: User can stop a running session (SIGTERM with SIGKILL fallback)
 - [ ] **SESS-03**: User can restart a stopped session
 - [ ] **SESS-04**: App cleans up all child processes on quit (process group management)
-- [ ] **SESS-05**: Process status indicators visible in TUI (running/stopped/failed/exited)
-- [ ] **SESS-06**: Output scrollback buffer with configurable capacity
+- [x] **SESS-05**: Process status indicators visible in TUI (running/stopped/failed/exited)
+- [x] **SESS-06**: Output scrollback buffer with configurable capacity
 
 ### UX
 
@@ -90,12 +90,12 @@ Deferred to future milestones. Tracked but not in current roadmap.
 | WORK-03 | Phase 2 | Complete |
 | WORK-04 | Phase 2 | Complete |
 | WORK-05 | Phase 2 | Complete |
-| SESS-01 | Phase 3 | Pending |
+| SESS-01 | Phase 3 | Complete |
 | SESS-02 | Phase 3 | Pending |
 | SESS-03 | Phase 3 | Pending |
 | SESS-04 | Phase 3 | Pending |
-| SESS-05 | Phase 3 | Pending |
-| SESS-06 | Phase 3 | Pending |
+| SESS-05 | Phase 3 | Complete |
+| SESS-06 | Phase 3 | Complete |
 | UX-01 | Phase 4 | Pending |
 | UX-02 | Phase 4 | Pending |
 | UX-03 | Phase 4 | Pending |
