@@ -9,11 +9,11 @@ Requirements for Milestone 1 (current). Each maps to roadmap phases.
 
 ### Stabilization
 
-- [ ] **STAB-01**: Codebase naming is consistent across core, cli, and tui (no misleading names)
-- [ ] **STAB-02**: Package boundaries match architecture direction (domain logic in core, thin apps)
-- [ ] **STAB-03**: Unit tests exist for core logic (state load/save, add_repo validation)
-- [ ] **STAB-04**: README has accurate build/run/test instructions
-- [ ] **STAB-05**: Git status execution handles edge cases (missing repo, not a git dir)
+- [x] **STAB-01**: Codebase naming is consistent across core, cli, and tui (no misleading names)
+- [x] **STAB-02**: Package boundaries match architecture direction (domain logic in core, thin apps)
+- [x] **STAB-03**: Unit tests exist for core logic (state load/save, add_repo validation)
+- [x] **STAB-04**: README has accurate build/run/test instructions
+- [x] **STAB-05**: Git status execution handles edge cases (missing repo, not a git dir)
 - [ ] **STAB-06**: Panic hook restores terminal state on crash
 - [ ] **STAB-07**: TUI event loop migrated to async (tokio + crossterm event-stream)
 
@@ -78,11 +78,11 @@ Deferred to future milestones. Tracked but not in current roadmap.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| STAB-01 | Phase 1 | Pending |
-| STAB-02 | Phase 1 | Pending |
-| STAB-03 | Phase 1 | Pending |
-| STAB-04 | Phase 1 | Pending |
-| STAB-05 | Phase 1 | Pending |
+| STAB-01 | Phase 1 | Complete |
+| STAB-02 | Phase 1 | Complete |
+| STAB-03 | Phase 1 | Complete |
+| STAB-04 | Phase 1 | Complete |
+| STAB-05 | Phase 1 | Complete |
 | STAB-06 | Phase 1 | Pending |
 | STAB-07 | Phase 1 | Pending |
 | WORK-01 | Phase 2 | Pending |
