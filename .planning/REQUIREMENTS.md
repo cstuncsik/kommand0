@@ -14,8 +14,8 @@ Requirements for Milestone 1 (current). Each maps to roadmap phases.
 - [x] **STAB-03**: Unit tests exist for core logic (state load/save, add_repo validation)
 - [x] **STAB-04**: README has accurate build/run/test instructions
 - [x] **STAB-05**: Git status execution handles edge cases (missing repo, not a git dir)
-- [ ] **STAB-06**: Panic hook restores terminal state on crash
-- [ ] **STAB-07**: TUI event loop migrated to async (tokio + crossterm event-stream)
+- [x] **STAB-06**: Panic hook restores terminal state on crash
+- [x] **STAB-07**: TUI event loop migrated to async (tokio + crossterm event-stream)
 
 ### Workspace
 
@@ -83,8 +83,8 @@ Deferred to future milestones. Tracked but not in current roadmap.
 | STAB-03 | Phase 1 | Complete |
 | STAB-04 | Phase 1 | Complete |
 | STAB-05 | Phase 1 | Complete |
-| STAB-06 | Phase 1 | Pending |
-| STAB-07 | Phase 1 | Pending |
+| STAB-06 | Phase 1 | Complete |
+| STAB-07 | Phase 1 | Complete |
 | WORK-01 | Phase 2 | Pending |
 | WORK-02 | Phase 2 | Pending |
 | WORK-03 | Phase 2 | Pending |
