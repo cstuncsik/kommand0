@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,12 +26,9 @@ impl AppState {
         PathBuf::from(Self::STATE_DIR)
     }
 
-    fn state_file() -> PathBuf {
-        Self::state_dir().join(Self::STATE_FILE)
-    }
-
-    pub fn load() -> anyhow::Result<Self> {
-        let path = Self::state_file();
+    /// Load state from the given base directory. Returns default if no state file exists.
+    pub fn load_from(base: &Path) -> anyhow::Result<Self> {
+        let path = base.join(Self::STATE_FILE);
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -42,19 +39,30 @@ impl AppState {
         Ok(state)
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        let dir = Self::state_dir();
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-        let path = Self::state_file();
+    /// Save state to the given base directory, creating it if needed.
+    pub fn save_to(&self, base: &Path) -> anyhow::Result<()> {
+        fs::create_dir_all(base)
+            .with_context(|| format!("failed to create {}", base.display()))?;
+        let path = base.join(Self::STATE_FILE);
         let data = serde_json::to_string_pretty(self)?;
         fs::write(&path, data)
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
 
-    pub fn add_repo(&mut self, path: &str) -> anyhow::Result<RepoEntry> {
-        let dir = std::path::Path::new(path);
+    /// Load state from the default state directory.
+    pub fn load() -> anyhow::Result<Self> {
+        Self::load_from(Self::state_dir().as_path())
+    }
+
+    /// Save state to the default state directory.
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.save_to(Self::state_dir().as_path())
+    }
+
+    /// Add a repo, saving state to a custom base directory.
+    pub fn add_repo_with_base(&mut self, path: &str, base: &Path) -> anyhow::Result<RepoEntry> {
+        let dir = Path::new(path);
         if !dir.is_dir() {
             bail!("path does not exist or is not a directory: {}", path);
         }
@@ -81,8 +89,13 @@ impl AppState {
         };
 
         self.repos.push(entry.clone());
-        self.save()?;
+        self.save_to(base)?;
         Ok(entry)
+    }
+
+    /// Add a repo, saving state to the default state directory.
+    pub fn add_repo(&mut self, path: &str) -> anyhow::Result<RepoEntry> {
+        self.add_repo_with_base(path, Self::state_dir().as_path())
     }
 }
 
