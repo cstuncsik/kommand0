@@ -19,11 +19,11 @@ Requirements for Milestone 1 (current). Each maps to roadmap phases.
 
 ### Workspace
 
-- [ ] **WORK-01**: User can create a logical workspace from a repo via CLI
-- [ ] **WORK-02**: User can list workspaces via CLI
-- [ ] **WORK-03**: User can list and select workspaces in TUI
-- [ ] **WORK-04**: Workspaces are persisted in state.json
-- [ ] **WORK-05**: TUI shows repo -> workspace relationships
+- [x] **WORK-01**: User can create a logical workspace from a repo via CLI
+- [x] **WORK-02**: User can list workspaces via CLI
+- [x] **WORK-03**: User can list and select workspaces in TUI
+- [x] **WORK-04**: Workspaces are persisted in state.json
+- [x] **WORK-05**: TUI shows repo -> workspace relationships
 
 ### Session
 
@@ -85,11 +85,11 @@ Deferred to future milestones. Tracked but not in current roadmap.
 | STAB-05 | Phase 1 | Complete |
 | STAB-06 | Phase 1 | Complete |
 | STAB-07 | Phase 1 | Complete |
-| WORK-01 | Phase 2 | Pending |
-| WORK-02 | Phase 2 | Pending |
-| WORK-03 | Phase 2 | Pending |
-| WORK-04 | Phase 2 | Pending |
-| WORK-05 | Phase 2 | Pending |
+| WORK-01 | Phase 2 | Complete |
+| WORK-02 | Phase 2 | Complete |
+| WORK-03 | Phase 2 | Complete |
+| WORK-04 | Phase 2 | Complete |
+| WORK-05 | Phase 2 | Complete |
 | SESS-01 | Phase 3 | Pending |
 | SESS-02 | Phase 3 | Pending |
 | SESS-03 | Phase 3 | Pending |
