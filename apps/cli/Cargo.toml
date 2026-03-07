@@ -3,6 +3,11 @@ name = "kommand0-cli"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "kmd"
+path = "src/main.rs"
+
 [dependencies]
+anyhow.workspace = true
 clap.workspace = true
 kommand0-core.workspace = true
