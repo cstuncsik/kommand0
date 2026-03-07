@@ -1,9 +1,11 @@
 pub mod id;
 pub mod repo;
+pub mod session;
 pub mod workspace;
 
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
+pub use session::{Session, SessionStatus};
 pub use workspace::Workspace;
 
 use std::fs;
@@ -18,6 +20,8 @@ pub struct AppState {
     pub repos: Vec<RepoEntry>,
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
+    #[serde(default)]
+    pub sessions: Vec<Session>,
 }
 
 impl AppState {
