@@ -1,4 +1,6 @@
+mod composer;
 mod scrollback;
+mod session_manager;
 
 use std::collections::HashSet;
 use std::time::Duration;
