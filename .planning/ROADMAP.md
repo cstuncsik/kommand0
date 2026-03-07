@@ -12,7 +12,7 @@ Kommand0 is a brownfield Rust TUI project with a working vertical slice (repo re
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Stabilization and Async Foundation** - Harden the codebase and migrate the TUI event loop to async tokio
+- [x] **Phase 1: Stabilization and Async Foundation** - Harden the codebase and migrate the TUI event loop to async tokio (completed 2026-03-07)
 - [ ] **Phase 2: Workspace Model** - Users can create, list, and navigate workspaces tied to repos
 - [ ] **Phase 3: Session Execution** - Users can run commands in workspaces with live output and full process lifecycle
 - [ ] **Phase 4: UX Polish** - Keyboard navigation, help overlay, pane focus, and zoomed output view
@@ -89,7 +89,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Stabilization and Async Foundation | 0/2 | Not started | - |
+| 1. Stabilization and Async Foundation | 0/2 | Complete    | 2026-03-07 |
 | 2. Workspace Model | 0/2 | Not started | - |
 | 3. Session Execution | 0/3 | Not started | - |
 | 4. UX Polish | 0/2 | Not started | - |
