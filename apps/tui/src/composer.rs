@@ -30,13 +30,13 @@ impl Composer {
     /// - All other keys are forwarded to the underlying TextArea
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
         match key {
-            // Shift+Enter = newline
+            // Shift+Enter = newline (use insert_newline directly for cross-terminal reliability)
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers,
                 ..
             } if modifiers.contains(KeyModifiers::SHIFT) => {
-                self.textarea.input(key);
+                self.textarea.insert_newline();
                 None
             }
             // Enter = send
