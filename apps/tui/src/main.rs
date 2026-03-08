@@ -1083,11 +1083,26 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         let composer_area = right_chunks[1];
         if session_status == SessionStatus::Running {
             frame.render_widget(app.composer.widget(), composer_area);
+            // Char/line count overlay in bottom-right corner
+            let status = app.composer.status_text();
+            let status_width = status.len() as u16 + 1;
+            if composer_area.width > status_width + 2 && composer_area.height > 0 {
+                let status_area = Rect::new(
+                    composer_area.x + composer_area.width.saturating_sub(status_width + 1),
+                    composer_area.y + composer_area.height.saturating_sub(1),
+                    status_width,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
+                    status_area,
+                );
+            }
         } else {
             // Show hint to resume
             let hint = Paragraph::new("Press 'R' to resume session")
                 .style(Style::default().fg(Color::DarkGray))
-                .block(Block::default().title(" Send message ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+                .block(Block::default().title(" Composer ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
             frame.render_widget(hint, composer_area);
         }
     } else {

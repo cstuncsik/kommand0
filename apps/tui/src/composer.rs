@@ -92,9 +92,19 @@ impl Composer {
         &self.textarea
     }
 
-    /// Minimum height hint for layout: 1 line of text + 2 border lines.
+    /// Dynamic height hint for layout: content lines (capped at 6) + 2 border lines.
     pub fn height_hint(&self) -> u16 {
-        3
+        let content_lines = self.textarea.lines().len().max(1);
+        let capped = content_lines.min(6); // max 6 lines of content
+        (capped as u16) + 2 // +2 for top/bottom borders
+    }
+
+    /// Return a status string showing line:char count.
+    pub fn status_text(&self) -> String {
+        let lines = self.textarea.lines();
+        let line_count = lines.len();
+        let char_count: usize = lines.iter().map(|l| l.len()).sum::<usize>() + line_count.saturating_sub(1); // +newlines
+        format!("{}:{}", line_count, char_count)
     }
 
     fn make_block(active: bool) -> Block<'static> {
@@ -104,7 +114,7 @@ impl Composer {
             Style::default().fg(Color::DarkGray)
         };
         Block::default()
-            .title(" Send message ")
+            .title(" Composer ")
             .borders(Borders::ALL)
             .border_style(border_style)
     }
@@ -112,7 +122,7 @@ impl Composer {
     fn make_textarea(active: bool) -> TextArea<'static> {
         let mut textarea = TextArea::default();
         textarea.set_block(Self::make_block(active));
-        textarea.set_placeholder_text("Type a message... (Enter to send, Shift+Enter for newline)");
+        textarea.set_placeholder_text("Type a message...");
         textarea.set_cursor_line_style(Style::default());
         textarea
     }
