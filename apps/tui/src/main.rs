@@ -74,12 +74,39 @@ impl App {
         let repos = state.repos.clone();
         let workspaces = state.workspaces.clone();
 
-        // Restore scrollback buffers for existing sessions with log files
-        let mut scrollbacks = HashMap::new();
+        // Restore scrollback buffers from log files for existing sessions
+        let mut scrollbacks: HashMap<String, ScrollbackBuffer> = HashMap::new();
         for session in &state.sessions {
-            scrollbacks
+            let buf = scrollbacks
                 .entry(session.workspace_id.clone())
                 .or_insert_with(|| ScrollbackBuffer::new(50_000));
+            // Load log file contents into scrollback
+            let log_path = std::path::Path::new(&session.log_file);
+            if log_path.exists() {
+                if let Ok(contents) = std::fs::read_to_string(log_path) {
+                    let mut last_source = String::new();
+                    for line in contents.lines() {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                            let source = val.get("source").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                            let content = val.get("content").and_then(|s| s.as_str()).unwrap_or("");
+                            if !content.is_empty() {
+                                // Add separator when switching between user and claude
+                                if !last_source.is_empty() && source != last_source {
+                                    buf.push_line("---".to_string());
+                                }
+                                if source == "user" {
+                                    buf.push_line(format!("> {}", content));
+                                } else {
+                                    buf.push_line(content.to_string());
+                                }
+                                last_source = source;
+                            }
+                        }
+                    }
+                    // Ensure scrolled to bottom after loading
+                    buf.reset_scroll();
+                }
+            }
         }
 
         let mut app = Self {
@@ -320,6 +347,62 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let state = AppState::load()?;
     let mut app = App::new(state);
 
+    // Auto-resume sessions that have history (stopped/exited with log files)
+    let sessions_to_resume: Vec<(String, String, String, Option<String>)> = app
+        .state
+        .sessions
+        .iter()
+        .filter(|s| s.status != SessionStatus::Running)
+        .filter(|s| {
+            app.scrollbacks
+                .get(&s.workspace_id)
+                .map_or(false, |b| !b.is_empty())
+        })
+        .map(|s| {
+            let ws_dir = app
+                .workspaces
+                .iter()
+                .find(|w| w.id == s.workspace_id)
+                .map(|w| w.working_dir.clone())
+                .unwrap_or_default();
+            (
+                s.id.clone(),
+                s.workspace_id.clone(),
+                ws_dir,
+                s.claude_session_id.clone(),
+            )
+        })
+        .collect();
+
+    for (old_sid, ws_id, ws_dir, claude_sid) in sessions_to_resume {
+        if ws_dir.is_empty() {
+            continue;
+        }
+        // Mark old session as stopped
+        let _ = app.state.update_session_status(&old_sid, SessionStatus::Stopped);
+        // Create new state session first to get the canonical ID
+        if let Ok(new_session) = app.state.create_session(&ws_id) {
+            let session_id = new_session.id.clone();
+            // Start process using the state session's ID
+            match app.session_manager.start_session(&session_id, &ws_dir, claude_sid.as_deref()) {
+                Ok(pid) => {
+                    if let Some(s) = app.state.find_session_mut(&session_id) {
+                        s.pid = Some(pid);
+                        s.claude_session_id = claude_sid;
+                    }
+                    let _ = app.state.save();
+                    app.active_session_id = Some(session_id);
+                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
+                        buf.reset_scroll();
+                    }
+                }
+                Err(_) => {
+                    let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                }
+            }
+        }
+    }
+
     let mut reader = EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
 
@@ -547,32 +630,32 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                         .filter(|s| s.status != SessionStatus::Running)
                                                         .map(|s| (s.id.clone(), s.claude_session_id.clone()));
                                                     if let Some((old_session_id, claude_sid)) = session_info {
-                                                        match app.session_manager.restart_session(
-                                                            &old_session_id,
-                                                            &ws.working_dir,
-                                                            claude_sid.as_deref(),
-                                                        ) {
-                                                            Ok((new_session_id, pid)) => {
-                                                                let _ = app.state.update_session_status(&old_session_id, SessionStatus::Stopped);
-                                                                match app.state.create_session(&ws.id) {
-                                                                    Ok(new_session) => {
-                                                                        if let Some(s) = app.state.find_session_mut(&new_session.id) {
-                                                                            s.pid = Some(pid);
-                                                                            s.claude_session_id = claude_sid.clone();
-                                                                        }
-                                                                        let _ = app.state.save();
-                                                                        app.active_session_id = Some(new_session_id);
+                                                        // Stop old, create new state session, start with its ID
+                                                        let _ = app.state.update_session_status(&old_session_id, SessionStatus::Stopped);
+                                                        if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                                            let session_id = new_session.id.clone();
+                                                            match app.session_manager.start_session(
+                                                                &session_id,
+                                                                &ws.working_dir,
+                                                                claude_sid.as_deref(),
+                                                            ) {
+                                                                Ok(pid) => {
+                                                                    if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                                        s.pid = Some(pid);
+                                                                        s.claude_session_id = claude_sid.clone();
                                                                     }
-                                                                    Err(_) => {
-                                                                        app.active_session_id = Some(new_session_id);
-                                                                    }
+                                                                    let _ = app.state.save();
+                                                                    app.active_session_id = Some(session_id);
+                                                                    app.scrollbacks
+                                                                        .entry(ws.id.clone())
+                                                                        .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                                        .reset_scroll();
+                                                                    app.focus = Focus::Output;
                                                                 }
-                                                                if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
-                                                                    buf.clear();
+                                                                Err(_) => {
+                                                                    let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
                                                                 }
-                                                                app.focus = Focus::Output;
                                                             }
-                                                            Err(_) => {}
                                                         }
                                                     }
                                                 }
@@ -802,11 +885,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         };
         let right_title = format!(" Workspace: {}{}", ws.name, status_icon);
 
-        let composer_height = if session_status == SessionStatus::Running {
-            app.composer.height_hint()
-        } else {
-            0
-        };
+        let composer_height = app.composer.height_hint();
 
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -875,10 +954,16 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
         }
 
-        // Composer area (only when running)
-        if session_status == SessionStatus::Running && composer_height > 0 {
-            let composer_area = right_chunks[1];
+        // Composer area
+        let composer_area = right_chunks[1];
+        if session_status == SessionStatus::Running {
             frame.render_widget(app.composer.widget(), composer_area);
+        } else {
+            // Show hint to resume
+            let hint = Paragraph::new("Press 'R' to resume session")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(Block::default().title(" Send message ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+            frame.render_widget(hint, composer_area);
         }
     } else {
         // No session: show workspace/repo details (original behavior)

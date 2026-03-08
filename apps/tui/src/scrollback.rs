@@ -51,9 +51,10 @@ impl ScrollbackBuffer {
         self.scroll_offset == 0
     }
 
+    /// Scroll up by `n` lines. Capped so at least `viewport_height` lines remain visible.
     pub fn scroll_up(&mut self, n: usize) {
-        let max_offset = self.lines.len().saturating_sub(1);
-        self.scroll_offset = (self.scroll_offset + n).min(max_offset);
+        self.scroll_offset += n;
+        // Will be clamped in visible_lines based on actual viewport height
     }
 
     pub fn scroll_down(&mut self, n: usize) {
@@ -73,7 +74,10 @@ impl ScrollbackBuffer {
         if self.lines.is_empty() || height == 0 {
             return Vec::new();
         }
-        let end = self.lines.len().saturating_sub(self.scroll_offset);
+        // Clamp scroll_offset so viewport always shows `height` lines (if available)
+        let max_offset = self.lines.len().saturating_sub(height);
+        let clamped_offset = self.scroll_offset.min(max_offset);
+        let end = self.lines.len().saturating_sub(clamped_offset);
         let start = end.saturating_sub(height);
         self.lines
             .iter()
@@ -195,7 +199,22 @@ mod tests {
         }
         buf.scroll_up(5);
         let visible = buf.visible_lines(3);
+        // With 10 lines, offset 5, viewport 3: end=5, start=2 -> lines 2,3,4
         assert_eq!(visible, vec!["line 2", "line 3", "line 4"]);
+    }
+
+    #[test]
+    fn scroll_offset_clamped_to_keep_viewport_full() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..10 {
+            buf.push_line(format!("line {}", i));
+        }
+        // Scroll way past the top
+        buf.scroll_up(100);
+        let visible = buf.visible_lines(3);
+        // Should clamp: still shows 3 lines (the first 3)
+        assert_eq!(visible, vec!["line 0", "line 1", "line 2"]);
+        assert_eq!(visible.len(), 3);
     }
 
     #[test]

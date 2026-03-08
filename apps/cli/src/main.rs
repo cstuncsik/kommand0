@@ -332,19 +332,24 @@ fn main() -> anyhow::Result<()> {
                 let mut state = AppState::load()?;
                 let ws = state.show_workspace(&workspace)?.clone();
 
-                // Find session for this workspace
-                let session_idx = state.sessions.iter()
-                    .position(|s| s.workspace_id == ws.id);
-
-                if let Some(idx) = session_idx {
-                    let session = state.sessions.remove(idx);
-                    // Delete log file if exists
-                    let log_path = std::path::Path::new(&session.log_file);
-                    if log_path.exists() {
-                        let _ = std::fs::remove_file(log_path);
+                // Remove ALL sessions for this workspace and delete their log files
+                let mut cleared = 0;
+                state.sessions.retain(|s| {
+                    if s.workspace_id == ws.id {
+                        let log_path = std::path::Path::new(&s.log_file);
+                        if log_path.exists() {
+                            let _ = std::fs::remove_file(log_path);
+                        }
+                        cleared += 1;
+                        false // remove
+                    } else {
+                        true // keep
                     }
+                });
+
+                if cleared > 0 {
                     state.save()?;
-                    println!("Cleared session for workspace: {}", workspace);
+                    println!("Cleared {} session(s) for workspace: {}", cleared, workspace);
                 } else {
                     println!("No session found for workspace: {}", workspace);
                 }
