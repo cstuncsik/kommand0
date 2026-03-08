@@ -92,6 +92,29 @@ impl ScrollbackBuffer {
         self.scroll_offset = 0;
         self.new_lines_since_scroll = 0;
     }
+
+    /// Jump to the top of the buffer by setting scroll_offset to max.
+    /// The offset will be clamped in `visible_lines()` based on viewport height.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = self.lines.len();
+    }
+
+    /// Return the total number of lines in the buffer.
+    pub fn total_lines(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Return scroll_offset clamped so the viewport stays within bounds.
+    pub fn clamped_offset(&self, viewport_height: usize) -> usize {
+        self.scroll_offset
+            .min(self.lines.len().saturating_sub(viewport_height))
+    }
+
+    /// Default page size for scrolling. Callers should prefer passing
+    /// actual viewport height, but this provides a backward-compatible default.
+    pub fn page_size(&self) -> usize {
+        20
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +238,49 @@ mod tests {
         // Should clamp: still shows 3 lines (the first 3)
         assert_eq!(visible, vec!["line 0", "line 1", "line 2"]);
         assert_eq!(visible.len(), 3);
+    }
+
+    #[test]
+    fn scroll_to_top_shows_first_lines() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..20 {
+            buf.push_line(format!("line {}", i));
+        }
+        buf.scroll_to_top();
+        let visible = buf.visible_lines(5);
+        assert_eq!(visible, vec!["line 0", "line 1", "line 2", "line 3", "line 4"]);
+    }
+
+    #[test]
+    fn total_lines_returns_count() {
+        let mut buf = ScrollbackBuffer::new(100);
+        assert_eq!(buf.total_lines(), 0);
+        for i in 0..7 {
+            buf.push_line(format!("line {}", i));
+        }
+        assert_eq!(buf.total_lines(), 7);
+    }
+
+    #[test]
+    fn clamped_offset_returns_min_of_offset_and_max() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..10 {
+            buf.push_line(format!("line {}", i));
+        }
+        // No scroll -- offset is 0
+        assert_eq!(buf.clamped_offset(5), 0);
+        // Scroll up 3 -- within bounds
+        buf.scroll_up(3);
+        assert_eq!(buf.clamped_offset(5), 3);
+        // Scroll way past top -- should clamp to max_offset (10-5=5)
+        buf.scroll_up(100);
+        assert_eq!(buf.clamped_offset(5), 5);
+    }
+
+    #[test]
+    fn page_size_returns_default() {
+        let buf = ScrollbackBuffer::new(100);
+        assert_eq!(buf.page_size(), 20);
     }
 
     #[test]
