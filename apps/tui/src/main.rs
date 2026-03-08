@@ -1,4 +1,5 @@
 mod composer;
+mod help;
 mod scrollback;
 mod session_manager;
 
@@ -398,6 +399,15 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             event = reader.next().fuse() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        // Help modal: swallow all keys except ?/Esc
+                        if app.show_help {
+                            match key.code {
+                                KeyCode::Char('?') | KeyCode::Esc => app.show_help = false,
+                                _ => {} // swallow all other keys
+                            }
+                            continue;
+                        }
+
                         // Global keys (work in any focus)
                         match key.code {
                             KeyCode::Char('q') if app.focus != Focus::Composer => {
@@ -493,15 +503,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 };
                             }
                             KeyCode::Esc => {
-                                // Esc always goes back to tree
-                                if app.show_help {
-                                    app.show_help = false;
-                                } else {
-                                    if app.focus == Focus::Composer {
-                                        app.composer.set_active(false);
-                                    }
-                                    app.focus = Focus::Tree;
+                                if app.focus == Focus::Composer {
+                                    app.composer.set_active(false);
                                 }
+                                app.focus = Focus::Tree;
                             }
                             KeyCode::Char('?') if app.focus != Focus::Composer => {
                                 app.show_help = !app.show_help;
@@ -847,16 +852,25 @@ fn truncate_path(path: &str, max_width: usize) -> String {
 }
 
 fn ui(frame: &mut ratatui::Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(frame.area());
+    if app.zoomed {
+        render_zoomed(frame, app);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(frame.area());
 
-    // Left pane: tree view
-    render_tree(frame, app, chunks[0]);
+        // Left pane: tree view
+        render_tree(frame, app, chunks[0]);
 
-    // Right pane: context-sensitive details or session view
-    render_right_pane(frame, app, chunks[1]);
+        // Right pane: context-sensitive details or session view
+        render_right_pane(frame, app, chunks[1]);
+    }
+
+    // Help overlay on top of any layout
+    if app.show_help {
+        help::render_help_overlay(frame, app.focus);
+    }
 }
 
 fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -1235,6 +1249,15 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .block(Block::default().title(right_title).borders(Borders::ALL).border_style(right_border));
         frame.render_widget(paragraph, area);
     }
+}
+
+fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
+    // Stub for Task 2 -- will be fully implemented
+    let area = frame.area();
+    let placeholder = Paragraph::new("Zoom mode (not yet implemented)")
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(placeholder, area);
+    app.last_output_height = area.height;
 }
 
 fn render_scrollbar(frame: &mut ratatui::Frame, area: Rect, total_lines: usize, viewport_height: usize, offset: usize) {
