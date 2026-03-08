@@ -36,9 +36,9 @@ Requirements for Milestone 1 (current). Each maps to roadmap phases.
 
 ### UX
 
-- [ ] **UX-01**: Keyboard-first navigation with consistent bindings (j/k, arrows, Enter, Tab)
+- [x] **UX-01**: Keyboard-first navigation with consistent bindings (j/k, arrows, Enter, Tab)
 - [ ] **UX-02**: Help overlay showing available keys for current context
-- [ ] **UX-03**: Pane navigation between repo list, workspace list, and output
+- [x] **UX-03**: Pane navigation between repo list, workspace list, and output
 - [ ] **UX-04**: Focused/zoomed output view (full-screen single session)
 
 ## v2 Requirements
@@ -96,9 +96,9 @@ Deferred to future milestones. Tracked but not in current roadmap.
 | SESS-04 | Phase 3 | Complete |
 | SESS-05 | Phase 3 | Complete |
 | SESS-06 | Phase 3 | Complete |
-| UX-01 | Phase 4 | Pending |
+| UX-01 | Phase 4 | Complete |
 | UX-02 | Phase 4 | Pending |
-| UX-03 | Phase 4 | Pending |
+| UX-03 | Phase 4 | Complete |
 | UX-04 | Phase 4 | Pending |
 
 **Coverage:**
