@@ -1,7 +1,7 @@
 use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
-use kommand0_core::AppState;
+use kommand0_core::{AppState, SessionStatus};
 use kommand0_core::workspace::format_timestamp;
 
 #[derive(Parser)]
@@ -22,6 +22,11 @@ enum Commands {
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
+    },
+    /// Manage sessions
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
     },
 }
 
@@ -77,6 +82,27 @@ enum WorkspaceAction {
     Activate {
         /// Workspace name
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Start a Claude session in a workspace
+    Start {
+        /// Workspace name
+        workspace: String,
+    },
+    /// Stop a running session
+    Stop {
+        /// Workspace name
+        workspace: String,
+    },
+    /// List all sessions
+    List,
+    /// Clear session metadata and log file
+    Clear {
+        /// Workspace name
+        workspace: String,
     },
 }
 
@@ -189,6 +215,144 @@ fn main() -> anyhow::Result<()> {
                 let mut state = AppState::load()?;
                 state.activate_workspace(&name)?;
                 println!("Activated workspace: {}", name);
+            }
+        },
+        Commands::Session { action } => match action {
+            SessionAction::Start { workspace } => {
+                let mut state = AppState::load()?;
+                let ws = state.show_workspace(&workspace)?.clone();
+
+                // Check no running session
+                if let Some(s) = state.find_session_by_workspace(&ws.id) {
+                    if s.status == SessionStatus::Running {
+                        anyhow::bail!("Workspace '{}' already has a running session ({})", workspace, s.id);
+                    }
+                }
+
+                // Create session record
+                let session = state.create_session(&ws.id)?;
+                let session_id = session.id.clone();
+
+                // Spawn claude process (non-async, fire-and-forget for CLI)
+                let child = std::process::Command::new("claude")
+                    .args([
+                        "-p",
+                        "--verbose",
+                        "--input-format", "stream-json",
+                        "--output-format", "stream-json",
+                    ])
+                    .current_dir(&ws.working_dir)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .env_remove("CLAUDECODE")
+                    .spawn();
+
+                match child {
+                    Ok(child) => {
+                        let pid = child.id();
+                        // Update session with PID
+                        if let Some(s) = state.find_session_mut(&session_id) {
+                            s.pid = Some(pid);
+                        }
+                        state.save()?;
+                        println!("Started session for workspace: {}", workspace);
+                        println!("Session ID: {}", session_id);
+                        println!("PID: {}", pid);
+                    }
+                    Err(e) => {
+                        let _ = state.update_session_status(&session_id, SessionStatus::Failed);
+                        anyhow::bail!("Failed to start claude process: {}", e);
+                    }
+                }
+            }
+            SessionAction::Stop { workspace } => {
+                let mut state = AppState::load()?;
+                let ws = state.show_workspace(&workspace)?.clone();
+
+                let session = state.find_session_by_workspace(&ws.id)
+                    .filter(|s| s.status == SessionStatus::Running)
+                    .ok_or_else(|| anyhow::anyhow!("No running session for workspace: {}", workspace))?;
+
+                let session_id = session.id.clone();
+                let pid = session.pid;
+
+                if let Some(pid) = pid {
+                    use nix::sys::signal::{Signal, kill};
+                    use nix::unistd::Pid;
+
+                    // Send SIGTERM to process group
+                    let pgid = pid as i32;
+                    let _ = kill(Pid::from_raw(-pgid), Signal::SIGTERM);
+
+                    // Wait briefly, then SIGKILL if needed
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+
+                    // Check if still running via kill(pid, 0)
+                    if kill(Pid::from_raw(pgid), None).is_ok() {
+                        let _ = kill(Pid::from_raw(-pgid), Signal::SIGKILL);
+                    }
+                }
+
+                state.update_session_status(&session_id, SessionStatus::Stopped)?;
+                println!("Stopped session for workspace: {}", workspace);
+            }
+            SessionAction::List => {
+                let state = AppState::load()?;
+                let sessions = state.list_sessions();
+                if sessions.is_empty() {
+                    println!("No sessions.");
+                } else {
+                    println!(
+                        "{:<38} {:<20} {:<10} {:<8} {:<20}",
+                        "SESSION_ID", "WORKSPACE", "STATUS", "PID", "CREATED"
+                    );
+                    for session in sessions {
+                        let ws_name = state.workspaces.iter()
+                            .find(|w| w.id == session.workspace_id)
+                            .map(|w| w.name.as_str())
+                            .unwrap_or("(unknown)");
+                        let status = match session.status {
+                            SessionStatus::Running => "running",
+                            SessionStatus::Stopped => "stopped",
+                            SessionStatus::Failed => "failed",
+                            SessionStatus::Exited => "exited",
+                        };
+                        let pid_str = session.pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        println!(
+                            "{:<38} {:<20} {:<10} {:<8} {:<20}",
+                            session.id, ws_name, status, pid_str, format_timestamp(session.created_at)
+                        );
+                    }
+                }
+            }
+            SessionAction::Clear { workspace } => {
+                let mut state = AppState::load()?;
+                let ws = state.show_workspace(&workspace)?.clone();
+
+                // Remove ALL sessions for this workspace and delete their log files
+                let mut cleared = 0;
+                state.sessions.retain(|s| {
+                    if s.workspace_id == ws.id {
+                        let log_path = std::path::Path::new(&s.log_file);
+                        if log_path.exists() {
+                            let _ = std::fs::remove_file(log_path);
+                        }
+                        cleared += 1;
+                        false // remove
+                    } else {
+                        true // keep
+                    }
+                });
+
+                if cleared > 0 {
+                    state.save()?;
+                    println!("Cleared {} session(s) for workspace: {}", cleared, workspace);
+                } else {
+                    println!("No session found for workspace: {}", workspace);
+                }
             }
         },
     }

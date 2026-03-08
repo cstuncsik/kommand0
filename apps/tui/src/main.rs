@@ -1,23 +1,38 @@
-use std::collections::HashSet;
+mod composer;
+mod scrollback;
+mod session_manager;
+
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crossterm::event::{EventStream, KeyEventKind};
 use futures::{FutureExt, StreamExt};
-use kommand0_core::{AppState, RepoEntry, Workspace, run_git_status, workspace::format_timestamp};
+use kommand0_core::{AppState, RepoEntry, SessionStatus, Workspace, run_git_status, workspace::format_timestamp};
 use ratatui::{
     DefaultTerminal,
-    crossterm::event::{Event, KeyCode},
-    layout::{Constraint, Direction, Layout},
+    crossterm::event::{Event, KeyCode, KeyModifiers},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
+
+use composer::Composer;
+use scrollback::ScrollbackBuffer;
+use session_manager::{SessionEvent, SessionManager};
 
 enum Status {
     Idle,
     Done,
     #[allow(dead_code)]
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Focus {
+    Tree,
+    Output,
+    Composer,
 }
 
 #[derive(Clone)]
@@ -40,23 +55,73 @@ enum TreeNode {
 struct App {
     repos: Vec<RepoEntry>,
     workspaces: Vec<Workspace>,
+    state: AppState,
     expanded: HashSet<String>,
     tree_items: Vec<TreeNode>,
     selected_index: usize,
-    output: String,
     status: Status,
+
+    // Session fields
+    session_manager: SessionManager,
+    scrollbacks: HashMap<String, ScrollbackBuffer>,
+    composer: Composer,
+    active_session_id: Option<String>,
+    focus: Focus,
 }
 
 impl App {
-    fn new(repos: Vec<RepoEntry>, workspaces: Vec<Workspace>) -> Self {
+    fn new(state: AppState) -> Self {
+        let repos = state.repos.clone();
+        let workspaces = state.workspaces.clone();
+
+        // Restore scrollback buffers from log files for existing sessions
+        let mut scrollbacks: HashMap<String, ScrollbackBuffer> = HashMap::new();
+        for session in &state.sessions {
+            let buf = scrollbacks
+                .entry(session.workspace_id.clone())
+                .or_insert_with(|| ScrollbackBuffer::new(50_000));
+            // Load log file contents into scrollback
+            let log_path = std::path::Path::new(&session.log_file);
+            if log_path.exists() {
+                if let Ok(contents) = std::fs::read_to_string(log_path) {
+                    let mut last_source = String::new();
+                    for line in contents.lines() {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                            let source = val.get("source").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                            let content = val.get("content").and_then(|s| s.as_str()).unwrap_or("");
+                            if !content.is_empty() {
+                                // Add separator when switching between user and claude
+                                if !last_source.is_empty() && source != last_source {
+                                    buf.push_line("---".to_string());
+                                }
+                                if source == "user" {
+                                    buf.push_line(format!("> {}", content));
+                                } else {
+                                    buf.push_line(content.to_string());
+                                }
+                                last_source = source;
+                            }
+                        }
+                    }
+                    // Ensure scrolled to bottom after loading
+                    buf.reset_scroll();
+                }
+            }
+        }
+
         let mut app = Self {
             repos,
             workspaces,
+            state,
             expanded: HashSet::new(),
             tree_items: Vec::new(),
             selected_index: 0,
-            output: String::new(),
             status: Status::Idle,
+            session_manager: SessionManager::new(),
+            scrollbacks,
+            composer: Composer::new(),
+            active_session_id: None,
+            focus: Focus::Tree,
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -118,13 +183,13 @@ impl App {
         } else {
             self.selected_index - 1
         };
-        // Skip hint nodes, with wrap-around protection
         let mut attempts = 0;
         while self.is_hint(next) && attempts < len {
             next = if next == 0 { len - 1 } else { next - 1 };
             attempts += 1;
         }
         self.selected_index = next;
+        self.update_active_session();
     }
 
     fn move_down(&mut self) {
@@ -137,13 +202,13 @@ impl App {
         } else {
             self.selected_index + 1
         };
-        // Skip hint nodes, with wrap-around protection
         let mut attempts = 0;
         while self.is_hint(next) && attempts < len {
             next = if next >= len - 1 { 0 } else { next + 1 };
             attempts += 1;
         }
         self.selected_index = next;
+        self.update_active_session();
     }
 
     fn toggle_expand(&mut self) {
@@ -154,10 +219,8 @@ impl App {
             } else {
                 self.expanded.insert(id.clone());
             }
-            // Find which repo index this is so we can keep selection on it
             let repo_id = id;
             self.rebuild_tree();
-            // Find the repo node in the rebuilt tree
             for (i, node) in self.tree_items.iter().enumerate() {
                 if let TreeNode::Repo { id, .. } = node {
                     if *id == repo_id {
@@ -166,7 +229,6 @@ impl App {
                     }
                 }
             }
-            // Clamp
             if !self.tree_items.is_empty() {
                 self.selected_index = self.selected_index.min(self.tree_items.len() - 1);
             }
@@ -176,13 +238,11 @@ impl App {
     fn run_status_for_repo_id(&mut self, repo_id: &str) {
         if let Some(repo) = self.repos.iter().find(|r| r.id == repo_id) {
             match run_git_status(&repo.path) {
-                Ok(out) => {
-                    self.output = out;
+                Ok(_out) => {
                     self.status = Status::Done;
                 }
-                Err(e) => {
-                    self.output = String::new();
-                    self.status = Status::Error(e.to_string());
+                Err(_e) => {
+                    self.status = Status::Error(_e.to_string());
                 }
             }
         }
@@ -198,6 +258,81 @@ impl App {
             Some(TreeNode::Hint { .. }) | None => {}
         }
     }
+
+    /// Update active_session_id based on current selection
+    fn update_active_session(&mut self) {
+        if let Some(TreeNode::Workspace { ws, .. }) = self.tree_items.get(self.selected_index) {
+            let ws_id = ws.id.clone();
+            self.active_session_id = self
+                .state
+                .find_session_by_workspace(&ws_id)
+                .map(|s| s.id.clone());
+
+            // Update composer active state based on whether there's a running session
+            let has_running = self
+                .state
+                .find_session_by_workspace(&ws_id)
+                .map(|s| s.status == SessionStatus::Running)
+                .unwrap_or(false);
+            if !has_running && self.focus == Focus::Composer {
+                self.focus = Focus::Tree;
+                self.composer.set_active(false);
+            }
+        } else {
+            self.active_session_id = None;
+            if self.focus != Focus::Tree {
+                self.focus = Focus::Tree;
+            }
+            self.composer.set_active(false);
+        }
+    }
+
+    /// Get the selected workspace, if any
+    fn selected_workspace(&self) -> Option<&Workspace> {
+        match self.tree_items.get(self.selected_index) {
+            Some(TreeNode::Workspace { ws, .. }) => Some(ws),
+            _ => None,
+        }
+    }
+
+    /// Get session status icon for a workspace
+    fn session_status_icon(&self, workspace_id: &str) -> Option<(&str, Color)> {
+        self.state
+            .find_session_by_workspace(workspace_id)
+            .map(|s| match s.status {
+                SessionStatus::Running => (" \u{25B6}", Color::Green),   // ▶
+                SessionStatus::Stopped => (" \u{25A0}", Color::Yellow),  // ■
+                SessionStatus::Failed => (" \u{2717}", Color::Red),      // ✗
+                SessionStatus::Exited => (" \u{2717}", Color::DarkGray), // ✗
+            })
+    }
+
+    /// Write a log line to the session's log file
+    fn write_log(&self, session_id: &str, source: &str, content: &str) {
+        if let Some(session) = self.state.sessions.iter().find(|s| s.id == session_id) {
+            let log_path = std::path::Path::new(&session.log_file);
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let entry = serde_json::json!({
+                "timestamp": timestamp,
+                "source": source,
+                "content": content,
+            });
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+            {
+                let _ = writeln!(f, "{}", entry);
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -210,7 +345,63 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let state = AppState::load()?;
-    let mut app = App::new(state.repos, state.workspaces);
+    let mut app = App::new(state);
+
+    // Auto-resume sessions that have history (stopped/exited with log files)
+    let sessions_to_resume: Vec<(String, String, String, Option<String>)> = app
+        .state
+        .sessions
+        .iter()
+        .filter(|s| s.status != SessionStatus::Running)
+        .filter(|s| {
+            app.scrollbacks
+                .get(&s.workspace_id)
+                .map_or(false, |b| !b.is_empty())
+        })
+        .map(|s| {
+            let ws_dir = app
+                .workspaces
+                .iter()
+                .find(|w| w.id == s.workspace_id)
+                .map(|w| w.working_dir.clone())
+                .unwrap_or_default();
+            (
+                s.id.clone(),
+                s.workspace_id.clone(),
+                ws_dir,
+                s.claude_session_id.clone(),
+            )
+        })
+        .collect();
+
+    for (old_sid, ws_id, ws_dir, claude_sid) in sessions_to_resume {
+        if ws_dir.is_empty() {
+            continue;
+        }
+        // Mark old session as stopped
+        let _ = app.state.update_session_status(&old_sid, SessionStatus::Stopped);
+        // Create new state session first to get the canonical ID
+        if let Ok(new_session) = app.state.create_session(&ws_id) {
+            let session_id = new_session.id.clone();
+            // Start process using the state session's ID
+            match app.session_manager.start_session(&session_id, &ws_dir, claude_sid.as_deref()) {
+                Ok(pid) => {
+                    if let Some(s) = app.state.find_session_mut(&session_id) {
+                        s.pid = Some(pid);
+                        s.claude_session_id = claude_sid;
+                    }
+                    let _ = app.state.save();
+                    app.active_session_id = Some(session_id);
+                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
+                        buf.reset_scroll();
+                    }
+                }
+                Err(_) => {
+                    let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                }
+            }
+        }
+    }
 
     let mut reader = EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
@@ -222,12 +413,258 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             event = reader.next().fuse() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        // Global keys (work in any focus)
                         match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                            KeyCode::Enter => app.handle_enter(),
-                            _ => {}
+                            KeyCode::Char('q') if app.focus != Focus::Composer => {
+                                app.session_manager.shutdown_all().await?;
+                                let running_ids: Vec<String> = app.state.sessions.iter()
+                                    .filter(|s| s.status == SessionStatus::Running)
+                                    .map(|s| s.id.clone())
+                                    .collect();
+                                for sid in running_ids {
+                                    let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+                                }
+                                break;
+                            }
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                match app.focus {
+                                    Focus::Composer => {
+                                        if app.composer.is_empty() {
+                                            // Empty composer: go back to output
+                                            app.focus = Focus::Output;
+                                            app.composer.set_active(false);
+                                        } else {
+                                            app.composer.clear();
+                                        }
+                                    }
+                                    _ => {
+                                        // Stop session if running, otherwise quit
+                                        let should_quit = if let Some(ws) = app.selected_workspace().cloned() {
+                                            let session_info = app.state.find_session_by_workspace(&ws.id)
+                                                .filter(|s| s.status == SessionStatus::Running)
+                                                .map(|s| s.id.clone());
+                                            if let Some(session_id) = session_info {
+                                                let _ = app.session_manager.stop_session(&session_id).await;
+                                                let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                                                app.focus = Focus::Tree;
+                                                app.composer.set_active(false);
+                                                if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
+                                                    buf.push_line("--- Session stopped ---".to_string());
+                                                }
+                                                false
+                                            } else {
+                                                true
+                                            }
+                                        } else {
+                                            true
+                                        };
+                                        if should_quit {
+                                            app.session_manager.shutdown_all().await?;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Tab => {
+                                // Cycle focus: Tree -> Output -> Composer -> Tree
+                                // Only cycle to Output/Composer when a session exists
+                                let has_session = app.selected_workspace()
+                                    .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                                    .is_some();
+                                let has_running = app.selected_workspace()
+                                    .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                                    .map(|s| s.status == SessionStatus::Running)
+                                    .unwrap_or(false);
+                                app.focus = match app.focus {
+                                    Focus::Tree if has_session => Focus::Output,
+                                    Focus::Output if has_running => {
+                                        app.composer.set_active(true);
+                                        Focus::Composer
+                                    }
+                                    Focus::Output => Focus::Tree,
+                                    Focus::Composer => {
+                                        app.composer.set_active(false);
+                                        Focus::Tree
+                                    }
+                                    _ => Focus::Tree,
+                                };
+                            }
+                            KeyCode::BackTab => {
+                                // Reverse cycle: Tree -> Composer -> Output -> Tree
+                                let has_session = app.selected_workspace()
+                                    .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                                    .is_some();
+                                let has_running = app.selected_workspace()
+                                    .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                                    .map(|s| s.status == SessionStatus::Running)
+                                    .unwrap_or(false);
+                                app.focus = match app.focus {
+                                    Focus::Tree if has_running => {
+                                        app.composer.set_active(true);
+                                        Focus::Composer
+                                    }
+                                    Focus::Tree if has_session => Focus::Output,
+                                    Focus::Output => Focus::Tree,
+                                    Focus::Composer => {
+                                        app.composer.set_active(false);
+                                        Focus::Output
+                                    }
+                                    _ => Focus::Tree,
+                                };
+                            }
+                            KeyCode::Esc => {
+                                // Esc always goes back to tree
+                                if app.focus == Focus::Composer {
+                                    app.composer.set_active(false);
+                                }
+                                app.focus = Focus::Tree;
+                            }
+                            _ => {
+                                // Focus-specific keys
+                                match app.focus {
+                                    Focus::Composer => {
+                                        if let Some(text) = app.composer.handle_key(key) {
+                                            if let Some(session_id) = app.active_session_id.clone() {
+                                                let ws_id = app.state.sessions.iter()
+                                                    .find(|s| s.id == session_id)
+                                                    .map(|s| s.workspace_id.clone());
+                                                if let Some(ws_id) = ws_id {
+                                                    let buf = app.scrollbacks
+                                                        .entry(ws_id)
+                                                        .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                                    buf.push_line(format!("> {}", text));
+                                                    buf.push_line("---".to_string());
+                                                }
+                                                app.write_log(&session_id, "user", &text);
+                                                let _ = app.session_manager.send_message(&session_id, &text).await;
+                                            }
+                                        }
+                                    }
+                                    Focus::Output => {
+                                        // Output scrolling with j/k/arrows/PageUp/PageDown
+                                        let ws_id = app.selected_workspace().map(|ws| ws.id.clone());
+                                        if let Some(ws_id) = ws_id {
+                                            match key.code {
+                                                KeyCode::Up | KeyCode::Char('k') => {
+                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
+                                                        buf.scroll_up(1);
+                                                    }
+                                                }
+                                                KeyCode::Down | KeyCode::Char('j') => {
+                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
+                                                        buf.scroll_down(1);
+                                                    }
+                                                }
+                                                KeyCode::PageUp => {
+                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
+                                                        buf.scroll_up(20);
+                                                    }
+                                                }
+                                                KeyCode::PageDown => {
+                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
+                                                        buf.scroll_down(20);
+                                                    }
+                                                }
+                                                KeyCode::Char('G') => {
+                                                    // Jump to bottom
+                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
+                                                        buf.reset_scroll();
+                                                    }
+                                                }
+                                                KeyCode::Char('i') => {
+                                                    // Enter composer from output
+                                                    let has_running = app.selected_workspace()
+                                                        .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                                                        .map(|s| s.status == SessionStatus::Running)
+                                                        .unwrap_or(false);
+                                                    if has_running {
+                                                        app.focus = Focus::Composer;
+                                                        app.composer.set_active(true);
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    Focus::Tree => {
+                                        match key.code {
+                                            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+                                            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                                            KeyCode::Enter => app.handle_enter(),
+                                            KeyCode::Char('r') => {
+                                                if let Some(ws) = app.selected_workspace().cloned() {
+                                                    let has_running = app.state.find_session_by_workspace(&ws.id)
+                                                        .map(|s| s.status == SessionStatus::Running)
+                                                        .unwrap_or(false);
+                                                    if !has_running {
+                                                        match app.state.create_session(&ws.id) {
+                                                            Ok(session) => {
+                                                                let session_id = session.id.clone();
+                                                                let ws_dir = ws.working_dir.clone();
+                                                                match app.session_manager.start_session(&session_id, &ws_dir, None) {
+                                                                    Ok(pid) => {
+                                                                        if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                                            s.pid = Some(pid);
+                                                                        }
+                                                                        let _ = app.state.save();
+                                                                        app.scrollbacks
+                                                                            .entry(ws.id.clone())
+                                                                            .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                                                        app.active_session_id = Some(session_id);
+                                                                        // Stay in tree focus -- don't auto-focus composer
+                                                                        app.focus = Focus::Output;
+                                                                    }
+                                                                    Err(_e) => {
+                                                                        let _ = app.state.update_session_status(&session_id, SessionStatus::Failed);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(_) => {}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            KeyCode::Char('R') => {
+                                                if let Some(ws) = app.selected_workspace().cloned() {
+                                                    let session_info = app.state.find_session_by_workspace(&ws.id)
+                                                        .filter(|s| s.status != SessionStatus::Running)
+                                                        .map(|s| (s.id.clone(), s.claude_session_id.clone()));
+                                                    if let Some((old_session_id, claude_sid)) = session_info {
+                                                        // Stop old, create new state session, start with its ID
+                                                        let _ = app.state.update_session_status(&old_session_id, SessionStatus::Stopped);
+                                                        if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                                            let session_id = new_session.id.clone();
+                                                            match app.session_manager.start_session(
+                                                                &session_id,
+                                                                &ws.working_dir,
+                                                                claude_sid.as_deref(),
+                                                            ) {
+                                                                Ok(pid) => {
+                                                                    if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                                        s.pid = Some(pid);
+                                                                        s.claude_session_id = claude_sid.clone();
+                                                                    }
+                                                                    let _ = app.state.save();
+                                                                    app.active_session_id = Some(session_id);
+                                                                    app.scrollbacks
+                                                                        .entry(ws.id.clone())
+                                                                        .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                                        .reset_scroll();
+                                                                    app.focus = Focus::Output;
+                                                                }
+                                                                Err(_) => {
+                                                                    let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     Some(Err(_)) => break,
@@ -236,7 +673,74 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 }
             }
             _ = tick_interval.tick() => {
-                // Future: refresh UI, poll background tasks
+                // Poll session events
+                let events = app.session_manager.poll_events();
+                for event in events {
+                    match event {
+                        SessionEvent::Output { session_id, line } => {
+                            // Find workspace_id for this session
+                            let ws_id = app.state.sessions.iter()
+                                .find(|s| s.id == session_id)
+                                .map(|s| s.workspace_id.clone());
+                            if let Some(ws_id) = ws_id {
+                                let buf = app.scrollbacks
+                                    .entry(ws_id)
+                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                buf.push_line(line.clone());
+                            }
+                            // Write log
+                            app.write_log(&session_id, "claude", &line);
+                        }
+                        SessionEvent::Exited { session_id, exit_code } => {
+                            let status = match exit_code {
+                                Some(0) | None => SessionStatus::Exited,
+                                Some(_) => SessionStatus::Failed,
+                            };
+                            // Update claude_session_id from session_manager before removing
+                            if let Some(csid) = app.session_manager.get_claude_session_id(&session_id) {
+                                if let Some(s) = app.state.find_session_mut(&session_id) {
+                                    s.claude_session_id = Some(csid);
+                                }
+                            }
+                            let _ = app.state.update_session_status(&session_id, status);
+                            // Push exit message to scrollback
+                            let ws_id = app.state.sessions.iter()
+                                .find(|s| s.id == session_id)
+                                .map(|s| s.workspace_id.clone());
+                            if let Some(ws_id) = ws_id {
+                                let buf = app.scrollbacks
+                                    .entry(ws_id)
+                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                let msg = match exit_code {
+                                    Some(code) => format!("--- Session exited (code: {}) ---", code),
+                                    None => "--- Session exited ---".to_string(),
+                                };
+                                buf.push_line(msg);
+                            }
+                            app.focus = Focus::Tree;
+                            app.composer.set_active(false);
+                        }
+                        SessionEvent::ClaudeSessionId { session_id, claude_session_id } => {
+                            if let Some(s) = app.state.find_session_mut(&session_id) {
+                                if s.claude_session_id.is_none() {
+                                    s.claude_session_id = Some(claude_session_id);
+                                    let _ = app.state.save();
+                                }
+                            }
+                        }
+                        SessionEvent::Error { session_id, error } => {
+                            let ws_id = app.state.sessions.iter()
+                                .find(|s| s.id == session_id)
+                                .map(|s| s.workspace_id.clone());
+                            if let Some(ws_id) = ws_id {
+                                let buf = app.scrollbacks
+                                    .entry(ws_id)
+                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                buf.push_line(format!("[ERROR] {}", error));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -262,11 +766,23 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         .split(frame.area());
 
     // Left pane: tree view
+    render_tree(frame, app, chunks[0]);
+
+    // Right pane: context-sensitive details or session view
+    render_right_pane(frame, app, chunks[1]);
+}
+
+fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     if app.tree_items.is_empty() {
+        let border_style = if app.focus == Focus::Tree {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let hint = Paragraph::new("No repos tracked. Run: kmd repo add <path>")
             .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default().title(" Repos ").borders(Borders::ALL));
-        frame.render_widget(hint, chunks[0]);
+            .block(Block::default().title(" Repos ").borders(Borders::ALL).border_style(border_style));
+        frame.render_widget(hint, area);
     } else {
         let items: Vec<ListItem> = app
             .tree_items
@@ -304,11 +820,15 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
                         } else {
                             Style::default()
                         };
-                        let spans = vec![
+                        let mut spans = vec![
                             Span::styled(prefix, style),
                             Span::styled(dot, Style::default().fg(dot_color)),
                             Span::styled(format!(" {}", ws.name), style),
                         ];
+                        // Session status icon
+                        if let Some((icon, color)) = app.session_status_icon(&ws.id) {
+                            spans.push(Span::styled(icon, Style::default().fg(color)));
+                        }
                         ListItem::new(Line::from(spans))
                     }
                     TreeNode::Hint { text } => {
@@ -325,131 +845,254 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         let mut list_state = ListState::default();
         list_state.select(Some(app.selected_index));
 
+        let tree_border_style = if app.focus == Focus::Tree {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let list = List::new(items)
-            .block(Block::default().title(" Repos ").borders(Borders::ALL))
+            .block(Block::default().title(" Repos ").borders(Borders::ALL).border_style(tree_border_style))
             .highlight_style(Style::default());
 
-        frame.render_stateful_widget(list, chunks[0], &mut list_state);
+        frame.render_stateful_widget(list, area, &mut list_state);
     }
+}
 
-    // Right pane: context-sensitive details
-    let right_width = chunks[1].width.saturating_sub(4) as usize;
+fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let right_width = area.width.saturating_sub(4) as usize;
 
-    let (right_title, right_content) = match app.tree_items.get(app.selected_index) {
-        Some(TreeNode::Repo { id, name, .. }) => {
-            // Find the repo for path info
-            let repo_path = app
-                .repos
-                .iter()
-                .find(|r| r.id == *id)
-                .map(|r| r.path.as_str())
-                .unwrap_or("unknown");
-            let total: usize = app.workspaces.iter().filter(|w| w.repo_id == *id).count();
-            let active: usize = app
-                .workspaces
-                .iter()
-                .filter(|w| w.repo_id == *id && w.active)
-                .count();
-
-            let title = format!(" Repo: {} ", name);
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        "Name: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(name.as_str()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Path: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(truncate_path(repo_path, right_width)),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Workspaces: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("{} active, {} total", active, total)),
-                ]),
-            ];
-            (title, lines)
+    // Check if selected workspace has an active session (running, or stopped/exited with scrollback)
+    let session_info = match app.tree_items.get(app.selected_index) {
+        Some(TreeNode::Workspace { ws, .. }) => {
+            app.state
+                .find_session_by_workspace(&ws.id)
+                .filter(|s| {
+                    s.status == SessionStatus::Running
+                        || app.scrollbacks.get(&ws.id).map_or(false, |b| !b.is_empty())
+                })
+                .map(|s| (ws.clone(), s.id.clone(), s.status.clone()))
         }
-        Some(TreeNode::Workspace { ws, repo_name }) => {
-            let title = format!(" Workspace: {} ", ws.name);
-            let status_span = if ws.active {
-                Span::styled("active", Style::default().fg(Color::Green))
-            } else {
-                Span::styled("archived", Style::default().fg(Color::DarkGray))
-            };
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        "Name: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(ws.name.as_str()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Repo: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(repo_name.as_str()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Dir: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(truncate_path(&ws.working_dir, right_width)),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Status: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    status_span,
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Created: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format_timestamp(ws.created_at)),
-                ]),
-            ];
-            (title, lines)
-        }
-        Some(TreeNode::Hint { .. }) | None => {
-            let title = " Details ".to_string();
-            let lines = vec![Line::styled(
-                "Select a workspace to see details",
-                Style::default().fg(Color::DarkGray),
-            )];
-            (title, lines)
-        }
+        _ => None,
     };
 
-    let paragraph = Paragraph::new(right_content)
-        .block(Block::default().title(right_title).borders(Borders::ALL));
-    frame.render_widget(paragraph, chunks[1]);
+    if let Some((ws, _session_id, session_status)) = session_info {
+        // Session view: output + composer
+        let status_icon = match session_status {
+            SessionStatus::Running => " \u{25B6} ",
+            SessionStatus::Stopped => " \u{25A0} ",
+            SessionStatus::Failed => " \u{2717} ",
+            SessionStatus::Exited => " \u{2717} ",
+        };
+        let right_title = format!(" Workspace: {}{}", ws.name, status_icon);
+
+        let composer_height = app.composer.height_hint();
+
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(composer_height),
+            ])
+            .split(area);
+
+        // Output area
+        let output_area = right_chunks[0];
+        let inner_height = output_area.height.saturating_sub(2) as usize; // account for borders
+
+        let scrollback = app.scrollbacks.get(&ws.id);
+        let visible: Vec<&str> = scrollback
+            .map(|buf| buf.visible_lines(inner_height))
+            .unwrap_or_default();
+
+        let lines: Vec<Line> = if visible.is_empty() {
+            if session_status == SessionStatus::Running {
+                vec![Line::styled(
+                    "Session started. Waiting for output...",
+                    Style::default().fg(Color::DarkGray),
+                )]
+            } else {
+                vec![Line::styled(
+                    "No output.",
+                    Style::default().fg(Color::DarkGray),
+                )]
+            }
+        } else {
+            visible.iter().map(|l| Line::raw(*l)).collect()
+        };
+
+        let output_border_style = if app.focus == Focus::Output {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let output_block = Block::default()
+            .title(right_title)
+            .borders(Borders::ALL)
+            .border_style(output_border_style);
+        let paragraph = Paragraph::new(lines)
+            .block(output_block)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, output_area);
+
+        // New lines indicator when scrolled up
+        if let Some(buf) = scrollback {
+            if !buf.is_at_bottom() {
+                let new_count = buf.new_lines_count();
+                if new_count > 0 {
+                    let indicator = format!(" \u{2193} {} new lines ", new_count);
+                    let indicator_width = indicator.len() as u16;
+                    let indicator_area = Rect::new(
+                        output_area.x + output_area.width.saturating_sub(indicator_width + 2),
+                        output_area.y + output_area.height.saturating_sub(1),
+                        indicator_width,
+                        1,
+                    );
+                    let indicator_widget = Paragraph::new(indicator)
+                        .style(Style::default().fg(Color::Cyan));
+                    frame.render_widget(indicator_widget, indicator_area);
+                }
+            }
+        }
+
+        // Composer area
+        let composer_area = right_chunks[1];
+        if session_status == SessionStatus::Running {
+            frame.render_widget(app.composer.widget(), composer_area);
+        } else {
+            // Show hint to resume
+            let hint = Paragraph::new("Press 'R' to resume session")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(Block::default().title(" Send message ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+            frame.render_widget(hint, composer_area);
+        }
+    } else {
+        // No session: show workspace/repo details (original behavior)
+        let (right_title, right_content) = match app.tree_items.get(app.selected_index) {
+            Some(TreeNode::Repo { id, name, .. }) => {
+                let repo_path = app
+                    .repos
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .map(|r| r.path.as_str())
+                    .unwrap_or("unknown");
+                let total: usize = app.workspaces.iter().filter(|w| w.repo_id == *id).count();
+                let active: usize = app
+                    .workspaces
+                    .iter()
+                    .filter(|w| w.repo_id == *id && w.active)
+                    .count();
+
+                let title = format!(" Repo: {} ", name);
+                let lines = vec![
+                    Line::from(vec![
+                        Span::styled(
+                            "Name: ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(name.as_str()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Path: ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(truncate_path(repo_path, right_width)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Workspaces: ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!("{} active, {} total", active, total)),
+                    ]),
+                ];
+                (title, lines)
+            }
+            Some(TreeNode::Workspace { ws, repo_name }) => {
+                let title = format!(" Workspace: {} ", ws.name);
+                let status_span = if ws.active {
+                    Span::styled("active", Style::default().fg(Color::Green))
+                } else {
+                    Span::styled("archived", Style::default().fg(Color::DarkGray))
+                };
+                let mut lines = vec![
+                    Line::from(vec![
+                        Span::styled(
+                            "Name: ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(ws.name.as_str()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Repo: ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(repo_name.as_str()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Dir: ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(truncate_path(&ws.working_dir, right_width)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Status: ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        status_span,
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Created: ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format_timestamp(ws.created_at)),
+                    ]),
+                ];
+                // Hint for starting session
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "Press 'r' to start a session",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                (title, lines)
+            }
+            Some(TreeNode::Hint { .. }) | None => {
+                let title = " Details ".to_string();
+                let lines = vec![Line::styled(
+                    "Select a workspace to see details",
+                    Style::default().fg(Color::DarkGray),
+                )];
+                (title, lines)
+            }
+        };
+
+        let right_border = if app.focus == Focus::Output {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let paragraph = Paragraph::new(right_content)
+            .block(Block::default().title(right_title).borders(Borders::ALL).border_style(right_border));
+        frame.render_widget(paragraph, area);
+    }
 }
