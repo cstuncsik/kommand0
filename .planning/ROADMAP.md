@@ -76,11 +76,12 @@ Plans:
   2. User can press `?` to see a help overlay showing all available keys for the current context
   3. User can press a key to zoom the output pane to full screen and press again to return to split view
   4. Navigation bindings are consistent: j/k or arrows for list movement, Enter to select, Esc to go back
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 04-01: TBD
-- [ ] 04-02: TBD
+- [ ] 04-01-PLAN.md — Complete key bindings, scrollback fixes, Enter-on-workspace auto-start
+- [ ] 04-02-PLAN.md — Visual polish: chat bubbles, scrollbar, composer auto-expand, focus indicators
+- [ ] 04-03-PLAN.md — Help overlay and zoomed output view
 
 ## Progress
 
@@ -92,4 +93,4 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | 1. Stabilization and Async Foundation | 0/2 | Complete    | 2026-03-07 |
 | 2. Workspace Model | 0/2 | Not started | - |
 | 3. Session Execution | 0/3 | Not started | - |
-| 4. UX Polish | 0/2 | Not started | - |
+| 4. UX Polish | 0/3 | Not started | - |
