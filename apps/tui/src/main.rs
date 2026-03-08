@@ -456,8 +456,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                             }
                             KeyCode::Tab => {
-                                // Cycle focus: Tree -> Output -> Composer -> Tree
-                                // Only cycle to Output/Composer when a session exists
                                 let has_session = app.selected_workspace()
                                     .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
                                     .is_some();
@@ -465,22 +463,37 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
                                     .map(|s| s.status == SessionStatus::Running)
                                     .unwrap_or(false);
-                                app.focus = match app.focus {
-                                    Focus::Tree if has_session => Focus::Output,
-                                    Focus::Output if has_running => {
-                                        app.composer.set_active(true);
-                                        Focus::Composer
-                                    }
-                                    Focus::Output => Focus::Tree,
-                                    Focus::Composer => {
-                                        app.composer.set_active(false);
-                                        Focus::Tree
-                                    }
-                                    _ => Focus::Tree,
-                                };
+                                if app.zoomed {
+                                    // In zoom mode, only cycle Output <-> Composer
+                                    app.focus = match app.focus {
+                                        Focus::Output if has_running => {
+                                            app.composer.set_active(true);
+                                            Focus::Composer
+                                        }
+                                        Focus::Composer => {
+                                            app.composer.set_active(false);
+                                            Focus::Output
+                                        }
+                                        _ => Focus::Output,
+                                    };
+                                } else {
+                                    // Normal cycle: Tree -> Output -> Composer -> Tree
+                                    app.focus = match app.focus {
+                                        Focus::Tree if has_session => Focus::Output,
+                                        Focus::Output if has_running => {
+                                            app.composer.set_active(true);
+                                            Focus::Composer
+                                        }
+                                        Focus::Output => Focus::Tree,
+                                        Focus::Composer => {
+                                            app.composer.set_active(false);
+                                            Focus::Tree
+                                        }
+                                        _ => Focus::Tree,
+                                    };
+                                }
                             }
                             KeyCode::BackTab => {
-                                // Reverse cycle: Tree -> Composer -> Output -> Tree
                                 let has_session = app.selected_workspace()
                                     .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
                                     .is_some();
@@ -488,25 +501,46 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
                                     .map(|s| s.status == SessionStatus::Running)
                                     .unwrap_or(false);
-                                app.focus = match app.focus {
-                                    Focus::Tree if has_running => {
-                                        app.composer.set_active(true);
-                                        Focus::Composer
-                                    }
-                                    Focus::Tree if has_session => Focus::Output,
-                                    Focus::Output => Focus::Tree,
-                                    Focus::Composer => {
-                                        app.composer.set_active(false);
-                                        Focus::Output
-                                    }
-                                    _ => Focus::Tree,
-                                };
+                                if app.zoomed {
+                                    // In zoom mode, only cycle Output <-> Composer
+                                    app.focus = match app.focus {
+                                        Focus::Composer => {
+                                            app.composer.set_active(false);
+                                            Focus::Output
+                                        }
+                                        Focus::Output if has_running => {
+                                            app.composer.set_active(true);
+                                            Focus::Composer
+                                        }
+                                        _ => Focus::Output,
+                                    };
+                                } else {
+                                    // Reverse cycle: Tree -> Composer -> Output -> Tree
+                                    app.focus = match app.focus {
+                                        Focus::Tree if has_running => {
+                                            app.composer.set_active(true);
+                                            Focus::Composer
+                                        }
+                                        Focus::Tree if has_session => Focus::Output,
+                                        Focus::Output => Focus::Tree,
+                                        Focus::Composer => {
+                                            app.composer.set_active(false);
+                                            Focus::Output
+                                        }
+                                        _ => Focus::Tree,
+                                    };
+                                }
                             }
                             KeyCode::Esc => {
-                                if app.focus == Focus::Composer {
-                                    app.composer.set_active(false);
+                                if app.zoomed {
+                                    app.zoomed = false;
+                                    // Don't change focus when exiting zoom
+                                } else {
+                                    if app.focus == Focus::Composer {
+                                        app.composer.set_active(false);
+                                    }
+                                    app.focus = Focus::Tree;
                                 }
-                                app.focus = Focus::Tree;
                             }
                             KeyCode::Char('?') if app.focus != Focus::Composer => {
                                 app.show_help = !app.show_help;
@@ -578,6 +612,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                     if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
                                                         buf.reset_scroll();
                                                     }
+                                                }
+                                                KeyCode::Char('z') => {
+                                                    app.zoomed = !app.zoomed;
                                                 }
                                                 KeyCode::Char('i') => {
                                                     // Enter composer from output
@@ -1018,55 +1055,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .map(|buf| buf.visible_lines(inner_height))
             .unwrap_or_default();
 
-        let lines: Vec<Line> = if visible.is_empty() {
-            if session_status == SessionStatus::Running {
-                vec![Line::styled(
-                    "Session started. Waiting for output...",
-                    Style::default().fg(Color::DarkGray),
-                )]
-            } else {
-                vec![Line::styled(
-                    "No output.",
-                    Style::default().fg(Color::DarkGray),
-                )]
-            }
-        } else {
-            let inner_width = output_area.width.saturating_sub(2) as usize; // inside borders
-            visible.iter().map(|l| {
-                if l.starts_with("> ") {
-                    let content = &l[2..];
-                    let content_len = content.len();
-                    let avail = inner_width.saturating_sub(1); // leave 1 for potential scrollbar
-                    if content_len <= avail {
-                        let padding = avail - content_len;
-                        Line::from(vec![
-                            Span::raw(" ".repeat(padding)),
-                            Span::styled(content, Style::default().bg(Color::DarkGray)),
-                        ])
-                    } else {
-                        Line::styled(content.to_string(), Style::default().bg(Color::DarkGray))
-                    }
-                } else if *l == "---" {
-                    Line::styled("---", Style::default().fg(Color::DarkGray))
-                } else {
-                    Line::raw(*l)
-                }
-            }).collect()
-        };
-
-        let output_border_style = if app.focus == Focus::Output {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let output_block = Block::default()
-            .title(right_title)
-            .borders(Borders::ALL)
-            .border_style(output_border_style);
-        let paragraph = Paragraph::new(lines)
-            .block(output_block)
-            .wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, output_area);
+        render_output_content(frame, output_area, &visible, &session_status, app.focus, right_title);
 
         // Scrollbar
         if let Some(buf) = scrollback {
@@ -1251,13 +1240,177 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
 }
 
+fn render_output_content(
+    frame: &mut ratatui::Frame,
+    output_area: Rect,
+    visible: &[&str],
+    session_status: &SessionStatus,
+    focus: Focus,
+    title: Line<'_>,
+) {
+    let inner_width = output_area.width.saturating_sub(2) as usize;
+
+    let lines: Vec<Line> = if visible.is_empty() {
+        if *session_status == SessionStatus::Running {
+            vec![Line::styled(
+                "Session started. Waiting for output...",
+                Style::default().fg(Color::DarkGray),
+            )]
+        } else {
+            vec![Line::styled(
+                "No output.",
+                Style::default().fg(Color::DarkGray),
+            )]
+        }
+    } else {
+        visible.iter().map(|l| {
+            if l.starts_with("> ") {
+                let content = &l[2..];
+                let content_len = content.len();
+                let avail = inner_width.saturating_sub(1);
+                if content_len <= avail {
+                    let padding = avail - content_len;
+                    Line::from(vec![
+                        Span::raw(" ".repeat(padding)),
+                        Span::styled(content, Style::default().bg(Color::DarkGray)),
+                    ])
+                } else {
+                    Line::styled(content.to_string(), Style::default().bg(Color::DarkGray))
+                }
+            } else if *l == "---" {
+                Line::styled("---", Style::default().fg(Color::DarkGray))
+            } else {
+                Line::raw(*l)
+            }
+        }).collect()
+    };
+
+    let output_border_style = if focus == Focus::Output {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let output_block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(output_border_style);
+    let paragraph = Paragraph::new(lines)
+        .block(output_block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, output_area);
+}
+
 fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
-    // Stub for Task 2 -- will be fully implemented
-    let area = frame.area();
-    let placeholder = Paragraph::new("Zoom mode (not yet implemented)")
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(placeholder, area);
-    app.last_output_height = area.height;
+    let ws_info = app.selected_workspace().cloned().and_then(|ws| {
+        app.state
+            .find_session_by_workspace(&ws.id)
+            .map(|s| (ws, s.id.clone(), s.status.clone()))
+    });
+
+    let Some((ws, _session_id, session_status)) = ws_info else {
+        // No workspace selected; exit zoom
+        app.zoomed = false;
+        return;
+    };
+
+    let composer_height = if session_status == SessionStatus::Running {
+        app.composer.height_hint()
+    } else {
+        3
+    };
+
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(composer_height),
+        Constraint::Length(1),
+    ])
+    .split(frame.area());
+
+    // Output area
+    let output_area = chunks[0];
+    app.last_output_height = output_area.height;
+    let inner_height = output_area.height.saturating_sub(2) as usize;
+
+    let scrollback = app.scrollbacks.get(&ws.id);
+    let visible: Vec<&str> = scrollback
+        .map(|buf| buf.visible_lines(inner_height))
+        .unwrap_or_default();
+
+    let (status_str, status_color) = match session_status {
+        SessionStatus::Running => ("\u{25B6}", Color::Green),
+        SessionStatus::Stopped => ("\u{25A0}", Color::Yellow),
+        SessionStatus::Failed => ("\u{2717}", Color::Red),
+        SessionStatus::Exited => ("\u{2717}", Color::DarkGray),
+    };
+    let output_title = Line::from(vec![
+        Span::raw(format!(" {} ", ws.name)),
+        Span::styled(status_str, Style::default().fg(status_color)),
+        Span::raw(" "),
+    ]);
+
+    render_output_content(frame, output_area, &visible, &session_status, app.focus, output_title);
+
+    // Scrollbar
+    if let Some(buf) = scrollback {
+        render_scrollbar(frame, output_area, buf.total_lines(), inner_height, buf.clamped_offset(inner_height));
+    }
+
+    // Composer area
+    let composer_area = chunks[1];
+    if session_status == SessionStatus::Running {
+        frame.render_widget(app.composer.widget(), composer_area);
+        // Char/line count overlay
+        let status = app.composer.status_text();
+        let status_width = status.len() as u16 + 1;
+        if composer_area.width > status_width + 2 && composer_area.height > 0 {
+            let status_area = Rect::new(
+                composer_area.x + composer_area.width.saturating_sub(status_width + 1),
+                composer_area.y + composer_area.height.saturating_sub(1),
+                status_width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
+                status_area,
+            );
+        }
+    } else {
+        let hint = Paragraph::new("Press 'R' to resume session")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().title(" Composer ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+        frame.render_widget(hint, composer_area);
+    }
+
+    // Status bar (bottom line)
+    let status_bar_area = chunks[2];
+    let (bar_icon, bar_color) = match session_status {
+        SessionStatus::Running => ("\u{25B6}", Color::Green),
+        SessionStatus::Stopped => ("\u{25A0}", Color::Yellow),
+        SessionStatus::Failed => ("\u{2717}", Color::Red),
+        SessionStatus::Exited => ("\u{2717}", Color::DarkGray),
+    };
+
+    let scroll_info = if let Some(buf) = app.scrollbacks.get(&ws.id) {
+        let total = buf.total_lines();
+        let offset = buf.clamped_offset(inner_height);
+        let current_line = total.saturating_sub(offset);
+        format!("line {}/{}", current_line, total)
+    } else {
+        String::new()
+    };
+
+    let status_line = Line::from(vec![
+        Span::styled(format!(" {} ", ws.name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {} ", bar_icon), Style::default().fg(bar_color)),
+        Span::raw(" "),
+        Span::styled(scroll_info, Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        Span::styled("[z] exit zoom", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(status_line).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        status_bar_area,
+    );
 }
 
 fn render_scrollbar(frame: &mut ratatui::Frame, area: Rect, total_lines: usize, viewport_height: usize, offset: usize) {
