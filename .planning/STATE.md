@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in-progress
-stopped_at: Completed 04-01-PLAN.md
-last_updated: "2026-03-08T14:41:16Z"
-last_activity: 2026-03-08 -- Completed Plan 04-01
+stopped_at: Completed 04-02-PLAN.md
+last_updated: "2026-03-08T14:45:52Z"
+last_activity: 2026-03-08 -- Completed Plan 04-02
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 10
-  completed_plans: 8
-  percent: 90
+  completed_plans: 9
+  percent: 95
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-07)
 
 **Core value:** Reliable process lifecycle management for parallel coding sessions from a fast keyboard-driven TUI
-**Current focus:** Phase 4 - UX Polish (Plan 01 complete)
+**Current focus:** Phase 4 - UX Polish (Plan 02 complete)
 
 ## Current Position
 
 Phase: 4 of 4 (UX Polish)
-Plan: 1 of 3 in current phase
-Status: Plan 04-01 Complete
-Last activity: 2026-03-08 -- Completed Plan 04-01
+Plan: 2 of 3 in current phase
+Status: Plan 04-02 Complete
+Last activity: 2026-03-08 -- Completed Plan 04-02
 
-Progress: [█████████░] 90%
+Progress: [█████████░] 95%
 
 ## Performance Metrics
 
@@ -56,6 +56,7 @@ Progress: [█████████░] 90%
 | Phase 03 P02 | 3min | 2 tasks | 3 files |
 | Phase 03 P03 | 4min | 3 tasks | 3 files |
 | Phase 04 P01 | 3min | 2 tasks | 3 files |
+| Phase 04 P02 | 2min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -88,6 +89,9 @@ Recent decisions affecting current work:
 - [Phase 04]: 04-01: Inline Enter handler in async run() for workspace session lifecycle
 - [Phase 04]: 04-01: TextArea::insert_newline() for Shift+Enter cross-terminal reliability
 - [Phase 04]: 04-01: last_output_height tracking during render for dynamic page scroll
+- [Phase 04]: 04-02: Right-align short user messages, full-width bg for long ones (per research pitfall 6)
+- [Phase 04]: 04-02: Scrollbar uses DarkGray color to stay subtle, only appears when needed
+- [Phase 04]: 04-02: Composer status_text() returns line:char for overlay on border
 
 ### Pending Todos
 
@@ -99,6 +103,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-08T14:41:16Z
-Stopped at: Completed 04-01-PLAN.md
-Resume file: .planning/phases/04-ux-polish/04-02-PLAN.md
+Last session: 2026-03-08T14:45:52Z
+Stopped at: Completed 04-02-PLAN.md
+Resume file: .planning/phases/04-ux-polish/04-03-PLAN.md
