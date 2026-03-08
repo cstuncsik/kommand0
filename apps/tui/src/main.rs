@@ -882,9 +882,13 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         let expanded = app.expanded.contains(id);
                         let indicator = if expanded { "\u{25BC} " } else { "\u{25B6} " };
                         let text = format!("{}{}", indicator, name);
-                        let style = if is_selected {
+                        let style = if is_selected && app.focus == Focus::Tree {
                             Style::default()
                                 .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else if is_selected {
+                            Style::default()
+                                .fg(Color::DarkGray)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
@@ -898,9 +902,13 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             ("\u{25CB}", Color::DarkGray)
                         };
                         let prefix = "  \u{251C}\u{2500} ";
-                        let style = if is_selected {
+                        let style = if is_selected && app.focus == Focus::Tree {
                             Style::default()
                                 .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else if is_selected {
+                            Style::default()
+                                .fg(Color::DarkGray)
                                 .add_modifier(Modifier::BOLD)
                         } else if !ws.active {
                             Style::default().fg(Color::DarkGray)
@@ -964,13 +972,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     if let Some((ws, _session_id, session_status)) = session_info {
         // Session view: output + composer
-        let status_icon = match session_status {
-            SessionStatus::Running => " \u{25B6} ",
-            SessionStatus::Stopped => " \u{25A0} ",
-            SessionStatus::Failed => " \u{2717} ",
-            SessionStatus::Exited => " \u{2717} ",
+        let (status_str, status_color) = match session_status {
+            SessionStatus::Running => ("\u{25B6}", Color::Green),
+            SessionStatus::Stopped => ("\u{25A0}", Color::Yellow),
+            SessionStatus::Failed => ("\u{2717}", Color::Red),
+            SessionStatus::Exited => ("\u{2717}", Color::DarkGray),
         };
-        let right_title = format!(" Workspace: {}{}", ws.name, status_icon);
+        let right_title = Line::from(vec![
+            Span::raw(format!(" Workspace: {} ", ws.name)),
+            Span::styled(status_str, Style::default().fg(status_color)),
+            Span::raw(" "),
+        ]);
 
         let composer_height = app.composer.height_hint();
 
@@ -1005,7 +1017,27 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 )]
             }
         } else {
-            visible.iter().map(|l| Line::raw(*l)).collect()
+            let inner_width = output_area.width.saturating_sub(2) as usize; // inside borders
+            visible.iter().map(|l| {
+                if l.starts_with("> ") {
+                    let content = &l[2..];
+                    let content_len = content.len();
+                    let avail = inner_width.saturating_sub(1); // leave 1 for potential scrollbar
+                    if content_len <= avail {
+                        let padding = avail - content_len;
+                        Line::from(vec![
+                            Span::raw(" ".repeat(padding)),
+                            Span::styled(content, Style::default().bg(Color::DarkGray)),
+                        ])
+                    } else {
+                        Line::styled(content.to_string(), Style::default().bg(Color::DarkGray))
+                    }
+                } else if *l == "---" {
+                    Line::styled("---", Style::default().fg(Color::DarkGray))
+                } else {
+                    Line::raw(*l)
+                }
+            }).collect()
         };
 
         let output_border_style = if app.focus == Focus::Output {
@@ -1021,6 +1053,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .block(output_block)
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, output_area);
+
+        // Scrollbar
+        if let Some(buf) = scrollback {
+            render_scrollbar(frame, output_area, buf.total_lines(), inner_height, buf.clamped_offset(inner_height));
+        }
 
         // New lines indicator when scrolled up
         if let Some(buf) = scrollback {
@@ -1182,5 +1219,31 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         let paragraph = Paragraph::new(right_content)
             .block(Block::default().title(right_title).borders(Borders::ALL).border_style(right_border));
         frame.render_widget(paragraph, area);
+    }
+}
+
+fn render_scrollbar(frame: &mut ratatui::Frame, area: Rect, total_lines: usize, viewport_height: usize, offset: usize) {
+    if total_lines <= viewport_height || area.height < 3 {
+        return;
+    }
+    let track_height = area.height.saturating_sub(2) as usize;
+    if track_height == 0 {
+        return;
+    }
+    let thumb_size = ((viewport_height as f64 / total_lines as f64) * track_height as f64).max(1.0) as usize;
+    let max_offset = total_lines.saturating_sub(viewport_height);
+    let thumb_pos = if max_offset == 0 {
+        0
+    } else {
+        ((max_offset.saturating_sub(offset)) as f64 / max_offset as f64 * (track_height.saturating_sub(thumb_size)) as f64) as usize
+    };
+    for i in 0..track_height {
+        let ch = if i >= thumb_pos && i < thumb_pos + thumb_size { "\u{2588}" } else { "\u{2502}" };
+        let y = area.y + 1 + i as u16;
+        let x = area.x + area.width.saturating_sub(2); // inside right border
+        frame.render_widget(
+            Paragraph::new(ch).style(Style::default().fg(Color::DarkGray)),
+            Rect::new(x, y, 1, 1),
+        );
     }
 }
