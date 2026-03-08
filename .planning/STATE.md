@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: Completed 02-02-PLAN.md
-last_updated: "2026-03-07T13:34:20.432Z"
-last_activity: 2026-03-07 -- Completed Plan 02-02
+stopped_at: Completed 03-03-PLAN.md
+last_updated: "2026-03-07T22:16:26.898Z"
+last_activity: 2026-03-07 -- Completed Plan 03-02
 progress:
   total_phases: 4
-  completed_phases: 2
-  total_plans: 4
-  completed_plans: 4
-  percent: 100
+  completed_phases: 3
+  total_plans: 7
+  completed_plans: 7
+  percent: 86
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-07)
 
 **Core value:** Reliable process lifecycle management for parallel coding sessions from a fast keyboard-driven TUI
-**Current focus:** Phase 2 Complete - Ready for Phase 3
+**Current focus:** Phase 3 - Session Execution (Plan 02 complete)
 
 ## Current Position
 
-Phase: 2 of 4 (Workspace Model) -- COMPLETE
-Plan: 2 of 2 in current phase
-Status: Phase 2 Complete
-Last activity: 2026-03-07 -- Completed Plan 02-02
+Phase: 3 of 4 (Session Execution)
+Plan: 2 of 3 in current phase
+Status: Plan 03-02 Complete
+Last activity: 2026-03-07 -- Completed Plan 03-02
 
-Progress: [██████████] 100%
+Progress: [█████████░] 86%
 
 ## Performance Metrics
 
@@ -52,6 +52,9 @@ Progress: [██████████] 100%
 *Updated after each plan completion*
 | Phase 02 P01 | 3min | 2 tasks | 7 files |
 | Phase 02 P02 | 2min | 2 tasks | 1 files |
+| Phase 03 P01 | 3min | 2 tasks | 8 files |
+| Phase 03 P02 | 3min | 2 tasks | 3 files |
+| Phase 03 P03 | 4min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -72,6 +75,15 @@ Recent decisions affecting current work:
 - [Phase 02]: 02-01: resolve_repo uses path-first heuristic when input contains '/'
 - [Phase 02]: 02-02: Flat Vec<TreeNode> rebuilt on expand/collapse for ratatui List widget compatibility
 - [Phase 02]: 02-02: Hint nodes skip during navigation, keeping render and nav logic separated
+- [Phase 03]: 03-01: UUID v4 for session IDs (not generate_id hex-millis) for RFC 4122 compliance
+- [Phase 03]: 03-01: ScrollbackBuffer pre-alloc capped at 10K, full capacity enforced on push
+- [Phase 03]: 03-01: Session CRUD follows existing _with_base pattern from workspace methods
+- [Phase 03]: Exit detection via stdout pipe closure instead of PID-polling watcher
+- [Phase 03]: JSON content extraction cascade: result.content > content > content blocks > message.content > raw fallback
+- [Phase 03]: Composer uses static make_textarea helper to DRY config across new/clear/set_active
+- [Phase 03]: Active session ID tracked per-workspace for instant switching on cursor move
+- [Phase 03]: Composer focus separate from session running state for explicit Tab/Esc control
+- [Phase 03]: CLI session start uses sync std::process::Command (fire-and-forget, no async)
 
 ### Pending Todos
 
@@ -83,6 +95,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-07T13:31:06.598Z
-Stopped at: Completed 02-02-PLAN.md
+Last session: 2026-03-07T22:16:26.895Z
+Stopped at: Completed 03-03-PLAN.md
 Resume file: None
