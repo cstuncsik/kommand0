@@ -8,6 +8,8 @@ pub struct Workspace {
     pub working_dir: String,
     pub active: bool,
     pub created_at: u64,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
 }
 
 /// Format a unix timestamp (seconds) as "YYYY-MM-DD HH:MM" in local timezone.

@@ -50,6 +50,9 @@ enum WorkspaceAction {
         /// Repo reference (name, path, or ID)
         #[arg(long)]
         repo: String,
+        /// Skip git worktree creation (use repo root as working directory)
+        #[arg(long)]
+        no_worktree: bool,
     },
     /// List workspaces
     List {
@@ -128,9 +131,18 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name, repo } => {
+            WorkspaceAction::Create { name, repo, no_worktree } => {
                 let mut state = AppState::load()?;
-                let ws = state.create_workspace(name.as_deref(), &repo)?;
+                let ws = if no_worktree {
+                    state.create_workspace_with_options(
+                        name.as_deref(),
+                        &repo,
+                        std::path::Path::new(".kommand0-dev"),
+                        false,
+                    )?
+                } else {
+                    state.create_workspace(name.as_deref(), &repo)?
+                };
                 let repo_name = state
                     .repos
                     .iter()

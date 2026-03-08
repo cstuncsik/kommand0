@@ -32,6 +32,8 @@ const TREE_BINDINGS: &[KeyBinding] = &[
     KeyBinding { keys: "[r]", description: "Start session" },
     KeyBinding { keys: "[R]", description: "Restart session" },
     KeyBinding { keys: "[x]", description: "Stop session" },
+    KeyBinding { keys: "[a]", description: "Add repository" },
+    KeyBinding { keys: "[w]", description: "Add workspace" },
 ];
 
 const OUTPUT_BINDINGS: &[KeyBinding] = &[
