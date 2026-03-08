@@ -25,6 +25,11 @@ pub enum SessionEvent {
         session_id: String,
         error: String,
     },
+    /// Claude session ID discovered from stream-json output (used for --resume).
+    ClaudeSessionId {
+        session_id: String,
+        claude_session_id: String,
+    },
 }
 
 /// Internal state for a running child process.
@@ -71,13 +76,13 @@ impl SessionManager {
         let mut cmd = Command::new("claude");
         cmd.args([
             "-p",
+            "--verbose",
             "--input-format",
             "stream-json",
             "--output-format",
             "stream-json",
-            "--cwd",
-            workspace_dir,
         ]);
+        cmd.current_dir(workspace_dir);
 
         if let Some(rid) = resume_id {
             cmd.args(["--resume", rid]);
@@ -118,7 +123,17 @@ impl SessionManager {
             let mut lines = reader.lines();
             while let Ok(Some(raw_line)) = lines.next_line().await {
                 let stripped = strip_ansi_escapes::strip_str(&raw_line);
+                // Try to extract claude session_id from any JSON line
+                if let Some(csid) = extract_claude_session_id(&stripped) {
+                    let _ = tx_stdout.send(SessionEvent::ClaudeSessionId {
+                        session_id: sid_stdout.clone(),
+                        claude_session_id: csid,
+                    });
+                }
                 let text = extract_text_from_json(&stripped);
+                if text.is_empty() {
+                    continue;
+                }
                 if tx_stdout
                     .send(SessionEvent::Output {
                         session_id: sid_stdout.clone(),
@@ -286,17 +301,15 @@ impl SessionManager {
         loop {
             match self.event_rx.try_recv() {
                 Ok(event) => {
-                    // Check for claude_session_id in Output events
-                    if let SessionEvent::Output {
+                    // Store claude_session_id when discovered
+                    if let SessionEvent::ClaudeSessionId {
                         ref session_id,
-                        ref line,
+                        ref claude_session_id,
                     } = event
                     {
-                        if let Some(csid) = extract_claude_session_id(line) {
-                            if let Some(session) = self.sessions.get_mut(session_id) {
-                                if session.claude_session_id.is_none() {
-                                    session.claude_session_id = Some(csid);
-                                }
+                        if let Some(session) = self.sessions.get_mut(session_id) {
+                            if session.claude_session_id.is_none() {
+                                session.claude_session_id = Some(claude_session_id.clone());
                             }
                         }
                     }
@@ -338,7 +351,44 @@ fn extract_text_from_json(line: &str) -> String {
 
     match serde_json::from_str::<Value>(trimmed) {
         Ok(val) => {
-            // Try result.content (final response)
+            let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            // Filter out non-content events (system hooks, init, etc.)
+            match event_type {
+                "system" | "start" | "ping" | "error" => return String::new(),
+                _ => {}
+            }
+
+            // content_block_delta: streaming text chunks
+            if event_type == "content_block_delta" {
+                if let Some(text) = val
+                    .get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    return text.to_string();
+                }
+            }
+
+            // assistant message with content blocks array
+            if event_type == "assistant" || event_type == "message" {
+                if let Some(blocks) = val
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .or_else(|| val.get("content").and_then(|c| c.as_array()))
+                {
+                    let texts: Vec<&str> = blocks
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect();
+                    if !texts.is_empty() {
+                        return texts.join("");
+                    }
+                }
+            }
+
+            // result.content (final response)
             if let Some(content) = val
                 .get("result")
                 .and_then(|r| r.get("content"))
@@ -347,13 +397,12 @@ fn extract_text_from_json(line: &str) -> String {
                 return content.to_string();
             }
 
-            // Try content as string (streaming text events)
-            if let Some(content) = val.get("content").and_then(|c| c.as_str()) {
-                return content.to_string();
-            }
-
-            // Try content as array of content blocks
-            if let Some(blocks) = val.get("content").and_then(|c| c.as_array()) {
+            // result with content blocks array
+            if let Some(blocks) = val
+                .get("result")
+                .and_then(|r| r.get("content"))
+                .and_then(|c| c.as_array())
+            {
                 let texts: Vec<&str> = blocks
                     .iter()
                     .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
@@ -363,17 +412,13 @@ fn extract_text_from_json(line: &str) -> String {
                 }
             }
 
-            // Try message.content for assistant message events
-            if let Some(content) = val
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-            {
+            // content as string directly
+            if let Some(content) = val.get("content").and_then(|c| c.as_str()) {
                 return content.to_string();
             }
 
-            // Return the raw JSON line as fallback
-            trimmed.to_string()
+            // Skip unrecognized JSON events silently (don't show raw JSON)
+            String::new()
         }
         Err(_) => {
             // Not valid JSON -- treat as raw text (pitfall 3)

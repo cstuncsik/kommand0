@@ -237,10 +237,11 @@ fn main() -> anyhow::Result<()> {
                 let child = std::process::Command::new("claude")
                     .args([
                         "-p",
+                        "--verbose",
                         "--input-format", "stream-json",
                         "--output-format", "stream-json",
-                        "--cwd", &ws.working_dir,
                     ])
+                    .current_dir(&ws.working_dir)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())

@@ -82,6 +82,11 @@ impl Composer {
         self.active
     }
 
+    /// Returns true if the composer has no text content.
+    pub fn is_empty(&self) -> bool {
+        self.textarea.lines().iter().all(|l| l.is_empty())
+    }
+
     /// Return a reference to the inner TextArea for rendering.
     pub fn widget(&self) -> &TextArea<'static> {
         &self.textarea
@@ -94,7 +99,7 @@ impl Composer {
 
     fn make_block(active: bool) -> Block<'static> {
         let border_style = if active {
-            Style::default()
+            Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::DarkGray)
         };
