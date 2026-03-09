@@ -41,6 +41,7 @@ mod tests {
             working_dir: "/tmp/myapp".to_string(),
             active: true,
             created_at: 1000,
+            worktree_path: None,
         });
         state.save_to(tmp.path()).unwrap();
         (state, "ws1".to_string())
