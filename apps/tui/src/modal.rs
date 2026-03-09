@@ -7,6 +7,13 @@ use ratatui::{
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// What kind of delete is being confirmed.
+#[derive(Clone)]
+pub(crate) enum DeleteTarget {
+    Workspace { name: String },
+    Repo { id: String, name: String, workspace_count: usize },
+}
+
 /// Modal dialog state.
 #[derive(Default)]
 pub(crate) enum ModalState {
@@ -26,6 +33,9 @@ pub(crate) enum ModalState {
         cursor: usize,
         error: Option<String>,
     },
+    ConfirmDelete {
+        target: DeleteTarget,
+    },
 }
 
 impl ModalState {
@@ -44,6 +54,8 @@ pub(crate) enum ModalResult {
     SubmitRepo(String),
     /// AddWorkspace submitted with (repo_id, name).
     SubmitWorkspace(String, String),
+    /// Delete confirmed.
+    ConfirmDelete(DeleteTarget),
 }
 
 /// Handle a key event when a modal is active.
@@ -224,6 +236,24 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                             .unwrap_or(input.len());
                     }
                     ModalResult::Consumed
+                }
+                _ => ModalResult::Consumed,
+            }
+        }
+        ModalState::ConfirmDelete { target } => {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let t = target.clone();
+                    *modal = ModalState::None;
+                    ModalResult::ConfirmDelete(t)
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
                 }
                 _ => ModalResult::Consumed,
             }
@@ -465,6 +495,69 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
                     Span::raw(": cancel"),
                 ])),
                 inner[4],
+            );
+        }
+        ModalState::ConfirmDelete { target } => {
+            let area = centered_rect(50, 20, frame.area());
+            frame.render_widget(Clear, area);
+
+            let (title, message) = match target {
+                DeleteTarget::Workspace { name } => (
+                    " Delete Workspace ".to_string(),
+                    format!("Delete workspace '{}'?", name),
+                ),
+                DeleteTarget::Repo { name, workspace_count, .. } => {
+                    if *workspace_count > 0 {
+                        (
+                            " Delete Repository ".to_string(),
+                            format!(
+                                "Delete repo '{}' and its {} workspace(s)?",
+                                name, workspace_count
+                            ),
+                        )
+                    } else {
+                        (
+                            " Delete Repository ".to_string(),
+                            format!("Delete repo '{}'?", name),
+                        )
+                    }
+                }
+            };
+
+            let inner = Layout::vertical([
+                Constraint::Length(2), // message
+                Constraint::Min(0),   // spacer
+                Constraint::Length(1), // footer
+            ])
+            .split(Rect::new(
+                area.x + 2,
+                area.y + 1,
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(2),
+            ));
+
+            let block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red));
+            frame.render_widget(block, area);
+
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    message,
+                    Style::default().fg(Color::White),
+                )),
+                inner[0],
+            );
+
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("y", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::raw(": delete  "),
+                    Span::styled("n/Esc", Style::default().fg(Color::Cyan)),
+                    Span::raw(": cancel"),
+                ])),
+                inner[2],
             );
         }
     }

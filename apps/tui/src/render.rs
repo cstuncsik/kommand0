@@ -192,26 +192,42 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         app.pane_areas.output = output_area;
         app.last_output_height = output_area.height;
         let inner_height = output_area.height.saturating_sub(2) as usize; // account for borders
+        let inner_width = output_area.width.saturating_sub(2) as usize;
 
-        let scrollback = app.scrollbacks.get(&ws.id);
-        let visible: Vec<&str> = scrollback
-            .map(|buf| buf.visible_lines(inner_height))
+        // Build styled lines, compute visual total, clamp scroll, then render
+        let mut all_lines: Vec<&str> = app.scrollbacks.get(&ws.id)
+            .map(|buf| buf.all_lines())
             .unwrap_or_default();
-
+        // Append in-progress streaming line if present
+        let streaming_partial = app.streaming_text.get(&ws.id);
+        if let Some(partial) = streaming_partial {
+            if !partial.is_empty() {
+                all_lines.push(partial.as_str());
+            }
+        }
         let spinner = if app.waiting_response.contains(&ws.id) {
             Some(app.spinner_tick)
         } else {
             None
         };
-        render_output_content(frame, output_area, &visible, &session_status, app.focus, right_title, spinner);
+        let styled_lines = build_output_lines(&all_lines, inner_width, &session_status, spinner);
+        let total_visual = styled_total_visual(&styled_lines, inner_width);
+        let max_offset = total_visual.saturating_sub(inner_height);
+        if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
+            buf.clamp_scroll_offset(max_offset);
+        }
+        let scroll_offset = app.scrollbacks.get(&ws.id)
+            .map(|buf| buf.scroll_offset()).unwrap_or(0);
 
-        // Scrollbar
-        if let Some(buf) = scrollback {
-            render_scrollbar(frame, output_area, buf.total_lines(), inner_height, buf.clamped_offset(inner_height));
+        render_output_content(frame, output_area, styled_lines, scroll_offset, inner_width, inner_height, app.focus, right_title);
+
+        // Scrollbar (use visual line counts)
+        if app.scrollbacks.contains_key(&ws.id) {
+            render_scrollbar(frame, output_area, total_visual, inner_height, scroll_offset);
         }
 
         // New lines indicator when scrolled up
-        if let Some(buf) = scrollback {
+        if let Some(buf) = app.scrollbacks.get(&ws.id) {
             if !buf.is_at_bottom() {
                 let new_count = buf.new_lines_count();
                 if new_count > 0 {
@@ -417,18 +433,235 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn render_output_content(
-    frame: &mut ratatui::Frame,
-    output_area: Rect,
-    visible: &[&str],
-    session_status: &SessionStatus,
-    focus: Focus,
-    title: Line<'_>,
-    spinner: Option<u8>,
-) {
-    let inner_width = output_area.width.saturating_sub(2) as usize;
+/// Calculate visual line count for a single line with wrapping.
+fn wrapped_line_height(line_len: usize, width: usize) -> usize {
+    if width == 0 || line_len == 0 {
+        return 1;
+    }
+    (line_len + width - 1) / width
+}
 
-    let mut lines: Vec<Line> = if visible.is_empty() {
+/// Parse inline markdown into styled spans.
+/// Handles: **bold**, *italic*, `inline code`, and plain text.
+fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    let mut plain_start = 0;
+
+    while let Some(&(i, ch)) = chars.peek() {
+        match ch {
+            '`' => {
+                // Inline code
+                if i > plain_start {
+                    spans.push(Span::styled(text[plain_start..i].to_string(), base_style));
+                }
+                chars.next();
+                let code_start = i + 1;
+                let mut found_end = false;
+                while let Some(&(j, c)) = chars.peek() {
+                    if c == '`' {
+                        spans.push(Span::styled(
+                            text[code_start..j].to_string(),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                        chars.next();
+                        plain_start = j + 1;
+                        found_end = true;
+                        break;
+                    }
+                    chars.next();
+                }
+                if !found_end {
+                    // No closing backtick, treat as plain
+                    spans.push(Span::styled(text[i..].to_string(), base_style));
+                    return spans;
+                }
+            }
+            '*' => {
+                if i > plain_start {
+                    spans.push(Span::styled(text[plain_start..i].to_string(), base_style));
+                }
+                chars.next();
+                // Check for ** (bold) vs * (italic)
+                if chars.peek().map(|&(_, c)| c) == Some('*') {
+                    // Bold **...**
+                    chars.next();
+                    let bold_start = i + 2;
+                    let mut found_end = false;
+                    while let Some(&(j, c)) = chars.peek() {
+                        if c == '*' {
+                            chars.next();
+                            if chars.peek().map(|&(_, c2)| c2) == Some('*') {
+                                chars.next();
+                                spans.push(Span::styled(
+                                    text[bold_start..j].to_string(),
+                                    base_style.add_modifier(Modifier::BOLD),
+                                ));
+                                plain_start = j + 2;
+                                found_end = true;
+                                break;
+                            }
+                        } else {
+                            chars.next();
+                        }
+                    }
+                    if !found_end {
+                        spans.push(Span::styled(text[i..].to_string(), base_style));
+                        return spans;
+                    }
+                } else {
+                    // Italic *...*
+                    let italic_start = i + 1;
+                    let mut found_end = false;
+                    while let Some(&(j, c)) = chars.peek() {
+                        if c == '*' {
+                            spans.push(Span::styled(
+                                text[italic_start..j].to_string(),
+                                base_style.add_modifier(Modifier::ITALIC),
+                            ));
+                            chars.next();
+                            plain_start = j + 1;
+                            found_end = true;
+                            break;
+                        }
+                        chars.next();
+                    }
+                    if !found_end {
+                        spans.push(Span::styled(text[i..].to_string(), base_style));
+                        return spans;
+                    }
+                }
+            }
+            _ => {
+                chars.next();
+            }
+        }
+    }
+
+    // Remaining plain text
+    if plain_start < text.len() {
+        spans.push(Span::styled(text[plain_start..].to_string(), base_style));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base_style));
+    }
+
+    spans
+}
+
+/// Style a single line with markdown awareness.
+/// `in_code_block` tracks fenced code block state across lines.
+fn style_markdown_line(line: &str, inner_width: usize, in_code_block: &mut bool) -> Line<'static> {
+    let code_style = Style::default().fg(Color::Green);
+    let code_block_style = Style::default().fg(Color::Green);
+
+    // Fenced code block toggle
+    if line.starts_with("```") {
+        *in_code_block = !*in_code_block;
+        if *in_code_block {
+            // Opening fence — show language hint if present
+            let lang = line[3..].trim();
+            if lang.is_empty() {
+                return Line::styled("───", Style::default().fg(Color::DarkGray));
+            } else {
+                return Line::from(vec![
+                    Span::styled("─── ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(lang.to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+                    Span::styled(" ───", Style::default().fg(Color::DarkGray)),
+                ]);
+            }
+        } else {
+            // Closing fence
+            return Line::styled("───", Style::default().fg(Color::DarkGray));
+        }
+    }
+
+    // Inside code block — render as code
+    if *in_code_block {
+        return Line::styled(format!("  {}", line), code_block_style);
+    }
+
+    // User message (chat bubble)
+    if line.starts_with("> ") {
+        let content = &line[2..];
+        let content_len = content.len();
+        let avail = inner_width.saturating_sub(1);
+        if content_len <= avail {
+            let padding = avail - content_len;
+            return Line::from(vec![
+                Span::raw(" ".repeat(padding)),
+                Span::styled(content.to_string(), Style::default().bg(Color::DarkGray)),
+            ]);
+        } else {
+            return Line::styled(content.to_string(), Style::default().bg(Color::DarkGray));
+        }
+    }
+
+    // Separator
+    if line == "---" {
+        return Line::styled("───", Style::default().fg(Color::DarkGray));
+    }
+
+    // Headers
+    if line.starts_with("### ") {
+        let text = &line[4..];
+        return Line::from(parse_inline_markdown(text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    }
+    if line.starts_with("## ") {
+        let text = &line[3..];
+        return Line::from(parse_inline_markdown(text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    }
+    if line.starts_with("# ") {
+        let text = &line[2..];
+        return Line::from(parse_inline_markdown(text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    }
+
+    // Bullet lists — keep bullet, parse rest as inline markdown
+    if line.starts_with("- ") || line.starts_with("* ") {
+        let mut spans = vec![Span::styled(
+            line[..2].to_string(),
+            Style::default().fg(Color::Cyan),
+        )];
+        spans.extend(parse_inline_markdown(&line[2..], Style::default()));
+        return Line::from(spans);
+    }
+    // Indented bullets
+    if line.starts_with("  - ") || line.starts_with("  * ") {
+        let mut spans = vec![Span::styled(
+            line[..4].to_string(),
+            Style::default().fg(Color::Cyan),
+        )];
+        spans.extend(parse_inline_markdown(&line[4..], Style::default()));
+        return Line::from(spans);
+    }
+
+    // Numbered lists
+    if let Some(rest) = line.strip_prefix(|c: char| c.is_ascii_digit()) {
+        if let Some(rest) = rest.strip_prefix(". ") {
+            let prefix_len = line.len() - rest.len();
+            let mut spans = vec![Span::styled(
+                line[..prefix_len].to_string(),
+                Style::default().fg(Color::Cyan),
+            )];
+            spans.extend(parse_inline_markdown(rest, Style::default()));
+            return Line::from(spans);
+        }
+    }
+
+    // Default: parse inline markdown
+    let _ = code_style; // suppress warning
+    Line::from(parse_inline_markdown(line, Style::default()))
+}
+
+/// Build styled Line items from raw scrollback lines (owned, no lifetime ties).
+fn build_output_lines(
+    raw_lines: &[&str],
+    inner_width: usize,
+    session_status: &SessionStatus,
+    spinner: Option<u8>,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = if raw_lines.is_empty() {
         if *session_status == SessionStatus::Running {
             vec![Line::styled(
                 "Session started. Waiting for output...",
@@ -441,29 +674,12 @@ fn render_output_content(
             )]
         }
     } else {
-        visible.iter().map(|l| {
-            if l.starts_with("> ") {
-                let content = &l[2..];
-                let content_len = content.len();
-                let avail = inner_width.saturating_sub(1);
-                if content_len <= avail {
-                    let padding = avail - content_len;
-                    Line::from(vec![
-                        Span::raw(" ".repeat(padding)),
-                        Span::styled(content, Style::default().bg(Color::DarkGray)),
-                    ])
-                } else {
-                    Line::styled(content.to_string(), Style::default().bg(Color::DarkGray))
-                }
-            } else if *l == "---" {
-                Line::styled("---", Style::default().fg(Color::DarkGray))
-            } else {
-                Line::raw(*l)
-            }
+        let mut in_code_block = false;
+        raw_lines.iter().map(|l| {
+            style_markdown_line(l, inner_width, &mut in_code_block)
         }).collect()
     };
 
-    // Append spinner if waiting for response
     if let Some(tick) = spinner {
         let frame_char = SPINNER_FRAMES[tick as usize % SPINNER_FRAMES.len()];
         lines.push(Line::styled(
@@ -471,6 +687,37 @@ fn render_output_content(
             Style::default().fg(Color::Cyan),
         ));
     }
+
+    lines
+}
+
+/// Calculate total visual (wrapped) line count from styled Lines.
+fn styled_total_visual(lines: &[Line], inner_width: usize) -> usize {
+    lines.iter()
+        .map(|l| {
+            let len: usize = l.spans.iter().map(|s| s.content.len()).sum();
+            wrapped_line_height(len, inner_width)
+        })
+        .sum()
+}
+
+fn render_output_content(
+    frame: &mut ratatui::Frame,
+    output_area: Rect,
+    lines: Vec<Line<'static>>,
+    scroll_offset: usize,
+    inner_width: usize,
+    inner_height: usize,
+    focus: Focus,
+    title: Line<'_>,
+) {
+    let total_visual = styled_total_visual(&lines, inner_width);
+
+    // scroll_offset = visual lines from the bottom (0 = at bottom)
+    // Paragraph::scroll takes lines from the top
+    let max_scroll = total_visual.saturating_sub(inner_height);
+    let clamped_offset = scroll_offset.min(max_scroll);
+    let scroll_from_top = max_scroll.saturating_sub(clamped_offset);
 
     let output_border_style = if focus == Focus::Output {
         Style::default().fg(Color::Cyan)
@@ -483,7 +730,8 @@ fn render_output_content(
         .border_style(output_border_style);
     let paragraph = Paragraph::new(lines)
         .block(output_block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_from_top as u16, 0));
     frame.render_widget(paragraph, output_area);
 }
 
@@ -519,11 +767,32 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
     app.pane_areas.tree = Rect::default(); // No tree in zoom mode
     app.last_output_height = output_area.height;
     let inner_height = output_area.height.saturating_sub(2) as usize;
+    let inner_width = output_area.width.saturating_sub(2) as usize;
 
-    let scrollback = app.scrollbacks.get(&ws.id);
-    let visible: Vec<&str> = scrollback
-        .map(|buf| buf.visible_lines(inner_height))
+    // Build styled lines, compute visual total, clamp scroll, then render
+    let mut all_lines: Vec<&str> = app.scrollbacks.get(&ws.id)
+        .map(|buf| buf.all_lines())
         .unwrap_or_default();
+    // Append in-progress streaming line if present
+    let streaming_partial = app.streaming_text.get(&ws.id);
+    if let Some(partial) = streaming_partial {
+        if !partial.is_empty() {
+            all_lines.push(partial.as_str());
+        }
+    }
+    let spinner = if app.waiting_response.contains(&ws.id) {
+        Some(app.spinner_tick)
+    } else {
+        None
+    };
+    let styled_lines = build_output_lines(&all_lines, inner_width, &session_status, spinner);
+    let total_visual = styled_total_visual(&styled_lines, inner_width);
+    let max_offset = total_visual.saturating_sub(inner_height);
+    if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
+        buf.clamp_scroll_offset(max_offset);
+    }
+    let scroll_offset = app.scrollbacks.get(&ws.id)
+        .map(|buf| buf.scroll_offset()).unwrap_or(0);
 
     let (status_str, status_color) = match session_status {
         SessionStatus::Running => ("\u{25B6}", Color::Green),
@@ -537,16 +806,11 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
         Span::raw(" "),
     ]);
 
-    let spinner = if app.waiting_response.contains(&ws.id) {
-        Some(app.spinner_tick)
-    } else {
-        None
-    };
-    render_output_content(frame, output_area, &visible, &session_status, app.focus, output_title, spinner);
+    render_output_content(frame, output_area, styled_lines, scroll_offset, inner_width, inner_height, app.focus, output_title);
 
-    // Scrollbar
-    if let Some(buf) = scrollback {
-        render_scrollbar(frame, output_area, buf.total_lines(), inner_height, buf.clamped_offset(inner_height));
+    // Scrollbar (use visual line counts)
+    if app.scrollbacks.contains_key(&ws.id) {
+        render_scrollbar(frame, output_area, total_visual, inner_height, scroll_offset);
     }
 
     // Composer area
@@ -585,11 +849,9 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
         SessionStatus::Exited => ("\u{2717}", Color::DarkGray),
     };
 
-    let scroll_info = if let Some(buf) = app.scrollbacks.get(&ws.id) {
-        let total = buf.total_lines();
-        let offset = buf.clamped_offset(inner_height);
-        let current_line = total.saturating_sub(offset);
-        format!("line {}/{}", current_line, total)
+    let scroll_info = if app.scrollbacks.contains_key(&ws.id) {
+        let current_line = total_visual.saturating_sub(scroll_offset);
+        format!("line {}/{}", current_line, total_visual)
     } else {
         String::new()
     };

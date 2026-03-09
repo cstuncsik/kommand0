@@ -39,6 +39,14 @@ enum RepoAction {
     },
     /// List all tracked repos
     List,
+    /// Delete a tracked repo and all its workspaces/sessions
+    Delete {
+        /// Repo reference (name, path, or ID)
+        name: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -128,6 +136,37 @@ fn main() -> anyhow::Result<()> {
                         println!("{}  {}  {}", repo.id, repo.name, repo.path);
                     }
                 }
+            }
+            RepoAction::Delete { name, force } => {
+                let mut state = AppState::load()?;
+                let repo = state.resolve_repo(&name)?.clone();
+                let ws_count = state.workspaces.iter().filter(|w| w.repo_id == repo.id).count();
+
+                if !force {
+                    let stdin = std::io::stdin();
+                    if !stdin.is_terminal() {
+                        eprintln!("error: refusing to delete without --force in non-interactive mode");
+                        std::process::exit(1);
+                    }
+                    if ws_count > 0 {
+                        print!(
+                            "Delete repo '{}' and its {} workspace(s)? [y/N] ",
+                            repo.name, ws_count
+                        );
+                    } else {
+                        print!("Delete repo '{}'? [y/N] ", repo.name);
+                    }
+                    std::io::stdout().flush()?;
+                    let mut input = String::new();
+                    stdin.read_line(&mut input)?;
+                    if !matches!(input.trim(), "y" | "Y") {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+
+                state.delete_repo(&name)?;
+                println!("Deleted repo: {} ({} workspace(s) removed)", repo.name, ws_count);
             }
         },
         Commands::Workspace { action } => match action {

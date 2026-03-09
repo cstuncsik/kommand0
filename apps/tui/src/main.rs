@@ -82,6 +82,9 @@ pub(crate) struct App {
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
     pub(crate) pending_button_action: Option<buttons::HitAction>,
     pub(crate) modal: modal::ModalState,
+    /// Accumulates streaming delta text per workspace until newlines flush to scrollback.
+    streaming_text: HashMap<String, String>,
+    tick_counter: u8,
 }
 
 impl App {
@@ -110,9 +113,13 @@ impl App {
                                     buf.push_line("---".to_string());
                                 }
                                 if source == "user" {
-                                    buf.push_line(format!("> {}", content));
+                                    for segment in content.split('\n') {
+                                        buf.push_line(format!("> {}", segment));
+                                    }
                                 } else {
-                                    buf.push_line(content.to_string());
+                                    for segment in content.split('\n') {
+                                        buf.push_line(segment.to_string());
+                                    }
                                 }
                                 last_source = source;
                             }
@@ -147,6 +154,8 @@ impl App {
             hit_regions: Vec::new(),
             pending_button_action: None,
             modal: modal::ModalState::default(),
+            streaming_text: HashMap::new(),
+            tick_counter: 0,
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -297,14 +306,22 @@ impl App {
     }
 
     /// Get session status icon for a workspace
-    pub(crate) fn session_status_icon(&self, workspace_id: &str) -> Option<(&str, Color)> {
+    pub(crate) fn session_status_icon(&self, workspace_id: &str) -> Option<(String, Color)> {
+        const SPINNER: &[&str] = &["\u{28CB}","\u{2819}","\u{2839}","\u{2838}","\u{283C}","\u{2834}","\u{2826}","\u{2827}","\u{2807}","\u{280F}"];
         self.state
             .find_session_by_workspace(workspace_id)
             .map(|s| match s.status {
-                SessionStatus::Running => (" \u{25B6}", Color::Green),   // ▶
-                SessionStatus::Stopped => (" \u{25A0}", Color::Yellow),  // ■
-                SessionStatus::Failed => (" \u{2717}", Color::Red),      // ✗
-                SessionStatus::Exited => (" \u{2717}", Color::DarkGray), // ✗
+                SessionStatus::Running => {
+                    if self.waiting_response.contains(workspace_id) {
+                        let frame = SPINNER[self.spinner_tick as usize % SPINNER.len()];
+                        (format!(" {}", frame), Color::Cyan)
+                    } else {
+                        (" \u{25B6}".to_string(), Color::Green) // ▶
+                    }
+                }
+                SessionStatus::Stopped => (" \u{25A0}".to_string(), Color::Yellow),  // ■
+                SessionStatus::Failed => (" \u{2717}".to_string(), Color::Red),      // ✗
+                SessionStatus::Exited => (" \u{2717}".to_string(), Color::DarkGray), // ✗
             })
     }
 
@@ -339,8 +356,25 @@ impl App {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
+    // DISAMBIGUATE_ESCAPE_CODES lets terminals report Shift+Enter distinctly from Enter
+    let supports_enhanced_keys = crossterm::terminal::supports_keyboard_enhancement()
+        .unwrap_or(false);
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    if supports_enhanced_keys {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            )
+        );
+    }
     let result = run(&mut terminal).await;
+    if supports_enhanced_keys {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     result
@@ -429,11 +463,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             }
         }
         app.update_active_session();
-        app.focus = Focus::Output;
+        app.focus = Focus::Tree;
     }
 
     let mut reader = EventStream::new();
-    let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
+    let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
 
     loop {
         terminal.draw(|frame| render::ui(frame, &mut app))?;
@@ -469,6 +503,55 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                 completions: Vec::new(),
                                                 completion_index: None,
                                             };
+                                        }
+                                    }
+                                }
+                                modal::ModalResult::ConfirmDelete(target) => {
+                                    match target {
+                                        modal::DeleteTarget::Workspace { name } => {
+                                            // Gather IDs before mutating
+                                            let ws_info = app.state.workspaces.iter()
+                                                .find(|w| w.name == name)
+                                                .map(|w| {
+                                                    let sid = app.state.find_session_by_workspace(&w.id)
+                                                        .filter(|s| s.status == SessionStatus::Running)
+                                                        .map(|s| s.id.clone());
+                                                    (w.id.clone(), sid)
+                                                });
+                                            if let Some((ws_id, running_sid)) = ws_info {
+                                                if let Some(sid) = running_sid {
+                                                    let _ = app.session_manager.stop_session(&sid).await;
+                                                    let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+                                                }
+                                                app.scrollbacks.remove(&ws_id);
+                                            }
+                                            let _ = app.state.delete_workspace(&name);
+                                            app.workspaces = app.state.workspaces.clone();
+                                            app.rebuild_tree();
+                                            app.update_active_session();
+                                        }
+                                        modal::DeleteTarget::Repo { id, .. } => {
+                                            // Stop all running sessions for this repo's workspaces
+                                            let ws_ids: Vec<String> = app.state.workspaces.iter()
+                                                .filter(|w| w.repo_id == id)
+                                                .map(|w| w.id.clone())
+                                                .collect();
+                                            for ws_id in &ws_ids {
+                                                if let Some(s) = app.state.find_session_by_workspace(ws_id) {
+                                                    if s.status == SessionStatus::Running {
+                                                        let sid = s.id.clone();
+                                                        let _ = app.session_manager.stop_session(&sid).await;
+                                                        let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+                                                    }
+                                                }
+                                                app.scrollbacks.remove(ws_id);
+                                            }
+                                            let _ = app.state.delete_repo(&id);
+                                            app.repos = app.state.repos.clone();
+                                            app.workspaces = app.state.workspaces.clone();
+                                            app.expanded.remove(&id);
+                                            app.rebuild_tree();
+                                            app.update_active_session();
                                         }
                                     }
                                 }
@@ -649,7 +732,13 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                     let buf = app.scrollbacks
                                                         .entry(ws_id.clone())
                                                         .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                                    buf.push_line(format!("> {}", text));
+                                                    // Add separator before user message if there's prior content
+                                                    if !buf.is_empty() {
+                                                        buf.push_line("---".to_string());
+                                                    }
+                                                    for line in text.split('\n') {
+                                                        buf.push_line(format!("> {}", line));
+                                                    }
                                                     buf.push_line("---".to_string());
                                                     app.waiting_response.insert(ws_id);
                                                 }
@@ -912,6 +1001,80 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                     };
                                                 }
                                             }
+                                            KeyCode::Char('d') => {
+                                                // Delete selected item with confirmation
+                                                match app.tree_items.get(app.selected_index).cloned() {
+                                                    Some(TreeNode::Workspace { ws, .. }) => {
+                                                        app.modal = modal::ModalState::ConfirmDelete {
+                                                            target: modal::DeleteTarget::Workspace {
+                                                                name: ws.name.clone(),
+                                                            },
+                                                        };
+                                                    }
+                                                    Some(TreeNode::Repo { id, name, .. }) => {
+                                                        let ws_count = app.workspaces.iter()
+                                                            .filter(|w| w.repo_id == id)
+                                                            .count();
+                                                        app.modal = modal::ModalState::ConfirmDelete {
+                                                            target: modal::DeleteTarget::Repo {
+                                                                id,
+                                                                name,
+                                                                workspace_count: ws_count,
+                                                            },
+                                                        };
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            KeyCode::Char('D') => {
+                                                // Force delete without confirmation
+                                                match app.tree_items.get(app.selected_index).cloned() {
+                                                    Some(TreeNode::Workspace { ws, .. }) => {
+                                                        let ws_info = app.state.workspaces.iter()
+                                                            .find(|w| w.name == ws.name)
+                                                            .map(|w| {
+                                                                let sid = app.state.find_session_by_workspace(&w.id)
+                                                                    .filter(|s| s.status == SessionStatus::Running)
+                                                                    .map(|s| s.id.clone());
+                                                                (w.id.clone(), sid)
+                                                            });
+                                                        if let Some((ws_id, running_sid)) = ws_info {
+                                                            if let Some(sid) = running_sid {
+                                                                let _ = app.session_manager.stop_session(&sid).await;
+                                                                let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+                                                            }
+                                                            app.scrollbacks.remove(&ws_id);
+                                                        }
+                                                        let _ = app.state.delete_workspace(&ws.name);
+                                                        app.workspaces = app.state.workspaces.clone();
+                                                        app.rebuild_tree();
+                                                        app.update_active_session();
+                                                    }
+                                                    Some(TreeNode::Repo { id, .. }) => {
+                                                        let ws_ids: Vec<String> = app.state.workspaces.iter()
+                                                            .filter(|w| w.repo_id == id)
+                                                            .map(|w| w.id.clone())
+                                                            .collect();
+                                                        for ws_id in &ws_ids {
+                                                            if let Some(s) = app.state.find_session_by_workspace(ws_id) {
+                                                                if s.status == SessionStatus::Running {
+                                                                    let sid = s.id.clone();
+                                                                    let _ = app.session_manager.stop_session(&sid).await;
+                                                                    let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+                                                                }
+                                                            }
+                                                            app.scrollbacks.remove(ws_id);
+                                                        }
+                                                        let _ = app.state.delete_repo(&id);
+                                                        app.repos = app.state.repos.clone();
+                                                        app.workspaces = app.state.workspaces.clone();
+                                                        app.expanded.remove(&id);
+                                                        app.rebuild_tree();
+                                                        app.update_active_session();
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -988,15 +1151,62 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 }
             }
             _ = tick_interval.tick() => {
-                // Advance spinner animation
-                app.spinner_tick = (app.spinner_tick + 1) % 10;
+                // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
+                app.tick_counter = app.tick_counter.wrapping_add(1);
+                if app.tick_counter % 5 == 0 {
+                    app.spinner_tick = (app.spinner_tick + 1) % 10;
+                }
 
                 // Poll session events
                 let events = app.session_manager.poll_events();
                 for event in events {
                     match event {
+                        SessionEvent::StreamDelta { session_id, text } => {
+                            let ws_id = app.state.sessions.iter()
+                                .find(|s| s.id == session_id)
+                                .map(|s| s.workspace_id.clone());
+                            if let Some(ws_id) = ws_id {
+                                // Clear waiting/thinking on first delta
+                                app.waiting_response.remove(&ws_id);
+
+                                let stream_buf = app.streaming_text
+                                    .entry(ws_id.clone())
+                                    .or_default();
+                                stream_buf.push_str(&text);
+
+                                // Flush completed lines (up to last \n) to scrollback
+                                let buf = app.scrollbacks
+                                    .entry(ws_id.clone())
+                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                let stream = app.streaming_text.get_mut(&ws_id).unwrap();
+                                while let Some(nl) = stream.find('\n') {
+                                    let line = stream[..nl].to_string();
+                                    buf.push_line(line);
+                                    *stream = stream[nl + 1..].to_string();
+                                }
+                                // Remaining partial text stays in streaming_text
+                                // and will be shown as an in-progress line by the renderer
+                            }
+                            app.write_log(&session_id, "claude", &text);
+                        }
+                        SessionEvent::StreamEnd { session_id } => {
+                            let ws_id = app.state.sessions.iter()
+                                .find(|s| s.id == session_id)
+                                .map(|s| s.workspace_id.clone());
+                            if let Some(ws_id) = ws_id {
+                                // Flush any remaining partial line
+                                if let Some(remaining) = app.streaming_text.remove(&ws_id) {
+                                    if !remaining.is_empty() {
+                                        let buf = app.scrollbacks
+                                            .entry(ws_id)
+                                            .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                        buf.push_line(remaining);
+                                    }
+                                }
+                            }
+                        }
                         SessionEvent::Output { session_id, line } => {
-                            // Find workspace_id for this session
+                            // Complete message (non-streaming, e.g. stderr or non-delta content)
                             let ws_id = app.state.sessions.iter()
                                 .find(|s| s.id == session_id)
                                 .map(|s| s.workspace_id.clone());
@@ -1004,13 +1214,13 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 let buf = app.scrollbacks
                                     .entry(ws_id.clone())
                                     .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                buf.push_line(line.clone());
-                                // Clear waiting indicator on first meaningful output
+                                for segment in line.split('\n') {
+                                    buf.push_line(segment.to_string());
+                                }
                                 if !line.is_empty() {
                                     app.waiting_response.remove(&ws_id);
                                 }
                             }
-                            // Write log
                             app.write_log(&session_id, "claude", &line);
                         }
                         SessionEvent::Exited { session_id, exit_code } => {

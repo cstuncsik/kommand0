@@ -30,12 +30,24 @@ impl Composer {
     /// - All other keys are forwarded to the underlying TextArea
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
         match key {
-            // Shift+Enter = newline (use insert_newline directly for cross-terminal reliability)
+            // Shift+Enter or Alt+Enter = newline
+            // iTerm2 sends Shift+Enter as "\n" (Char('\n')), so catch that too.
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers,
                 ..
-            } if modifiers.contains(KeyModifiers::SHIFT) => {
+            } if modifiers.contains(KeyModifiers::SHIFT)
+                || modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.textarea.insert_newline();
+                None
+            }
+            // iTerm2 key binding: Shift+Return sends "\n" which arrives as Ctrl+J
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.textarea.insert_newline();
                 None
             }

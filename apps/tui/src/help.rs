@@ -34,6 +34,8 @@ const TREE_BINDINGS: &[KeyBinding] = &[
     KeyBinding { keys: "[x]", description: "Stop session" },
     KeyBinding { keys: "[a]", description: "Add repository" },
     KeyBinding { keys: "[w]", description: "Add workspace" },
+    KeyBinding { keys: "[d]", description: "Delete selected" },
+    KeyBinding { keys: "[D]", description: "Force delete" },
 ];
 
 const OUTPUT_BINDINGS: &[KeyBinding] = &[
@@ -48,7 +50,7 @@ const OUTPUT_BINDINGS: &[KeyBinding] = &[
 
 const COMPOSER_BINDINGS: &[KeyBinding] = &[
     KeyBinding { keys: "[Enter]", description: "Send message" },
-    KeyBinding { keys: "[Shift+Enter]", description: "New line" },
+    KeyBinding { keys: "[Shift+Enter / Alt+Enter]", description: "New line" },
     KeyBinding { keys: "[Ctrl+C]", description: "Clear input" },
 ];
 

@@ -72,6 +72,15 @@ pub fn create_worktree(
     }
 
     let worktree_dir = base_dir.join("worktrees").join(workspace_name);
+    // Canonicalize base_dir to ensure absolute path (worktree dir doesn't exist yet,
+    // so canonicalize the parent and re-append)
+    let worktree_dir = if worktree_dir.is_relative() {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(&worktree_dir)
+    } else {
+        worktree_dir
+    };
     let worktree_path = worktree_dir.to_string_lossy().to_string();
 
     // If worktree path already exists, try to clean it up

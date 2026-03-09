@@ -105,6 +105,61 @@ impl AppState {
         self.add_repo_with_base(path, Self::state_dir().as_path())
     }
 
+    /// Delete a repo by reference (name, path, or ID), cascading to workspaces and sessions.
+    ///
+    /// Removes all workspaces (and their worktrees) and sessions belonging to the repo.
+    pub fn delete_repo_with_base(
+        &mut self,
+        repo_ref: &str,
+        base: &Path,
+    ) -> anyhow::Result<RepoEntry> {
+        let repo = self.resolve_repo(repo_ref)?.clone();
+
+        // Collect workspace IDs for this repo
+        let ws_ids: Vec<String> = self
+            .workspaces
+            .iter()
+            .filter(|w| w.repo_id == repo.id)
+            .map(|w| w.id.clone())
+            .collect();
+
+        // Remove sessions for these workspaces and clean up log files
+        self.sessions.retain(|s| {
+            if ws_ids.contains(&s.workspace_id) {
+                let log_path = Path::new(&s.log_file);
+                if log_path.exists() {
+                    let _ = fs::remove_file(log_path);
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        // Remove workspaces and their worktrees
+        self.workspaces.retain(|w| {
+            if w.repo_id == repo.id {
+                if let Some(wt_path) = &w.worktree_path {
+                    let _ = worktree::remove_worktree(&repo.path, wt_path);
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        // Remove the repo itself
+        self.repos.retain(|r| r.id != repo.id);
+
+        self.save_to(base)?;
+        Ok(repo)
+    }
+
+    /// Delete a repo, saving state to the default state directory.
+    pub fn delete_repo(&mut self, repo_ref: &str) -> anyhow::Result<RepoEntry> {
+        self.delete_repo_with_base(repo_ref, Self::state_dir().as_path())
+    }
+
     // --- Workspace methods ---
 
     /// Resolve a repo reference by name, path, or ID.
@@ -194,16 +249,11 @@ impl AppState {
             match worktree::create_worktree(&repo.path, &ws_name, base) {
                 worktree::WorktreeResult::Created {
                     worktree_path,
-                    branch_name,
+                    branch_name: _,
                 } => {
-                    eprintln!(
-                        "Created worktree on branch {} at {}",
-                        branch_name, worktree_path
-                    );
                     (worktree_path.clone(), Some(worktree_path))
                 }
-                worktree::WorktreeResult::Fallback { reason } => {
-                    eprintln!("Worktree skipped ({}), using repo root", reason);
+                worktree::WorktreeResult::Fallback { reason: _ } => {
                     (repo.path.clone(), None)
                 }
             }
