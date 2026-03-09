@@ -2,6 +2,7 @@ pub mod id;
 pub mod repo;
 pub mod session;
 pub mod workspace;
+pub mod worktree;
 
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
@@ -104,6 +105,61 @@ impl AppState {
         self.add_repo_with_base(path, Self::state_dir().as_path())
     }
 
+    /// Delete a repo by reference (name, path, or ID), cascading to workspaces and sessions.
+    ///
+    /// Removes all workspaces (and their worktrees) and sessions belonging to the repo.
+    pub fn delete_repo_with_base(
+        &mut self,
+        repo_ref: &str,
+        base: &Path,
+    ) -> anyhow::Result<RepoEntry> {
+        let repo = self.resolve_repo(repo_ref)?.clone();
+
+        // Collect workspace IDs for this repo
+        let ws_ids: Vec<String> = self
+            .workspaces
+            .iter()
+            .filter(|w| w.repo_id == repo.id)
+            .map(|w| w.id.clone())
+            .collect();
+
+        // Remove sessions for these workspaces and clean up log files
+        self.sessions.retain(|s| {
+            if ws_ids.contains(&s.workspace_id) {
+                let log_path = Path::new(&s.log_file);
+                if log_path.exists() {
+                    let _ = fs::remove_file(log_path);
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        // Remove workspaces and their worktrees
+        self.workspaces.retain(|w| {
+            if w.repo_id == repo.id {
+                if let Some(wt_path) = &w.worktree_path {
+                    let _ = worktree::remove_worktree(&repo.path, wt_path);
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        // Remove the repo itself
+        self.repos.retain(|r| r.id != repo.id);
+
+        self.save_to(base)?;
+        Ok(repo)
+    }
+
+    /// Delete a repo, saving state to the default state directory.
+    pub fn delete_repo(&mut self, repo_ref: &str) -> anyhow::Result<RepoEntry> {
+        self.delete_repo_with_base(repo_ref, Self::state_dir().as_path())
+    }
+
     // --- Workspace methods ---
 
     /// Resolve a repo reference by name, path, or ID.
@@ -142,11 +198,35 @@ impl AppState {
     }
 
     /// Create a workspace with a custom base directory for state persistence.
+    ///
+    /// By default, creates a git worktree for the workspace. Set `use_worktree` to
+    /// `false` to skip worktree creation and use the repo root as working directory.
     pub fn create_workspace_with_base(
         &mut self,
         name: Option<&str>,
         repo_ref: &str,
         base: &Path,
+    ) -> anyhow::Result<Workspace> {
+        self.create_workspace_impl(name, repo_ref, base, true)
+    }
+
+    /// Create a workspace, optionally skipping worktree creation.
+    pub fn create_workspace_with_options(
+        &mut self,
+        name: Option<&str>,
+        repo_ref: &str,
+        base: &Path,
+        use_worktree: bool,
+    ) -> anyhow::Result<Workspace> {
+        self.create_workspace_impl(name, repo_ref, base, use_worktree)
+    }
+
+    fn create_workspace_impl(
+        &mut self,
+        name: Option<&str>,
+        repo_ref: &str,
+        base: &Path,
+        use_worktree: bool,
     ) -> anyhow::Result<Workspace> {
         let repo = self.resolve_repo(repo_ref)?.clone();
 
@@ -164,13 +244,31 @@ impl AppState {
             .expect("time went backwards")
             .as_secs();
 
+        // Try to create a git worktree
+        let (working_dir, worktree_path) = if use_worktree {
+            match worktree::create_worktree(&repo.path, &ws_name, base) {
+                worktree::WorktreeResult::Created {
+                    worktree_path,
+                    branch_name: _,
+                } => {
+                    (worktree_path.clone(), Some(worktree_path))
+                }
+                worktree::WorktreeResult::Fallback { reason: _ } => {
+                    (repo.path.clone(), None)
+                }
+            }
+        } else {
+            (repo.path.clone(), None)
+        };
+
         let ws = Workspace {
             id: generate_id(),
             name: ws_name,
             repo_id: repo.id.clone(),
-            working_dir: repo.path.clone(),
+            working_dir,
             active: true,
             created_at: now,
+            worktree_path,
         };
 
         self.workspaces.push(ws.clone());
@@ -220,6 +318,7 @@ impl AppState {
     }
 
     /// Delete a workspace by name, saving to custom base directory.
+    /// Also removes the git worktree if one was created.
     pub fn delete_workspace_with_base(
         &mut self,
         name: &str,
@@ -231,6 +330,14 @@ impl AppState {
             .position(|w| w.name == name)
             .ok_or_else(|| anyhow::anyhow!("workspace not found: {}", name))?;
         let removed = self.workspaces.remove(idx);
+
+        // Clean up worktree if present
+        if let Some(wt_path) = &removed.worktree_path {
+            if let Some(repo) = self.repos.iter().find(|r| r.id == removed.repo_id) {
+                let _ = worktree::remove_worktree(&repo.path, wt_path);
+            }
+        }
+
         self.save_to(base)?;
         Ok(removed)
     }
