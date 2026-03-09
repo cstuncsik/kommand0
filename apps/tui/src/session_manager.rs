@@ -17,6 +17,15 @@ pub enum SessionEvent {
         session_id: String,
         line: String,
     },
+    /// A small streaming text chunk from content_block_delta.
+    StreamDelta {
+        session_id: String,
+        text: String,
+    },
+    /// Streaming content block finished (content_block_stop / message_stop).
+    StreamEnd {
+        session_id: String,
+    },
     Exited {
         session_id: String,
         exit_code: Option<i32>,
@@ -121,6 +130,7 @@ impl SessionManager {
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
+            let mut had_deltas = false;
             while let Ok(Some(raw_line)) = lines.next_line().await {
                 let stripped = strip_ansi_escapes::strip_str(&raw_line);
                 // Try to extract claude session_id from any JSON line
@@ -130,17 +140,41 @@ impl SessionManager {
                         claude_session_id: csid,
                     });
                 }
-                let text = extract_text_from_json(&stripped);
-                if text.is_empty() {
-                    continue;
-                }
-                if tx_stdout
-                    .send(SessionEvent::Output {
-                        session_id: sid_stdout.clone(),
-                        line: text,
-                    })
-                    .is_err()
-                {
+                let event = match classify_json_event(&stripped) {
+                    JsonEvent::Delta(text) => {
+                        had_deltas = true;
+                        SessionEvent::StreamDelta {
+                            session_id: sid_stdout.clone(),
+                            text,
+                        }
+                    }
+                    JsonEvent::StreamEnd => {
+                        let was_streaming = had_deltas;
+                        had_deltas = false;
+                        if was_streaming {
+                            SessionEvent::StreamEnd {
+                                session_id: sid_stdout.clone(),
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    JsonEvent::Complete(text) => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        // If we already streamed deltas, skip the duplicate complete message
+                        if had_deltas {
+                            continue;
+                        }
+                        SessionEvent::Output {
+                            session_id: sid_stdout.clone(),
+                            line: text,
+                        }
+                    }
+                    JsonEvent::Empty => continue,
+                };
+                if tx_stdout.send(event).is_err() {
                     break;
                 }
             }
@@ -335,94 +369,102 @@ impl SessionManager {
     }
 }
 
-/// Extract text content from a stream-json output line.
-///
-/// Parses the line as JSON and looks for content in common locations:
-/// - `result.content` (final result)
-/// - `content` as string (streaming events)
-/// - `content` as array of content blocks with `text` fields
-/// - `message.content` (assistant message events)
-/// - Falls back to the raw line if JSON parsing fails (pitfall 3: graceful fallback).
-fn extract_text_from_json(line: &str) -> String {
+/// Classified JSON event from Claude CLI stream-json output.
+enum JsonEvent {
+    /// Streaming text chunk (content_block_delta).
+    Delta(String),
+    /// End of a streaming content block.
+    StreamEnd,
+    /// Complete text from assistant/message/result (may duplicate deltas).
+    Complete(String),
+    /// Non-content event or empty.
+    Empty,
+}
+
+/// Classify a stream-json output line into a JsonEvent.
+fn classify_json_event(line: &str) -> JsonEvent {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return JsonEvent::Empty;
     }
 
     match serde_json::from_str::<Value>(trimmed) {
         Ok(val) => {
             let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-            // Filter out non-content events (system hooks, init, etc.)
             match event_type {
-                "system" | "start" | "ping" | "error" => return String::new(),
-                _ => {}
-            }
+                "system" | "start" | "ping" | "error" => JsonEvent::Empty,
 
-            // content_block_delta: streaming text chunks
-            if event_type == "content_block_delta" {
-                if let Some(text) = val
-                    .get("delta")
-                    .and_then(|d| d.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    return text.to_string();
-                }
-            }
-
-            // assistant message with content blocks array
-            if event_type == "assistant" || event_type == "message" {
-                if let Some(blocks) = val
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array())
-                    .or_else(|| val.get("content").and_then(|c| c.as_array()))
-                {
-                    let texts: Vec<&str> = blocks
-                        .iter()
-                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                        .collect();
-                    if !texts.is_empty() {
-                        return texts.join("");
+                "content_block_delta" => {
+                    if let Some(text) = val
+                        .get("delta")
+                        .and_then(|d| d.get("text"))
+                        .and_then(|t| t.as_str())
+                    {
+                        JsonEvent::Delta(text.to_string())
+                    } else {
+                        JsonEvent::Empty
                     }
                 }
-            }
 
-            // result.content (final response)
-            if let Some(content) = val
-                .get("result")
-                .and_then(|r| r.get("content"))
-                .and_then(|c| c.as_str())
-            {
-                return content.to_string();
-            }
+                "content_block_stop" | "message_stop" => JsonEvent::StreamEnd,
 
-            // result with content blocks array
-            if let Some(blocks) = val
-                .get("result")
-                .and_then(|r| r.get("content"))
-                .and_then(|c| c.as_array())
-            {
-                let texts: Vec<&str> = blocks
-                    .iter()
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect();
-                if !texts.is_empty() {
-                    return texts.join("");
+                "assistant" | "message" => {
+                    if let Some(blocks) = val
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_array())
+                        .or_else(|| val.get("content").and_then(|c| c.as_array()))
+                    {
+                        let texts: Vec<&str> = blocks
+                            .iter()
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect();
+                        if !texts.is_empty() {
+                            return JsonEvent::Complete(texts.join(""));
+                        }
+                    }
+                    JsonEvent::Empty
+                }
+
+                "result" => {
+                    // result.content as string
+                    if let Some(content) = val
+                        .get("result")
+                        .and_then(|r| r.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        return JsonEvent::Complete(content.to_string());
+                    }
+                    // result with content blocks array
+                    if let Some(blocks) = val
+                        .get("result")
+                        .and_then(|r| r.get("content"))
+                        .and_then(|c| c.as_array())
+                    {
+                        let texts: Vec<&str> = blocks
+                            .iter()
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect();
+                        if !texts.is_empty() {
+                            return JsonEvent::Complete(texts.join(""));
+                        }
+                    }
+                    JsonEvent::Empty
+                }
+
+                _ => {
+                    // content as string directly
+                    if let Some(content) = val.get("content").and_then(|c| c.as_str()) {
+                        return JsonEvent::Complete(content.to_string());
+                    }
+                    JsonEvent::Empty
                 }
             }
-
-            // content as string directly
-            if let Some(content) = val.get("content").and_then(|c| c.as_str()) {
-                return content.to_string();
-            }
-
-            // Skip unrecognized JSON events silently (don't show raw JSON)
-            String::new()
         }
         Err(_) => {
             // Not valid JSON -- treat as raw text (pitfall 3)
-            trimmed.to_string()
+            JsonEvent::Complete(trimmed.to_string())
         }
     }
 }

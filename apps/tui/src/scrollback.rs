@@ -33,6 +33,16 @@ impl ScrollbackBuffer {
         }
     }
 
+    /// Append text to the last line in the buffer (for streaming accumulation).
+    /// If the buffer is empty, pushes a new line.
+    pub fn append_to_last_line(&mut self, text: &str) {
+        if let Some(last) = self.lines.back_mut() {
+            last.push_str(text);
+        } else {
+            self.push_line(text.to_string());
+        }
+    }
+
     pub fn push_lines(&mut self, lines: impl IntoIterator<Item = String>) {
         for line in lines {
             self.push_line(line);
@@ -85,6 +95,24 @@ impl ScrollbackBuffer {
             .take(end - start)
             .map(|s| s.as_str())
             .collect()
+    }
+
+    /// Return all lines as string slices (for Paragraph::scroll-based rendering).
+    pub fn all_lines(&self) -> Vec<&str> {
+        self.lines.iter().map(|s| s.as_str()).collect()
+    }
+
+    /// Return the raw scroll_offset (not clamped).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    /// Clamp scroll_offset to a maximum value. Called by the renderer
+    /// after computing the actual max based on visual (wrapped) line count.
+    pub fn clamp_scroll_offset(&mut self, max_offset: usize) {
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
     }
 
     pub fn clear(&mut self) {
