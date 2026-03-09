@@ -21,6 +21,7 @@ cargo build --workspace
 # Repos
 kmd repo add /path/to/your/repo
 kmd repo list
+kmd repo delete <name-or-path> [--force]
 
 # Workspaces
 kmd workspace create --repo <name-or-path>
@@ -43,23 +44,41 @@ kmd session clear <workspace>
 cargo run -p kommand0-tui
 ```
 
+### Features
+
+- **3-pane layout**: Tree (repos/workspaces), Output (streaming Claude responses), Composer (message input)
+- **Streaming output**: Responses stream in real-time with markdown rendering (headers, bold, italic, code blocks, lists)
+- **Mouse support**: Click to focus panes, click tree items, scroll wheel in output and tree
+- **Buttons**: Clickable [Start], [Stop], [Resume] with hover highlighting
+- **Modals**: Add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion
+- **Git worktrees**: Each workspace gets an isolated git worktree branch
+- **Activity indicator**: Animated spinner on workspace tree item while Claude is thinking
+- **Zoom mode**: Full-screen output with `z`, status bar shows workspace/session info
+- **Session resume**: Sessions auto-resume on TUI restart with full scrollback history
+
 ### Keybindings
 
 | Key | Context | Action |
 |-----|---------|--------|
 | `j` / `k` / `Up` / `Down` | Tree | Navigate workspaces |
-| `Enter` | Tree | Select workspace |
+| `Enter` | Tree | Select / start / resume workspace session |
 | `r` | Tree | Start Claude session in selected workspace |
 | `R` | Tree | Restart / resume session |
+| `a` | Tree | Add repository (modal) |
+| `w` | Tree | Add workspace to selected repo (modal) |
 | `Ctrl+C` | Tree / Output | Stop running session |
 | `Tab` | Any | Cycle focus: Tree -> Output -> Composer |
 | `Shift+Tab` | Any | Reverse cycle focus |
-| `Esc` | Any | Return focus to Tree |
+| `Esc` | Any | Return focus to Tree / exit zoom |
+| `z` | Output | Toggle zoom mode |
 | `j` / `k` | Output | Scroll output 1 line |
-| `PageUp` / `PageDown` | Output | Scroll output 20 lines |
-| `G` | Output | Jump to bottom |
+| `g` / `G` | Output | Jump to top / bottom |
+| `PageUp` / `PageDown` | Output | Scroll output by page |
 | `i` | Output | Switch focus to Composer |
 | `Enter` | Composer | Send message |
+| `Shift+Enter` | Composer | New line (Alt+Enter also works) |
+| `Ctrl+C` | Composer | Clear input |
+| `?` | Tree / Output | Toggle help overlay |
 | `q` | Tree / Output | Quit (stops all sessions) |
 
 ## Test
