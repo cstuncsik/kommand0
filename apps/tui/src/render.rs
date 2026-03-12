@@ -12,14 +12,25 @@ use super::{App, Focus, TreeNode, buttons, help, modal};
 const SPINNER_FRAMES: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
 
 fn truncate_path(path: &str, max_width: usize) -> String {
-    if path.len() <= max_width {
+    if UnicodeWidthStr::width(path) <= max_width {
         return path.to_string();
     }
     if max_width < 4 {
         return "...".to_string();
     }
-    let keep = max_width - 3;
-    format!("...{}", &path[path.len() - keep..])
+    let keep = max_width - 3; // display columns available for the tail
+    // Walk from the end, accumulating display width to find the tail substring
+    let mut tail_width = 0;
+    let mut start_byte = path.len();
+    for ch in path.chars().rev() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if tail_width + cw > keep {
+            break;
+        }
+        tail_width += cw;
+        start_byte -= ch.len_utf8();
+    }
+    format!("...{}", &path[start_byte..])
 }
 
 pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
