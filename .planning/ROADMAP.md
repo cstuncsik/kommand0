@@ -26,11 +26,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. Clicking an icon triggers the correct action on the correct workspace (not the selected one)
   3. Workspace names truncate with ellipsis when icons need space, without panicking on non-ASCII characters
   4. Icon positions adjust correctly when the tree pane is resized
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 01-01: TBD
-- [ ] 01-02: TBD
+- [ ] 01-01-PLAN.md — Fix unicode truncation, create icon cluster function, extend HitAction with workspace-ID variants
+- [ ] 01-02-PLAN.md — Wire icon cluster into tree renderer with fill-span layout, add click dispatch
 
 ### Phase 2: Interaction Polish
 **Goal**: Icon interactions feel polished with hover feedback, animation, tooltip, and graceful degradation at narrow widths
@@ -54,5 +54,5 @@ Phases execute in numeric order: 1 -> 2
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Core Icon Rendering and Click Handling | 0/? | Not started | - |
+| 1. Core Icon Rendering and Click Handling | 0/2 | Not started | - |
 | 2. Interaction Polish | 0/? | Not started | - |
