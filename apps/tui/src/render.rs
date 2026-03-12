@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use super::{App, Focus, TreeNode, buttons, help, modal};
+use super::buttons::HitAction;
 
 const SPINNER_FRAMES: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
 
@@ -908,8 +909,50 @@ fn render_scrollbar(frame: &mut ratatui::Frame, area: Rect, total_lines: usize, 
     }
 }
 
+/// Icon cluster for a workspace in the tree view.
+/// Contains the spans to render and hit regions for click handling.
+#[allow(dead_code)]
+pub(crate) struct IconCluster {
+    pub spans: Vec<Span<'static>>,
+    pub hit_regions: Vec<(HitAction, u16)>, // (action, icon_display_width)
+    pub total_width: u16,
+}
+
+/// Build an icon cluster for a workspace based on its session state.
+/// Each icon is " X" (space + glyph) = 2 display columns.
+#[allow(dead_code)]
+pub(crate) fn workspace_icon_cluster(
+    session: Option<&kommand0_core::Session>,
+    workspace_id: &str,
+) -> IconCluster {
+    let ws_id = workspace_id.to_string();
+    match session.map(|s| &s.status) {
+        None => IconCluster {
+            spans: vec![Span::styled(" \u{25B6}", Style::default().fg(Color::Green))], // ▶
+            hit_regions: vec![(HitAction::StartSessionFor { workspace_id: ws_id }, 2)],
+            total_width: 2,
+        },
+        Some(SessionStatus::Running) => IconCluster {
+            spans: vec![Span::styled(" \u{25A0}", Style::default().fg(Color::Yellow))], // ■
+            hit_regions: vec![(HitAction::StopSessionFor { workspace_id: ws_id }, 2)],
+            total_width: 2,
+        },
+        Some(SessionStatus::Stopped) | Some(SessionStatus::Exited) => IconCluster {
+            spans: vec![Span::styled(" \u{25B6}", Style::default().fg(Color::Green))], // ▶
+            hit_regions: vec![(HitAction::ResumeSessionFor { workspace_id: ws_id }, 2)],
+            total_width: 2,
+        },
+        Some(SessionStatus::Failed) => IconCluster {
+            spans: vec![Span::styled(" \u{21BA}", Style::default().fg(Color::Red))], // ↺
+            hit_regions: vec![(HitAction::RetrySessionFor { workspace_id: ws_id }, 2)],
+            total_width: 2,
+        },
+    }
+}
+
 /// Truncate a string to fit `max_width` display columns, keeping the start.
 /// Does not add ellipsis -- the caller handles that.
+#[allow(dead_code)]
 pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(s) <= max_width {
         return s.to_string();
@@ -987,6 +1030,73 @@ mod tests {
     #[test]
     fn truncate_to_width_truncates() {
         assert_eq!(truncate_to_width("hello world", 5), "hello");
+    }
+
+    fn make_session(status: SessionStatus) -> kommand0_core::Session {
+        kommand0_core::Session {
+            id: "s-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            claude_session_id: None,
+            pid: None,
+            status,
+            created_at: 0,
+            ended_at: None,
+            log_file: String::new(),
+        }
+    }
+
+    #[test]
+    fn icon_cluster_no_session() {
+        let cluster = workspace_icon_cluster(None, "ws-1");
+        assert_eq!(cluster.total_width, 2);
+        assert_eq!(cluster.hit_regions.len(), 1);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::StartSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_running() {
+        let session = make_session(SessionStatus::Running);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1");
+        assert_eq!(cluster.total_width, 2);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_stopped() {
+        let session = make_session(SessionStatus::Stopped);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1");
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::ResumeSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_exited() {
+        let session = make_session(SessionStatus::Exited);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1");
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::ResumeSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_failed() {
+        let session = make_session(SessionStatus::Failed);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1");
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::RetrySessionFor { workspace_id: "ws-1".to_string() }
+        );
+        // Retry icon should be red "↺"
+        assert!(cluster.spans[0].content.contains('\u{21BA}'));
     }
 
     #[test]

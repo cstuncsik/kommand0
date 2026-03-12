@@ -41,7 +41,7 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
     // Check button hit regions first
     for region in &app.hit_regions {
         if contains(region.area, col, row) {
-            app.pending_button_action = Some(region.action);
+            app.pending_button_action = Some(region.action.clone());
             return;
         }
     }

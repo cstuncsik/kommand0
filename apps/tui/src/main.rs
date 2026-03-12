@@ -1096,18 +1096,37 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 if let Some(action) = app.pending_button_action.take() {
                     if let Some(ws) = app.selected_workspace().cloned() {
                         match action {
-                            buttons::HitAction::StartSession | buttons::HitAction::ResumeSession => {
-                                let claude_sid = if action == buttons::HitAction::ResumeSession {
-                                    app.state.find_session_by_workspace(&ws.id)
-                                        .and_then(|s| s.claude_session_id.clone())
-                                } else {
-                                    None
-                                };
-                                // Stop existing session if resuming
-                                if action == buttons::HitAction::ResumeSession {
-                                    if let Some(old_id) = app.state.find_session_by_workspace(&ws.id).map(|s| s.id.clone()) {
-                                        let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
+                            buttons::HitAction::StartSession => {
+                                let claude_sid: Option<String> = None;
+                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                    let session_id = new_session.id.clone();
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
+                                        Ok(pid) => {
+                                            if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                s.pid = Some(pid);
+                                                s.claude_session_id = claude_sid;
+                                            }
+                                            let _ = app.state.save();
+                                            app.active_session_id = Some(session_id);
+                                            app.scrollbacks
+                                                .entry(ws.id.clone())
+                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                .reset_scroll();
+                                            app.focus = Focus::Composer;
+                                            app.composer.set_active(true);
+                                        }
+                                        Err(_) => {
+                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                        }
                                     }
+                                }
+                            }
+                            buttons::HitAction::ResumeSession => {
+                                let claude_sid = app.state.find_session_by_workspace(&ws.id)
+                                    .and_then(|s| s.claude_session_id.clone());
+                                // Stop existing session before resuming
+                                if let Some(old_id) = app.state.find_session_by_workspace(&ws.id).map(|s| s.id.clone()) {
+                                    let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
                                 }
                                 if let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
@@ -1146,6 +1165,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.composer.set_active(false);
                                 }
                             }
+                            // New workspace-ID variants will be handled in Plan 02
+                            _ => {}
                         }
                     }
                 }
