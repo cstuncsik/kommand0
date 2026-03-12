@@ -305,7 +305,8 @@ impl App {
         }
     }
 
-    /// Get session status icon for a workspace
+    /// Get session status icon for a workspace (used by detail pane)
+    #[allow(dead_code)]
     pub(crate) fn session_status_icon(&self, workspace_id: &str) -> Option<(String, Color)> {
         const SPINNER: &[&str] = &["\u{28CB}","\u{2819}","\u{2839}","\u{2838}","\u{283C}","\u{2834}","\u{2826}","\u{2827}","\u{2807}","\u{280F}"];
         self.state
