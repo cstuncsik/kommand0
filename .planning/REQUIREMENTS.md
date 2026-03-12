@@ -49,23 +49,23 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FIX-01 | — | Pending |
-| ICON-01 | — | Pending |
-| ICON-02 | — | Pending |
-| ICON-03 | — | Pending |
-| ICON-04 | — | Pending |
-| CLICK-01 | — | Pending |
-| CLICK-02 | — | Pending |
-| CLICK-03 | — | Pending |
-| VIS-01 | — | Pending |
-| VIS-02 | — | Pending |
-| VIS-03 | — | Pending |
+| FIX-01 | Phase 1 | Pending |
+| ICON-01 | Phase 1 | Pending |
+| ICON-02 | Phase 1 | Pending |
+| ICON-03 | Phase 1 | Pending |
+| ICON-04 | Phase 2 | Pending |
+| CLICK-01 | Phase 1 | Pending |
+| CLICK-02 | Phase 1 | Pending |
+| CLICK-03 | Phase 2 | Pending |
+| VIS-01 | Phase 2 | Pending |
+| VIS-02 | Phase 2 | Pending |
+| VIS-03 | Phase 2 | Pending |
 
 **Coverage:**
 - v1 requirements: 11 total
-- Mapped to phases: 0
-- Unmapped: 11 ⚠️
+- Mapped to phases: 11
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-12*
-*Last updated: 2026-03-12 after initial definition*
+*Last updated: 2026-03-12 after roadmap creation*
