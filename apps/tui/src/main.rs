@@ -1095,9 +1095,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
 
                 // Process pending button actions (from mouse clicks)
                 if let Some(action) = app.pending_button_action.take() {
-                    if let Some(ws) = app.selected_workspace().cloned() {
-                        match action {
-                            buttons::HitAction::StartSession => {
+                    match action {
+                        // Detail-pane buttons (use selected workspace)
+                        buttons::HitAction::StartSession => {
+                            if let Some(ws) = app.selected_workspace().cloned() {
                                 let claude_sid: Option<String> = None;
                                 if let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
@@ -1122,10 +1123,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            buttons::HitAction::ResumeSession => {
+                        }
+                        buttons::HitAction::ResumeSession => {
+                            if let Some(ws) = app.selected_workspace().cloned() {
                                 let claude_sid = app.state.find_session_by_workspace(&ws.id)
                                     .and_then(|s| s.claude_session_id.clone());
-                                // Stop existing session before resuming
                                 if let Some(old_id) = app.state.find_session_by_workspace(&ws.id).map(|s| s.id.clone()) {
                                     let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
                                 }
@@ -1152,7 +1154,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            buttons::HitAction::StopSession => {
+                        }
+                        buttons::HitAction::StopSession => {
+                            if let Some(ws) = app.selected_workspace().cloned() {
                                 if let Some(session_id) = app.state.find_session_by_workspace(&ws.id)
                                     .filter(|s| s.status == SessionStatus::Running)
                                     .map(|s| s.id.clone())
@@ -1166,8 +1170,91 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.composer.set_active(false);
                                 }
                             }
-                            // New workspace-ID variants will be handled in Plan 02
-                            _ => {}
+                        }
+                        // Tree-icon buttons (use carried workspace_id, do NOT change focus)
+                        buttons::HitAction::StartSessionFor { workspace_id } => {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
+                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                    let session_id = new_session.id.clone();
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
+                                        Ok(pid) => {
+                                            if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                s.pid = Some(pid);
+                                            }
+                                            let _ = app.state.save();
+                                            app.scrollbacks
+                                                .entry(ws.id.clone())
+                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                .reset_scroll();
+                                        }
+                                        Err(_) => {
+                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        buttons::HitAction::StopSessionFor { workspace_id } => {
+                            if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
+                                .filter(|s| s.status == SessionStatus::Running)
+                                .map(|s| s.id.clone())
+                            {
+                                let _ = app.session_manager.stop_session(&session_id).await;
+                                let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                                if let Some(buf) = app.scrollbacks.get_mut(&workspace_id) {
+                                    buf.push_line("--- Session stopped ---".to_string());
+                                }
+                            }
+                        }
+                        buttons::HitAction::ResumeSessionFor { workspace_id } => {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
+                                let claude_sid = app.state.find_session_by_workspace(&ws.id)
+                                    .and_then(|s| s.claude_session_id.clone());
+                                if let Some(old_id) = app.state.find_session_by_workspace(&ws.id).map(|s| s.id.clone()) {
+                                    let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
+                                }
+                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                    let session_id = new_session.id.clone();
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
+                                        Ok(pid) => {
+                                            if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                s.pid = Some(pid);
+                                                s.claude_session_id = claude_sid;
+                                            }
+                                            let _ = app.state.save();
+                                            app.scrollbacks
+                                                .entry(ws.id.clone())
+                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                .reset_scroll();
+                                        }
+                                        Err(_) => {
+                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        buttons::HitAction::RetrySessionFor { workspace_id } => {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
+                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                    let session_id = new_session.id.clone();
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
+                                        Ok(pid) => {
+                                            if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                s.pid = Some(pid);
+                                            }
+                                            let _ = app.state.save();
+                                            app.scrollbacks
+                                                .entry(ws.id.clone())
+                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                .reset_scroll();
+                                        }
+                                        Err(_) => {
+                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
