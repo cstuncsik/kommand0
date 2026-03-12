@@ -7,7 +7,7 @@
 
 ### Icon Rendering
 
-- [ ] **ICON-01**: Each workspace row displays right-aligned icons based on session state (none→▶, idle→▶■, thinking→⠸■, stopped→▶, failed→↺)
+- [x] **ICON-01**: Each workspace row displays right-aligned icons based on session state (none→▶, idle→▶■, thinking→⠸■, stopped→▶, failed→↺)
 - [ ] **ICON-02**: Workspace name truncates with ellipsis when icons need space
 - [ ] **ICON-03**: Icon positions calculated relative to tree pane width (layout-safe)
 - [ ] **ICON-04**: Icons hidden gracefully when pane is too narrow to fit them
@@ -15,7 +15,7 @@
 ### Click Interaction
 
 - [ ] **CLICK-01**: User can click an icon to execute its action (start, stop, focus-composer, retry)
-- [ ] **CLICK-02**: Each icon hit region carries workspace ID to prevent action-target mismatch
+- [x] **CLICK-02**: Each icon hit region carries workspace ID to prevent action-target mismatch
 - [ ] **CLICK-03**: Hovering an icon shows tooltip with action name
 
 ### Visual Polish
@@ -26,7 +26,7 @@
 
 ### Bug Fix
 
-- [ ] **FIX-01**: Fix `truncate_path` to use char-safe slicing instead of byte offsets
+- [x] **FIX-01**: Fix `truncate_path` to use char-safe slicing instead of byte offsets
 
 ## v2 Requirements
 
@@ -49,13 +49,13 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FIX-01 | Phase 1 | Pending |
-| ICON-01 | Phase 1 | Pending |
+| FIX-01 | Phase 1 | Complete |
+| ICON-01 | Phase 1 | Complete |
 | ICON-02 | Phase 1 | Pending |
 | ICON-03 | Phase 1 | Pending |
 | ICON-04 | Phase 2 | Pending |
 | CLICK-01 | Phase 1 | Pending |
-| CLICK-02 | Phase 1 | Pending |
+| CLICK-02 | Phase 1 | Complete |
 | CLICK-03 | Phase 2 | Pending |
 | VIS-01 | Phase 2 | Pending |
 | VIS-02 | Phase 2 | Pending |
