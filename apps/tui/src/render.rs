@@ -1,4 +1,5 @@
 use kommand0_core::{SessionStatus, workspace::format_timestamp};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -893,5 +894,96 @@ fn render_scrollbar(frame: &mut ratatui::Frame, area: Rect, total_lines: usize, 
             Paragraph::new(ch).style(Style::default().fg(Color::DarkGray)),
             Rect::new(x, y, 1, 1),
         );
+    }
+}
+
+/// Truncate a string to fit `max_width` display columns, keeping the start.
+/// Does not add ellipsis -- the caller handles that.
+pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+    let mut width = 0;
+    let mut end = 0;
+    for (i, ch) in s.char_indices() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + cw > max_width {
+            break;
+        }
+        width += cw;
+        end = i + ch.len_utf8();
+    }
+    s[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_path_fits() {
+        assert_eq!(truncate_path("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_path_truncated() {
+        assert_eq!(truncate_path("hello/world/path", 10), "...ld/path");
+    }
+
+    #[test]
+    fn truncate_path_exact_fit() {
+        assert_eq!(truncate_path("ab", 2), "ab");
+    }
+
+    #[test]
+    fn truncate_path_max_width_less_than_4() {
+        assert_eq!(truncate_path("abcdef", 3), "...");
+    }
+
+    #[test]
+    fn truncate_path_cjk_no_panic() {
+        // \u{4F60} = 你 (width 2), \u{597D} = 好 (width 2), total "你好abc" = 2+2+1+1+1 = 7
+        let result = truncate_path("\u{4F60}\u{597D}abc", 5);
+        // Should not panic. Result should fit in 5 display columns.
+        assert!(UnicodeWidthStr::width(result.as_str()) <= 5);
+    }
+
+    #[test]
+    fn truncate_path_cjk_only() {
+        // "你好世界" = 4 chars, 12 bytes, 8 display width
+        // With max_width=6, should truncate by display width, not byte count
+        let result = truncate_path("\u{4F60}\u{597D}\u{4E16}\u{754C}", 6);
+        // Should show "...界" (3 + 2 = 5 display width) -- fits in 6
+        assert!(UnicodeWidthStr::width(result.as_str()) <= 6);
+        assert!(result.starts_with("..."));
+    }
+
+    #[test]
+    fn truncate_path_mixed_cjk_ascii() {
+        // "a你b好c" = 5 chars, 1+3+1+3+1=9 bytes, 1+2+1+2+1=7 display width
+        // With max_width=5: should use display width (7 > 5), not byte len (9 > 5)
+        // keep = 5 - 3 = 2 display cols from tail -> "c" only (width 1) or "好c" won't fit (width 3)
+        let result = truncate_path("a\u{4F60}b\u{597D}c", 5);
+        assert!(UnicodeWidthStr::width(result.as_str()) <= 5);
+        assert!(result.starts_with("..."));
+    }
+
+    #[test]
+    fn truncate_to_width_fits() {
+        assert_eq!(truncate_to_width("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_to_width_truncates() {
+        assert_eq!(truncate_to_width("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_width_cjk_no_partial() {
+        // Each CJK char is width 2. "你好x" = 2+2+1 = 5 width
+        // With max 3, should get "你" (width 2), not "你好" (width 4)
+        let result = truncate_to_width("\u{4F60}\u{597D}x", 3);
+        assert_eq!(result, "\u{4F60}");
+        assert!(UnicodeWidthStr::width(result.as_str()) <= 3);
     }
 }
