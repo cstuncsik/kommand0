@@ -77,6 +77,11 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .block(Block::default().title(" Repos ").borders(Borders::ALL).border_style(border_style));
         frame.render_widget(hint, area);
     } else {
+        let pane_inner_width = area.width.saturating_sub(2) as usize; // subtract left+right borders
+
+        // Two-phase approach: collect items + icon data, then register hit regions after render
+        let mut workspace_icons: Vec<(usize, IconCluster)> = Vec::new();
+
         let items: Vec<ListItem> = app
             .tree_items
             .iter()
@@ -121,15 +126,32 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default()
                         };
+
+                        // Build icon cluster from session state
+                        let session = app.state.find_session_by_workspace(&ws.id);
+                        let icons = workspace_icon_cluster(session, &ws.id);
+
+                        // Fill-span layout: prefix + dot + space + name + fill + icons
+                        let prefix_width = UnicodeWidthStr::width(prefix);
+                        let dot_width: usize = 1;
+                        let space_after_dot: usize = 1;
+                        let fixed_width = prefix_width + dot_width + space_after_dot;
+                        let name_max_width = pane_inner_width.saturating_sub(fixed_width + icons.total_width as usize);
+                        let display_name = truncate_to_width(&ws.name, name_max_width);
+                        let name_display_width = UnicodeWidthStr::width(display_name.as_str());
+                        let fill_width = pane_inner_width.saturating_sub(fixed_width + name_display_width + icons.total_width as usize);
+
                         let mut spans = vec![
                             Span::styled(prefix, style),
                             Span::styled(dot, Style::default().fg(dot_color)),
-                            Span::styled(format!(" {}", ws.name), style),
+                            Span::styled(format!(" {}", display_name), style),
+                            Span::raw(" ".repeat(fill_width)),
                         ];
-                        // Session status icon
-                        if let Some((icon, color)) = app.session_status_icon(&ws.id) {
-                            spans.push(Span::styled(icon, Style::default().fg(color)));
-                        }
+                        spans.extend(icons.spans.clone());
+
+                        // Collect icon data for hit region registration after render
+                        workspace_icons.push((i, icons));
+
                         ListItem::new(Line::from(spans))
                     }
                     TreeNode::Hint { text } => {
@@ -156,6 +178,24 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .highlight_style(Style::default());
 
         frame.render_stateful_widget(list, area, &mut list_state);
+
+        // Phase 2: Register hit regions using scroll offset from rendered list state
+        let scroll_offset = list_state.offset();
+        for (item_idx, icons) in &workspace_icons {
+            if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
+                let y = area.y + 1 + row_in_viewport as u16; // +1 for top border
+                if y < area.y + area.height - 1 { // within viewport (before bottom border)
+                    let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+                    for (action, icon_width) in &icons.hit_regions {
+                        app.hit_regions.push(buttons::HitRegion {
+                            area: Rect::new(icon_x, y, *icon_width, 1),
+                            action: action.clone(),
+                        });
+                        icon_x += icon_width;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -911,7 +951,6 @@ fn render_scrollbar(frame: &mut ratatui::Frame, area: Rect, total_lines: usize, 
 
 /// Icon cluster for a workspace in the tree view.
 /// Contains the spans to render and hit regions for click handling.
-#[allow(dead_code)]
 pub(crate) struct IconCluster {
     pub spans: Vec<Span<'static>>,
     pub hit_regions: Vec<(HitAction, u16)>, // (action, icon_display_width)
@@ -920,7 +959,6 @@ pub(crate) struct IconCluster {
 
 /// Build an icon cluster for a workspace based on its session state.
 /// Each icon is " X" (space + glyph) = 2 display columns.
-#[allow(dead_code)]
 pub(crate) fn workspace_icon_cluster(
     session: Option<&kommand0_core::Session>,
     workspace_id: &str,
@@ -952,7 +990,6 @@ pub(crate) fn workspace_icon_cluster(
 
 /// Truncate a string to fit `max_width` display columns, keeping the start.
 /// Does not add ellipsis -- the caller handles that.
-#[allow(dead_code)]
 pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(s) <= max_width {
         return s.to_string();
