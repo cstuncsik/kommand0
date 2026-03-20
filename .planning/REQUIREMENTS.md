@@ -8,13 +8,13 @@
 ### Icon Rendering
 
 - [x] **ICON-01**: Each workspace row displays right-aligned icons based on session state (none→▶, idle→▶■, thinking→⠸■, stopped→▶, failed→↺)
-- [ ] **ICON-02**: Workspace name truncates with ellipsis when icons need space
-- [ ] **ICON-03**: Icon positions calculated relative to tree pane width (layout-safe)
+- [x] **ICON-02**: Workspace name truncates with ellipsis when icons need space
+- [x] **ICON-03**: Icon positions calculated relative to tree pane width (layout-safe)
 - [ ] **ICON-04**: Icons hidden gracefully when pane is too narrow to fit them
 
 ### Click Interaction
 
-- [ ] **CLICK-01**: User can click an icon to execute its action (start, stop, focus-composer, retry)
+- [x] **CLICK-01**: User can click an icon to execute its action (start, stop, focus-composer, retry)
 - [x] **CLICK-02**: Each icon hit region carries workspace ID to prevent action-target mismatch
 - [ ] **CLICK-03**: Hovering an icon shows tooltip with action name
 
@@ -51,10 +51,10 @@
 |-------------|-------|--------|
 | FIX-01 | Phase 1 | Complete |
 | ICON-01 | Phase 1 | Complete |
-| ICON-02 | Phase 1 | Pending |
-| ICON-03 | Phase 1 | Pending |
+| ICON-02 | Phase 1 | Complete |
+| ICON-03 | Phase 1 | Complete |
 | ICON-04 | Phase 2 | Pending |
-| CLICK-01 | Phase 1 | Pending |
+| CLICK-01 | Phase 1 | Complete |
 | CLICK-02 | Phase 1 | Complete |
 | CLICK-03 | Phase 2 | Pending |
 | VIS-01 | Phase 2 | Pending |

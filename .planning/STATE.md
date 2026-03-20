@@ -1,3 +1,19 @@
+---
+gsd_state_version: 1.0
+milestone: v1.0
+milestone_name: milestone
+status: phase-1-complete
+stopped_at: Completed 01-02-PLAN.md
+last_updated: "2026-03-20T09:43:30.834Z"
+last_activity: 2026-03-20 -- Completed 01-02-PLAN.md (Phase 1 complete)
+progress:
+  total_phases: 2
+  completed_phases: 1
+  total_plans: 2
+  completed_plans: 2
+  percent: 100
+---
+
 # Project State
 
 ## Project Reference
@@ -10,28 +26,28 @@ See: .planning/PROJECT.md (updated 2026-03-12)
 ## Current Position
 
 Phase: 1 of 2 (Core Icon Rendering and Click Handling)
-Plan: 1 of 2 in current phase
-Status: Executing
-Last activity: 2026-03-12 -- Completed 01-01-PLAN.md
+Plan: 2 of 2 in current phase (COMPLETE)
+Status: Phase 1 Complete
+Last activity: 2026-03-20 -- Completed 01-02-PLAN.md
 
-Progress: [██████░░░░] 50%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1
-- Average duration: 4 min
-- Total execution time: 0.07 hours
+- Total plans completed: 2
+- Average duration: 4.5 min
+- Total execution time: 0.15 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 01 | 1 | 4 min | 4 min |
+| 01 | 2 | 9 min | 4.5 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (4 min)
-- Trend: -
+- Last 5 plans: 01-01 (4 min), 01-02 (5 min)
+- Trend: stable
 
 *Updated after each plan completion*
 
@@ -47,6 +63,9 @@ Recent decisions affecting current work:
 - [01-01]: Used char-by-char reverse walk for truncate_path tail extraction
 - [01-01]: Suppressed dead_code warnings on new functions pending Plan 02 wiring
 - [01-01]: Separated StartSession/ResumeSession into distinct match arms
+- [01-02]: Two-phase render+register approach for borrow checker in tree icon hit regions
+- [01-02]: Fill-span layout with pane_inner_width matching List widget border accounting
+- [01-02]: *For handlers call update_active_session() but do NOT change focus/selection
 
 ### Pending Todos
 
@@ -59,6 +78,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-12
-Stopped at: Completed 01-01-PLAN.md
+Last session: 2026-03-20
+Stopped at: Completed 01-02-PLAN.md (Phase 1 complete)
 Resume file: None
