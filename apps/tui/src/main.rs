@@ -741,6 +741,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                         buf.push_line(format!("> {}", line));
                                                     }
                                                     buf.push_line("---".to_string());
+                                                    buf.reset_scroll(); // pin to bottom so response is visible
                                                     app.waiting_response.insert(ws_id);
                                                 }
                                                 app.write_log(&session_id, "user", &text);
@@ -1186,6 +1187,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                 .entry(ws.id.clone())
                                                 .or_insert_with(|| ScrollbackBuffer::new(50_000))
                                                 .reset_scroll();
+                                            app.update_active_session();
                                         }
                                         Err(_) => {
                                             let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
@@ -1204,6 +1206,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 if let Some(buf) = app.scrollbacks.get_mut(&workspace_id) {
                                     buf.push_line("--- Session stopped ---".to_string());
                                 }
+                                app.update_active_session();
                             }
                         }
                         buttons::HitAction::ResumeSessionFor { workspace_id } => {
@@ -1226,6 +1229,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                 .entry(ws.id.clone())
                                                 .or_insert_with(|| ScrollbackBuffer::new(50_000))
                                                 .reset_scroll();
+                                            app.update_active_session();
                                         }
                                         Err(_) => {
                                             let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
@@ -1248,6 +1252,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                 .entry(ws.id.clone())
                                                 .or_insert_with(|| ScrollbackBuffer::new(50_000))
                                                 .reset_scroll();
+                                            app.update_active_session();
                                         }
                                         Err(_) => {
                                             let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
@@ -1314,8 +1319,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        SessionEvent::Output { session_id, line } => {
-                            // Complete message (non-streaming, e.g. stderr or non-delta content)
+                        SessionEvent::Output { session_id, line, source } => {
+                            // Complete message (non-streaming content or stderr).
                             let ws_id = app.state.sessions.iter()
                                 .find(|s| s.id == session_id)
                                 .map(|s| s.workspace_id.clone());
@@ -1326,7 +1331,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 for segment in line.split('\n') {
                                     buf.push_line(segment.to_string());
                                 }
-                                if !line.is_empty() {
+                                // Clear "Thinking..." for stdout content (actual responses).
+                                // Don't clear for stderr (CLI warnings, version info).
+                                if !line.is_empty() && source == session_manager::OutputSource::Stdout {
                                     app.waiting_response.remove(&ws_id);
                                 }
                             }
@@ -1337,10 +1344,26 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 Some(0) | None => SessionStatus::Exited,
                                 Some(_) => SessionStatus::Failed,
                             };
-                            // Update claude_session_id from session_manager before removing
+                            // Update claude_session_id from session_manager before removing.
+                            // If the process never produced a session_id (e.g. --resume with a
+                            // stale ID caused immediate exit), clear the stored one so the next
+                            // attempt starts fresh instead of repeating the same failure.
+                            // BUT: don't clear if session was explicitly stopped (status already
+                            // Stopped) — stop_session() removes from manager before Exited arrives,
+                            // so get_claude_session_id() returns None even though the ID is valid.
                             if let Some(csid) = app.session_manager.get_claude_session_id(&session_id) {
                                 if let Some(s) = app.state.find_session_mut(&session_id) {
                                     s.claude_session_id = Some(csid);
+                                }
+                            } else {
+                                let already_stopped = app.state.sessions.iter()
+                                    .find(|s| s.id == session_id)
+                                    .map(|s| s.status == SessionStatus::Stopped)
+                                    .unwrap_or(false);
+                                if !already_stopped {
+                                    if let Some(s) = app.state.find_session_mut(&session_id) {
+                                        s.claude_session_id = None;
+                                    }
                                 }
                             }
                             let _ = app.state.update_session_status(&session_id, status);
