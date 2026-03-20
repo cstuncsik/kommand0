@@ -12,7 +12,7 @@ This project adds right-aligned action icons to workspace rows in the kommand0 T
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Core Icon Rendering and Click Handling** - State-dependent icons on workspace rows with clickable hit regions and correct action dispatch
+- [x] **Phase 1: Core Icon Rendering and Click Handling** - State-dependent icons on workspace rows with clickable hit regions and correct action dispatch
 - [ ] **Phase 2: Interaction Polish** - Hover feedback, animated spinner, tooltip, and narrow-width graceful degradation
 
 ## Phase Details
@@ -29,8 +29,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Fix unicode truncation, create icon cluster function, extend HitAction with workspace-ID variants
-- [ ] 01-02-PLAN.md — Wire icon cluster into tree renderer with fill-span layout, add click dispatch
+- [x] 01-01-PLAN.md — Fix unicode truncation, create icon cluster function, extend HitAction with workspace-ID variants
+- [x] 01-02-PLAN.md — Wire icon cluster into tree renderer with fill-span layout, add click dispatch
 
 ### Phase 2: Interaction Polish
 **Goal**: Icon interactions feel polished with hover feedback, animation, tooltip, and graceful degradation at narrow widths
@@ -54,5 +54,5 @@ Phases execute in numeric order: 1 -> 2
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Core Icon Rendering and Click Handling | 0/2 | Not started | - |
+| 1. Core Icon Rendering and Click Handling | 2/2 | Complete | 2026-03-20 |
 | 2. Interaction Polish | 0/? | Not started | - |
