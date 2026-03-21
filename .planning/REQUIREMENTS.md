@@ -16,7 +16,7 @@
 
 - [x] **CLICK-01**: User can click an icon to execute its action (start, stop, focus-composer, retry)
 - [x] **CLICK-02**: Each icon hit region carries workspace ID to prevent action-target mismatch
-- [ ] **CLICK-03**: Hovering an icon shows tooltip with action name
+- [x] **CLICK-03**: Hovering an icon shows tooltip with action name
 
 ### Visual Polish
 
@@ -56,7 +56,7 @@
 | ICON-04 | Phase 2 | Complete |
 | CLICK-01 | Phase 1 | Complete |
 | CLICK-02 | Phase 1 | Complete |
-| CLICK-03 | Phase 2 | Pending |
+| CLICK-03 | Phase 2 | Complete |
 | VIS-01 | Phase 2 | Complete |
 | VIS-02 | Phase 2 | Complete |
 | VIS-03 | Phase 2 | Complete |

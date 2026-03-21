@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in-progress
-stopped_at: Completed 02-01-PLAN.md
-last_updated: "2026-03-21T20:08:33Z"
-last_activity: 2026-03-21 -- Completed 02-01-PLAN.md
+stopped_at: Checkpoint 02-02-PLAN.md (human-verify)
+last_updated: "2026-03-21T20:13:57Z"
+last_activity: 2026-03-21 -- Completed auto tasks of 02-02-PLAN.md, awaiting human verification
 progress:
   total_phases: 2
   completed_phases: 1
   total_plans: 4
-  completed_plans: 3
-  percent: 75
+  completed_plans: 4
+  percent: 100
 ---
 
 # Project State
@@ -26,29 +26,29 @@ See: .planning/PROJECT.md (updated 2026-03-12)
 ## Current Position
 
 Phase: 2 of 2 (Interaction Polish)
-Plan: 1 of 2 in current phase (COMPLETE)
-Status: In Progress
-Last activity: 2026-03-21 -- Completed 02-01-PLAN.md
+Plan: 2 of 2 in current phase (AWAITING VERIFICATION)
+Status: In Progress (checkpoint: human-verify)
+Last activity: 2026-03-21 -- Completed auto tasks of 02-02-PLAN.md
 
-Progress: [████████░░] 75%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3
-- Average duration: 4.3 min
-- Total execution time: 0.22 hours
+- Total plans completed: 4
+- Average duration: 4.0 min
+- Total execution time: 0.27 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01 | 2 | 9 min | 4.5 min |
-| 02 | 1 | 4 min | 4 min |
+| 02 | 2 | 7 min | 3.5 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (4 min), 01-02 (5 min), 02-01 (4 min)
-- Trend: stable
+- Last 5 plans: 01-01 (4 min), 01-02 (5 min), 02-01 (4 min), 02-02 (3 min)
+- Trend: stable, accelerating
 
 *Updated after each plan completion*
 
@@ -70,6 +70,9 @@ Recent decisions affecting current work:
 - [02-01]: Hover overlay uses same Paragraph technique as scrollbar overlay
 - [02-01]: Spinner morphs to stop icon on hover via separate hover_texts field in IconCluster
 - [02-01]: Pane width change clears expanded_icon_rows to reset narrow-mode toggle state
+- [02-02]: Tooltip state updated during render_tree frame pass for simpler borrow management
+- [02-02]: Instant tooltip switching: changing icons keeps hover timer
+- [02-02]: Tooltip falls back to below when icon is on top row of tree
 
 ### Pending Todos
 
@@ -82,6 +85,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-21T20:08:33Z
-Stopped at: Completed 02-01-PLAN.md
+Last session: 2026-03-21T20:13:57Z
+Stopped at: Checkpoint 02-02-PLAN.md (human-verify)
 Resume file: .planning/phases/02-interaction-polish/02-02-PLAN.md
