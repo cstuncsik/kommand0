@@ -41,11 +41,11 @@ Plans:
   2. Workspaces in thinking state display an animated braille spinner that cycles with the tick mechanism
   3. Running idle sessions show a composer-focus icon that opens the composer on click
   4. Icons hide gracefully when the tree pane is too narrow to fit them
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: TBD
-- [ ] 02-02: TBD
+- [ ] 02-01-PLAN.md — Extend icon cluster with thinking/idle states, hover highlights, narrow-width degradation
+- [ ] 02-02-PLAN.md — Tooltip rendering with 300ms delay, FocusComposer and ToggleIcons click dispatch
 
 ## Progress
 

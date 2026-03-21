@@ -10,7 +10,7 @@
 - [x] **ICON-01**: Each workspace row displays right-aligned icons based on session state (none→▶, idle→▶■, thinking→⠸■, stopped→▶, failed→↺)
 - [x] **ICON-02**: Workspace name truncates with ellipsis when icons need space
 - [x] **ICON-03**: Icon positions calculated relative to tree pane width (layout-safe)
-- [ ] **ICON-04**: Icons hidden gracefully when pane is too narrow to fit them
+- [x] **ICON-04**: Icons hidden gracefully when pane is too narrow to fit them
 
 ### Click Interaction
 
@@ -20,9 +20,9 @@
 
 ### Visual Polish
 
-- [ ] **VIS-01**: Icons highlight cyan on hover (matching existing button style)
-- [ ] **VIS-02**: Thinking state shows animated braille spinner (not clickable)
-- [ ] **VIS-03**: Running idle session shows ▶ icon that focuses composer on click
+- [x] **VIS-01**: Icons highlight cyan on hover (matching existing button style)
+- [x] **VIS-02**: Thinking state shows animated braille spinner (not clickable)
+- [x] **VIS-03**: Running idle session shows ▶ icon that focuses composer on click
 
 ### Bug Fix
 
@@ -53,13 +53,13 @@
 | ICON-01 | Phase 1 | Complete |
 | ICON-02 | Phase 1 | Complete |
 | ICON-03 | Phase 1 | Complete |
-| ICON-04 | Phase 2 | Pending |
+| ICON-04 | Phase 2 | Complete |
 | CLICK-01 | Phase 1 | Complete |
 | CLICK-02 | Phase 1 | Complete |
 | CLICK-03 | Phase 2 | Pending |
-| VIS-01 | Phase 2 | Pending |
-| VIS-02 | Phase 2 | Pending |
-| VIS-03 | Phase 2 | Pending |
+| VIS-01 | Phase 2 | Complete |
+| VIS-02 | Phase 2 | Complete |
+| VIS-03 | Phase 2 | Complete |
 
 **Coverage:**
 - v1 requirements: 11 total
