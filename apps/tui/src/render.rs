@@ -79,6 +79,12 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else {
         let pane_inner_width = area.width.saturating_sub(2) as usize; // subtract left+right borders
 
+        // Reset expanded icon rows when pane width changes
+        if pane_inner_width as u16 != app.last_pane_width {
+            app.expanded_icon_rows.clear();
+            app.last_pane_width = pane_inner_width as u16;
+        }
+
         // Two-phase approach: collect items + icon data, then register hit regions after render
         let mut workspace_icons: Vec<(usize, IconCluster)> = Vec::new();
 
@@ -129,7 +135,16 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
                         // Build icon cluster from session state
                         let session = app.state.find_session_by_workspace(&ws.id);
-                        let icons = workspace_icon_cluster(session, &ws.id);
+                        let is_thinking = app.waiting_response.contains(&ws.id);
+                        let is_expanded_narrow = app.expanded_icon_rows.contains(&ws.id);
+                        let icons = workspace_icon_cluster(
+                            session,
+                            &ws.id,
+                            is_thinking,
+                            app.spinner_tick,
+                            pane_inner_width,
+                            is_expanded_narrow,
+                        );
 
                         // Fill-span layout: prefix + dot + space + name + fill + icons
                         let prefix_width = UnicodeWidthStr::width(prefix);
@@ -955,36 +970,112 @@ pub(crate) struct IconCluster {
     pub spans: Vec<Span<'static>>,
     pub hit_regions: Vec<(HitAction, u16)>, // (action, icon_display_width)
     pub total_width: u16,
+    pub texts: Vec<String>,         // icon text for each hit region (normal state)
+    pub hover_texts: Vec<String>,   // alternative text for hover overlay (e.g., spinner -> stop)
 }
 
 /// Build an icon cluster for a workspace based on its session state.
 /// Each icon is " X" (space + glyph) = 2 display columns.
+///
+/// - `is_thinking`: whether the workspace has a pending response (spinner)
+/// - `spinner_tick`: global tick counter for spinner animation
+/// - `pane_inner_width`: inner width of the tree pane (for narrow degradation)
+/// - `is_expanded_narrow`: whether the user force-expanded icons at narrow width
 pub(crate) fn workspace_icon_cluster(
     session: Option<&kommand0_core::Session>,
     workspace_id: &str,
+    is_thinking: bool,
+    spinner_tick: u8,
+    pane_inner_width: usize,
+    is_expanded_narrow: bool,
 ) -> IconCluster {
     let ws_id = workspace_id.to_string();
+
+    // Narrow-width degradation: below 12 cols, show ellipsis unless force-expanded
+    if pane_inner_width < 12 && !is_expanded_narrow {
+        let text = " \u{2026}".to_string(); // " …"
+        return IconCluster {
+            spans: vec![Span::styled(text.clone(), Style::default().fg(Color::DarkGray))],
+            hit_regions: vec![(HitAction::ToggleIconsFor { workspace_id: ws_id }, 2)],
+            total_width: 2,
+            texts: vec![text.clone()],
+            hover_texts: vec![text],
+        };
+    }
+
     match session.map(|s| &s.status) {
-        None => IconCluster {
-            spans: vec![Span::styled(" \u{25B6}", Style::default().fg(Color::Green))], // ▶
-            hit_regions: vec![(HitAction::StartSessionFor { workspace_id: ws_id }, 2)],
-            total_width: 2,
-        },
-        Some(SessionStatus::Running) => IconCluster {
-            spans: vec![Span::styled(" \u{25A0}", Style::default().fg(Color::Yellow))], // ■
-            hit_regions: vec![(HitAction::StopSessionFor { workspace_id: ws_id }, 2)],
-            total_width: 2,
-        },
-        Some(SessionStatus::Stopped) | Some(SessionStatus::Exited) => IconCluster {
-            spans: vec![Span::styled(" \u{25B6}", Style::default().fg(Color::Green))], // ▶
-            hit_regions: vec![(HitAction::ResumeSessionFor { workspace_id: ws_id }, 2)],
-            total_width: 2,
-        },
-        Some(SessionStatus::Failed) => IconCluster {
-            spans: vec![Span::styled(" \u{21BA}", Style::default().fg(Color::Red))], // ↺
-            hit_regions: vec![(HitAction::RetrySessionFor { workspace_id: ws_id }, 2)],
-            total_width: 2,
-        },
+        None => {
+            let text = " \u{25B6}".to_string(); // " ▶"
+            IconCluster {
+                spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Green))],
+                hit_regions: vec![(HitAction::StartSessionFor { workspace_id: ws_id }, 2)],
+                total_width: 2,
+                texts: vec![text.clone()],
+                hover_texts: vec![text],
+            }
+        }
+        Some(SessionStatus::Running) => {
+            if is_thinking {
+                // Spinner for thinking state
+                let frame = SPINNER_FRAMES[spinner_tick as usize % SPINNER_FRAMES.len()];
+                let text = format!(" {}", frame);
+                let hover_text = " \u{25A0}".to_string(); // " ■" on hover
+                IconCluster {
+                    spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Cyan))],
+                    hit_regions: vec![(HitAction::StopSessionFor { workspace_id: ws_id }, 2)],
+                    total_width: 2,
+                    texts: vec![text],
+                    hover_texts: vec![hover_text],
+                }
+            } else if pane_inner_width < 20 {
+                // Narrow: only stop icon, drop pencil
+                let text = " \u{25A0}".to_string(); // " ■"
+                IconCluster {
+                    spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Cyan))],
+                    hit_regions: vec![(HitAction::StopSessionFor { workspace_id: ws_id }, 2)],
+                    total_width: 2,
+                    texts: vec![text.clone()],
+                    hover_texts: vec![text],
+                }
+            } else {
+                // Idle running: pencil + stop
+                let pencil_text = " \u{270E}".to_string(); // " ✎"
+                let stop_text = " \u{25A0}".to_string();   // " ■"
+                IconCluster {
+                    spans: vec![
+                        Span::styled(pencil_text.clone(), Style::default().fg(Color::Cyan)),
+                        Span::styled(stop_text.clone(), Style::default().fg(Color::Cyan)),
+                    ],
+                    hit_regions: vec![
+                        (HitAction::FocusComposerFor { workspace_id: ws_id.clone() }, 2),
+                        (HitAction::StopSessionFor { workspace_id: ws_id }, 2),
+                    ],
+                    total_width: 4,
+                    texts: vec![pencil_text.clone(), stop_text.clone()],
+                    hover_texts: vec![pencil_text, stop_text],
+                }
+            }
+        }
+        Some(SessionStatus::Stopped) | Some(SessionStatus::Exited) => {
+            let text = " \u{25B6}".to_string(); // " ▶"
+            IconCluster {
+                spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Green))],
+                hit_regions: vec![(HitAction::ResumeSessionFor { workspace_id: ws_id }, 2)],
+                total_width: 2,
+                texts: vec![text.clone()],
+                hover_texts: vec![text],
+            }
+        }
+        Some(SessionStatus::Failed) => {
+            let text = " \u{21BA}".to_string(); // " ↺"
+            IconCluster {
+                spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Red))],
+                hit_regions: vec![(HitAction::RetrySessionFor { workspace_id: ws_id }, 2)],
+                total_width: 2,
+                texts: vec![text.clone()],
+                hover_texts: vec![text],
+            }
+        }
     }
 }
 
@@ -1084,7 +1175,7 @@ mod tests {
 
     #[test]
     fn icon_cluster_no_session() {
-        let cluster = workspace_icon_cluster(None, "ws-1");
+        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 40, false);
         assert_eq!(cluster.total_width, 2);
         assert_eq!(cluster.hit_regions.len(), 1);
         assert_eq!(
@@ -1094,10 +1185,69 @@ mod tests {
     }
 
     #[test]
-    fn icon_cluster_running() {
+    fn icon_cluster_running_thinking_returns_spinner() {
         let session = make_session(SessionStatus::Running);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1");
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", true, 0, 40, false);
         assert_eq!(cluster.total_width, 2);
+        // Should contain a braille spinner character
+        let text = &cluster.spans[0].content;
+        assert!(SPINNER_FRAMES.iter().any(|f| text.contains(f)),
+            "Spinner span should contain a braille frame, got: {:?}", text);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_running_idle_returns_pencil_and_stop() {
+        let session = make_session(SessionStatus::Running);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        assert_eq!(cluster.total_width, 4);
+        assert_eq!(cluster.spans.len(), 2);
+        assert_eq!(cluster.hit_regions.len(), 2);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::FocusComposerFor { workspace_id: "ws-1".to_string() }
+        );
+        assert_eq!(
+            cluster.hit_regions[1].0,
+            HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_running_narrow_drops_pencil() {
+        let session = make_session(SessionStatus::Running);
+        // pane_inner_width < 20 but >= 12: drop pencil, keep stop only
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 15, false);
+        assert_eq!(cluster.total_width, 2);
+        assert_eq!(cluster.hit_regions.len(), 1);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_very_narrow_shows_ellipsis() {
+        let session = make_session(SessionStatus::Running);
+        // pane_inner_width < 12, not expanded: ellipsis
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, false);
+        assert_eq!(cluster.total_width, 2);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::ToggleIconsFor { workspace_id: "ws-1".to_string() }
+        );
+        assert!(cluster.spans[0].content.contains('\u{2026}')); // ellipsis
+    }
+
+    #[test]
+    fn icon_cluster_very_narrow_expanded_shows_normal() {
+        let session = make_session(SessionStatus::Running);
+        // pane_inner_width < 12, but is_expanded_narrow=true: normal icons
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, true);
+        // Should NOT be ellipsis -- should be stop icon (narrow < 20 drops pencil)
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
@@ -1107,7 +1257,7 @@ mod tests {
     #[test]
     fn icon_cluster_stopped() {
         let session = make_session(SessionStatus::Stopped);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1");
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::ResumeSessionFor { workspace_id: "ws-1".to_string() }
@@ -1117,7 +1267,7 @@ mod tests {
     #[test]
     fn icon_cluster_exited() {
         let session = make_session(SessionStatus::Exited);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1");
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::ResumeSessionFor { workspace_id: "ws-1".to_string() }
@@ -1127,7 +1277,7 @@ mod tests {
     #[test]
     fn icon_cluster_failed() {
         let session = make_session(SessionStatus::Failed);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1");
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::RetrySessionFor { workspace_id: "ws-1".to_string() }

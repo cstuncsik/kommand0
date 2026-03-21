@@ -82,6 +82,8 @@ pub(crate) struct App {
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
     pub(crate) pending_button_action: Option<buttons::HitAction>,
     pub(crate) modal: modal::ModalState,
+    pub(crate) expanded_icon_rows: HashSet<String>,
+    pub(crate) last_pane_width: u16,
     /// Accumulates streaming delta text per workspace until newlines flush to scrollback.
     streaming_text: HashMap<String, String>,
     tick_counter: u8,
@@ -154,6 +156,8 @@ impl App {
             hit_regions: Vec::new(),
             pending_button_action: None,
             modal: modal::ModalState::default(),
+            expanded_icon_rows: HashSet::new(),
+            last_pane_width: 0,
             streaming_text: HashMap::new(),
             tick_counter: 0,
         };
@@ -1259,6 +1263,34 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        buttons::HitAction::FocusComposerFor { workspace_id } => {
+                            // Focus the composer for the given workspace's running session
+                            if app.state.find_session_by_workspace(&workspace_id)
+                                .map(|s| s.status == SessionStatus::Running)
+                                .unwrap_or(false)
+                            {
+                                // Navigate selection to this workspace
+                                for (i, node) in app.tree_items.iter().enumerate() {
+                                    if let TreeNode::Workspace { ws, .. } = node {
+                                        if ws.id == workspace_id {
+                                            app.selected_index = i;
+                                            break;
+                                        }
+                                    }
+                                }
+                                app.update_active_session();
+                                app.focus = Focus::Composer;
+                                app.composer.set_active(true);
+                            }
+                        }
+                        buttons::HitAction::ToggleIconsFor { workspace_id } => {
+                            // Toggle force-expanded icons for narrow pane
+                            if app.expanded_icon_rows.contains(&workspace_id) {
+                                app.expanded_icon_rows.remove(&workspace_id);
+                            } else {
+                                app.expanded_icon_rows.insert(workspace_id);
                             }
                         }
                     }
