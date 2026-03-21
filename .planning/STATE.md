@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: phase-1-complete
-stopped_at: Completed 01-02-PLAN.md
-last_updated: "2026-03-20T09:43:30.834Z"
-last_activity: 2026-03-20 -- Completed 01-02-PLAN.md (Phase 1 complete)
+status: in-progress
+stopped_at: Completed 02-01-PLAN.md
+last_updated: "2026-03-21T20:08:33Z"
+last_activity: 2026-03-21 -- Completed 02-01-PLAN.md
 progress:
   total_phases: 2
   completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
-  percent: 100
+  total_plans: 4
+  completed_plans: 3
+  percent: 75
 ---
 
 # Project State
@@ -21,32 +21,33 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-12)
 
 **Core value:** Every workspace action is one click away, visible at a glance in the tree
-**Current focus:** Phase 1 - Core Icon Rendering and Click Handling
+**Current focus:** Phase 2 - Interaction Polish
 
 ## Current Position
 
-Phase: 1 of 2 (Core Icon Rendering and Click Handling)
-Plan: 2 of 2 in current phase (COMPLETE)
-Status: Phase 1 Complete
-Last activity: 2026-03-20 -- Completed 01-02-PLAN.md
+Phase: 2 of 2 (Interaction Polish)
+Plan: 1 of 2 in current phase (COMPLETE)
+Status: In Progress
+Last activity: 2026-03-21 -- Completed 02-01-PLAN.md
 
-Progress: [██████████] 100%
+Progress: [████████░░] 75%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
-- Average duration: 4.5 min
-- Total execution time: 0.15 hours
+- Total plans completed: 3
+- Average duration: 4.3 min
+- Total execution time: 0.22 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01 | 2 | 9 min | 4.5 min |
+| 02 | 1 | 4 min | 4 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (4 min), 01-02 (5 min)
+- Last 5 plans: 01-01 (4 min), 01-02 (5 min), 02-01 (4 min)
 - Trend: stable
 
 *Updated after each plan completion*
@@ -66,6 +67,9 @@ Recent decisions affecting current work:
 - [01-02]: Two-phase render+register approach for borrow checker in tree icon hit regions
 - [01-02]: Fill-span layout with pane_inner_width matching List widget border accounting
 - [01-02]: *For handlers call update_active_session() but do NOT change focus/selection
+- [02-01]: Hover overlay uses same Paragraph technique as scrollbar overlay
+- [02-01]: Spinner morphs to stop icon on hover via separate hover_texts field in IconCluster
+- [02-01]: Pane width change clears expanded_icon_rows to reset narrow-mode toggle state
 
 ### Pending Todos
 
@@ -78,6 +82,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-20
-Stopped at: Completed 01-02-PLAN.md (Phase 1 complete)
-Resume file: None
+Last session: 2026-03-21T20:08:33Z
+Stopped at: Completed 02-01-PLAN.md
+Resume file: .planning/phases/02-interaction-polish/02-02-PLAN.md
