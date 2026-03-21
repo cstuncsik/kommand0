@@ -15,6 +15,8 @@ pub(crate) enum HitAction {
     StopSessionFor { workspace_id: String },
     ResumeSessionFor { workspace_id: String },
     RetrySessionFor { workspace_id: String },
+    FocusComposerFor { workspace_id: String },
+    ToggleIconsFor { workspace_id: String },
 }
 
 /// A clickable region tracked during rendering.
@@ -111,5 +113,17 @@ mod tests {
         let a = HitAction::StartSession;
         let b = HitAction::StartSession;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hit_action_focus_composer_and_toggle_icons_clone_and_eq() {
+        let focus = HitAction::FocusComposerFor { workspace_id: "ws-1".to_string() };
+        let toggle = HitAction::ToggleIconsFor { workspace_id: "ws-2".to_string() };
+
+        assert_eq!(focus.clone(), focus);
+        assert_eq!(toggle.clone(), toggle);
+
+        assert_ne!(focus, HitAction::FocusComposerFor { workspace_id: "ws-other".to_string() });
+        assert_ne!(toggle, HitAction::ToggleIconsFor { workspace_id: "ws-other".to_string() });
     }
 }
