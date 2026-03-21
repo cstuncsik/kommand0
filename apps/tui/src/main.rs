@@ -84,6 +84,8 @@ pub(crate) struct App {
     pub(crate) modal: modal::ModalState,
     pub(crate) expanded_icon_rows: HashSet<String>,
     pub(crate) last_pane_width: u16,
+    pub(crate) tooltip_hover_start: Option<std::time::Instant>,
+    pub(crate) tooltip_target: Option<(ratatui::layout::Rect, String)>,
     /// Accumulates streaming delta text per workspace until newlines flush to scrollback.
     streaming_text: HashMap<String, String>,
     tick_counter: u8,
@@ -158,6 +160,8 @@ impl App {
             modal: modal::ModalState::default(),
             expanded_icon_rows: HashSet::new(),
             last_pane_width: 0,
+            tooltip_hover_start: None,
+            tooltip_target: None,
             streaming_text: HashMap::new(),
             tick_counter: 0,
         };
