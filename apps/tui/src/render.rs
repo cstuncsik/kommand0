@@ -211,6 +211,57 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 }
             }
         }
+
+        // Phase 3: Render hover overlays on top of the tree widget
+        let mouse_pos = app.mouse_pos;
+        render_icon_hover_overlays(
+            frame,
+            mouse_pos,
+            area,
+            &workspace_icons,
+            scroll_offset,
+            pane_inner_width,
+        );
+    }
+}
+
+/// Render hover highlights for tree icons as overlay widgets.
+/// Uses the same overlay technique as the scrollbar (render small Paragraph at specific Rect).
+fn render_icon_hover_overlays(
+    frame: &mut ratatui::Frame,
+    mouse_pos: Option<(u16, u16)>,
+    area: Rect,
+    workspace_icons: &[(usize, IconCluster)],
+    scroll_offset: usize,
+    pane_inner_width: usize,
+) {
+    let hover_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    for (item_idx, icons) in workspace_icons {
+        if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
+            let y = area.y + 1 + row_in_viewport as u16;
+            if y >= area.y + area.height - 1 {
+                continue; // outside viewport
+            }
+
+            let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+            for (idx, (_action, icon_width)) in icons.hit_regions.iter().enumerate() {
+                let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
+                if buttons::is_hovered(mouse_pos, icon_rect) {
+                    // Use hover_text (e.g., stop icon instead of spinner)
+                    let empty = String::new();
+                    let text = icons.hover_texts.get(idx)
+                        .or_else(|| icons.texts.get(idx))
+                        .unwrap_or(&empty);
+                    let overlay = Paragraph::new(text.clone()).style(hover_style);
+                    frame.render_widget(overlay, icon_rect);
+                }
+                icon_x += icon_width;
+            }
+        }
     }
 }
 
