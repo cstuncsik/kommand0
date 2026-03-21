@@ -63,6 +63,10 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     if app.modal.is_active() {
         modal::render_modal(frame, &app.modal);
     }
+
+    // Tooltip overlay on top of everything (after 300ms hover delay)
+    let tree_area = app.pane_areas.tree;
+    render_tooltip(frame, app, tree_area);
 }
 
 fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -222,6 +226,62 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             scroll_offset,
             pane_inner_width,
         );
+
+        // Phase 4: Update tooltip state based on which icon is hovered
+        let mut new_tooltip: Option<(Rect, String)> = None;
+        for (item_idx, icons) in &workspace_icons {
+            if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
+                let y = area.y + 1 + row_in_viewport as u16;
+                if y >= area.y + area.height - 1 {
+                    continue;
+                }
+                let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+                for (action, icon_width) in &icons.hit_regions {
+                    let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
+                    if buttons::is_hovered(mouse_pos, icon_rect) {
+                        let label = action_label(action).to_string();
+                        new_tooltip = Some((icon_rect, label));
+                    }
+                    icon_x += icon_width;
+                }
+            }
+        }
+
+        match (&app.tooltip_target, &new_tooltip) {
+            (None, Some(_)) => {
+                // Entering an icon: start hover timer
+                app.tooltip_hover_start = Some(std::time::Instant::now());
+                app.tooltip_target = new_tooltip;
+            }
+            (Some((_, old_label)), Some((_, new_label))) if old_label != new_label => {
+                // Switched to a different icon: update target, keep timer (instant switch)
+                app.tooltip_target = new_tooltip;
+            }
+            (Some(_), Some(_)) => {
+                // Same icon: just update rect position (in case of scroll)
+                app.tooltip_target = new_tooltip;
+            }
+            (Some(_), None) => {
+                // Left all icons: clear tooltip
+                app.tooltip_hover_start = None;
+                app.tooltip_target = None;
+            }
+            (None, None) => {
+                // Nothing hovered, nothing was hovered
+            }
+        }
+    }
+}
+
+/// Map a HitAction to a human-readable label for tooltips.
+pub(crate) fn action_label(action: &HitAction) -> &'static str {
+    match action {
+        HitAction::StartSession | HitAction::StartSessionFor { .. } => "Start",
+        HitAction::StopSession | HitAction::StopSessionFor { .. } => "Stop",
+        HitAction::ResumeSession | HitAction::ResumeSessionFor { .. } => "Resume",
+        HitAction::RetrySessionFor { .. } => "Retry",
+        HitAction::FocusComposerFor { .. } => "Write Message",
+        HitAction::ToggleIconsFor { .. } => "Show Icons",
     }
 }
 
@@ -263,6 +323,58 @@ fn render_icon_hover_overlays(
             }
         }
     }
+}
+
+/// Render a floating tooltip above (or below) a hovered icon after 300ms delay.
+fn render_tooltip(frame: &mut ratatui::Frame, app: &App, tree_area: Rect) {
+    let (icon_rect, label_text) = match &app.tooltip_target {
+        Some((r, t)) => (*r, t.as_str()),
+        None => return,
+    };
+
+    // Check 300ms delay
+    let elapsed = match app.tooltip_hover_start {
+        Some(start) => start.elapsed(),
+        None => return,
+    };
+    if elapsed < std::time::Duration::from_millis(300) {
+        return;
+    }
+
+    let label_width = UnicodeWidthStr::width(label_text) as u16;
+    let tooltip_width = label_width + 4; // border + 1 char padding each side
+    let tooltip_height: u16 = 3; // top border + text + bottom border
+
+    let frame_area = frame.area();
+
+    // Position: center above icon
+    let tooltip_x = icon_rect
+        .x
+        .saturating_sub(tooltip_width.saturating_sub(icon_rect.width) / 2)
+        .max(frame_area.x)
+        .min(frame_area.x + frame_area.width.saturating_sub(tooltip_width));
+
+    // Above the icon by default, below if icon is on top row of tree
+    let tooltip_y = if icon_rect.y <= tree_area.y + 1 {
+        // Icon is on top row: place below
+        (icon_rect.y + 1).min(frame_area.y + frame_area.height.saturating_sub(tooltip_height))
+    } else {
+        // Place above
+        icon_rect.y.saturating_sub(tooltip_height)
+            .max(frame_area.y)
+    };
+
+    let tooltip_rect = Rect::new(tooltip_x, tooltip_y, tooltip_width, tooltip_height);
+
+    let tooltip = Paragraph::new(label_text.to_string())
+        .style(Style::default().fg(Color::White).bg(Color::DarkGray))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray))
+                .style(Style::default().bg(Color::DarkGray)),
+        );
+    frame.render_widget(tooltip, tooltip_rect);
 }
 
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -1344,5 +1456,22 @@ mod tests {
         let result = truncate_to_width("\u{4F60}\u{597D}x", 3);
         assert_eq!(result, "\u{4F60}");
         assert!(UnicodeWidthStr::width(result.as_str()) <= 3);
+    }
+
+    #[test]
+    fn action_label_tree_icon_variants() {
+        assert_eq!(action_label(&HitAction::StartSessionFor { workspace_id: "ws-1".into() }), "Start");
+        assert_eq!(action_label(&HitAction::StopSessionFor { workspace_id: "ws-1".into() }), "Stop");
+        assert_eq!(action_label(&HitAction::ResumeSessionFor { workspace_id: "ws-1".into() }), "Resume");
+        assert_eq!(action_label(&HitAction::RetrySessionFor { workspace_id: "ws-1".into() }), "Retry");
+        assert_eq!(action_label(&HitAction::FocusComposerFor { workspace_id: "ws-1".into() }), "Write Message");
+        assert_eq!(action_label(&HitAction::ToggleIconsFor { workspace_id: "ws-1".into() }), "Show Icons");
+    }
+
+    #[test]
+    fn action_label_detail_pane_variants() {
+        assert_eq!(action_label(&HitAction::StartSession), "Start");
+        assert_eq!(action_label(&HitAction::StopSession), "Stop");
+        assert_eq!(action_label(&HitAction::ResumeSession), "Resume");
     }
 }
