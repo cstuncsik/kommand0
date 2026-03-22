@@ -70,30 +70,30 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CURS-01 | TBD | Pending |
-| CURS-02 | TBD | Pending |
-| OSEL-01 | TBD | Pending |
-| OSEL-02 | TBD | Pending |
-| OSEL-03 | TBD | Pending |
-| OSEL-04 | TBD | Pending |
-| OSEL-05 | TBD | Pending |
-| OSEL-06 | TBD | Pending |
-| COMP-01 | TBD | Pending |
-| COMP-02 | TBD | Pending |
-| CLIP-01 | TBD | Pending |
-| CLIP-02 | TBD | Pending |
-| CLIP-03 | TBD | Pending |
-| KEYS-01 | TBD | Pending |
-| KEYS-02 | TBD | Pending |
-| CORD-01 | TBD | Pending |
-| CORD-02 | TBD | Pending |
-| CORD-03 | TBD | Pending |
+| CURS-01 | Phase 2 | Pending |
+| CURS-02 | Phase 2 | Pending |
+| OSEL-01 | Phase 2 | Pending |
+| OSEL-02 | Phase 2 | Pending |
+| OSEL-03 | Phase 2 | Pending |
+| OSEL-04 | Phase 2 | Pending |
+| OSEL-05 | Phase 2 | Pending |
+| OSEL-06 | Phase 2 | Pending |
+| COMP-01 | Phase 3 | Pending |
+| COMP-02 | Phase 3 | Pending |
+| CLIP-01 | Phase 3 | Pending |
+| CLIP-02 | Phase 3 | Pending |
+| CLIP-03 | Phase 1 | Pending |
+| KEYS-01 | Phase 3 | Pending |
+| KEYS-02 | Phase 3 | Pending |
+| CORD-01 | Phase 1 | Pending |
+| CORD-02 | Phase 1 | Pending |
+| CORD-03 | Phase 1 | Pending |
 
 **Coverage:**
 - v1 requirements: 18 total
-- Mapped to phases: 0
-- Unmapped: 18 ⚠️
+- Mapped to phases: 18
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-22*
-*Last updated: 2026-03-22 after initial definition*
+*Last updated: 2026-03-22 after roadmap creation*
