@@ -17,6 +17,10 @@ pub(crate) enum HitAction {
     RetrySessionFor { workspace_id: String },
     FocusComposerFor { workspace_id: String },
     ToggleIconsFor { workspace_id: String },
+    DeleteWorkspaceFor { workspace_id: String },
+    DeleteRepoFor { repo_name: String },
+    AddWorkspaceFor { repo_id: String },
+    AddRepo,
 }
 
 /// A clickable region tracked during rendering.
