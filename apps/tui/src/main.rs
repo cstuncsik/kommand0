@@ -82,6 +82,8 @@ pub(crate) struct App {
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
     pub(crate) pending_button_action: Option<buttons::HitAction>,
     pub(crate) modal: modal::ModalState,
+    pub(crate) expanded_icon_rows: HashSet<String>,
+    pub(crate) last_pane_width: u16,
     /// Accumulates streaming delta text per workspace until newlines flush to scrollback.
     streaming_text: HashMap<String, String>,
     tick_counter: u8,
@@ -154,6 +156,8 @@ impl App {
             hit_regions: Vec::new(),
             pending_button_action: None,
             modal: modal::ModalState::default(),
+            expanded_icon_rows: HashSet::new(),
+            last_pane_width: 0,
             streaming_text: HashMap::new(),
             tick_counter: 0,
         };
@@ -305,7 +309,8 @@ impl App {
         }
     }
 
-    /// Get session status icon for a workspace
+    /// Get session status icon for a workspace (used by detail pane)
+    #[allow(dead_code)]
     pub(crate) fn session_status_icon(&self, workspace_id: &str) -> Option<(String, Color)> {
         const SPINNER: &[&str] = &["\u{28CB}","\u{2819}","\u{2839}","\u{2838}","\u{283C}","\u{2834}","\u{2826}","\u{2827}","\u{2807}","\u{280F}"];
         self.state
@@ -740,6 +745,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                         buf.push_line(format!("> {}", line));
                                                     }
                                                     buf.push_line("---".to_string());
+                                                    buf.reset_scroll(); // pin to bottom so response is visible
                                                     app.waiting_response.insert(ws_id);
                                                 }
                                                 app.write_log(&session_id, "user", &text);
@@ -1094,20 +1100,41 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
 
                 // Process pending button actions (from mouse clicks)
                 if let Some(action) = app.pending_button_action.take() {
-                    if let Some(ws) = app.selected_workspace().cloned() {
-                        match action {
-                            buttons::HitAction::StartSession | buttons::HitAction::ResumeSession => {
-                                let claude_sid = if action == buttons::HitAction::ResumeSession {
-                                    app.state.find_session_by_workspace(&ws.id)
-                                        .and_then(|s| s.claude_session_id.clone())
-                                } else {
-                                    None
-                                };
-                                // Stop existing session if resuming
-                                if action == buttons::HitAction::ResumeSession {
-                                    if let Some(old_id) = app.state.find_session_by_workspace(&ws.id).map(|s| s.id.clone()) {
-                                        let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
+                    match action {
+                        // Detail-pane buttons (use selected workspace)
+                        buttons::HitAction::StartSession => {
+                            if let Some(ws) = app.selected_workspace().cloned() {
+                                let claude_sid: Option<String> = None;
+                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                    let session_id = new_session.id.clone();
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
+                                        Ok(pid) => {
+                                            if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                s.pid = Some(pid);
+                                                s.claude_session_id = claude_sid;
+                                            }
+                                            let _ = app.state.save();
+                                            app.active_session_id = Some(session_id);
+                                            app.scrollbacks
+                                                .entry(ws.id.clone())
+                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                .reset_scroll();
+                                            app.focus = Focus::Composer;
+                                            app.composer.set_active(true);
+                                        }
+                                        Err(_) => {
+                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                        }
                                     }
+                                }
+                            }
+                        }
+                        buttons::HitAction::ResumeSession => {
+                            if let Some(ws) = app.selected_workspace().cloned() {
+                                let claude_sid = app.state.find_session_by_workspace(&ws.id)
+                                    .and_then(|s| s.claude_session_id.clone());
+                                if let Some(old_id) = app.state.find_session_by_workspace(&ws.id).map(|s| s.id.clone()) {
+                                    let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
                                 }
                                 if let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
@@ -1132,7 +1159,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            buttons::HitAction::StopSession => {
+                        }
+                        buttons::HitAction::StopSession => {
+                            if let Some(ws) = app.selected_workspace().cloned() {
                                 if let Some(session_id) = app.state.find_session_by_workspace(&ws.id)
                                     .filter(|s| s.status == SessionStatus::Running)
                                     .map(|s| s.id.clone())
@@ -1146,6 +1175,200 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.composer.set_active(false);
                                 }
                             }
+                        }
+                        // Tree-icon buttons (use carried workspace_id, do NOT change focus)
+                        buttons::HitAction::StartSessionFor { workspace_id } => {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
+                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                    let session_id = new_session.id.clone();
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
+                                        Ok(pid) => {
+                                            if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                s.pid = Some(pid);
+                                            }
+                                            let _ = app.state.save();
+                                            app.scrollbacks
+                                                .entry(ws.id.clone())
+                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                .reset_scroll();
+                                            app.update_active_session();
+                                        }
+                                        Err(_) => {
+                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        buttons::HitAction::StopSessionFor { workspace_id } => {
+                            if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
+                                .filter(|s| s.status == SessionStatus::Running)
+                                .map(|s| s.id.clone())
+                            {
+                                let _ = app.session_manager.stop_session(&session_id).await;
+                                let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                                if let Some(buf) = app.scrollbacks.get_mut(&workspace_id) {
+                                    buf.push_line("--- Session stopped ---".to_string());
+                                }
+                                app.update_active_session();
+                            }
+                        }
+                        buttons::HitAction::ResumeSessionFor { workspace_id } => {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
+                                let claude_sid = app.state.find_session_by_workspace(&ws.id)
+                                    .and_then(|s| s.claude_session_id.clone());
+                                if let Some(old_id) = app.state.find_session_by_workspace(&ws.id).map(|s| s.id.clone()) {
+                                    let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
+                                }
+                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                    let session_id = new_session.id.clone();
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
+                                        Ok(pid) => {
+                                            if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                s.pid = Some(pid);
+                                                s.claude_session_id = claude_sid;
+                                            }
+                                            let _ = app.state.save();
+                                            app.scrollbacks
+                                                .entry(ws.id.clone())
+                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                .reset_scroll();
+                                            app.update_active_session();
+                                        }
+                                        Err(_) => {
+                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        buttons::HitAction::RetrySessionFor { workspace_id } => {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
+                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                    let session_id = new_session.id.clone();
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
+                                        Ok(pid) => {
+                                            if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                s.pid = Some(pid);
+                                            }
+                                            let _ = app.state.save();
+                                            app.scrollbacks
+                                                .entry(ws.id.clone())
+                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                .reset_scroll();
+                                            app.update_active_session();
+                                        }
+                                        Err(_) => {
+                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        buttons::HitAction::FocusComposerFor { workspace_id } => {
+                            // Focus the composer for the given workspace's running session
+                            if app.state.find_session_by_workspace(&workspace_id)
+                                .map(|s| s.status == SessionStatus::Running)
+                                .unwrap_or(false)
+                            {
+                                // Navigate selection to this workspace
+                                for (i, node) in app.tree_items.iter().enumerate() {
+                                    if let TreeNode::Workspace { ws, .. } = node {
+                                        if ws.id == workspace_id {
+                                            app.selected_index = i;
+                                            break;
+                                        }
+                                    }
+                                }
+                                app.update_active_session();
+                                app.focus = Focus::Composer;
+                                app.composer.set_active(true);
+                            }
+                        }
+                        buttons::HitAction::ToggleIconsFor { workspace_id } => {
+                            // Toggle force-expanded icons for narrow pane
+                            if app.expanded_icon_rows.contains(&workspace_id) {
+                                app.expanded_icon_rows.remove(&workspace_id);
+                            } else {
+                                app.expanded_icon_rows.insert(workspace_id);
+                            }
+                        }
+                        buttons::HitAction::DeleteWorkspaceFor { workspace_id } => {
+                            // Find workspace name from ID
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
+                                // Stop running session first
+                                if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
+                                    .filter(|s| s.status == SessionStatus::Running)
+                                    .map(|s| s.id.clone())
+                                {
+                                    let _ = app.session_manager.stop_session(&session_id).await;
+                                    let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                                }
+                                if let Ok(_) = app.state.delete_workspace(&ws.name) {
+                                    app.scrollbacks.remove(&workspace_id);
+                                    app.waiting_response.remove(&workspace_id);
+                                    app.expanded_icon_rows.remove(&workspace_id);
+                                    app.repos = app.state.repos.clone();
+                                    app.workspaces = app.state.workspaces.clone();
+                                    app.rebuild_tree();
+                                    if app.selected_index >= app.tree_items.len() && !app.tree_items.is_empty() {
+                                        app.selected_index = app.tree_items.len() - 1;
+                                    }
+                                    app.update_active_session();
+                                }
+                            }
+                        }
+                        buttons::HitAction::DeleteRepoFor { repo_name } => {
+                            // Stop all running sessions for this repo's workspaces
+                            if let Ok(repo) = app.state.resolve_repo(&repo_name).cloned() {
+                                let ws_ids: Vec<String> = app.state.workspaces.iter()
+                                    .filter(|w| w.repo_id == repo.id)
+                                    .map(|w| w.id.clone())
+                                    .collect();
+                                for ws_id in &ws_ids {
+                                    if let Some(session_id) = app.state.find_session_by_workspace(ws_id)
+                                        .filter(|s| s.status == SessionStatus::Running)
+                                        .map(|s| s.id.clone())
+                                    {
+                                        let _ = app.session_manager.stop_session(&session_id).await;
+                                        let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                                    }
+                                    app.scrollbacks.remove(ws_id);
+                                    app.waiting_response.remove(ws_id);
+                                    app.expanded_icon_rows.remove(ws_id);
+                                }
+                                if let Ok(_) = app.state.delete_repo(&repo_name) {
+                                    app.expanded.remove(&repo.id);
+                                    app.repos = app.state.repos.clone();
+                                    app.workspaces = app.state.workspaces.clone();
+                                    app.rebuild_tree();
+                                    if app.selected_index >= app.tree_items.len() && !app.tree_items.is_empty() {
+                                        app.selected_index = app.tree_items.len() - 1;
+                                    }
+                                    app.update_active_session();
+                                }
+                            }
+                        }
+                        buttons::HitAction::AddWorkspaceFor { repo_id } => {
+                            // Open modal to add workspace to this repo
+                            if let Some(repo) = app.state.repos.iter().find(|r| r.id == repo_id).cloned() {
+                                app.modal = modal::ModalState::AddWorkspace {
+                                    repo_id,
+                                    repo_name: repo.name,
+                                    input: String::new(),
+                                    cursor: 0,
+                                    error: None,
+                                };
+                            }
+                        }
+                        buttons::HitAction::AddRepo => {
+                            app.modal = modal::ModalState::AddRepo {
+                                input: String::new(),
+                                cursor: 0,
+                                error: None,
+                                completions: Vec::new(),
+                                completion_index: None,
+                            };
                         }
                     }
                 }
@@ -1205,8 +1428,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        SessionEvent::Output { session_id, line } => {
-                            // Complete message (non-streaming, e.g. stderr or non-delta content)
+                        SessionEvent::Output { session_id, line, source } => {
+                            // Complete message (non-streaming content or stderr).
                             let ws_id = app.state.sessions.iter()
                                 .find(|s| s.id == session_id)
                                 .map(|s| s.workspace_id.clone());
@@ -1217,7 +1440,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 for segment in line.split('\n') {
                                     buf.push_line(segment.to_string());
                                 }
-                                if !line.is_empty() {
+                                // Clear "Thinking..." for stdout content (actual responses).
+                                // Don't clear for stderr (CLI warnings, version info).
+                                if !line.is_empty() && source == session_manager::OutputSource::Stdout {
                                     app.waiting_response.remove(&ws_id);
                                 }
                             }
@@ -1228,10 +1453,26 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 Some(0) | None => SessionStatus::Exited,
                                 Some(_) => SessionStatus::Failed,
                             };
-                            // Update claude_session_id from session_manager before removing
+                            // Update claude_session_id from session_manager before removing.
+                            // If the process never produced a session_id (e.g. --resume with a
+                            // stale ID caused immediate exit), clear the stored one so the next
+                            // attempt starts fresh instead of repeating the same failure.
+                            // BUT: don't clear if session was explicitly stopped (status already
+                            // Stopped) — stop_session() removes from manager before Exited arrives,
+                            // so get_claude_session_id() returns None even though the ID is valid.
                             if let Some(csid) = app.session_manager.get_claude_session_id(&session_id) {
                                 if let Some(s) = app.state.find_session_mut(&session_id) {
                                     s.claude_session_id = Some(csid);
+                                }
+                            } else {
+                                let already_stopped = app.state.sessions.iter()
+                                    .find(|s| s.id == session_id)
+                                    .map(|s| s.status == SessionStatus::Stopped)
+                                    .unwrap_or(false);
+                                if !already_stopped {
+                                    if let Some(s) = app.state.find_session_mut(&session_id) {
+                                        s.claude_session_id = None;
+                                    }
                                 }
                             }
                             let _ = app.state.update_session_status(&session_id, status);

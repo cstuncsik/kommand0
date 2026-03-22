@@ -1,4 +1,5 @@
 use kommand0_core::{SessionStatus, workspace::format_timestamp};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -7,18 +8,30 @@ use ratatui::{
 };
 
 use super::{App, Focus, TreeNode, buttons, help, modal};
+use super::buttons::HitAction;
 
 const SPINNER_FRAMES: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
 
 fn truncate_path(path: &str, max_width: usize) -> String {
-    if path.len() <= max_width {
+    if UnicodeWidthStr::width(path) <= max_width {
         return path.to_string();
     }
     if max_width < 4 {
         return "...".to_string();
     }
-    let keep = max_width - 3;
-    format!("...{}", &path[path.len() - keep..])
+    let keep = max_width - 3; // display columns available for the tail
+    // Walk from the end, accumulating display width to find the tail substring
+    let mut tail_width = 0;
+    let mut start_byte = path.len();
+    for ch in path.chars().rev() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if tail_width + cw > keep {
+            break;
+        }
+        tail_width += cw;
+        start_byte -= ch.len_utf8();
+    }
+    format!("...{}", &path[start_byte..])
 }
 
 pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
@@ -50,6 +63,7 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     if app.modal.is_active() {
         modal::render_modal(frame, &app.modal);
     }
+
 }
 
 fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -64,6 +78,18 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .block(Block::default().title(" Repos ").borders(Borders::ALL).border_style(border_style));
         frame.render_widget(hint, area);
     } else {
+        let pane_inner_width = area.width.saturating_sub(2) as usize; // subtract left+right borders
+
+        // Reset expanded icon rows when pane width changes
+        if pane_inner_width as u16 != app.last_pane_width {
+            app.expanded_icon_rows.clear();
+            app.last_pane_width = pane_inner_width as u16;
+        }
+
+        // Two-phase approach: collect items + icon data, then register hit regions after render
+        let mut workspace_icons: Vec<(usize, IconCluster)> = Vec::new();
+        let mut repo_icons: Vec<(usize, IconCluster)> = Vec::new();
+
         let items: Vec<ListItem> = app
             .tree_items
             .iter()
@@ -73,8 +99,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 match node {
                     TreeNode::Repo { id, name, .. } => {
                         let expanded = app.expanded.contains(id);
-                        let indicator = if expanded { "\u{25BC} " } else { "\u{25B6} " };
-                        let text = format!("{}{}", indicator, name);
+                        let indicator = if expanded { "\u{25BE} " } else { "\u{203A} " }; // ▾ / ›
                         let style = if is_selected && app.focus == Focus::Tree {
                             Style::default()
                                 .fg(Color::Yellow)
@@ -86,7 +111,23 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default()
                         };
-                        ListItem::new(Line::styled(text, style))
+
+                        // Build repo line icons: ✕ (delete) + (add workspace)
+                        let icons = repo_line_icons(id, name, pane_inner_width);
+
+                        let prefix = format!("{}{}", indicator, name);
+                        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+                        let fill_width = pane_inner_width.saturating_sub(prefix_width + icons.total_width as usize);
+
+                        let mut spans = vec![
+                            Span::styled(prefix, style),
+                            Span::raw(" ".repeat(fill_width)),
+                        ];
+                        spans.extend(icons.spans.clone());
+
+                        repo_icons.push((i, icons));
+
+                        ListItem::new(Line::from(spans))
                     }
                     TreeNode::Workspace { ws, .. } => {
                         let (dot, dot_color) = if ws.active {
@@ -108,15 +149,41 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default()
                         };
+
+                        // Build icon cluster from session state
+                        let session = app.state.find_session_by_workspace(&ws.id);
+                        let is_thinking = app.waiting_response.contains(&ws.id);
+                        let is_expanded_narrow = app.expanded_icon_rows.contains(&ws.id);
+                        let icons = workspace_icon_cluster(
+                            session,
+                            &ws.id,
+                            is_thinking,
+                            app.spinner_tick,
+                            pane_inner_width,
+                            is_expanded_narrow,
+                        );
+
+                        // Fill-span layout: prefix + dot + space + name + fill + icons
+                        let prefix_width = UnicodeWidthStr::width(prefix);
+                        let dot_width: usize = 1;
+                        let space_after_dot: usize = 1;
+                        let fixed_width = prefix_width + dot_width + space_after_dot;
+                        let name_max_width = pane_inner_width.saturating_sub(fixed_width + icons.total_width as usize);
+                        let display_name = truncate_to_width(&ws.name, name_max_width);
+                        let name_display_width = UnicodeWidthStr::width(display_name.as_str());
+                        let fill_width = pane_inner_width.saturating_sub(fixed_width + name_display_width + icons.total_width as usize);
+
                         let mut spans = vec![
                             Span::styled(prefix, style),
                             Span::styled(dot, Style::default().fg(dot_color)),
-                            Span::styled(format!(" {}", ws.name), style),
+                            Span::styled(format!(" {}", display_name), style),
+                            Span::raw(" ".repeat(fill_width)),
                         ];
-                        // Session status icon
-                        if let Some((icon, color)) = app.session_status_icon(&ws.id) {
-                            spans.push(Span::styled(icon, Style::default().fg(color)));
-                        }
+                        spans.extend(icons.spans.clone());
+
+                        // Collect icon data for hit region registration after render
+                        workspace_icons.push((i, icons));
+
                         ListItem::new(Line::from(spans))
                     }
                     TreeNode::Hint { text } => {
@@ -138,13 +205,105 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
+
         let list = List::new(items)
             .block(Block::default().title(" Repos ").borders(Borders::ALL).border_style(tree_border_style))
             .highlight_style(Style::default());
 
         frame.render_stateful_widget(list, area, &mut list_state);
+
+        // Render "+" button on title bar (top-right corner)
+        {
+            let plus_x = area.x + area.width.saturating_sub(4);
+            let plus_rect = Rect::new(plus_x, area.y, 3, 1);
+            let plus_hovered = buttons::is_hovered(app.mouse_pos, plus_rect);
+            let plus_style = if plus_hovered {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            frame.render_widget(Paragraph::new(" + ").style(plus_style), plus_rect);
+        }
+
+        // Phase 2: Register hit regions using scroll offset from rendered list state
+        let scroll_offset = list_state.offset();
+        let all_icons: Vec<&(usize, IconCluster)> = workspace_icons.iter().chain(repo_icons.iter()).collect();
+        for (item_idx, icons) in all_icons {
+            if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
+                let y = area.y + 1 + row_in_viewport as u16; // +1 for top border
+                if y < area.y + area.height - 1 { // within viewport (before bottom border)
+                    let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+                    for (action, icon_width) in &icons.hit_regions {
+                        app.hit_regions.push(buttons::HitRegion {
+                            area: Rect::new(icon_x, y, *icon_width, 1),
+                            action: action.clone(),
+                        });
+                        icon_x += icon_width;
+                    }
+                }
+            }
+        }
+
+        // Register "Add Repo" hit region on the title bar "+" button
+        {
+            let plus_x = area.x + area.width.saturating_sub(4);
+            let plus_rect = Rect::new(plus_x, area.y, 3, 1);
+            app.hit_regions.push(buttons::HitRegion {
+                area: plus_rect,
+                action: HitAction::AddRepo,
+            });
+        }
+
+        // Phase 3: Render hover overlays (white color) for hovered icons
+        let mouse_pos = app.mouse_pos;
+        for (item_idx, icons) in &workspace_icons {
+            if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
+                let y = area.y + 1 + row_in_viewport as u16;
+                if y >= area.y + area.height - 1 {
+                    continue;
+                }
+                let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+                for (idx, (_action, icon_width)) in icons.hit_regions.iter().enumerate() {
+                    let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
+                    if buttons::is_hovered(mouse_pos, icon_rect) {
+                        let empty = String::new();
+                        let text = icons.hover_texts.get(idx)
+                            .or_else(|| icons.texts.get(idx))
+                            .unwrap_or(&empty);
+                        let overlay = Paragraph::new(text.clone())
+                            .style(Style::default().fg(Color::White));
+                        frame.render_widget(overlay, icon_rect);
+                    }
+                    icon_x += icon_width;
+                }
+            }
+        }
+
+        // Phase 4: Render hover overlays for repo line icons
+        for (item_idx, icons) in &repo_icons {
+            if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
+                let y = area.y + 1 + row_in_viewport as u16;
+                if y >= area.y + area.height - 1 {
+                    continue;
+                }
+                let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+                for (idx, (_action, icon_width)) in icons.hit_regions.iter().enumerate() {
+                    let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
+                    if buttons::is_hovered(mouse_pos, icon_rect) {
+                        let text = icons.texts.get(idx).cloned().unwrap_or_default();
+                        let overlay = Paragraph::new(text)
+                            .style(Style::default().fg(Color::White));
+                        frame.render_widget(overlay, icon_rect);
+                    }
+                    icon_x += icon_width;
+                }
+            }
+        }
     }
 }
+
+
+
 
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let right_width = area.width.saturating_sub(4) as usize;
@@ -893,5 +1052,467 @@ fn render_scrollbar(frame: &mut ratatui::Frame, area: Rect, total_lines: usize, 
             Paragraph::new(ch).style(Style::default().fg(Color::DarkGray)),
             Rect::new(x, y, 1, 1),
         );
+    }
+}
+
+/// Icon cluster for a workspace or repo line in the tree view.
+/// Contains the spans to render and hit regions for click handling.
+pub(crate) struct IconCluster {
+    pub spans: Vec<Span<'static>>,
+    pub hit_regions: Vec<(HitAction, u16)>, // (action, icon_display_width)
+    pub total_width: u16,
+    pub texts: Vec<String>,         // icon text for each hit region (normal state)
+    pub hover_texts: Vec<String>,   // alternative text for hover overlay (e.g., spinner -> stop)
+}
+
+/// Build an icon cluster for a workspace based on its session state.
+/// Each icon is " X" (space + glyph) = 2 display columns.
+///
+/// Icons: ❯ (write prompt), ■ (stop), ▶ (start/resume), ↺ (retry), ✕ (delete)
+/// Spinner (braille) shown when thinking, morphs to ■ on hover.
+pub(crate) fn workspace_icon_cluster(
+    session: Option<&kommand0_core::Session>,
+    workspace_id: &str,
+    is_thinking: bool,
+    spinner_tick: u8,
+    pane_inner_width: usize,
+    is_expanded_narrow: bool,
+) -> IconCluster {
+    let ws_id = workspace_id.to_string();
+    let icon_style = Style::default().fg(Color::Cyan);
+    let delete_text = " \u{2715}".to_string(); // " ✕"
+
+    // Narrow-width degradation: below 12 cols, show ellipsis unless force-expanded
+    if pane_inner_width < 12 && !is_expanded_narrow {
+        let text = " \u{2026}".to_string(); // " …"
+        return IconCluster {
+            spans: vec![Span::styled(text.clone(), Style::default().fg(Color::DarkGray))],
+            hit_regions: vec![(HitAction::ToggleIconsFor { workspace_id: ws_id }, 2)],
+            total_width: 2,
+            texts: vec![text.clone()],
+            hover_texts: vec![text],
+        };
+    }
+
+    match session.map(|s| &s.status) {
+        None => {
+            // No session: start + delete
+            let start_text = " \u{25B6}".to_string(); // " ▶"
+            let mut spans = vec![
+                Span::styled(start_text.clone(), Style::default().fg(Color::Green)),
+                Span::styled(delete_text.clone(), icon_style),
+            ];
+            let mut regions = vec![
+                (HitAction::StartSessionFor { workspace_id: ws_id.clone() }, 2),
+                (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+            ];
+            let mut texts = vec![start_text.clone(), delete_text.clone()];
+            let mut hover_texts = vec![start_text, delete_text];
+            let total = if pane_inner_width < 20 {
+                // Narrow: drop delete
+                spans.truncate(1);
+                regions.truncate(1);
+                texts.truncate(1);
+                hover_texts.truncate(1);
+                2
+            } else {
+                4
+            };
+            IconCluster { spans, hit_regions: regions, total_width: total, texts, hover_texts }
+        }
+        Some(SessionStatus::Running) => {
+            if is_thinking {
+                // Spinner for thinking state + delete
+                let frame = SPINNER_FRAMES[spinner_tick as usize % SPINNER_FRAMES.len()];
+                let text = format!(" {}", frame);
+                let hover_text = " \u{25A0}".to_string(); // " ■" on hover
+                let mut spans = vec![
+                    Span::styled(text.clone(), icon_style),
+                    Span::styled(delete_text.clone(), icon_style),
+                ];
+                let mut regions = vec![
+                    (HitAction::StopSessionFor { workspace_id: ws_id.clone() }, 2),
+                    (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+                ];
+                let mut texts_v = vec![text, delete_text.clone()];
+                let mut hover_v = vec![hover_text, delete_text];
+                let total = if pane_inner_width < 20 {
+                    spans.truncate(1);
+                    regions.truncate(1);
+                    texts_v.truncate(1);
+                    hover_v.truncate(1);
+                    2
+                } else {
+                    4
+                };
+                IconCluster { spans, hit_regions: regions, total_width: total, texts: texts_v, hover_texts: hover_v }
+            } else {
+                // Idle running: prompt + stop + delete
+                let prompt_text = " \u{276F}".to_string(); // " ❯"
+                let stop_text = " \u{25A0}".to_string();   // " ■"
+                let mut spans = vec![
+                    Span::styled(prompt_text.clone(), icon_style),
+                    Span::styled(stop_text.clone(), icon_style),
+                    Span::styled(delete_text.clone(), icon_style),
+                ];
+                let mut regions = vec![
+                    (HitAction::FocusComposerFor { workspace_id: ws_id.clone() }, 2),
+                    (HitAction::StopSessionFor { workspace_id: ws_id.clone() }, 2),
+                    (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+                ];
+                let mut texts_v = vec![prompt_text.clone(), stop_text.clone(), delete_text.clone()];
+                let mut hover_v = vec![prompt_text, stop_text, delete_text];
+                let total = if pane_inner_width < 20 {
+                    // Narrow: drop prompt and delete, keep stop only
+                    spans = vec![spans.remove(1)];
+                    regions = vec![regions.remove(1)];
+                    texts_v = vec![texts_v.remove(1)];
+                    hover_v = vec![hover_v.remove(1)];
+                    2
+                } else {
+                    6
+                };
+                IconCluster { spans, hit_regions: regions, total_width: total, texts: texts_v, hover_texts: hover_v }
+            }
+        }
+        Some(SessionStatus::Stopped) | Some(SessionStatus::Exited) => {
+            let resume_text = " \u{25B6}".to_string(); // " ▶"
+            let mut spans = vec![
+                Span::styled(resume_text.clone(), Style::default().fg(Color::Green)),
+                Span::styled(delete_text.clone(), icon_style),
+            ];
+            let mut regions = vec![
+                (HitAction::ResumeSessionFor { workspace_id: ws_id.clone() }, 2),
+                (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+            ];
+            let mut texts = vec![resume_text.clone(), delete_text.clone()];
+            let mut hover_texts = vec![resume_text, delete_text];
+            let total = if pane_inner_width < 20 {
+                spans.truncate(1);
+                regions.truncate(1);
+                texts.truncate(1);
+                hover_texts.truncate(1);
+                2
+            } else {
+                4
+            };
+            IconCluster { spans, hit_regions: regions, total_width: total, texts, hover_texts }
+        }
+        Some(SessionStatus::Failed) => {
+            let retry_text = " \u{21BA}".to_string(); // " ↺"
+            let mut spans = vec![
+                Span::styled(retry_text.clone(), Style::default().fg(Color::Red)),
+                Span::styled(delete_text.clone(), icon_style),
+            ];
+            let mut regions = vec![
+                (HitAction::RetrySessionFor { workspace_id: ws_id.clone() }, 2),
+                (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+            ];
+            let mut texts = vec![retry_text.clone(), delete_text.clone()];
+            let mut hover_texts = vec![retry_text, delete_text];
+            let total = if pane_inner_width < 20 {
+                spans.truncate(1);
+                regions.truncate(1);
+                texts.truncate(1);
+                hover_texts.truncate(1);
+                2
+            } else {
+                4
+            };
+            IconCluster { spans, hit_regions: regions, total_width: total, texts, hover_texts }
+        }
+    }
+}
+
+/// Build icons for a repo line: ✕ (delete repo) + (add workspace)
+fn repo_line_icons(repo_id: &str, repo_name: &str, pane_inner_width: usize) -> IconCluster {
+    let icon_style = Style::default().fg(Color::Cyan);
+
+    if pane_inner_width < 20 {
+        // Too narrow for repo icons
+        return IconCluster {
+            spans: vec![],
+            hit_regions: vec![],
+            total_width: 0,
+            texts: vec![],
+            hover_texts: vec![],
+        };
+    }
+
+    let delete_text = " \u{2715}".to_string(); // " ✕"
+    let add_text = " +".to_string();
+
+    IconCluster {
+        spans: vec![
+            Span::styled(delete_text.clone(), icon_style),
+            Span::styled(add_text.clone(), icon_style),
+        ],
+        hit_regions: vec![
+            (HitAction::DeleteRepoFor { repo_name: repo_name.to_string() }, 2),
+            (HitAction::AddWorkspaceFor { repo_id: repo_id.to_string() }, 2),
+        ],
+        total_width: 4,
+        texts: vec![delete_text.clone(), add_text.clone()],
+        hover_texts: vec![delete_text, add_text],
+    }
+}
+
+/// Truncate a string to fit `max_width` display columns, keeping the start.
+/// Does not add ellipsis -- the caller handles that.
+pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+    let mut width = 0;
+    let mut end = 0;
+    for (i, ch) in s.char_indices() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + cw > max_width {
+            break;
+        }
+        width += cw;
+        end = i + ch.len_utf8();
+    }
+    s[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_path_fits() {
+        assert_eq!(truncate_path("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_path_truncated() {
+        assert_eq!(truncate_path("hello/world/path", 10), "...ld/path");
+    }
+
+    #[test]
+    fn truncate_path_exact_fit() {
+        assert_eq!(truncate_path("ab", 2), "ab");
+    }
+
+    #[test]
+    fn truncate_path_max_width_less_than_4() {
+        assert_eq!(truncate_path("abcdef", 3), "...");
+    }
+
+    #[test]
+    fn truncate_path_cjk_no_panic() {
+        // \u{4F60} = 你 (width 2), \u{597D} = 好 (width 2), total "你好abc" = 2+2+1+1+1 = 7
+        let result = truncate_path("\u{4F60}\u{597D}abc", 5);
+        // Should not panic. Result should fit in 5 display columns.
+        assert!(UnicodeWidthStr::width(result.as_str()) <= 5);
+    }
+
+    #[test]
+    fn truncate_path_cjk_only() {
+        // "你好世界" = 4 chars, 12 bytes, 8 display width
+        // With max_width=6, should truncate by display width, not byte count
+        let result = truncate_path("\u{4F60}\u{597D}\u{4E16}\u{754C}", 6);
+        // Should show "...界" (3 + 2 = 5 display width) -- fits in 6
+        assert!(UnicodeWidthStr::width(result.as_str()) <= 6);
+        assert!(result.starts_with("..."));
+    }
+
+    #[test]
+    fn truncate_path_mixed_cjk_ascii() {
+        // "a你b好c" = 5 chars, 1+3+1+3+1=9 bytes, 1+2+1+2+1=7 display width
+        // With max_width=5: should use display width (7 > 5), not byte len (9 > 5)
+        // keep = 5 - 3 = 2 display cols from tail -> "c" only (width 1) or "好c" won't fit (width 3)
+        let result = truncate_path("a\u{4F60}b\u{597D}c", 5);
+        assert!(UnicodeWidthStr::width(result.as_str()) <= 5);
+        assert!(result.starts_with("..."));
+    }
+
+    #[test]
+    fn truncate_to_width_fits() {
+        assert_eq!(truncate_to_width("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_to_width_truncates() {
+        assert_eq!(truncate_to_width("hello world", 5), "hello");
+    }
+
+    fn make_session(status: SessionStatus) -> kommand0_core::Session {
+        kommand0_core::Session {
+            id: "s-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            claude_session_id: None,
+            pid: None,
+            status,
+            created_at: 0,
+            ended_at: None,
+            log_file: String::new(),
+        }
+    }
+
+    #[test]
+    fn icon_cluster_no_session() {
+        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 40, false);
+        assert_eq!(cluster.total_width, 4); // start + delete
+        assert_eq!(cluster.hit_regions.len(), 2);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::StartSessionFor { workspace_id: "ws-1".to_string() }
+        );
+        assert_eq!(
+            cluster.hit_regions[1].0,
+            HitAction::DeleteWorkspaceFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_running_thinking_returns_spinner() {
+        let session = make_session(SessionStatus::Running);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", true, 0, 40, false);
+        assert_eq!(cluster.total_width, 4); // spinner + delete
+        // Should contain a braille spinner character
+        let text = &cluster.spans[0].content;
+        assert!(SPINNER_FRAMES.iter().any(|f| text.contains(f)),
+            "Spinner span should contain a braille frame, got: {:?}", text);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_running_idle_returns_prompt_stop_delete() {
+        let session = make_session(SessionStatus::Running);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        assert_eq!(cluster.total_width, 6); // prompt + stop + delete
+        assert_eq!(cluster.spans.len(), 3);
+        assert_eq!(cluster.hit_regions.len(), 3);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::FocusComposerFor { workspace_id: "ws-1".to_string() }
+        );
+        assert_eq!(
+            cluster.hit_regions[1].0,
+            HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
+        );
+        assert_eq!(
+            cluster.hit_regions[2].0,
+            HitAction::DeleteWorkspaceFor { workspace_id: "ws-1".to_string() }
+        );
+        // Prompt icon should be ❯
+        assert!(cluster.spans[0].content.contains('\u{276F}'));
+    }
+
+    #[test]
+    fn icon_cluster_running_narrow_drops_to_stop_only() {
+        let session = make_session(SessionStatus::Running);
+        // pane_inner_width < 20 but >= 12: keep stop only
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 15, false);
+        assert_eq!(cluster.total_width, 2);
+        assert_eq!(cluster.hit_regions.len(), 1);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_very_narrow_shows_ellipsis() {
+        let session = make_session(SessionStatus::Running);
+        // pane_inner_width < 12, not expanded: ellipsis
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, false);
+        assert_eq!(cluster.total_width, 2);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::ToggleIconsFor { workspace_id: "ws-1".to_string() }
+        );
+        assert!(cluster.spans[0].content.contains('\u{2026}')); // ellipsis
+    }
+
+    #[test]
+    fn icon_cluster_very_narrow_expanded_shows_normal() {
+        let session = make_session(SessionStatus::Running);
+        // pane_inner_width < 12, but is_expanded_narrow=true: normal icons
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, true);
+        // Should NOT be ellipsis -- should be stop icon (narrow < 20 drops others)
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_stopped() {
+        let session = make_session(SessionStatus::Stopped);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        assert_eq!(cluster.total_width, 4); // resume + delete
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::ResumeSessionFor { workspace_id: "ws-1".to_string() }
+        );
+        assert_eq!(
+            cluster.hit_regions[1].0,
+            HitAction::DeleteWorkspaceFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_exited() {
+        let session = make_session(SessionStatus::Exited);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::ResumeSessionFor { workspace_id: "ws-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn icon_cluster_failed() {
+        let session = make_session(SessionStatus::Failed);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        assert_eq!(cluster.total_width, 4); // retry + delete
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::RetrySessionFor { workspace_id: "ws-1".to_string() }
+        );
+        // Retry icon should be red "↺"
+        assert!(cluster.spans[0].content.contains('\u{21BA}'));
+    }
+
+    #[test]
+    fn icon_cluster_no_session_narrow_drops_delete() {
+        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 15, false);
+        assert_eq!(cluster.total_width, 2); // start only
+        assert_eq!(cluster.hit_regions.len(), 1);
+    }
+
+    #[test]
+    fn repo_line_icons_normal_width() {
+        let icons = repo_line_icons("r-1", "myrepo", 40);
+        assert_eq!(icons.total_width, 4); // delete + add
+        assert_eq!(icons.hit_regions.len(), 2);
+        assert_eq!(
+            icons.hit_regions[0].0,
+            HitAction::DeleteRepoFor { repo_name: "myrepo".to_string() }
+        );
+        assert_eq!(
+            icons.hit_regions[1].0,
+            HitAction::AddWorkspaceFor { repo_id: "r-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn repo_line_icons_narrow_hidden() {
+        let icons = repo_line_icons("r-1", "myrepo", 15);
+        assert_eq!(icons.total_width, 0);
+        assert!(icons.hit_regions.is_empty());
+    }
+
+    #[test]
+    fn truncate_to_width_cjk_no_partial() {
+        let result = truncate_to_width("\u{4F60}\u{597D}x", 3);
+        assert_eq!(result, "\u{4F60}");
+        assert!(UnicodeWidthStr::width(result.as_str()) <= 3);
     }
 }
