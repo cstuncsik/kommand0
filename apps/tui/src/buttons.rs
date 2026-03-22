@@ -5,12 +5,22 @@ use ratatui::{
 };
 
 /// An action triggered by clicking a button.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum HitAction {
     StartSession,
     StopSession,
     ResumeSession,
+    StartSessionFor { workspace_id: String },
+    StopSessionFor { workspace_id: String },
+    ResumeSessionFor { workspace_id: String },
+    RetrySessionFor { workspace_id: String },
+    FocusComposerFor { workspace_id: String },
+    ToggleIconsFor { workspace_id: String },
+    DeleteWorkspaceFor { workspace_id: String },
+    DeleteRepoFor { repo_name: String },
+    AddWorkspaceFor { repo_id: String },
+    AddRepo,
 }
 
 /// A clickable region tracked during rendering.
@@ -81,4 +91,43 @@ pub(crate) fn button_line(
         action,
     };
     (line, region)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_hit_action_variants_clone_and_eq() {
+        let start = HitAction::StartSessionFor { workspace_id: "ws-1".to_string() };
+        let stop = HitAction::StopSessionFor { workspace_id: "ws-2".to_string() };
+        let resume = HitAction::ResumeSessionFor { workspace_id: "ws-3".to_string() };
+        let retry = HitAction::RetrySessionFor { workspace_id: "ws-4".to_string() };
+
+        assert_eq!(start.clone(), start);
+        assert_eq!(stop.clone(), stop);
+        assert_eq!(resume.clone(), resume);
+        assert_eq!(retry.clone(), retry);
+
+        assert_ne!(start, HitAction::StartSessionFor { workspace_id: "ws-other".to_string() });
+    }
+
+    #[test]
+    fn existing_variants_still_work() {
+        let a = HitAction::StartSession;
+        let b = HitAction::StartSession;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hit_action_focus_composer_and_toggle_icons_clone_and_eq() {
+        let focus = HitAction::FocusComposerFor { workspace_id: "ws-1".to_string() };
+        let toggle = HitAction::ToggleIconsFor { workspace_id: "ws-2".to_string() };
+
+        assert_eq!(focus.clone(), focus);
+        assert_eq!(toggle.clone(), toggle);
+
+        assert_ne!(focus, HitAction::FocusComposerFor { workspace_id: "ws-other".to_string() });
+        assert_ne!(toggle, HitAction::ToggleIconsFor { workspace_id: "ws-other".to_string() });
+    }
 }

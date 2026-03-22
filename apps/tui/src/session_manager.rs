@@ -9,6 +9,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
+/// Where an Output event originated from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutputSource {
+    Stdout,
+    Stderr,
+}
+
 /// Events emitted by background reader tasks for a session.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -16,6 +23,7 @@ pub enum SessionEvent {
     Output {
         session_id: String,
         line: String,
+        source: OutputSource,
     },
     /// A small streaming text chunk from content_block_delta.
     StreamDelta {
@@ -170,6 +178,7 @@ impl SessionManager {
                         SessionEvent::Output {
                             session_id: sid_stdout.clone(),
                             line: text,
+                            source: OutputSource::Stdout,
                         }
                     }
                     JsonEvent::Empty => continue,
@@ -197,6 +206,7 @@ impl SessionManager {
                     .send(SessionEvent::Output {
                         session_id: sid_stderr.clone(),
                         line: stripped.to_string(),
+                        source: OutputSource::Stderr,
                     })
                     .is_err()
                 {
