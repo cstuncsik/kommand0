@@ -64,9 +64,6 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         modal::render_modal(frame, &app.modal);
     }
 
-    // Tooltip overlay on top of everything (after 300ms hover delay)
-    let tree_area = app.pane_areas.tree;
-    render_tooltip(frame, app, tree_area);
 }
 
 fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -91,6 +88,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
         // Two-phase approach: collect items + icon data, then register hit regions after render
         let mut workspace_icons: Vec<(usize, IconCluster)> = Vec::new();
+        let mut repo_icons: Vec<(usize, IconCluster)> = Vec::new();
 
         let items: Vec<ListItem> = app
             .tree_items
@@ -101,8 +99,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 match node {
                     TreeNode::Repo { id, name, .. } => {
                         let expanded = app.expanded.contains(id);
-                        let indicator = if expanded { "\u{25BC} " } else { "\u{25B6} " };
-                        let text = format!("{}{}", indicator, name);
+                        let indicator = if expanded { "\u{25BE} " } else { "\u{203A} " }; // ▾ / ›
                         let style = if is_selected && app.focus == Focus::Tree {
                             Style::default()
                                 .fg(Color::Yellow)
@@ -114,7 +111,23 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default()
                         };
-                        ListItem::new(Line::styled(text, style))
+
+                        // Build repo line icons: ✕ (delete) + (add workspace)
+                        let icons = repo_line_icons(id, name, pane_inner_width);
+
+                        let prefix = format!("{}{}", indicator, name);
+                        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+                        let fill_width = pane_inner_width.saturating_sub(prefix_width + icons.total_width as usize);
+
+                        let mut spans = vec![
+                            Span::styled(prefix, style),
+                            Span::raw(" ".repeat(fill_width)),
+                        ];
+                        spans.extend(icons.spans.clone());
+
+                        repo_icons.push((i, icons));
+
+                        ListItem::new(Line::from(spans))
                     }
                     TreeNode::Workspace { ws, .. } => {
                         let (dot, dot_color) = if ws.active {
@@ -192,15 +205,30 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
+
         let list = List::new(items)
             .block(Block::default().title(" Repos ").borders(Borders::ALL).border_style(tree_border_style))
             .highlight_style(Style::default());
 
         frame.render_stateful_widget(list, area, &mut list_state);
 
+        // Render "+" button on title bar (top-right corner)
+        {
+            let plus_x = area.x + area.width.saturating_sub(4);
+            let plus_rect = Rect::new(plus_x, area.y, 3, 1);
+            let plus_hovered = buttons::is_hovered(app.mouse_pos, plus_rect);
+            let plus_style = if plus_hovered {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            frame.render_widget(Paragraph::new(" + ").style(plus_style), plus_rect);
+        }
+
         // Phase 2: Register hit regions using scroll offset from rendered list state
         let scroll_offset = list_state.offset();
-        for (item_idx, icons) in &workspace_icons {
+        let all_icons: Vec<&(usize, IconCluster)> = workspace_icons.iter().chain(repo_icons.iter()).collect();
+        for (item_idx, icons) in all_icons {
             if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
                 let y = area.y + 1 + row_in_viewport as u16; // +1 for top border
                 if y < area.y + area.height - 1 { // within viewport (before bottom border)
@@ -216,19 +244,18 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
         }
 
-        // Phase 3: Render hover overlays on top of the tree widget
-        let mouse_pos = app.mouse_pos;
-        render_icon_hover_overlays(
-            frame,
-            mouse_pos,
-            area,
-            &workspace_icons,
-            scroll_offset,
-            pane_inner_width,
-        );
+        // Register "Add Repo" hit region on the title bar "+" button
+        {
+            let plus_x = area.x + area.width.saturating_sub(4);
+            let plus_rect = Rect::new(plus_x, area.y, 3, 1);
+            app.hit_regions.push(buttons::HitRegion {
+                area: plus_rect,
+                action: HitAction::AddRepo,
+            });
+        }
 
-        // Phase 4: Update tooltip state based on which icon is hovered
-        let mut new_tooltip: Option<(Rect, String)> = None;
+        // Phase 3: Render hover overlays (white color) for hovered icons
+        let mouse_pos = app.mouse_pos;
         for (item_idx, icons) in &workspace_icons {
             if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
                 let y = area.y + 1 + row_in_viewport as u16;
@@ -236,146 +263,47 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     continue;
                 }
                 let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
-                for (action, icon_width) in &icons.hit_regions {
+                for (idx, (_action, icon_width)) in icons.hit_regions.iter().enumerate() {
                     let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
                     if buttons::is_hovered(mouse_pos, icon_rect) {
-                        let label = action_label(action).to_string();
-                        new_tooltip = Some((icon_rect, label));
+                        let empty = String::new();
+                        let text = icons.hover_texts.get(idx)
+                            .or_else(|| icons.texts.get(idx))
+                            .unwrap_or(&empty);
+                        let overlay = Paragraph::new(text.clone())
+                            .style(Style::default().fg(Color::White));
+                        frame.render_widget(overlay, icon_rect);
                     }
                     icon_x += icon_width;
                 }
             }
         }
 
-        match (&app.tooltip_target, &new_tooltip) {
-            (None, Some(_)) => {
-                // Entering an icon: start hover timer
-                app.tooltip_hover_start = Some(std::time::Instant::now());
-                app.tooltip_target = new_tooltip;
-            }
-            (Some((_, old_label)), Some((_, new_label))) if old_label != new_label => {
-                // Switched to a different icon: update target, keep timer (instant switch)
-                app.tooltip_target = new_tooltip;
-            }
-            (Some(_), Some(_)) => {
-                // Same icon: just update rect position (in case of scroll)
-                app.tooltip_target = new_tooltip;
-            }
-            (Some(_), None) => {
-                // Left all icons: clear tooltip
-                app.tooltip_hover_start = None;
-                app.tooltip_target = None;
-            }
-            (None, None) => {
-                // Nothing hovered, nothing was hovered
-            }
-        }
-    }
-}
-
-/// Map a HitAction to a human-readable label for tooltips.
-pub(crate) fn action_label(action: &HitAction) -> &'static str {
-    match action {
-        HitAction::StartSession | HitAction::StartSessionFor { .. } => "Start",
-        HitAction::StopSession | HitAction::StopSessionFor { .. } => "Stop",
-        HitAction::ResumeSession | HitAction::ResumeSessionFor { .. } => "Resume",
-        HitAction::RetrySessionFor { .. } => "Retry",
-        HitAction::FocusComposerFor { .. } => "Write Message",
-        HitAction::ToggleIconsFor { .. } => "Show Icons",
-    }
-}
-
-/// Render hover highlights for tree icons as overlay widgets.
-/// Uses the same overlay technique as the scrollbar (render small Paragraph at specific Rect).
-fn render_icon_hover_overlays(
-    frame: &mut ratatui::Frame,
-    mouse_pos: Option<(u16, u16)>,
-    area: Rect,
-    workspace_icons: &[(usize, IconCluster)],
-    scroll_offset: usize,
-    pane_inner_width: usize,
-) {
-    let hover_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-
-    for (item_idx, icons) in workspace_icons {
-        if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
-            let y = area.y + 1 + row_in_viewport as u16;
-            if y >= area.y + area.height - 1 {
-                continue; // outside viewport
-            }
-
-            let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
-            for (idx, (_action, icon_width)) in icons.hit_regions.iter().enumerate() {
-                let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
-                if buttons::is_hovered(mouse_pos, icon_rect) {
-                    // Use hover_text (e.g., stop icon instead of spinner)
-                    let empty = String::new();
-                    let text = icons.hover_texts.get(idx)
-                        .or_else(|| icons.texts.get(idx))
-                        .unwrap_or(&empty);
-                    let overlay = Paragraph::new(text.clone()).style(hover_style);
-                    frame.render_widget(overlay, icon_rect);
+        // Phase 4: Render hover overlays for repo line icons
+        for (item_idx, icons) in &repo_icons {
+            if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
+                let y = area.y + 1 + row_in_viewport as u16;
+                if y >= area.y + area.height - 1 {
+                    continue;
                 }
-                icon_x += icon_width;
+                let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+                for (idx, (_action, icon_width)) in icons.hit_regions.iter().enumerate() {
+                    let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
+                    if buttons::is_hovered(mouse_pos, icon_rect) {
+                        let text = icons.texts.get(idx).cloned().unwrap_or_default();
+                        let overlay = Paragraph::new(text)
+                            .style(Style::default().fg(Color::White));
+                        frame.render_widget(overlay, icon_rect);
+                    }
+                    icon_x += icon_width;
+                }
             }
         }
     }
 }
 
-/// Render a floating tooltip above (or below) a hovered icon after 300ms delay.
-fn render_tooltip(frame: &mut ratatui::Frame, app: &App, tree_area: Rect) {
-    let (icon_rect, label_text) = match &app.tooltip_target {
-        Some((r, t)) => (*r, t.as_str()),
-        None => return,
-    };
 
-    // Check 300ms delay
-    let elapsed = match app.tooltip_hover_start {
-        Some(start) => start.elapsed(),
-        None => return,
-    };
-    if elapsed < std::time::Duration::from_millis(300) {
-        return;
-    }
 
-    let label_width = UnicodeWidthStr::width(label_text) as u16;
-    let tooltip_width = label_width + 4; // border + 1 char padding each side
-    let tooltip_height: u16 = 3; // top border + text + bottom border
-
-    let frame_area = frame.area();
-
-    // Position: center above icon
-    let tooltip_x = icon_rect
-        .x
-        .saturating_sub(tooltip_width.saturating_sub(icon_rect.width) / 2)
-        .max(frame_area.x)
-        .min(frame_area.x + frame_area.width.saturating_sub(tooltip_width));
-
-    // Above the icon by default, below if icon is on top row of tree
-    let tooltip_y = if icon_rect.y <= tree_area.y + 1 {
-        // Icon is on top row: place below
-        (icon_rect.y + 1).min(frame_area.y + frame_area.height.saturating_sub(tooltip_height))
-    } else {
-        // Place above
-        icon_rect.y.saturating_sub(tooltip_height)
-            .max(frame_area.y)
-    };
-
-    let tooltip_rect = Rect::new(tooltip_x, tooltip_y, tooltip_width, tooltip_height);
-
-    let tooltip = Paragraph::new(label_text.to_string())
-        .style(Style::default().fg(Color::White).bg(Color::DarkGray))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Gray))
-                .style(Style::default().bg(Color::DarkGray)),
-        );
-    frame.render_widget(tooltip, tooltip_rect);
-}
 
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let right_width = area.width.saturating_sub(4) as usize;
@@ -1127,7 +1055,7 @@ fn render_scrollbar(frame: &mut ratatui::Frame, area: Rect, total_lines: usize, 
     }
 }
 
-/// Icon cluster for a workspace in the tree view.
+/// Icon cluster for a workspace or repo line in the tree view.
 /// Contains the spans to render and hit regions for click handling.
 pub(crate) struct IconCluster {
     pub spans: Vec<Span<'static>>,
@@ -1140,10 +1068,8 @@ pub(crate) struct IconCluster {
 /// Build an icon cluster for a workspace based on its session state.
 /// Each icon is " X" (space + glyph) = 2 display columns.
 ///
-/// - `is_thinking`: whether the workspace has a pending response (spinner)
-/// - `spinner_tick`: global tick counter for spinner animation
-/// - `pane_inner_width`: inner width of the tree pane (for narrow degradation)
-/// - `is_expanded_narrow`: whether the user force-expanded icons at narrow width
+/// Icons: ❯ (write prompt), ■ (stop), ▶ (start/resume), ↺ (retry), ✕ (delete)
+/// Spinner (braille) shown when thinking, morphs to ■ on hover.
 pub(crate) fn workspace_icon_cluster(
     session: Option<&kommand0_core::Session>,
     workspace_id: &str,
@@ -1153,6 +1079,8 @@ pub(crate) fn workspace_icon_cluster(
     is_expanded_narrow: bool,
 ) -> IconCluster {
     let ws_id = workspace_id.to_string();
+    let icon_style = Style::default().fg(Color::Cyan);
+    let delete_text = " \u{2715}".to_string(); // " ✕"
 
     // Narrow-width degradation: below 12 cols, show ellipsis unless force-expanded
     if pane_inner_width < 12 && !is_expanded_narrow {
@@ -1168,77 +1096,164 @@ pub(crate) fn workspace_icon_cluster(
 
     match session.map(|s| &s.status) {
         None => {
-            let text = " \u{25B6}".to_string(); // " ▶"
-            IconCluster {
-                spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Green))],
-                hit_regions: vec![(HitAction::StartSessionFor { workspace_id: ws_id }, 2)],
-                total_width: 2,
-                texts: vec![text.clone()],
-                hover_texts: vec![text],
-            }
+            // No session: start + delete
+            let start_text = " \u{25B6}".to_string(); // " ▶"
+            let mut spans = vec![
+                Span::styled(start_text.clone(), Style::default().fg(Color::Green)),
+                Span::styled(delete_text.clone(), icon_style),
+            ];
+            let mut regions = vec![
+                (HitAction::StartSessionFor { workspace_id: ws_id.clone() }, 2),
+                (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+            ];
+            let mut texts = vec![start_text.clone(), delete_text.clone()];
+            let mut hover_texts = vec![start_text, delete_text];
+            let total = if pane_inner_width < 20 {
+                // Narrow: drop delete
+                spans.truncate(1);
+                regions.truncate(1);
+                texts.truncate(1);
+                hover_texts.truncate(1);
+                2
+            } else {
+                4
+            };
+            IconCluster { spans, hit_regions: regions, total_width: total, texts, hover_texts }
         }
         Some(SessionStatus::Running) => {
             if is_thinking {
-                // Spinner for thinking state
+                // Spinner for thinking state + delete
                 let frame = SPINNER_FRAMES[spinner_tick as usize % SPINNER_FRAMES.len()];
                 let text = format!(" {}", frame);
                 let hover_text = " \u{25A0}".to_string(); // " ■" on hover
-                IconCluster {
-                    spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Cyan))],
-                    hit_regions: vec![(HitAction::StopSessionFor { workspace_id: ws_id }, 2)],
-                    total_width: 2,
-                    texts: vec![text],
-                    hover_texts: vec![hover_text],
-                }
-            } else if pane_inner_width < 20 {
-                // Narrow: only stop icon, drop pencil
-                let text = " \u{25A0}".to_string(); // " ■"
-                IconCluster {
-                    spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Cyan))],
-                    hit_regions: vec![(HitAction::StopSessionFor { workspace_id: ws_id }, 2)],
-                    total_width: 2,
-                    texts: vec![text.clone()],
-                    hover_texts: vec![text],
-                }
+                let mut spans = vec![
+                    Span::styled(text.clone(), icon_style),
+                    Span::styled(delete_text.clone(), icon_style),
+                ];
+                let mut regions = vec![
+                    (HitAction::StopSessionFor { workspace_id: ws_id.clone() }, 2),
+                    (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+                ];
+                let mut texts_v = vec![text, delete_text.clone()];
+                let mut hover_v = vec![hover_text, delete_text];
+                let total = if pane_inner_width < 20 {
+                    spans.truncate(1);
+                    regions.truncate(1);
+                    texts_v.truncate(1);
+                    hover_v.truncate(1);
+                    2
+                } else {
+                    4
+                };
+                IconCluster { spans, hit_regions: regions, total_width: total, texts: texts_v, hover_texts: hover_v }
             } else {
-                // Idle running: pencil + stop
-                let pencil_text = " \u{270E}".to_string(); // " ✎"
+                // Idle running: prompt + stop + delete
+                let prompt_text = " \u{276F}".to_string(); // " ❯"
                 let stop_text = " \u{25A0}".to_string();   // " ■"
-                IconCluster {
-                    spans: vec![
-                        Span::styled(pencil_text.clone(), Style::default().fg(Color::Cyan)),
-                        Span::styled(stop_text.clone(), Style::default().fg(Color::Cyan)),
-                    ],
-                    hit_regions: vec![
-                        (HitAction::FocusComposerFor { workspace_id: ws_id.clone() }, 2),
-                        (HitAction::StopSessionFor { workspace_id: ws_id }, 2),
-                    ],
-                    total_width: 4,
-                    texts: vec![pencil_text.clone(), stop_text.clone()],
-                    hover_texts: vec![pencil_text, stop_text],
-                }
+                let mut spans = vec![
+                    Span::styled(prompt_text.clone(), icon_style),
+                    Span::styled(stop_text.clone(), icon_style),
+                    Span::styled(delete_text.clone(), icon_style),
+                ];
+                let mut regions = vec![
+                    (HitAction::FocusComposerFor { workspace_id: ws_id.clone() }, 2),
+                    (HitAction::StopSessionFor { workspace_id: ws_id.clone() }, 2),
+                    (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+                ];
+                let mut texts_v = vec![prompt_text.clone(), stop_text.clone(), delete_text.clone()];
+                let mut hover_v = vec![prompt_text, stop_text, delete_text];
+                let total = if pane_inner_width < 20 {
+                    // Narrow: drop prompt and delete, keep stop only
+                    spans = vec![spans.remove(1)];
+                    regions = vec![regions.remove(1)];
+                    texts_v = vec![texts_v.remove(1)];
+                    hover_v = vec![hover_v.remove(1)];
+                    2
+                } else {
+                    6
+                };
+                IconCluster { spans, hit_regions: regions, total_width: total, texts: texts_v, hover_texts: hover_v }
             }
         }
         Some(SessionStatus::Stopped) | Some(SessionStatus::Exited) => {
-            let text = " \u{25B6}".to_string(); // " ▶"
-            IconCluster {
-                spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Green))],
-                hit_regions: vec![(HitAction::ResumeSessionFor { workspace_id: ws_id }, 2)],
-                total_width: 2,
-                texts: vec![text.clone()],
-                hover_texts: vec![text],
-            }
+            let resume_text = " \u{25B6}".to_string(); // " ▶"
+            let mut spans = vec![
+                Span::styled(resume_text.clone(), Style::default().fg(Color::Green)),
+                Span::styled(delete_text.clone(), icon_style),
+            ];
+            let mut regions = vec![
+                (HitAction::ResumeSessionFor { workspace_id: ws_id.clone() }, 2),
+                (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+            ];
+            let mut texts = vec![resume_text.clone(), delete_text.clone()];
+            let mut hover_texts = vec![resume_text, delete_text];
+            let total = if pane_inner_width < 20 {
+                spans.truncate(1);
+                regions.truncate(1);
+                texts.truncate(1);
+                hover_texts.truncate(1);
+                2
+            } else {
+                4
+            };
+            IconCluster { spans, hit_regions: regions, total_width: total, texts, hover_texts }
         }
         Some(SessionStatus::Failed) => {
-            let text = " \u{21BA}".to_string(); // " ↺"
-            IconCluster {
-                spans: vec![Span::styled(text.clone(), Style::default().fg(Color::Red))],
-                hit_regions: vec![(HitAction::RetrySessionFor { workspace_id: ws_id }, 2)],
-                total_width: 2,
-                texts: vec![text.clone()],
-                hover_texts: vec![text],
-            }
+            let retry_text = " \u{21BA}".to_string(); // " ↺"
+            let mut spans = vec![
+                Span::styled(retry_text.clone(), Style::default().fg(Color::Red)),
+                Span::styled(delete_text.clone(), icon_style),
+            ];
+            let mut regions = vec![
+                (HitAction::RetrySessionFor { workspace_id: ws_id.clone() }, 2),
+                (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+            ];
+            let mut texts = vec![retry_text.clone(), delete_text.clone()];
+            let mut hover_texts = vec![retry_text, delete_text];
+            let total = if pane_inner_width < 20 {
+                spans.truncate(1);
+                regions.truncate(1);
+                texts.truncate(1);
+                hover_texts.truncate(1);
+                2
+            } else {
+                4
+            };
+            IconCluster { spans, hit_regions: regions, total_width: total, texts, hover_texts }
         }
+    }
+}
+
+/// Build icons for a repo line: ✕ (delete repo) + (add workspace)
+fn repo_line_icons(repo_id: &str, repo_name: &str, pane_inner_width: usize) -> IconCluster {
+    let icon_style = Style::default().fg(Color::Cyan);
+
+    if pane_inner_width < 20 {
+        // Too narrow for repo icons
+        return IconCluster {
+            spans: vec![],
+            hit_regions: vec![],
+            total_width: 0,
+            texts: vec![],
+            hover_texts: vec![],
+        };
+    }
+
+    let delete_text = " \u{2715}".to_string(); // " ✕"
+    let add_text = " +".to_string();
+
+    IconCluster {
+        spans: vec![
+            Span::styled(delete_text.clone(), icon_style),
+            Span::styled(add_text.clone(), icon_style),
+        ],
+        hit_regions: vec![
+            (HitAction::DeleteRepoFor { repo_name: repo_name.to_string() }, 2),
+            (HitAction::AddWorkspaceFor { repo_id: repo_id.to_string() }, 2),
+        ],
+        total_width: 4,
+        texts: vec![delete_text.clone(), add_text.clone()],
+        hover_texts: vec![delete_text, add_text],
     }
 }
 
@@ -1339,11 +1354,15 @@ mod tests {
     #[test]
     fn icon_cluster_no_session() {
         let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 40, false);
-        assert_eq!(cluster.total_width, 2);
-        assert_eq!(cluster.hit_regions.len(), 1);
+        assert_eq!(cluster.total_width, 4); // start + delete
+        assert_eq!(cluster.hit_regions.len(), 2);
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::StartSessionFor { workspace_id: "ws-1".to_string() }
+        );
+        assert_eq!(
+            cluster.hit_regions[1].0,
+            HitAction::DeleteWorkspaceFor { workspace_id: "ws-1".to_string() }
         );
     }
 
@@ -1351,7 +1370,7 @@ mod tests {
     fn icon_cluster_running_thinking_returns_spinner() {
         let session = make_session(SessionStatus::Running);
         let cluster = workspace_icon_cluster(Some(&session), "ws-1", true, 0, 40, false);
-        assert_eq!(cluster.total_width, 2);
+        assert_eq!(cluster.total_width, 4); // spinner + delete
         // Should contain a braille spinner character
         let text = &cluster.spans[0].content;
         assert!(SPINNER_FRAMES.iter().any(|f| text.contains(f)),
@@ -1363,12 +1382,12 @@ mod tests {
     }
 
     #[test]
-    fn icon_cluster_running_idle_returns_pencil_and_stop() {
+    fn icon_cluster_running_idle_returns_prompt_stop_delete() {
         let session = make_session(SessionStatus::Running);
         let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
-        assert_eq!(cluster.total_width, 4);
-        assert_eq!(cluster.spans.len(), 2);
-        assert_eq!(cluster.hit_regions.len(), 2);
+        assert_eq!(cluster.total_width, 6); // prompt + stop + delete
+        assert_eq!(cluster.spans.len(), 3);
+        assert_eq!(cluster.hit_regions.len(), 3);
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::FocusComposerFor { workspace_id: "ws-1".to_string() }
@@ -1377,12 +1396,18 @@ mod tests {
             cluster.hit_regions[1].0,
             HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
         );
+        assert_eq!(
+            cluster.hit_regions[2].0,
+            HitAction::DeleteWorkspaceFor { workspace_id: "ws-1".to_string() }
+        );
+        // Prompt icon should be ❯
+        assert!(cluster.spans[0].content.contains('\u{276F}'));
     }
 
     #[test]
-    fn icon_cluster_running_narrow_drops_pencil() {
+    fn icon_cluster_running_narrow_drops_to_stop_only() {
         let session = make_session(SessionStatus::Running);
-        // pane_inner_width < 20 but >= 12: drop pencil, keep stop only
+        // pane_inner_width < 20 but >= 12: keep stop only
         let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 15, false);
         assert_eq!(cluster.total_width, 2);
         assert_eq!(cluster.hit_regions.len(), 1);
@@ -1410,7 +1435,7 @@ mod tests {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 12, but is_expanded_narrow=true: normal icons
         let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, true);
-        // Should NOT be ellipsis -- should be stop icon (narrow < 20 drops pencil)
+        // Should NOT be ellipsis -- should be stop icon (narrow < 20 drops others)
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
@@ -1421,9 +1446,14 @@ mod tests {
     fn icon_cluster_stopped() {
         let session = make_session(SessionStatus::Stopped);
         let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        assert_eq!(cluster.total_width, 4); // resume + delete
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::ResumeSessionFor { workspace_id: "ws-1".to_string() }
+        );
+        assert_eq!(
+            cluster.hit_regions[1].0,
+            HitAction::DeleteWorkspaceFor { workspace_id: "ws-1".to_string() }
         );
     }
 
@@ -1441,6 +1471,7 @@ mod tests {
     fn icon_cluster_failed() {
         let session = make_session(SessionStatus::Failed);
         let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        assert_eq!(cluster.total_width, 4); // retry + delete
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::RetrySessionFor { workspace_id: "ws-1".to_string() }
@@ -1450,28 +1481,38 @@ mod tests {
     }
 
     #[test]
+    fn icon_cluster_no_session_narrow_drops_delete() {
+        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 15, false);
+        assert_eq!(cluster.total_width, 2); // start only
+        assert_eq!(cluster.hit_regions.len(), 1);
+    }
+
+    #[test]
+    fn repo_line_icons_normal_width() {
+        let icons = repo_line_icons("r-1", "myrepo", 40);
+        assert_eq!(icons.total_width, 4); // delete + add
+        assert_eq!(icons.hit_regions.len(), 2);
+        assert_eq!(
+            icons.hit_regions[0].0,
+            HitAction::DeleteRepoFor { repo_name: "myrepo".to_string() }
+        );
+        assert_eq!(
+            icons.hit_regions[1].0,
+            HitAction::AddWorkspaceFor { repo_id: "r-1".to_string() }
+        );
+    }
+
+    #[test]
+    fn repo_line_icons_narrow_hidden() {
+        let icons = repo_line_icons("r-1", "myrepo", 15);
+        assert_eq!(icons.total_width, 0);
+        assert!(icons.hit_regions.is_empty());
+    }
+
+    #[test]
     fn truncate_to_width_cjk_no_partial() {
-        // Each CJK char is width 2. "你好x" = 2+2+1 = 5 width
-        // With max 3, should get "你" (width 2), not "你好" (width 4)
         let result = truncate_to_width("\u{4F60}\u{597D}x", 3);
         assert_eq!(result, "\u{4F60}");
         assert!(UnicodeWidthStr::width(result.as_str()) <= 3);
-    }
-
-    #[test]
-    fn action_label_tree_icon_variants() {
-        assert_eq!(action_label(&HitAction::StartSessionFor { workspace_id: "ws-1".into() }), "Start");
-        assert_eq!(action_label(&HitAction::StopSessionFor { workspace_id: "ws-1".into() }), "Stop");
-        assert_eq!(action_label(&HitAction::ResumeSessionFor { workspace_id: "ws-1".into() }), "Resume");
-        assert_eq!(action_label(&HitAction::RetrySessionFor { workspace_id: "ws-1".into() }), "Retry");
-        assert_eq!(action_label(&HitAction::FocusComposerFor { workspace_id: "ws-1".into() }), "Write Message");
-        assert_eq!(action_label(&HitAction::ToggleIconsFor { workspace_id: "ws-1".into() }), "Show Icons");
-    }
-
-    #[test]
-    fn action_label_detail_pane_variants() {
-        assert_eq!(action_label(&HitAction::StartSession), "Start");
-        assert_eq!(action_label(&HitAction::StopSession), "Stop");
-        assert_eq!(action_label(&HitAction::ResumeSession), "Resume");
     }
 }

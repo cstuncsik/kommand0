@@ -84,8 +84,6 @@ pub(crate) struct App {
     pub(crate) modal: modal::ModalState,
     pub(crate) expanded_icon_rows: HashSet<String>,
     pub(crate) last_pane_width: u16,
-    pub(crate) tooltip_hover_start: Option<std::time::Instant>,
-    pub(crate) tooltip_target: Option<(ratatui::layout::Rect, String)>,
     /// Accumulates streaming delta text per workspace until newlines flush to scrollback.
     streaming_text: HashMap<String, String>,
     tick_counter: u8,
@@ -160,8 +158,6 @@ impl App {
             modal: modal::ModalState::default(),
             expanded_icon_rows: HashSet::new(),
             last_pane_width: 0,
-            tooltip_hover_start: None,
-            tooltip_target: None,
             streaming_text: HashMap::new(),
             tick_counter: 0,
         };
@@ -1296,6 +1292,83 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             } else {
                                 app.expanded_icon_rows.insert(workspace_id);
                             }
+                        }
+                        buttons::HitAction::DeleteWorkspaceFor { workspace_id } => {
+                            // Find workspace name from ID
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
+                                // Stop running session first
+                                if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
+                                    .filter(|s| s.status == SessionStatus::Running)
+                                    .map(|s| s.id.clone())
+                                {
+                                    let _ = app.session_manager.stop_session(&session_id).await;
+                                    let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                                }
+                                if let Ok(_) = app.state.delete_workspace(&ws.name) {
+                                    app.scrollbacks.remove(&workspace_id);
+                                    app.waiting_response.remove(&workspace_id);
+                                    app.expanded_icon_rows.remove(&workspace_id);
+                                    app.repos = app.state.repos.clone();
+                                    app.workspaces = app.state.workspaces.clone();
+                                    app.rebuild_tree();
+                                    if app.selected_index >= app.tree_items.len() && !app.tree_items.is_empty() {
+                                        app.selected_index = app.tree_items.len() - 1;
+                                    }
+                                    app.update_active_session();
+                                }
+                            }
+                        }
+                        buttons::HitAction::DeleteRepoFor { repo_name } => {
+                            // Stop all running sessions for this repo's workspaces
+                            if let Ok(repo) = app.state.resolve_repo(&repo_name).cloned() {
+                                let ws_ids: Vec<String> = app.state.workspaces.iter()
+                                    .filter(|w| w.repo_id == repo.id)
+                                    .map(|w| w.id.clone())
+                                    .collect();
+                                for ws_id in &ws_ids {
+                                    if let Some(session_id) = app.state.find_session_by_workspace(ws_id)
+                                        .filter(|s| s.status == SessionStatus::Running)
+                                        .map(|s| s.id.clone())
+                                    {
+                                        let _ = app.session_manager.stop_session(&session_id).await;
+                                        let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                                    }
+                                    app.scrollbacks.remove(ws_id);
+                                    app.waiting_response.remove(ws_id);
+                                    app.expanded_icon_rows.remove(ws_id);
+                                }
+                                if let Ok(_) = app.state.delete_repo(&repo_name) {
+                                    app.expanded.remove(&repo.id);
+                                    app.repos = app.state.repos.clone();
+                                    app.workspaces = app.state.workspaces.clone();
+                                    app.rebuild_tree();
+                                    if app.selected_index >= app.tree_items.len() && !app.tree_items.is_empty() {
+                                        app.selected_index = app.tree_items.len() - 1;
+                                    }
+                                    app.update_active_session();
+                                }
+                            }
+                        }
+                        buttons::HitAction::AddWorkspaceFor { repo_id } => {
+                            // Open modal to add workspace to this repo
+                            if let Some(repo) = app.state.repos.iter().find(|r| r.id == repo_id).cloned() {
+                                app.modal = modal::ModalState::AddWorkspace {
+                                    repo_id,
+                                    repo_name: repo.name,
+                                    input: String::new(),
+                                    cursor: 0,
+                                    error: None,
+                                };
+                            }
+                        }
+                        buttons::HitAction::AddRepo => {
+                            app.modal = modal::ModalState::AddRepo {
+                                input: String::new(),
+                                cursor: 0,
+                                error: None,
+                                completions: Vec::new(),
+                                completion_index: None,
+                            };
                         }
                     }
                 }
