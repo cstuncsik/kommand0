@@ -27,11 +27,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. Coordinate translation accounts for border padding, scroll offset, and line wrapping
   3. arboard clipboard can be initialized and write text on the target platform without error
   4. SelectionState can represent no-selection, cursor-only, and anchor+cursor range states
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 01-01: TBD
-- [ ] 01-02: TBD
+- [ ] 01-01-PLAN.md — WrapMap coordinate translation + SelectionState (TDD)
+- [ ] 01-02-PLAN.md — ClipboardBridge + display-width bug fix
 
 ### Phase 2: Output Pane Selection
 **Goal**: Users can see a cursor, navigate it, and select text in the output pane with visual feedback
