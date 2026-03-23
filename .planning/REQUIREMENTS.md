@@ -37,9 +37,9 @@
 
 ### Coordinate Translation
 
-- [ ] **CORD-01**: Screen position (x,y) correctly maps to text position (line, char) accounting for line wrapping
-- [ ] **CORD-02**: Coordinate translation handles unicode characters (CJK, emoji) correctly
-- [ ] **CORD-03**: Coordinate translation accounts for border padding and scroll offset
+- [x] **CORD-01**: Screen position (x,y) correctly maps to text position (line, char) accounting for line wrapping
+- [x] **CORD-02**: Coordinate translation handles unicode characters (CJK, emoji) correctly
+- [x] **CORD-03**: Coordinate translation accounts for border padding and scroll offset
 
 ## v2 Requirements
 
@@ -85,9 +85,9 @@
 | CLIP-03 | Phase 1 | Complete |
 | KEYS-01 | Phase 3 | Pending |
 | KEYS-02 | Phase 3 | Pending |
-| CORD-01 | Phase 1 | Pending |
-| CORD-02 | Phase 1 | Pending |
-| CORD-03 | Phase 1 | Pending |
+| CORD-01 | Phase 1 | Complete |
+| CORD-02 | Phase 1 | Complete |
+| CORD-03 | Phase 1 | Complete |
 
 **Coverage:**
 - v1 requirements: 18 total
