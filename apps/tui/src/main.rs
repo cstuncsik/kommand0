@@ -1,11 +1,14 @@
 mod buttons;
+mod clipboard;
 mod composer;
 mod help;
 mod modal;
 mod mouse;
 mod render;
 mod scrollback;
+mod selection;
 mod session_manager;
+mod wrap_map;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
