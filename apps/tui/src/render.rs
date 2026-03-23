@@ -593,11 +593,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 }
 
 /// Calculate visual line count for a single line with wrapping.
-fn wrapped_line_height(line_len: usize, width: usize) -> usize {
-    if width == 0 || line_len == 0 {
+fn wrapped_line_height(display_width: usize, width: usize) -> usize {
+    if width == 0 || display_width == 0 {
         return 1;
     }
-    (line_len + width - 1) / width
+    (display_width + width - 1) / width
 }
 
 /// Parse inline markdown into styled spans.
@@ -854,8 +854,10 @@ fn build_output_lines(
 fn styled_total_visual(lines: &[Line], inner_width: usize) -> usize {
     lines.iter()
         .map(|l| {
-            let len: usize = l.spans.iter().map(|s| s.content.len()).sum();
-            wrapped_line_height(len, inner_width)
+            let display_width: usize = l.spans.iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
+            wrapped_line_height(display_width, inner_width)
         })
         .sum()
 }
