@@ -28,7 +28,7 @@
 
 - [ ] **CLIP-01**: User can copy selected text to system clipboard with Ctrl+C or Cmd+C
 - [ ] **CLIP-02**: Ctrl+C with no active selection does nothing (no side effects)
-- [ ] **CLIP-03**: Clipboard integration works cross-platform via arboard crate
+- [x] **CLIP-03**: Clipboard integration works cross-platform via arboard crate
 
 ### Keybindings
 
@@ -82,7 +82,7 @@
 | COMP-02 | Phase 3 | Pending |
 | CLIP-01 | Phase 3 | Pending |
 | CLIP-02 | Phase 3 | Pending |
-| CLIP-03 | Phase 1 | Pending |
+| CLIP-03 | Phase 1 | Complete |
 | KEYS-01 | Phase 3 | Pending |
 | KEYS-02 | Phase 3 | Pending |
 | CORD-01 | Phase 1 | Pending |
