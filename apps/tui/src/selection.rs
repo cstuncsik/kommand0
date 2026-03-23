@@ -20,23 +20,39 @@ pub enum SelectionState {
 impl SelectionState {
     /// Returns true if the selection state is None.
     pub fn is_none(&self) -> bool {
-        todo!()
+        matches!(self, Self::None)
     }
 
     /// Returns true if there is an active range selection.
     pub fn has_range(&self) -> bool {
-        todo!()
+        matches!(self, Self::Range { .. })
     }
 
     /// Returns (start, end) in document order regardless of anchor/cursor direction.
     /// Returns None for None and Cursor states.
     pub fn ordered_range(&self) -> Option<((usize, usize), (usize, usize))> {
-        todo!()
+        match self {
+            Self::Range {
+                anchor_line,
+                anchor_char,
+                cursor_line,
+                cursor_char,
+            } => {
+                let anchor = (*anchor_line, *anchor_char);
+                let cursor = (*cursor_line, *cursor_char);
+                if anchor.0 < cursor.0 || (anchor.0 == cursor.0 && anchor.1 <= cursor.1) {
+                    Some((anchor, cursor))
+                } else {
+                    Some((cursor, anchor))
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Resets to None.
     pub fn clear(&mut self) {
-        todo!()
+        *self = Self::None;
     }
 }
 
