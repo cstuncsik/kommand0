@@ -24,33 +24,325 @@ pub struct WrapMap {
 impl WrapMap {
     /// Build from raw text lines at a given pane width.
     /// Replicates ratatui's WordWrapper with trim=false.
-    pub fn build(_lines: &[&str], pane_width: usize) -> Self {
-        Self {
-            rows: Vec::new(),
-            pane_width,
+    pub fn build(lines: &[&str], pane_width: usize) -> Self {
+        let mut rows = Vec::new();
+
+        if lines.is_empty() {
+            return Self { rows, pane_width };
         }
+
+        for (line_idx, line) in lines.iter().enumerate() {
+            if line.is_empty() {
+                rows.push(VisualRow {
+                    logical_line: line_idx,
+                    start_byte: 0,
+                    end_byte: 0,
+                    width: 0,
+                });
+                continue;
+            }
+
+            Self::wrap_line(line, line_idx, pane_width, &mut rows);
+        }
+
+        Self { rows, pane_width }
+    }
+
+    /// Wrap a single logical line into visual rows.
+    /// Replicates ratatui WordWrapper with trim=false.
+    fn wrap_line(line: &str, line_idx: usize, pane_width: usize, rows: &mut Vec<VisualRow>) {
+        // Collect grapheme info: (byte_start, byte_end, display_width, is_whitespace)
+        let graphemes: Vec<(usize, usize, usize, bool)> = {
+            let indices: Vec<(usize, &str)> = line.grapheme_indices(true).collect();
+            indices
+                .iter()
+                .enumerate()
+                .map(|(i, &(byte_start, g))| {
+                    let byte_end = if i + 1 < indices.len() {
+                        indices[i + 1].0
+                    } else {
+                        line.len()
+                    };
+                    let w = UnicodeWidthStr::width(g);
+                    let is_ws = g.chars().all(|c| c.is_whitespace());
+                    (byte_start, byte_end, w, is_ws)
+                })
+                .collect()
+        };
+
+        // State for word-wrapping
+        let mut current_row_start: usize = 0;
+        let mut current_row_width: usize = 0;
+        let mut current_row_end: usize = 0; // byte end of last content on current row
+
+        // Pending whitespace and word buffers
+        // Each entry: (byte_start, byte_end, display_width)
+        let mut pending_ws: Vec<(usize, usize, usize)> = Vec::new();
+        let mut pending_word: Vec<(usize, usize, usize)> = Vec::new();
+
+        for &(byte_start, byte_end, g_width, is_ws) in &graphemes {
+            // Skip graphemes wider than pane_width
+            if g_width > pane_width {
+                continue;
+            }
+
+            if is_ws {
+                // Whitespace: flush any pending word first
+                if !pending_word.is_empty() {
+                    Self::flush_word(
+                        line_idx,
+                        pane_width,
+                        rows,
+                        &mut current_row_start,
+                        &mut current_row_width,
+                        &mut current_row_end,
+                        &mut pending_ws,
+                        &mut pending_word,
+                    );
+                }
+                pending_ws.push((byte_start, byte_end, g_width));
+            } else {
+                pending_word.push((byte_start, byte_end, g_width));
+            }
+        }
+
+        // Flush remaining content
+        if !pending_word.is_empty() {
+            Self::flush_word(
+                line_idx,
+                pane_width,
+                rows,
+                &mut current_row_start,
+                &mut current_row_width,
+                &mut current_row_end,
+                &mut pending_ws,
+                &mut pending_word,
+            );
+        } else if !pending_ws.is_empty() {
+            // Trailing whitespace only
+            let ws_width: usize = pending_ws.iter().map(|e| e.2).sum();
+            if current_row_width + ws_width <= pane_width {
+                current_row_width += ws_width;
+                current_row_end = pending_ws.last().unwrap().1;
+            } else {
+                // Emit current row, start new with trailing ws
+                if current_row_width > 0 || current_row_end > current_row_start {
+                    rows.push(VisualRow {
+                        logical_line: line_idx,
+                        start_byte: current_row_start,
+                        end_byte: current_row_end,
+                        width: current_row_width as u16,
+                    });
+                }
+                current_row_start = pending_ws[0].0;
+                current_row_width = ws_width;
+                current_row_end = pending_ws.last().unwrap().1;
+            }
+            pending_ws.clear();
+        }
+
+        // Emit final row
+        rows.push(VisualRow {
+            logical_line: line_idx,
+            start_byte: current_row_start,
+            end_byte: current_row_end,
+            width: current_row_width as u16,
+        });
+    }
+
+    /// Flush pending whitespace + word onto current row, wrapping if needed.
+    /// Handles overlong words (exceeding pane_width) with character-level breaks.
+    fn flush_word(
+        line_idx: usize,
+        pane_width: usize,
+        rows: &mut Vec<VisualRow>,
+        current_row_start: &mut usize,
+        current_row_width: &mut usize,
+        current_row_end: &mut usize,
+        pending_ws: &mut Vec<(usize, usize, usize)>,
+        pending_word: &mut Vec<(usize, usize, usize)>,
+    ) {
+        let ws_width: usize = pending_ws.iter().map(|e| e.2).sum();
+        let word_width: usize = pending_word.iter().map(|e| e.2).sum();
+
+        if *current_row_width + ws_width + word_width <= pane_width {
+            // Fits on current row
+            *current_row_width += ws_width + word_width;
+            *current_row_end = pending_word.last().unwrap().1;
+        } else if ws_width + word_width <= pane_width {
+            // Word fits on a new row (with whitespace), but not on current row
+            // Emit current row if it has content
+            if *current_row_width > 0 || *current_row_end > *current_row_start {
+                rows.push(VisualRow {
+                    logical_line: line_idx,
+                    start_byte: *current_row_start,
+                    end_byte: *current_row_end,
+                    width: *current_row_width as u16,
+                });
+            }
+            // trim=false: new row starts with the whitespace
+            let new_start = if !pending_ws.is_empty() {
+                pending_ws[0].0
+            } else {
+                pending_word[0].0
+            };
+            *current_row_start = new_start;
+            *current_row_width = ws_width + word_width;
+            *current_row_end = pending_word.last().unwrap().1;
+        } else {
+            // Word itself exceeds pane_width: character-level break needed
+            // Emit current row if it has content
+            if *current_row_width > 0 || *current_row_end > *current_row_start {
+                rows.push(VisualRow {
+                    logical_line: line_idx,
+                    start_byte: *current_row_start,
+                    end_byte: *current_row_end,
+                    width: *current_row_width as u16,
+                });
+            }
+
+            // Include whitespace at start of first break line (trim=false)
+            let ws_start = pending_ws.first().map(|e| e.0);
+            let word_start = pending_word[0].0;
+            let effective_start = ws_start.unwrap_or(word_start);
+
+            let mut partial_start = effective_start;
+            let mut partial_width: usize = ws_width;
+            let mut partial_end = if !pending_ws.is_empty() {
+                pending_ws.last().unwrap().1
+            } else {
+                word_start
+            };
+
+            for &(bs, be, gw) in pending_word.iter() {
+                if partial_width + gw > pane_width && partial_width > 0 {
+                    rows.push(VisualRow {
+                        logical_line: line_idx,
+                        start_byte: partial_start,
+                        end_byte: partial_end,
+                        width: partial_width as u16,
+                    });
+                    partial_start = bs;
+                    partial_width = 0;
+                }
+                partial_width += gw;
+                partial_end = be;
+            }
+
+            *current_row_start = partial_start;
+            *current_row_width = partial_width;
+            *current_row_end = partial_end;
+        }
+
+        pending_ws.clear();
+        pending_word.clear();
     }
 
     /// Screen (x, y) -> (logical_line, grapheme_offset).
     /// Needs access to original lines to walk grapheme clusters.
     pub fn screen_to_logical(
         &self,
-        _x: u16,
-        _y: u16,
-        _scroll_from_top: usize,
-        _lines: &[&str],
+        x: u16,
+        y: u16,
+        scroll_from_top: usize,
+        lines: &[&str],
     ) -> Option<(usize, usize)> {
-        None
+        let visual_row_idx = y as usize + scroll_from_top;
+        let row = self.rows.get(visual_row_idx)?;
+        let line = lines.get(row.logical_line)?;
+        let row_text = &line[row.start_byte..row.end_byte];
+
+        // Count graphemes before this row's start to get base offset
+        let base_grapheme_offset = line[..row.start_byte].graphemes(true).count();
+
+        let mut col = 0u16;
+        let mut grapheme_idx = 0usize;
+
+        for grapheme in row_text.graphemes(true) {
+            let g_width = UnicodeWidthStr::width(grapheme) as u16;
+            if col + g_width > x {
+                return Some((row.logical_line, base_grapheme_offset + grapheme_idx));
+            }
+            col += g_width;
+            grapheme_idx += 1;
+        }
+
+        // Past end of row content: clamp to last position
+        if grapheme_idx > 0 {
+            Some((
+                row.logical_line,
+                base_grapheme_offset + grapheme_idx.saturating_sub(1),
+            ))
+        } else {
+            Some((row.logical_line, base_grapheme_offset))
+        }
     }
 
     /// (logical_line, grapheme_offset) -> (x_column, y_visual_row).
     pub fn logical_to_screen(
         &self,
-        _line: usize,
-        _char_offset: usize,
-        _scroll_from_top: usize,
-        _lines: &[&str],
+        line: usize,
+        char_offset: usize,
+        scroll_from_top: usize,
+        lines: &[&str],
     ) -> Option<(u16, u16)> {
+        let source_line = lines.get(line)?;
+
+        // Find the byte offset for the given grapheme index
+        let mut target_byte_offset = source_line.len();
+        for (i, (byte_idx, _)) in source_line.grapheme_indices(true).enumerate() {
+            if i == char_offset {
+                target_byte_offset = byte_idx;
+                break;
+            }
+        }
+
+        // Find which visual row contains this byte offset
+        for (row_idx, row) in self.rows.iter().enumerate() {
+            if row.logical_line != line {
+                continue;
+            }
+            let in_range = if row.start_byte == row.end_byte {
+                // Empty row
+                target_byte_offset == row.start_byte
+            } else {
+                target_byte_offset >= row.start_byte && target_byte_offset < row.end_byte
+            };
+
+            if in_range {
+                let row_text = &source_line[row.start_byte..row.end_byte];
+                let mut x = 0u16;
+                for (byte_idx, grapheme) in row_text.grapheme_indices(true) {
+                    if row.start_byte + byte_idx >= target_byte_offset {
+                        break;
+                    }
+                    x += UnicodeWidthStr::width(grapheme) as u16;
+                }
+
+                if row_idx < scroll_from_top {
+                    return None;
+                }
+                let y = (row_idx - scroll_from_top) as u16;
+                return Some((x, y));
+            }
+        }
+
+        // char_offset at end of line: use last row for this line
+        for (row_idx, row) in self.rows.iter().enumerate().rev() {
+            if row.logical_line == line {
+                let row_text = &source_line[row.start_byte..row.end_byte];
+                let x: u16 = row_text
+                    .graphemes(true)
+                    .map(|g| UnicodeWidthStr::width(g) as u16)
+                    .sum();
+                if row_idx < scroll_from_top {
+                    return None;
+                }
+                let y = (row_idx - scroll_from_top) as u16;
+                return Some((x, y));
+            }
+        }
+
         None
     }
 
@@ -60,14 +352,54 @@ impl WrapMap {
     }
 
     /// Extract text between two logical positions.
-    /// start and end are (line, grapheme_index) in document order.
+    /// start and end are (line, grapheme_index) in document order (inclusive).
     pub fn extract_text(
         &self,
-        _lines: &[&str],
-        _start: (usize, usize),
-        _end: (usize, usize),
+        lines: &[&str],
+        start: (usize, usize),
+        end: (usize, usize),
     ) -> String {
-        String::new()
+        let (start_line, start_char) = start;
+        let (end_line, end_char) = end;
+
+        if start_line == end_line {
+            let line = match lines.get(start_line) {
+                Some(l) => l,
+                None => return String::new(),
+            };
+            let graphemes: Vec<&str> = line.graphemes(true).collect();
+            let end_idx = (end_char + 1).min(graphemes.len());
+            if start_char >= graphemes.len() {
+                return String::new();
+            }
+            graphemes[start_char..end_idx].join("")
+        } else {
+            let mut result = Vec::new();
+
+            // First line: from start_char to end
+            if let Some(line) = lines.get(start_line) {
+                let graphemes: Vec<&str> = line.graphemes(true).collect();
+                if start_char < graphemes.len() {
+                    result.push(graphemes[start_char..].join(""));
+                }
+            }
+
+            // Middle lines: full
+            for line_idx in (start_line + 1)..end_line {
+                if let Some(line) = lines.get(line_idx) {
+                    result.push(line.to_string());
+                }
+            }
+
+            // Last line: from start to end_char
+            if let Some(line) = lines.get(end_line) {
+                let graphemes: Vec<&str> = line.graphemes(true).collect();
+                let end_idx = (end_char + 1).min(graphemes.len());
+                result.push(graphemes[..end_idx].join(""));
+            }
+
+            result.join("\n")
+        }
     }
 
     /// Access the rows (for testing).
