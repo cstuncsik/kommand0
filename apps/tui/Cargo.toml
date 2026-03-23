@@ -16,4 +16,6 @@ serde_json.workspace = true
 serde.workspace = true
 uuid.workspace = true
 unicode-width.workspace = true
+unicode-segmentation.workspace = true
+arboard.workspace = true
 kommand0-core.workspace = true
