@@ -1,3 +1,19 @@
+---
+gsd_state_version: 1.0
+milestone: v1.0
+milestone_name: milestone
+status: executing
+stopped_at: Completed 01-01-PLAN.md
+last_updated: "2026-03-23T19:57:38.459Z"
+last_activity: 2026-03-23 -- Completed 01-02-PLAN.md
+progress:
+  total_phases: 3
+  completed_phases: 1
+  total_plans: 2
+  completed_plans: 2
+  percent: 100
+---
+
 # Project State
 
 ## Project Reference
@@ -14,7 +30,7 @@ Plan: 1 of 2 in current phase
 Status: Executing
 Last activity: 2026-03-23 -- Completed 01-02-PLAN.md
 
-Progress: [█████░░░░░] 50%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -34,6 +50,7 @@ Progress: [█████░░░░░] 50%
 - Trend: baseline
 
 *Updated after each plan completion*
+| Phase 01 P01 | 7min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -44,6 +61,9 @@ Recent decisions affecting current work:
 
 - [Roadmap]: WrapMap is highest-risk component -- build and test first before any interaction handlers
 - [Roadmap]: Ctrl+Q must be wired and verified before Ctrl+C semantics change
+- [01-01]: screen_to_logical/logical_to_screen accept lines param to avoid lifetime complexity
+- [01-01]: Character-level word breaks deferred to flush time matching ratatui WordWrapper
+- [01-01]: extract_text uses grapheme indices in public API, byte offsets internally
 - [01-02]: ClipboardBridge uses Option<Clipboard> for graceful fallback on headless systems
 - [01-02]: Display-width fix is approximation until WrapMap replaces styled_total_visual
 
@@ -58,6 +78,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-23
-Stopped at: Completed 01-02-PLAN.md
+Last session: 2026-03-23T19:57:38.456Z
+Stopped at: Completed 01-01-PLAN.md
 Resume file: None
