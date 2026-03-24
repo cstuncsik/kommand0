@@ -7,17 +7,17 @@
 
 ### Output Cursor
 
-- [ ] **CURS-01**: User can move a blinking cursor in output pane using arrow keys
-- [ ] **CURS-02**: Cursor scrolls into view when moved beyond visible area
+- [x] **CURS-01**: User can move a blinking cursor in output pane using arrow keys
+- [x] **CURS-02**: Cursor scrolls into view when moved beyond visible area
 
 ### Output Selection
 
-- [ ] **OSEL-01**: User can select text by holding Shift+arrow keys in output pane
-- [ ] **OSEL-02**: User can select to start/end of line with Shift+Home/Shift+End
+- [x] **OSEL-01**: User can select text by holding Shift+arrow keys in output pane
+- [x] **OSEL-02**: User can select to start/end of line with Shift+Home/Shift+End
 - [ ] **OSEL-03**: User can drag mouse to select text region in output pane
 - [x] **OSEL-04**: Selected text is highlighted with cyan background and black text
-- [ ] **OSEL-05**: User can select all output text with Ctrl+A when output pane is focused
-- [ ] **OSEL-06**: Selection clears when user scrolls
+- [x] **OSEL-05**: User can select all output text with Ctrl+A when output pane is focused
+- [x] **OSEL-06**: Selection clears when user scrolls
 
 ### Composer Selection
 
@@ -70,14 +70,14 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CURS-01 | Phase 2 | Pending |
-| CURS-02 | Phase 2 | Pending |
-| OSEL-01 | Phase 2 | Pending |
-| OSEL-02 | Phase 2 | Pending |
+| CURS-01 | Phase 2 | Complete |
+| CURS-02 | Phase 2 | Complete |
+| OSEL-01 | Phase 2 | Complete |
+| OSEL-02 | Phase 2 | Complete |
 | OSEL-03 | Phase 2 | Pending |
 | OSEL-04 | Phase 2 | Complete |
-| OSEL-05 | Phase 2 | Pending |
-| OSEL-06 | Phase 2 | Pending |
+| OSEL-05 | Phase 2 | Complete |
+| OSEL-06 | Phase 2 | Complete |
 | COMP-01 | Phase 3 | Pending |
 | COMP-02 | Phase 3 | Pending |
 | CLIP-01 | Phase 3 | Pending |
