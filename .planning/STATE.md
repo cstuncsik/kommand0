@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 2 context gathered
-last_updated: "2026-03-24T10:34:32.327Z"
-last_activity: 2026-03-23 -- Completed 01-02-PLAN.md
+stopped_at: Completed 02-01-PLAN.md
+last_updated: "2026-03-24T11:16:00Z"
+last_activity: 2026-03-24 -- Completed 02-01-PLAN.md
 progress:
   total_phases: 3
   completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
-  percent: 100
+  total_plans: 8
+  completed_plans: 3
+  percent: 38
 ---
 
 # Project State
@@ -21,36 +21,38 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-22)
 
 **Core value:** Users can select any text in the TUI and copy it to the system clipboard
-**Current focus:** Phase 1: Coordinate Translation & Infrastructure
+**Current focus:** Phase 2: Output Pane Selection
 
 ## Current Position
 
-Phase: 1 of 3 (Coordinate Translation & Infrastructure)
-Plan: 1 of 2 in current phase
+Phase: 2 of 3 (Output Pane Selection)
+Plan: 2 of 3 in current phase
 Status: Executing
-Last activity: 2026-03-23 -- Completed 01-02-PLAN.md
+Last activity: 2026-03-24 -- Completed 02-01-PLAN.md
 
-Progress: [██████████] 100%
+Progress: [████------] 38%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1
-- Average duration: 4min
-- Total execution time: 0.07 hours
+- Total plans completed: 3
+- Average duration: 5min
+- Total execution time: 0.25 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 01 | 1 | 4min | 4min |
+| 01 | 2 | 11min | 6min |
+| 02 | 1 | 5min | 5min |
 
 **Recent Trend:**
-- Last 5 plans: 4min
-- Trend: baseline
+- Last 5 plans: 7min, 4min, 5min
+- Trend: stable
 
 *Updated after each plan completion*
 | Phase 01 P01 | 7min | 2 tasks | 5 files |
+| Phase 02 P01 | 5min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -66,6 +68,8 @@ Recent decisions affecting current work:
 - [01-01]: extract_text uses grapheme indices in public API, byte offsets internally
 - [01-02]: ClipboardBridge uses Option<Clipboard> for graceful fallback on headless systems
 - [01-02]: Display-width fix is approximation until WrapMap replaces styled_total_visual
+- [02-01]: Collect scrollback lines into owned Vec<String> to resolve borrow-checker conflict in render pipeline
+- [02-01]: Cursor and selection highlights operate on pre-wrap styled Lines using logical line indices
 
 ### Pending Todos
 
@@ -78,6 +82,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-24T10:34:32.323Z
-Stopped at: Phase 2 context gathered
-Resume file: .planning/phases/02-output-pane-selection/02-CONTEXT.md
+Last session: 2026-03-24T11:16:00Z
+Stopped at: Completed 02-01-PLAN.md
+Resume file: .planning/phases/02-output-pane-selection/02-01-SUMMARY.md

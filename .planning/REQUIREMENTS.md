@@ -15,7 +15,7 @@
 - [ ] **OSEL-01**: User can select text by holding Shift+arrow keys in output pane
 - [ ] **OSEL-02**: User can select to start/end of line with Shift+Home/Shift+End
 - [ ] **OSEL-03**: User can drag mouse to select text region in output pane
-- [ ] **OSEL-04**: Selected text is highlighted with cyan background and black text
+- [x] **OSEL-04**: Selected text is highlighted with cyan background and black text
 - [ ] **OSEL-05**: User can select all output text with Ctrl+A when output pane is focused
 - [ ] **OSEL-06**: Selection clears when user scrolls
 
@@ -75,7 +75,7 @@
 | OSEL-01 | Phase 2 | Pending |
 | OSEL-02 | Phase 2 | Pending |
 | OSEL-03 | Phase 2 | Pending |
-| OSEL-04 | Phase 2 | Pending |
+| OSEL-04 | Phase 2 | Complete |
 | OSEL-05 | Phase 2 | Pending |
 | OSEL-06 | Phase 2 | Pending |
 | COMP-01 | Phase 3 | Pending |
