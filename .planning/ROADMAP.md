@@ -43,12 +43,12 @@ Plans:
   3. User can drag the mouse across output text and see cyan-background/black-text highlight appear in real time
   4. User can hold Shift+arrow keys (and Shift+Home/End) to extend a selection from the cursor position
   5. Ctrl+A selects all text in the output pane when it is focused, and selection clears on scroll
-**Plans**: TBD
+**Plans:** 3 plans
 
 Plans:
-- [ ] 02-01: TBD
-- [ ] 02-02: TBD
-- [ ] 02-03: TBD
+- [ ] 02-01-PLAN.md — App state fields + highlight overlay rendering engine
+- [ ] 02-02-PLAN.md — Cursor navigation + keyboard selection
+- [ ] 02-03-PLAN.md — Mouse click/drag interaction + visual checkpoint
 
 ### Phase 3: Clipboard, Keybindings & Composer
 **Goal**: Selected text anywhere in the TUI can be copied to the system clipboard, and all keybindings reflect the new Ctrl+C/Q semantics
