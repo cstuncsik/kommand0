@@ -22,10 +22,13 @@ use ratatui::{
     style::Color,
 };
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use composer::Composer;
 use scrollback::ScrollbackBuffer;
 use selection::SelectionState;
 use session_manager::{SessionEvent, SessionManager};
+use wrap_map::WrapMap;
 
 #[allow(dead_code)]
 pub(crate) enum Status {
@@ -89,7 +92,7 @@ pub(crate) struct App {
     pub(crate) expanded_icon_rows: HashSet<String>,
     pub(crate) last_pane_width: u16,
     /// Accumulates streaming delta text per workspace until newlines flush to scrollback.
-    streaming_text: HashMap<String, String>,
+    pub(crate) streaming_text: HashMap<String, String>,
     tick_counter: u8,
     /// Per-workspace composer drafts so switching workspaces preserves unsent text.
     pub(crate) composer_drafts: HashMap<String, String>,
