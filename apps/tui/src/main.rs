@@ -415,6 +415,595 @@ impl App {
             }
         }
     }
+
+    // --- Cursor movement and selection helpers ---
+
+    /// Get the scrollback lines and inner width for the given workspace.
+    /// Returns (owned_lines, inner_width) or None if unavailable.
+    fn output_context(&self, ws_id: &str) -> Option<(Vec<String>, usize)> {
+        let buf = self.scrollbacks.get(ws_id)?;
+        let lines: Vec<String> = buf.all_lines().iter().map(|s| s.to_string()).collect();
+        let inner_width = if self.pane_areas.output.width > 2 {
+            (self.pane_areas.output.width - 2) as usize
+        } else {
+            80
+        };
+        Some((lines, inner_width))
+    }
+
+    /// Initialize cursor to bottom-left if not already set for this workspace.
+    fn init_cursor_if_needed(&mut self, ws_id: &str) {
+        if self.selections.get(ws_id).map_or(true, |s| s.is_none()) {
+            if let Some(buf) = self.scrollbacks.get(ws_id) {
+                let total = buf.total_lines();
+                let line = if total > 0 { total - 1 } else { 0 };
+                self.selections.insert(ws_id.to_string(), SelectionState::Cursor { line, char_offset: 0 });
+                self.cursor_desired_col.insert(ws_id.to_string(), 0);
+                self.auto_scroll_suppressed.insert(ws_id.to_string());
+            }
+        }
+    }
+
+    /// Get current cursor position from selection state.
+    fn cursor_pos(&self, ws_id: &str) -> Option<(usize, usize)> {
+        match self.selections.get(ws_id)? {
+            SelectionState::Cursor { line, char_offset } => Some((*line, *char_offset)),
+            SelectionState::Range { cursor_line, cursor_char, .. } => Some((*cursor_line, *cursor_char)),
+            SelectionState::None => None,
+        }
+    }
+
+    /// Set cursor position (collapse any range to cursor).
+    fn set_cursor(&mut self, ws_id: &str, line: usize, char_offset: usize) {
+        self.selections.insert(ws_id.to_string(), SelectionState::Cursor { line, char_offset });
+    }
+
+    /// Extend selection: if currently Cursor, anchor at current pos and move cursor to new_pos.
+    /// If currently Range, keep anchor and move cursor.
+    fn extend_selection(&mut self, ws_id: &str, new_line: usize, new_char: usize) {
+        let current = self.selections.get(ws_id).cloned().unwrap_or_default();
+        match current {
+            SelectionState::Cursor { line, char_offset } => {
+                self.selections.insert(ws_id.to_string(), SelectionState::Range {
+                    anchor_line: line,
+                    anchor_char: char_offset,
+                    cursor_line: new_line,
+                    cursor_char: new_char,
+                });
+            }
+            SelectionState::Range { anchor_line, anchor_char, .. } => {
+                self.selections.insert(ws_id.to_string(), SelectionState::Range {
+                    anchor_line,
+                    anchor_char,
+                    cursor_line: new_line,
+                    cursor_char: new_char,
+                });
+            }
+            SelectionState::None => {
+                self.selections.insert(ws_id.to_string(), SelectionState::Cursor {
+                    line: new_line,
+                    char_offset: new_char,
+                });
+            }
+        }
+    }
+
+    /// Ensure cursor is visible, adjusting scroll_offset.
+    fn ensure_cursor_visible(&mut self, ws_id: &str) {
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+        let total_visual = wrap_map.total_visual_rows();
+        let inner_height = if self.pane_areas.output.height > 2 {
+            (self.pane_areas.output.height - 2) as usize
+        } else {
+            1
+        };
+        let max_scroll = total_visual.saturating_sub(inner_height);
+
+        // Find cursor's visual row (using scroll_from_top=0 to get absolute visual row)
+        if let Some((_x, y)) = wrap_map.logical_to_screen(cursor_line, cursor_char, 0, &lines_ref) {
+            let buf = match self.scrollbacks.get_mut(ws_id) {
+                Some(b) => b,
+                None => return,
+            };
+            let clamped_offset = buf.scroll_offset().min(max_scroll);
+            let scroll_from_top = max_scroll.saturating_sub(clamped_offset);
+
+            if (y as usize) < scroll_from_top {
+                // Cursor above viewport
+                let new_offset = max_scroll.saturating_sub(y as usize);
+                buf.set_scroll_offset(new_offset);
+            } else if (y as usize) >= scroll_from_top + inner_height {
+                // Cursor below viewport
+                let new_scroll_from_top = (y as usize).saturating_sub(inner_height) + 1;
+                let new_offset = max_scroll.saturating_sub(new_scroll_from_top);
+                buf.set_scroll_offset(new_offset);
+            }
+        }
+    }
+
+    /// Move cursor vertically by `direction` visual rows (-1 = up, 1 = down).
+    fn move_cursor_vertical(&mut self, ws_id: &str, direction: i32) {
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+
+        // Get current screen position (absolute, scroll_from_top=0)
+        if let Some((_cx, cy)) = wrap_map.logical_to_screen(cursor_line, cursor_char, 0, &lines_ref) {
+            let desired_col = self.cursor_desired_col.get(ws_id).copied().unwrap_or(0);
+            let new_y = if direction < 0 {
+                (cy as usize).saturating_sub((-direction) as usize)
+            } else {
+                let total = wrap_map.total_visual_rows();
+                ((cy as usize) + direction as usize).min(total.saturating_sub(1))
+            };
+
+            // Convert back to logical using desired_col as x
+            if let Some((new_line, new_char)) = wrap_map.screen_to_logical(desired_col as u16, new_y as u16, 0, &lines_ref) {
+                self.set_cursor(ws_id, new_line, new_char);
+                // Do NOT update desired_col on vertical movement
+                self.auto_scroll_suppressed.insert(ws_id.to_string());
+                self.ensure_cursor_visible(ws_id);
+            }
+        }
+    }
+
+    /// Extend selection vertically by `direction` visual rows.
+    fn extend_selection_vertical(&mut self, ws_id: &str, direction: i32) {
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+
+        if let Some((_cx, cy)) = wrap_map.logical_to_screen(cursor_line, cursor_char, 0, &lines_ref) {
+            let desired_col = self.cursor_desired_col.get(ws_id).copied().unwrap_or(0);
+            let new_y = if direction < 0 {
+                (cy as usize).saturating_sub((-direction) as usize)
+            } else {
+                let total = wrap_map.total_visual_rows();
+                ((cy as usize) + direction as usize).min(total.saturating_sub(1))
+            };
+
+            if let Some((new_line, new_char)) = wrap_map.screen_to_logical(desired_col as u16, new_y as u16, 0, &lines_ref) {
+                self.extend_selection(ws_id, new_line, new_char);
+                self.auto_scroll_suppressed.insert(ws_id.to_string());
+                self.ensure_cursor_visible(ws_id);
+            }
+        }
+    }
+
+    /// Move cursor horizontally by `direction` characters (-1 = left, 1 = right).
+    fn move_cursor_horizontal(&mut self, ws_id: &str, direction: i32) {
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+
+        let (new_line, new_char) = if direction > 0 {
+            // Move right
+            let line_text = lines_ref.get(cursor_line).copied().unwrap_or("");
+            let grapheme_count = line_text.graphemes(true).count();
+            if cursor_char + 1 < grapheme_count {
+                (cursor_line, cursor_char + 1)
+            } else if cursor_line + 1 < lines_ref.len() {
+                // Wrap to start of next line
+                (cursor_line + 1, 0)
+            } else {
+                (cursor_line, cursor_char)
+            }
+        } else {
+            // Move left
+            if cursor_char > 0 {
+                (cursor_line, cursor_char - 1)
+            } else if cursor_line > 0 {
+                // Wrap to end of previous line
+                let prev_text = lines_ref.get(cursor_line - 1).copied().unwrap_or("");
+                let prev_count = prev_text.graphemes(true).count();
+                (cursor_line - 1, prev_count.saturating_sub(1))
+            } else {
+                (cursor_line, cursor_char)
+            }
+        };
+
+        self.set_cursor(ws_id, new_line, new_char);
+        // Update desired_col on horizontal movement
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+        if let Some((x, _y)) = wrap_map.logical_to_screen(new_line, new_char, 0, &lines_ref) {
+            self.cursor_desired_col.insert(ws_id.to_string(), x as usize);
+        }
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Extend selection horizontally.
+    fn extend_selection_horizontal(&mut self, ws_id: &str, direction: i32) {
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+
+        let (new_line, new_char) = if direction > 0 {
+            let line_text = lines_ref.get(cursor_line).copied().unwrap_or("");
+            let grapheme_count = line_text.graphemes(true).count();
+            if cursor_char + 1 < grapheme_count {
+                (cursor_line, cursor_char + 1)
+            } else if cursor_line + 1 < lines_ref.len() {
+                (cursor_line + 1, 0)
+            } else {
+                (cursor_line, cursor_char)
+            }
+        } else {
+            if cursor_char > 0 {
+                (cursor_line, cursor_char - 1)
+            } else if cursor_line > 0 {
+                let prev_text = lines_ref.get(cursor_line - 1).copied().unwrap_or("");
+                let prev_count = prev_text.graphemes(true).count();
+                (cursor_line - 1, prev_count.saturating_sub(1))
+            } else {
+                (cursor_line, cursor_char)
+            }
+        };
+
+        self.extend_selection(ws_id, new_line, new_char);
+        // Update desired_col on horizontal movement
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+        if let Some((x, _y)) = wrap_map.logical_to_screen(new_line, new_char, 0, &lines_ref) {
+            self.cursor_desired_col.insert(ws_id.to_string(), x as usize);
+        }
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Move cursor to next word boundary.
+    fn move_cursor_word_right(&mut self, ws_id: &str) {
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+        let line_text = lines_ref.get(cursor_line).copied().unwrap_or("");
+        let new_char = next_word_boundary(line_text, cursor_char);
+        let grapheme_count = line_text.graphemes(true).count();
+
+        let (new_line, new_char) = if new_char >= grapheme_count && cursor_line + 1 < lines_ref.len() {
+            (cursor_line + 1, 0)
+        } else {
+            (cursor_line, new_char.min(grapheme_count.saturating_sub(1)))
+        };
+
+        self.set_cursor(ws_id, new_line, new_char);
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+        if let Some((x, _y)) = wrap_map.logical_to_screen(new_line, new_char, 0, &lines_ref) {
+            self.cursor_desired_col.insert(ws_id.to_string(), x as usize);
+        }
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Move cursor to previous word boundary.
+    fn move_cursor_word_left(&mut self, ws_id: &str) {
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+        let line_text = lines_ref.get(cursor_line).copied().unwrap_or("");
+        let new_char = prev_word_boundary(line_text, cursor_char);
+
+        let (new_line, new_char) = if new_char == 0 && cursor_char == 0 && cursor_line > 0 {
+            let prev_text = lines_ref.get(cursor_line - 1).copied().unwrap_or("");
+            let prev_count = prev_text.graphemes(true).count();
+            (cursor_line - 1, prev_count.saturating_sub(1))
+        } else {
+            (cursor_line, new_char)
+        };
+
+        self.set_cursor(ws_id, new_line, new_char);
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+        if let Some((x, _y)) = wrap_map.logical_to_screen(new_line, new_char, 0, &lines_ref) {
+            self.cursor_desired_col.insert(ws_id.to_string(), x as usize);
+        }
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Extend selection by word to the right.
+    fn extend_selection_word_right(&mut self, ws_id: &str) {
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+        let line_text = lines_ref.get(cursor_line).copied().unwrap_or("");
+        let new_char = next_word_boundary(line_text, cursor_char);
+        let grapheme_count = line_text.graphemes(true).count();
+
+        let (new_line, new_char) = if new_char >= grapheme_count && cursor_line + 1 < lines_ref.len() {
+            (cursor_line + 1, 0)
+        } else {
+            (cursor_line, new_char.min(grapheme_count.saturating_sub(1)))
+        };
+
+        self.extend_selection(ws_id, new_line, new_char);
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+        if let Some((x, _y)) = wrap_map.logical_to_screen(new_line, new_char, 0, &lines_ref) {
+            self.cursor_desired_col.insert(ws_id.to_string(), x as usize);
+        }
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Extend selection by word to the left.
+    fn extend_selection_word_left(&mut self, ws_id: &str) {
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+        let line_text = lines_ref.get(cursor_line).copied().unwrap_or("");
+        let new_char = prev_word_boundary(line_text, cursor_char);
+
+        let (new_line, new_char) = if new_char == 0 && cursor_char == 0 && cursor_line > 0 {
+            let prev_text = lines_ref.get(cursor_line - 1).copied().unwrap_or("");
+            let prev_count = prev_text.graphemes(true).count();
+            (cursor_line - 1, prev_count.saturating_sub(1))
+        } else {
+            (cursor_line, new_char)
+        };
+
+        self.extend_selection(ws_id, new_line, new_char);
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+        if let Some((x, _y)) = wrap_map.logical_to_screen(new_line, new_char, 0, &lines_ref) {
+            self.cursor_desired_col.insert(ws_id.to_string(), x as usize);
+        }
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Move cursor to document start (line 0, char 0).
+    fn move_cursor_to_document_start(&mut self, ws_id: &str) {
+        self.set_cursor(ws_id, 0, 0);
+        self.cursor_desired_col.insert(ws_id.to_string(), 0);
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Move cursor to document end (last line, char 0).
+    fn move_cursor_to_document_end(&mut self, ws_id: &str) {
+        if let Some(buf) = self.scrollbacks.get(ws_id) {
+            let total = buf.total_lines();
+            let line = if total > 0 { total - 1 } else { 0 };
+            self.set_cursor(ws_id, line, 0);
+            self.cursor_desired_col.insert(ws_id.to_string(), 0);
+            // Going to the end re-enables auto-scroll
+            self.auto_scroll_suppressed.remove(ws_id);
+            self.ensure_cursor_visible(ws_id);
+        }
+    }
+
+    /// Extend selection to document start.
+    fn extend_selection_to_document_start(&mut self, ws_id: &str) {
+        self.extend_selection(ws_id, 0, 0);
+        self.cursor_desired_col.insert(ws_id.to_string(), 0);
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Extend selection to document end.
+    fn extend_selection_to_document_end(&mut self, ws_id: &str) {
+        if let Some((owned_lines, _)) = self.output_context(ws_id) {
+            let last_line = if owned_lines.is_empty() { 0 } else { owned_lines.len() - 1 };
+            let last_char = if let Some(line) = owned_lines.last() {
+                line.graphemes(true).count().saturating_sub(1)
+            } else {
+                0
+            };
+            self.extend_selection(ws_id, last_line, last_char);
+            self.cursor_desired_col.insert(ws_id.to_string(), 0);
+            self.auto_scroll_suppressed.insert(ws_id.to_string());
+            self.ensure_cursor_visible(ws_id);
+        }
+    }
+
+    /// Page up: move cursor and viewport up by page size.
+    fn move_cursor_page_up(&mut self, ws_id: &str) {
+        let page_size = if self.last_output_height > 2 {
+            (self.last_output_height - 2) as usize
+        } else {
+            20
+        };
+
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+
+        if let Some((_cx, cy)) = wrap_map.logical_to_screen(cursor_line, cursor_char, 0, &lines_ref) {
+            let desired_col = self.cursor_desired_col.get(ws_id).copied().unwrap_or(0);
+            let new_y = (cy as usize).saturating_sub(page_size);
+
+            if let Some((new_line, new_char)) = wrap_map.screen_to_logical(desired_col as u16, new_y as u16, 0, &lines_ref) {
+                self.set_cursor(ws_id, new_line, new_char);
+            }
+        }
+
+        // Also scroll viewport
+        if let Some(buf) = self.scrollbacks.get_mut(ws_id) {
+            buf.scroll_up(page_size);
+        }
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Page down: move cursor and viewport down by page size.
+    fn move_cursor_page_down(&mut self, ws_id: &str) {
+        let page_size = if self.last_output_height > 2 {
+            (self.last_output_height - 2) as usize
+        } else {
+            20
+        };
+
+        let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let (owned_lines, inner_width) = match self.output_context(ws_id) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+        let wrap_map = WrapMap::build(&lines_ref, inner_width);
+        let total = wrap_map.total_visual_rows();
+
+        if let Some((_cx, cy)) = wrap_map.logical_to_screen(cursor_line, cursor_char, 0, &lines_ref) {
+            let desired_col = self.cursor_desired_col.get(ws_id).copied().unwrap_or(0);
+            let new_y = ((cy as usize) + page_size).min(total.saturating_sub(1));
+
+            if let Some((new_line, new_char)) = wrap_map.screen_to_logical(desired_col as u16, new_y as u16, 0, &lines_ref) {
+                self.set_cursor(ws_id, new_line, new_char);
+            }
+        }
+
+        // Also scroll viewport
+        if let Some(buf) = self.scrollbacks.get_mut(ws_id) {
+            buf.scroll_down(page_size);
+        }
+        self.auto_scroll_suppressed.insert(ws_id.to_string());
+        self.ensure_cursor_visible(ws_id);
+    }
+
+    /// Select all text in the output pane.
+    fn select_all(&mut self, ws_id: &str) {
+        if let Some((owned_lines, _)) = self.output_context(ws_id) {
+            let last_line = if owned_lines.is_empty() { 0 } else { owned_lines.len() - 1 };
+            let last_char = if let Some(line) = owned_lines.last() {
+                line.graphemes(true).count().saturating_sub(1)
+            } else {
+                0
+            };
+            self.selections.insert(ws_id.to_string(), SelectionState::Range {
+                anchor_line: 0,
+                anchor_char: 0,
+                cursor_line: last_line,
+                cursor_char: last_char,
+            });
+        }
+    }
+
+    /// Scroll and clear selection (for j/k scroll shortcuts).
+    fn scroll_and_clear_selection(&mut self, ws_id: &str, up: bool) {
+        if let Some(buf) = self.scrollbacks.get_mut(ws_id) {
+            if up {
+                buf.scroll_up(1);
+            } else {
+                buf.scroll_down(1);
+            }
+        }
+        self.clear_selection_for_workspace(ws_id);
+    }
+
+    /// Clear selection for a workspace.
+    pub(crate) fn clear_selection_for_workspace(&mut self, ws_id: &str) {
+        if let Some(sel) = self.selections.get_mut(ws_id) {
+            sel.clear();
+        }
+    }
+
+    /// Collapse range selection to cursor at cursor end (for plain arrow after selection).
+    fn collapse_selection_to_cursor(&mut self, ws_id: &str) {
+        if let Some(SelectionState::Range { cursor_line, cursor_char, .. }) = self.selections.get(ws_id).cloned() {
+            self.set_cursor(ws_id, cursor_line, cursor_char);
+        }
+    }
+}
+
+/// Find the next word boundary position moving right from `char_offset` in `line`.
+fn next_word_boundary(line: &str, char_offset: usize) -> usize {
+    let graphemes: Vec<&str> = line.graphemes(true).collect();
+    if char_offset >= graphemes.len() {
+        return graphemes.len();
+    }
+    let mut i = char_offset;
+    // Skip current word (non-whitespace)
+    while i < graphemes.len() && !graphemes[i].chars().all(|c| c.is_whitespace()) {
+        i += 1;
+    }
+    // Skip whitespace
+    while i < graphemes.len() && graphemes[i].chars().all(|c| c.is_whitespace()) {
+        i += 1;
+    }
+    i
+}
+
+/// Find the previous word boundary position moving left from `char_offset` in `line`.
+fn prev_word_boundary(line: &str, char_offset: usize) -> usize {
+    let graphemes: Vec<&str> = line.graphemes(true).collect();
+    if char_offset == 0 {
+        return 0;
+    }
+    let mut i = char_offset;
+    // Skip whitespace
+    while i > 0 && graphemes[i - 1].chars().all(|c| c.is_whitespace()) {
+        i -= 1;
+    }
+    // Skip word
+    while i > 0 && !graphemes[i - 1].chars().all(|c| c.is_whitespace()) {
+        i -= 1;
+    }
+    i
 }
 
 #[tokio::main]
@@ -813,56 +1402,131 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         }
                                     }
                                     Focus::Output => {
-                                        // Output scrolling with j/k/arrows/PageUp/PageDown
+                                        // Cursor movement, selection, and navigation
                                         let ws_id = app.selected_workspace().map(|ws| ws.id.clone());
                                         if let Some(ws_id) = ws_id {
-                                            match key.code {
-                                                KeyCode::Up | KeyCode::Char('k') => {
-                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
-                                                        buf.scroll_up(1);
-                                                    }
+                                            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+                                            match (key.code, ctrl, shift) {
+                                                // --- Cursor movement (no modifiers) ---
+                                                (KeyCode::Up, false, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.collapse_selection_to_cursor(&ws_id);
+                                                    app.move_cursor_vertical(&ws_id, -1);
                                                 }
-                                                KeyCode::Down | KeyCode::Char('j') => {
-                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
-                                                        buf.scroll_down(1);
-                                                    }
+                                                (KeyCode::Down, false, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.collapse_selection_to_cursor(&ws_id);
+                                                    app.move_cursor_vertical(&ws_id, 1);
                                                 }
-                                                KeyCode::PageUp => {
-                                                    let page = if app.last_output_height > 2 {
-                                                        (app.last_output_height - 2) as usize
-                                                    } else {
-                                                        20
-                                                    };
-                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
-                                                        buf.scroll_up(page);
-                                                    }
+                                                (KeyCode::Left, false, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.collapse_selection_to_cursor(&ws_id);
+                                                    app.move_cursor_horizontal(&ws_id, -1);
                                                 }
-                                                KeyCode::PageDown => {
-                                                    let page = if app.last_output_height > 2 {
-                                                        (app.last_output_height - 2) as usize
-                                                    } else {
-                                                        20
-                                                    };
-                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
-                                                        buf.scroll_down(page);
-                                                    }
+                                                (KeyCode::Right, false, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.collapse_selection_to_cursor(&ws_id);
+                                                    app.move_cursor_horizontal(&ws_id, 1);
                                                 }
-                                                KeyCode::Char('g') | KeyCode::Home => {
-                                                    // Jump to top
-                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
-                                                        buf.scroll_to_top();
-                                                    }
+
+                                                // --- Word jump (Ctrl+arrow) ---
+                                                (KeyCode::Left, true, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.collapse_selection_to_cursor(&ws_id);
+                                                    app.move_cursor_word_left(&ws_id);
                                                 }
-                                                KeyCode::Char('G') | KeyCode::End => {
-                                                    // Jump to bottom
-                                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
-                                                        buf.reset_scroll();
-                                                    }
+                                                (KeyCode::Right, true, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.collapse_selection_to_cursor(&ws_id);
+                                                    app.move_cursor_word_right(&ws_id);
                                                 }
-                                                KeyCode::Char('z') => {
+
+                                                // --- Selection extend (Shift+arrow) ---
+                                                (KeyCode::Up, false, true) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.extend_selection_vertical(&ws_id, -1);
+                                                }
+                                                (KeyCode::Down, false, true) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.extend_selection_vertical(&ws_id, 1);
+                                                }
+                                                (KeyCode::Left, false, true) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.extend_selection_horizontal(&ws_id, -1);
+                                                }
+                                                (KeyCode::Right, false, true) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.extend_selection_horizontal(&ws_id, 1);
+                                                }
+
+                                                // --- Word-extend selection (Shift+Ctrl+arrow) ---
+                                                (KeyCode::Left, true, true) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.extend_selection_word_left(&ws_id);
+                                                }
+                                                (KeyCode::Right, true, true) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.extend_selection_word_right(&ws_id);
+                                                }
+
+                                                // --- Document navigation ---
+                                                (KeyCode::Home, _, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.move_cursor_to_document_start(&ws_id);
+                                                }
+                                                (KeyCode::End, _, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.move_cursor_to_document_end(&ws_id);
+                                                }
+                                                (KeyCode::Home, _, true) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.extend_selection_to_document_start(&ws_id);
+                                                }
+                                                (KeyCode::End, _, true) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.extend_selection_to_document_end(&ws_id);
+                                                }
+
+                                                // --- Page navigation ---
+                                                (KeyCode::PageUp, false, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.move_cursor_page_up(&ws_id);
+                                                }
+                                                (KeyCode::PageDown, false, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.move_cursor_page_down(&ws_id);
+                                                }
+
+                                                // --- Select all ---
+                                                (KeyCode::Char('a'), true, _) => {
+                                                    app.select_all(&ws_id);
+                                                }
+
+                                                // --- Scroll-only shortcuts (j/k remain for scrolling) ---
+                                                (KeyCode::Char('k'), false, false) => {
+                                                    app.scroll_and_clear_selection(&ws_id, true);
+                                                }
+                                                (KeyCode::Char('j'), false, false) => {
+                                                    app.scroll_and_clear_selection(&ws_id, false);
+                                                }
+
+                                                // --- Legacy shortcuts remapped ---
+                                                (KeyCode::Char('g'), false, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.move_cursor_to_document_start(&ws_id);
+                                                }
+                                                (KeyCode::Char('G'), false, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.move_cursor_to_document_end(&ws_id);
+                                                }
+
+                                                // --- Existing ---
+                                                (KeyCode::Char('z'), false, false) => {
                                                     app.zoomed = !app.zoomed;
                                                 }
-                                                KeyCode::Char('i') => {
+                                                (KeyCode::Char('i'), false, false) => {
                                                     // Enter composer from output
                                                     let has_running = app.selected_workspace()
                                                         .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
@@ -873,6 +1537,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                         app.composer.set_active(true);
                                                     }
                                                 }
+
                                                 _ => {}
                                             }
                                         }
