@@ -77,7 +77,9 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().title(" Repos ").borders(Borders::ALL).border_style(border_style));
         frame.render_widget(hint, area);
-    } else {
+    }
+
+    if !app.tree_items.is_empty() {
         let pane_inner_width = area.width.saturating_sub(2) as usize; // subtract left+right borders
 
         // Reset expanded icon rows when pane width changes
@@ -212,20 +214,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
         frame.render_stateful_widget(list, area, &mut list_state);
 
-        // Render "+" button on title bar (top-right corner)
-        {
-            let plus_x = area.x + area.width.saturating_sub(4);
-            let plus_rect = Rect::new(plus_x, area.y, 3, 1);
-            let plus_hovered = buttons::is_hovered(app.mouse_pos, plus_rect);
-            let plus_style = if plus_hovered {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-            frame.render_widget(Paragraph::new(" + ").style(plus_style), plus_rect);
-        }
-
-        // Phase 2: Register hit regions using scroll offset from rendered list state
+        // Register hit regions using scroll offset from rendered list state
         let scroll_offset = list_state.offset();
         let all_icons: Vec<&(usize, IconCluster)> = workspace_icons.iter().chain(repo_icons.iter()).collect();
         for (item_idx, icons) in all_icons {
@@ -244,17 +233,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
         }
 
-        // Register "Add Repo" hit region on the title bar "+" button
-        {
-            let plus_x = area.x + area.width.saturating_sub(4);
-            let plus_rect = Rect::new(plus_x, area.y, 3, 1);
-            app.hit_regions.push(buttons::HitRegion {
-                area: plus_rect,
-                action: HitAction::AddRepo,
-            });
-        }
-
-        // Phase 3: Render hover overlays (white color) for hovered icons
+        // Render hover overlays (white color) for hovered icons
         let mouse_pos = app.mouse_pos;
         for (item_idx, icons) in &workspace_icons {
             if let Some(row_in_viewport) = item_idx.checked_sub(scroll_offset) {
@@ -299,6 +278,28 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 }
             }
         }
+    }
+
+    // Render "+" button on title bar (top-right corner) — after all widgets so it's not overwritten
+    {
+        let border_style = if app.focus == Focus::Tree {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let plus_x = area.x + area.width.saturating_sub(4);
+        let plus_rect = Rect::new(plus_x, area.y, 3, 1);
+        let plus_hovered = buttons::is_hovered(app.mouse_pos, plus_rect);
+        let plus_style = if plus_hovered {
+            Style::default().fg(Color::White)
+        } else {
+            border_style
+        };
+        frame.render_widget(Paragraph::new(" + ").style(plus_style), plus_rect);
+        app.hit_regions.push(buttons::HitRegion {
+            area: plus_rect,
+            action: HitAction::AddRepo,
+        });
     }
 }
 
@@ -862,6 +863,16 @@ fn styled_total_visual(lines: &[Line], inner_width: usize) -> usize {
         .sum()
 }
 
+/// Convert a bottom-based scroll_offset to a top-based scroll_from_top value.
+///
+/// `scroll_offset` is the number of visual lines from the bottom (0 = at bottom).
+/// Returns the number of visual lines from the top for Paragraph::scroll.
+pub(crate) fn compute_scroll_from_top(scroll_offset: usize, total_visual: usize, inner_height: usize) -> usize {
+    let max_scroll = total_visual.saturating_sub(inner_height);
+    let clamped = scroll_offset.min(max_scroll);
+    max_scroll.saturating_sub(clamped)
+}
+
 fn render_output_content(
     frame: &mut ratatui::Frame,
     output_area: Rect,
@@ -873,12 +884,7 @@ fn render_output_content(
     title: Line<'_>,
 ) {
     let total_visual = styled_total_visual(&lines, inner_width);
-
-    // scroll_offset = visual lines from the bottom (0 = at bottom)
-    // Paragraph::scroll takes lines from the top
-    let max_scroll = total_visual.saturating_sub(inner_height);
-    let clamped_offset = scroll_offset.min(max_scroll);
-    let scroll_from_top = max_scroll.saturating_sub(clamped_offset);
+    let scroll_from_top = compute_scroll_from_top(scroll_offset, total_visual, inner_height);
 
     let output_border_style = if focus == Focus::Output {
         Style::default().fg(Color::Cyan)
@@ -1509,6 +1515,37 @@ mod tests {
         let icons = repo_line_icons("r-1", "myrepo", 15);
         assert_eq!(icons.total_width, 0);
         assert!(icons.hit_regions.is_empty());
+    }
+
+    #[test]
+    fn compute_scroll_from_top_at_bottom() {
+        // scroll_offset=0 means at bottom, scroll_from_top should be max
+        assert_eq!(compute_scroll_from_top(0, 100, 20), 80);
+    }
+
+    #[test]
+    fn compute_scroll_from_top_at_top() {
+        // scroll_offset=max means at top, scroll_from_top should be 0
+        assert_eq!(compute_scroll_from_top(80, 100, 20), 0);
+    }
+
+    #[test]
+    fn compute_scroll_from_top_mid() {
+        // scroll_offset=30 with total=100, height=20 => max=80, clamped=30, from_top=50
+        assert_eq!(compute_scroll_from_top(30, 100, 20), 50);
+    }
+
+    #[test]
+    fn compute_scroll_from_top_oversized_offset() {
+        // scroll_offset exceeds max -- should clamp
+        assert_eq!(compute_scroll_from_top(200, 100, 20), 0);
+    }
+
+    #[test]
+    fn compute_scroll_from_top_content_smaller_than_viewport() {
+        // total < inner_height => max_scroll=0, always scroll_from_top=0
+        assert_eq!(compute_scroll_from_top(0, 10, 20), 0);
+        assert_eq!(compute_scroll_from_top(5, 10, 20), 0);
     }
 
     #[test]
