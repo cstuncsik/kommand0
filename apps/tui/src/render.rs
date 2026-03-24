@@ -1,4 +1,5 @@
 use kommand0_core::{SessionStatus, workspace::format_timestamp};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -9,6 +10,7 @@ use ratatui::{
 
 use super::{App, Focus, TreeNode, buttons, help, modal};
 use super::buttons::HitAction;
+use super::selection::SelectionState;
 
 const SPINNER_FRAMES: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
 
@@ -355,22 +357,25 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         let inner_width = output_area.width.saturating_sub(2) as usize;
 
         // Build styled lines, compute visual total, clamp scroll, then render
-        let mut all_lines: Vec<&str> = app.scrollbacks.get(&ws.id)
-            .map(|buf| buf.all_lines())
-            .unwrap_or_default();
-        // Append in-progress streaming line if present
-        let streaming_partial = app.streaming_text.get(&ws.id);
-        if let Some(partial) = streaming_partial {
-            if !partial.is_empty() {
-                all_lines.push(partial.as_str());
+        // Collect lines into owned Vec to avoid borrow conflict with scrollbacks.get_mut
+        let owned_lines: Vec<String> = {
+            let mut lines: Vec<String> = app.scrollbacks.get(&ws.id)
+                .map(|buf| buf.all_lines().into_iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default();
+            if let Some(partial) = app.streaming_text.get(&ws.id) {
+                if !partial.is_empty() {
+                    lines.push(partial.clone());
+                }
             }
-        }
+            lines
+        };
+        let all_lines: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
         let spinner = if app.waiting_response.contains(&ws.id) {
             Some(app.spinner_tick)
         } else {
             None
         };
-        let styled_lines = build_output_lines(&all_lines, inner_width, &session_status, spinner);
+        let mut styled_lines = build_output_lines(&all_lines, inner_width, &session_status, spinner);
         let total_visual = styled_total_visual(&styled_lines, inner_width);
         let max_offset = total_visual.saturating_sub(inner_height);
         if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
@@ -378,6 +383,35 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         }
         let scroll_offset = app.scrollbacks.get(&ws.id)
             .map(|buf| buf.scroll_offset()).unwrap_or(0);
+
+        // Apply cursor and selection highlights
+        let selection = app.selections.get(&ws.id).cloned().unwrap_or_default();
+        if !selection.is_none() {
+            let wrap_map = super::wrap_map::WrapMap::build(&all_lines, inner_width);
+            let scroll_from_top = compute_scroll_from_top(scroll_offset, total_visual, inner_height);
+            if selection.has_range() {
+                apply_selection_highlight(
+                    &mut styled_lines,
+                    &selection,
+                    scroll_from_top,
+                    inner_height,
+                    &all_lines,
+                    &wrap_map,
+                );
+            }
+            let (cursor_line, cursor_char) = match &selection {
+                SelectionState::Cursor { line, char_offset } => (*line, *char_offset),
+                SelectionState::Range { cursor_line, cursor_char, .. } => (*cursor_line, *cursor_char),
+                SelectionState::None => unreachable!(),
+            };
+            apply_cursor_highlight(
+                &mut styled_lines,
+                cursor_line,
+                cursor_char,
+                app.cursor_blink_on,
+                app.focus == Focus::Output,
+            );
+        }
 
         render_output_content(frame, output_area, styled_lines, scroll_offset, inner_width, inner_height, app.focus, right_title);
 
@@ -863,6 +897,154 @@ fn styled_total_visual(lines: &[Line], inner_width: usize) -> usize {
         .sum()
 }
 
+/// Split a Line's spans to apply a highlight style over a display-column range.
+///
+/// `start_col` and `end_col` are display-column offsets (half-open: [start_col, end_col)).
+/// Spans that partially overlap the range are split at grapheme boundaries.
+pub(crate) fn overlay_style_on_line(
+    line: &mut Line<'static>,
+    start_col: usize,
+    end_col: usize,
+    style: Style,
+) {
+    let mut new_spans: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+
+    for span in line.spans.drain(..) {
+        let span_text: &str = span.content.as_ref();
+        let span_width: usize = UnicodeWidthStr::width(span_text);
+        let span_end = col + span_width;
+
+        if span_end <= start_col || col >= end_col {
+            // Entirely outside selection
+            new_spans.push(span);
+        } else if col >= start_col && span_end <= end_col {
+            // Entirely inside selection
+            new_spans.push(Span::styled(span.content.into_owned(), style));
+        } else {
+            // Partially overlapping -- split by graphemes
+            let mut pre = String::new();
+            let mut mid = String::new();
+            let mut post = String::new();
+            let mut c = col;
+            for g in span_text.graphemes(true) {
+                let gw = UnicodeWidthStr::width(g);
+                if c < start_col {
+                    pre.push_str(g);
+                } else if c < end_col {
+                    mid.push_str(g);
+                } else {
+                    post.push_str(g);
+                }
+                c += gw;
+            }
+            if !pre.is_empty() {
+                new_spans.push(Span::styled(pre, span.style));
+            }
+            if !mid.is_empty() {
+                new_spans.push(Span::styled(mid, style));
+            }
+            if !post.is_empty() {
+                new_spans.push(Span::styled(post, span.style));
+            }
+        }
+        col = span_end;
+    }
+    line.spans = new_spans;
+}
+
+/// Apply selection highlight (cyan bg / black fg) to lines that overlap the selection range.
+///
+/// Operates on pre-wrap styled Lines using logical line indices and character offsets.
+/// The styled Lines from build_output_lines correspond 1:1 with the logical raw_lines.
+#[allow(dead_code)]
+pub(crate) fn apply_selection_highlight(
+    lines: &mut Vec<Line<'static>>,
+    selection: &SelectionState,
+    _scroll_from_top: usize,
+    _inner_height: usize,
+    _raw_lines: &[&str],
+    _wrap_map: &super::wrap_map::WrapMap,
+) {
+    let Some(((start_line, start_char), (end_line, end_char))) = selection.ordered_range() else {
+        return;
+    };
+
+    let sel_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+
+    for line_idx in start_line..=end_line.min(lines.len().saturating_sub(1)) {
+        if line_idx >= lines.len() {
+            break;
+        }
+
+        let line_display_width: usize = lines[line_idx]
+            .spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+
+        let col_start = if line_idx == start_line { start_char } else { 0 };
+        let col_end = if line_idx == end_line {
+            end_char + 1 // inclusive end -> exclusive for overlay
+        } else {
+            line_display_width
+        };
+
+        if col_start < col_end {
+            overlay_style_on_line(&mut lines[line_idx], col_start, col_end, sel_style);
+        }
+    }
+}
+
+/// Apply cursor highlight to a single character position.
+///
+/// - focused + blink_on: white bg / black fg (visible cursor)
+/// - focused + blink_off: no change (cursor invisible during off phase)
+/// - unfocused: dim modifier on cursor character
+/// - cursor past end of line: append a styled space
+pub(crate) fn apply_cursor_highlight(
+    lines: &mut Vec<Line<'static>>,
+    cursor_line: usize,
+    cursor_char: usize,
+    blink_on: bool,
+    focused: bool,
+) {
+    if cursor_line >= lines.len() {
+        return;
+    }
+
+    let cursor_style = if !focused {
+        Style::default().add_modifier(Modifier::DIM)
+    } else if blink_on {
+        Style::default().bg(Color::White).fg(Color::Black)
+    } else {
+        // blink_off + focused: no visible cursor
+        return;
+    };
+
+    let line = &lines[cursor_line];
+    let line_display_width: usize = line
+        .spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+
+    if cursor_char >= line_display_width {
+        // Cursor past end of line -- append a styled space
+        lines[cursor_line]
+            .spans
+            .push(Span::styled(" ".to_string(), cursor_style));
+    } else {
+        // Highlight single character at cursor_char
+        overlay_style_on_line(
+            &mut lines[cursor_line],
+            cursor_char,
+            cursor_char + 1,
+            cursor_style,
+        );
+    }
+}
+
 /// Convert a bottom-based scroll_offset to a top-based scroll_from_top value.
 ///
 /// `scroll_offset` is the number of visual lines from the bottom (0 = at bottom).
@@ -937,22 +1119,24 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
     let inner_width = output_area.width.saturating_sub(2) as usize;
 
     // Build styled lines, compute visual total, clamp scroll, then render
-    let mut all_lines: Vec<&str> = app.scrollbacks.get(&ws.id)
-        .map(|buf| buf.all_lines())
-        .unwrap_or_default();
-    // Append in-progress streaming line if present
-    let streaming_partial = app.streaming_text.get(&ws.id);
-    if let Some(partial) = streaming_partial {
-        if !partial.is_empty() {
-            all_lines.push(partial.as_str());
+    let owned_lines: Vec<String> = {
+        let mut lines: Vec<String> = app.scrollbacks.get(&ws.id)
+            .map(|buf| buf.all_lines().into_iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        if let Some(partial) = app.streaming_text.get(&ws.id) {
+            if !partial.is_empty() {
+                lines.push(partial.clone());
+            }
         }
-    }
+        lines
+    };
+    let all_lines: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
     let spinner = if app.waiting_response.contains(&ws.id) {
         Some(app.spinner_tick)
     } else {
         None
     };
-    let styled_lines = build_output_lines(&all_lines, inner_width, &session_status, spinner);
+    let mut styled_lines = build_output_lines(&all_lines, inner_width, &session_status, spinner);
     let total_visual = styled_total_visual(&styled_lines, inner_width);
     let max_offset = total_visual.saturating_sub(inner_height);
     if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
@@ -960,6 +1144,35 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
     }
     let scroll_offset = app.scrollbacks.get(&ws.id)
         .map(|buf| buf.scroll_offset()).unwrap_or(0);
+
+    // Apply cursor and selection highlights
+    let selection = app.selections.get(&ws.id).cloned().unwrap_or_default();
+    if !selection.is_none() {
+        let wrap_map = super::wrap_map::WrapMap::build(&all_lines, inner_width);
+        let scroll_from_top = compute_scroll_from_top(scroll_offset, total_visual, inner_height);
+        if selection.has_range() {
+            apply_selection_highlight(
+                &mut styled_lines,
+                &selection,
+                scroll_from_top,
+                inner_height,
+                &all_lines,
+                &wrap_map,
+            );
+        }
+        let (cursor_line, cursor_char) = match &selection {
+            SelectionState::Cursor { line, char_offset } => (*line, *char_offset),
+            SelectionState::Range { cursor_line, cursor_char, .. } => (*cursor_line, *cursor_char),
+            SelectionState::None => unreachable!(),
+        };
+        apply_cursor_highlight(
+            &mut styled_lines,
+            cursor_line,
+            cursor_char,
+            app.cursor_blink_on,
+            app.focus == Focus::Output,
+        );
+    }
 
     let (status_str, status_color) = match session_status {
         SessionStatus::Running => ("\u{25B6}", Color::Green),
@@ -1516,6 +1729,138 @@ mod tests {
         assert_eq!(icons.total_width, 0);
         assert!(icons.hit_regions.is_empty());
     }
+
+    // === overlay_style_on_line tests ===
+
+    fn make_line(spans: Vec<(&str, Style)>) -> Line<'static> {
+        Line::from(
+            spans
+                .into_iter()
+                .map(|(text, style)| Span::styled(text.to_string(), style))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn cyan_sel() -> Style {
+        Style::default().bg(Color::Cyan).fg(Color::Black)
+    }
+
+    #[test]
+    fn overlay_entire_span() {
+        let base = Style::default().fg(Color::White);
+        let mut line = make_line(vec![("hello", base)]);
+        overlay_style_on_line(&mut line, 0, 5, cyan_sel());
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content.as_ref(), "hello");
+        assert_eq!(line.spans[0].style, cyan_sel());
+    }
+
+    #[test]
+    fn overlay_partial_span_splits() {
+        let base = Style::default().fg(Color::White);
+        let mut line = make_line(vec![("hello world", base)]);
+        // Select columns 2..7 ("llo w")
+        overlay_style_on_line(&mut line, 2, 7, cyan_sel());
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[0].content.as_ref(), "he");
+        assert_eq!(line.spans[0].style, base);
+        assert_eq!(line.spans[1].content.as_ref(), "llo w");
+        assert_eq!(line.spans[1].style, cyan_sel());
+        assert_eq!(line.spans[2].content.as_ref(), "orld");
+        assert_eq!(line.spans[2].style, base);
+    }
+
+    #[test]
+    fn overlay_outside_range_unchanged() {
+        let base = Style::default().fg(Color::White);
+        let mut line = make_line(vec![("abc", base)]);
+        overlay_style_on_line(&mut line, 5, 10, cyan_sel());
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content.as_ref(), "abc");
+        assert_eq!(line.spans[0].style, base);
+    }
+
+    #[test]
+    fn overlay_cjk_at_split_boundary() {
+        let base = Style::default().fg(Color::White);
+        // "\u{4F60}\u{597D}" = "你好", each 2 display columns wide = total 4 columns
+        let mut line = make_line(vec![("\u{4F60}\u{597D}", base)]);
+        // Select columns 0..2 (just the first CJK character)
+        overlay_style_on_line(&mut line, 0, 2, cyan_sel());
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content.as_ref(), "\u{4F60}");
+        assert_eq!(line.spans[0].style, cyan_sel());
+        assert_eq!(line.spans[1].content.as_ref(), "\u{597D}");
+        assert_eq!(line.spans[1].style, base);
+    }
+
+    #[test]
+    fn overlay_multiple_spans_splits_correctly() {
+        let s1 = Style::default().fg(Color::Red);
+        let s2 = Style::default().fg(Color::Green);
+        let mut line = make_line(vec![("abc", s1), ("def", s2)]);
+        // Select columns 1..5 ("bcde")
+        overlay_style_on_line(&mut line, 1, 5, cyan_sel());
+        assert_eq!(line.spans.len(), 4);
+        assert_eq!(line.spans[0].content.as_ref(), "a");
+        assert_eq!(line.spans[0].style, s1);
+        assert_eq!(line.spans[1].content.as_ref(), "bc");
+        assert_eq!(line.spans[1].style, cyan_sel());
+        assert_eq!(line.spans[2].content.as_ref(), "de");
+        assert_eq!(line.spans[2].style, cyan_sel());
+        assert_eq!(line.spans[3].content.as_ref(), "f");
+        assert_eq!(line.spans[3].style, s2);
+    }
+
+    // === apply_cursor_highlight tests ===
+
+    #[test]
+    fn cursor_highlight_focused_blink_on() {
+        let base = Style::default().fg(Color::White);
+        let mut lines = vec![make_line(vec![("hello", base)])];
+        let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+        apply_cursor_highlight(&mut lines, 0, 2, true, true);
+        // Character at col 2 ('l') should be white bg/black fg
+        // Line should be split into: "he" (base), "l" (cursor), "lo" (base)
+        assert_eq!(lines[0].spans.len(), 3);
+        assert_eq!(lines[0].spans[1].content.as_ref(), "l");
+        assert_eq!(lines[0].spans[1].style, cursor_style);
+    }
+
+    #[test]
+    fn cursor_highlight_past_end_appends_space() {
+        let base = Style::default().fg(Color::White);
+        let mut lines = vec![make_line(vec![("hi", base)])];
+        let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+        apply_cursor_highlight(&mut lines, 0, 5, true, true);
+        // Should append styled space at the end
+        let last = lines[0].spans.last().unwrap();
+        assert_eq!(last.content.as_ref(), " ");
+        assert_eq!(last.style, cursor_style);
+    }
+
+    #[test]
+    fn cursor_highlight_unfocused_uses_dim() {
+        let base = Style::default().fg(Color::White);
+        let mut lines = vec![make_line(vec![("hello", base)])];
+        apply_cursor_highlight(&mut lines, 0, 2, true, false);
+        // Unfocused: dim style on cursor character
+        let cursor_span = &lines[0].spans[1];
+        assert_eq!(cursor_span.content.as_ref(), "l");
+        assert!(cursor_span.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn cursor_highlight_blink_off_no_change() {
+        let base = Style::default().fg(Color::White);
+        let mut lines = vec![make_line(vec![("hello", base)])];
+        apply_cursor_highlight(&mut lines, 0, 2, false, true);
+        // blink_off + focused: no style override, line unchanged
+        assert_eq!(lines[0].spans.len(), 1);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "hello");
+    }
+
+    // === compute_scroll_from_top tests ===
 
     #[test]
     fn compute_scroll_from_top_at_bottom() {
