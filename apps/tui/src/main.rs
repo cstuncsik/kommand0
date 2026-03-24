@@ -1394,6 +1394,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                     }
                                                     buf.push_line("---".to_string());
                                                     buf.reset_scroll(); // pin to bottom so response is visible
+                                                    // Sending a message re-enables auto-scroll and clears selection
+                                                    app.auto_scroll_suppressed.remove(&ws_id);
+                                                    app.clear_selection_for_workspace(&ws_id);
                                                     app.waiting_response.insert(ws_id);
                                                 }
                                                 app.write_log(&session_id, "user", &text);

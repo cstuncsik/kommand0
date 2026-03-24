@@ -191,7 +191,7 @@ fn handle_scroll(app: &mut App, col: u16, row: u16, up: bool) {
     let scroll_lines = 3;
 
     if contains(areas.output, col, row) {
-        // Scroll output
+        // Scroll output and clear selection
         if let Some(ws_id) = app.selected_workspace().map(|ws| ws.id.clone()) {
             if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
                 if up {
@@ -200,6 +200,7 @@ fn handle_scroll(app: &mut App, col: u16, row: u16, up: bool) {
                     buf.scroll_down(scroll_lines);
                 }
             }
+            app.clear_selection_for_workspace(&ws_id);
         }
     } else if contains(areas.tree, col, row) {
         // Navigate tree
