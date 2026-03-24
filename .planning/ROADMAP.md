@@ -72,6 +72,6 @@ Phases execute in numeric order: 1 -> 2 -> 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Coordinate Translation & Infrastructure | 0/2 | Not started | - |
-| 2. Output Pane Selection | 0/3 | Not started | - |
+| 1. Coordinate Translation & Infrastructure | 2/2 | Complete | 2026-03-23 |
+| 2. Output Pane Selection | 1/3 | In progress | - |
 | 3. Clipboard, Keybindings & Composer | 0/2 | Not started | - |
