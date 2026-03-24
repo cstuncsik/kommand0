@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02-01-PLAN.md
-last_updated: "2026-03-24T11:16:00Z"
-last_activity: 2026-03-24 -- Completed 02-01-PLAN.md
+stopped_at: Completed 02-02-PLAN.md
+last_updated: "2026-03-24T11:25:52Z"
+last_activity: 2026-03-24 -- Completed 02-02-PLAN.md
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 8
-  completed_plans: 3
-  percent: 38
+  completed_plans: 4
+  percent: 50
 ---
 
 # Project State
@@ -26,33 +26,34 @@ See: .planning/PROJECT.md (updated 2026-03-22)
 ## Current Position
 
 Phase: 2 of 3 (Output Pane Selection)
-Plan: 2 of 3 in current phase
+Plan: 3 of 3 in current phase
 Status: Executing
-Last activity: 2026-03-24 -- Completed 02-01-PLAN.md
+Last activity: 2026-03-24 -- Completed 02-02-PLAN.md
 
-Progress: [████------] 38%
+Progress: [█████-----] 50%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3
+- Total plans completed: 4
 - Average duration: 5min
-- Total execution time: 0.25 hours
+- Total execution time: 0.33 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01 | 2 | 11min | 6min |
-| 02 | 1 | 5min | 5min |
+| 02 | 2 | 10min | 5min |
 
 **Recent Trend:**
-- Last 5 plans: 7min, 4min, 5min
+- Last 5 plans: 7min, 4min, 5min, 5min
 - Trend: stable
 
 *Updated after each plan completion*
 | Phase 01 P01 | 7min | 2 tasks | 5 files |
 | Phase 02 P01 | 5min | 2 tasks | 3 files |
+| Phase 02 P02 | 5min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -70,6 +71,9 @@ Recent decisions affecting current work:
 - [01-02]: Display-width fix is approximation until WrapMap replaces styled_total_visual
 - [02-01]: Collect scrollback lines into owned Vec<String> to resolve borrow-checker conflict in render pipeline
 - [02-01]: Cursor and selection highlights operate on pre-wrap styled Lines using logical line indices
+- [02-02]: Cursor initializes lazily to bottom-left on first arrow key press
+- [02-02]: Sending user message always re-enables auto-scroll and clears selection
+- [02-02]: j/k remain scroll-only shortcuts (not cursor movement) per editor-style navigation decision
 
 ### Pending Todos
 
@@ -82,6 +86,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-24T11:16:00Z
-Stopped at: Completed 02-01-PLAN.md
-Resume file: .planning/phases/02-output-pane-selection/02-01-SUMMARY.md
+Last session: 2026-03-24T11:25:52Z
+Stopped at: Completed 02-02-PLAN.md
+Resume file: .planning/phases/02-output-pane-selection/02-02-SUMMARY.md
