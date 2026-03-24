@@ -24,6 +24,7 @@ use ratatui::{
 
 use composer::Composer;
 use scrollback::ScrollbackBuffer;
+use selection::SelectionState;
 use session_manager::{SessionEvent, SessionManager};
 
 #[allow(dead_code)]
@@ -90,6 +91,18 @@ pub(crate) struct App {
     /// Accumulates streaming delta text per workspace until newlines flush to scrollback.
     streaming_text: HashMap<String, String>,
     tick_counter: u8,
+    /// Per-workspace composer drafts so switching workspaces preserves unsent text.
+    pub(crate) composer_drafts: HashMap<String, String>,
+
+    // Selection/cursor state
+    /// Per-workspace selection state (cursor position or range).
+    pub(crate) selections: HashMap<String, SelectionState>,
+    /// Per-workspace desired column for Up/Down movement across short lines.
+    pub(crate) cursor_desired_col: HashMap<String, usize>,
+    /// Cursor blink toggle -- flips every ~500ms.
+    pub(crate) cursor_blink_on: bool,
+    /// Workspaces where auto-scroll is suppressed (user placed cursor mid-document).
+    pub(crate) auto_scroll_suppressed: HashSet<String>,
 }
 
 impl App {
@@ -163,6 +176,11 @@ impl App {
             last_pane_width: 0,
             streaming_text: HashMap::new(),
             tick_counter: 0,
+            composer_drafts: HashMap::new(),
+            selections: HashMap::new(),
+            cursor_desired_col: HashMap::new(),
+            cursor_blink_on: true,
+            auto_scroll_suppressed: HashSet::new(),
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -218,6 +236,7 @@ impl App {
         if self.tree_items.is_empty() {
             return;
         }
+        let old = self.selected_index;
         let len = self.tree_items.len();
         let mut next = if self.selected_index == 0 {
             len - 1
@@ -229,6 +248,7 @@ impl App {
             next = if next == 0 { len - 1 } else { next - 1 };
             attempts += 1;
         }
+        self.swap_composer_draft(old, next);
         self.selected_index = next;
         self.update_active_session();
     }
@@ -237,6 +257,7 @@ impl App {
         if self.tree_items.is_empty() {
             return;
         }
+        let old = self.selected_index;
         let len = self.tree_items.len();
         let mut next = if self.selected_index >= len - 1 {
             0
@@ -248,6 +269,7 @@ impl App {
             next = if next >= len - 1 { 0 } else { next + 1 };
             attempts += 1;
         }
+        self.swap_composer_draft(old, next);
         self.selected_index = next;
         self.update_active_session();
     }
@@ -309,6 +331,37 @@ impl App {
         match self.tree_items.get(self.selected_index) {
             Some(TreeNode::Workspace { ws, .. }) => Some(ws),
             _ => None,
+        }
+    }
+
+    /// Get the workspace ID at the given tree index, if it's a workspace node.
+    fn workspace_id_at(&self, index: usize) -> Option<String> {
+        match self.tree_items.get(index) {
+            Some(TreeNode::Workspace { ws, .. }) => Some(ws.id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Save current composer draft for old workspace, restore draft for new workspace.
+    fn swap_composer_draft(&mut self, old_index: usize, new_index: usize) {
+        // Save draft from old workspace
+        if let Some(old_ws_id) = self.workspace_id_at(old_index) {
+            let draft = self.composer.draft_text();
+            if draft.trim().is_empty() {
+                self.composer_drafts.remove(&old_ws_id);
+            } else {
+                self.composer_drafts.insert(old_ws_id, draft);
+            }
+        }
+        // Restore draft for new workspace
+        if let Some(new_ws_id) = self.workspace_id_at(new_index) {
+            if let Some(draft) = self.composer_drafts.get(&new_ws_id) {
+                self.composer.set_text(draft);
+            } else {
+                self.composer.clear();
+            }
+        } else {
+            self.composer.clear();
         }
     }
 
@@ -1275,9 +1328,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 .unwrap_or(false)
                             {
                                 // Navigate selection to this workspace
+                                let old = app.selected_index;
                                 for (i, node) in app.tree_items.iter().enumerate() {
                                     if let TreeNode::Workspace { ws, .. } = node {
                                         if ws.id == workspace_id {
+                                            app.swap_composer_draft(old, i);
                                             app.selected_index = i;
                                             break;
                                         }
@@ -1311,6 +1366,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.scrollbacks.remove(&workspace_id);
                                     app.waiting_response.remove(&workspace_id);
                                     app.expanded_icon_rows.remove(&workspace_id);
+                                    app.composer_drafts.remove(&workspace_id);
                                     app.repos = app.state.repos.clone();
                                     app.workspaces = app.state.workspaces.clone();
                                     app.rebuild_tree();
@@ -1339,6 +1395,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.scrollbacks.remove(ws_id);
                                     app.waiting_response.remove(ws_id);
                                     app.expanded_icon_rows.remove(ws_id);
+                                    app.composer_drafts.remove(ws_id);
                                 }
                                 if let Ok(_) = app.state.delete_repo(&repo_name) {
                                     app.expanded.remove(&repo.id);
@@ -1381,6 +1438,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 app.tick_counter = app.tick_counter.wrapping_add(1);
                 if app.tick_counter % 5 == 0 {
                     app.spinner_tick = (app.spinner_tick + 1) % 10;
+                }
+                // Cursor blink toggle every 10th tick (~500ms at 50ms interval)
+                if app.tick_counter % 10 == 0 {
+                    app.cursor_blink_on = !app.cursor_blink_on;
                 }
 
                 // Poll session events

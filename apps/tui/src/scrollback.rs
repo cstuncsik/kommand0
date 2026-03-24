@@ -115,6 +115,11 @@ impl ScrollbackBuffer {
         }
     }
 
+    /// Set scroll_offset to an exact value. Used by cursor auto-scroll.
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        self.scroll_offset = offset;
+    }
+
     pub fn clear(&mut self) {
         self.lines.clear();
         self.scroll_offset = 0;
@@ -309,6 +314,28 @@ mod tests {
     fn page_size_returns_default() {
         let buf = ScrollbackBuffer::new(100);
         assert_eq!(buf.page_size(), 20);
+    }
+
+    #[test]
+    fn set_scroll_offset_sets_value() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..20 {
+            buf.push_line(format!("line {}", i));
+        }
+        buf.set_scroll_offset(7);
+        assert_eq!(buf.scroll_offset(), 7);
+    }
+
+    #[test]
+    fn set_scroll_offset_zero_is_at_bottom() {
+        let mut buf = ScrollbackBuffer::new(100);
+        for i in 0..20 {
+            buf.push_line(format!("line {}", i));
+        }
+        buf.scroll_up(5);
+        assert!(!buf.is_at_bottom());
+        buf.set_scroll_offset(0);
+        assert!(buf.is_at_bottom());
     }
 
     #[test]
