@@ -83,11 +83,16 @@ impl Composer {
         self.textarea = Self::make_textarea(self.active);
     }
 
-    /// Set active state, updating border styling.
+    /// Set active state, updating border and selection styling.
     pub fn set_active(&mut self, active: bool) {
         self.active = active;
         let block = Self::make_block(active);
         self.textarea.set_block(block);
+        if active {
+            self.textarea.set_selection_style(Style::default().bg(Color::Cyan).fg(Color::Black));
+        } else {
+            self.textarea.set_selection_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        }
     }
 
     pub fn is_active(&self) -> bool {
@@ -97,6 +102,22 @@ impl Composer {
     /// Returns true if the composer has no text content.
     pub fn is_empty(&self) -> bool {
         self.textarea.lines().iter().all(|l| l.is_empty())
+    }
+
+    /// Get the current draft text.
+    pub fn draft_text(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    /// Replace the composer content with the given text.
+    pub fn set_text(&mut self, text: &str) {
+        self.textarea = Self::make_textarea(self.active);
+        for (i, line) in text.lines().enumerate() {
+            if i > 0 {
+                self.textarea.insert_newline();
+            }
+            self.textarea.insert_str(line);
+        }
     }
 
     /// Return a reference to the inner TextArea for rendering.
@@ -131,11 +152,58 @@ impl Composer {
             .border_style(border_style)
     }
 
+    /// Returns true if the composer has an active text selection.
+    pub fn has_selection(&self) -> bool {
+        self.textarea.is_selecting()
+    }
+
+    /// Extract the currently selected text from the composer.
+    /// Returns None if no selection is active.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((r1, c1), (r2, c2)) = self.textarea.selection_range()?;
+        let lines = self.textarea.lines();
+        if r1 == r2 {
+            // Single-line selection
+            let line = lines.get(r1)?;
+            let chars: Vec<char> = line.chars().collect();
+            let start = c1.min(chars.len());
+            let end = c2.min(chars.len());
+            Some(chars[start..end].iter().collect())
+        } else {
+            // Multi-line selection
+            let mut result = String::new();
+            for row in r1..=r2 {
+                let line = lines.get(row).map(|s| s.as_str()).unwrap_or("");
+                let chars: Vec<char> = line.chars().collect();
+                if row == r1 {
+                    let start = c1.min(chars.len());
+                    result.extend(&chars[start..]);
+                } else if row == r2 {
+                    let end = c2.min(chars.len());
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.extend(&chars[..end]);
+                } else {
+                    result.push('\n');
+                    result.extend(chars.iter());
+                }
+            }
+            Some(result)
+        }
+    }
+
+    /// Select all text in the composer.
+    pub fn select_all(&mut self) {
+        self.textarea.select_all();
+    }
+
     fn make_textarea(active: bool) -> TextArea<'static> {
         let mut textarea = TextArea::default();
         textarea.set_block(Self::make_block(active));
         textarea.set_placeholder_text("Type a message...");
         textarea.set_cursor_line_style(Style::default());
+        textarea.set_selection_style(Style::default().bg(Color::Cyan).fg(Color::Black));
         textarea
     }
 }
