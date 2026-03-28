@@ -11,7 +11,7 @@ mod session_manager;
 mod wrap_map;
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{EventStream, KeyEventKind};
 use futures::{FutureExt, StreamExt};
@@ -106,6 +106,10 @@ pub(crate) struct App {
     pub(crate) cursor_blink_on: bool,
     /// Workspaces where auto-scroll is suppressed (user placed cursor mid-document).
     pub(crate) auto_scroll_suppressed: HashSet<String>,
+
+    // Clipboard
+    pub(crate) clipboard: clipboard::ClipboardBridge,
+    pub(crate) copy_flash_until: Option<Instant>,
 }
 
 impl App {
@@ -184,6 +188,8 @@ impl App {
             cursor_desired_col: HashMap::new(),
             cursor_blink_on: true,
             auto_scroll_suppressed: HashSet::new(),
+            clipboard: clipboard::ClipboardBridge::new(),
+            copy_flash_until: None,
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -567,16 +573,28 @@ impl App {
     fn extend_selection_vertical(&mut self, ws_id: &str, direction: i32) {
         let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
             Some(pos) => pos,
-            None => return,
+            None => {
+                let _ = std::fs::write("/tmp/dalat_debug.log", "extend_sel_vert: cursor_pos returned None\n");
+                return;
+            }
         };
         let (owned_lines, inner_width) = match self.output_context(ws_id) {
             Some(ctx) => ctx,
-            None => return,
+            None => {
+                let _ = std::fs::write("/tmp/dalat_debug.log", "extend_sel_vert: output_context returned None\n");
+                return;
+            }
         };
         let lines_ref: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
         let wrap_map = WrapMap::build(&lines_ref, inner_width);
 
-        if let Some((_cx, cy)) = wrap_map.logical_to_screen(cursor_line, cursor_char, 0, &lines_ref) {
+        let screen_pos = wrap_map.logical_to_screen(cursor_line, cursor_char, 0, &lines_ref);
+        let _ = std::fs::write("/tmp/dalat_debug.log", format!(
+            "extend_sel_vert: dir={} cursor=({},{}) inner_width={} total_lines={} total_visual={} screen_pos={:?}\n",
+            direction, cursor_line, cursor_char, inner_width, lines_ref.len(), wrap_map.total_visual_rows(), screen_pos
+        ));
+
+        if let Some((_cx, cy)) = screen_pos {
             let desired_col = self.cursor_desired_col.get(ws_id).copied().unwrap_or(0);
             let new_y = if direction < 0 {
                 (cy as usize).saturating_sub((-direction) as usize)
@@ -585,7 +603,15 @@ impl App {
                 ((cy as usize) + direction as usize).min(total.saturating_sub(1))
             };
 
-            if let Some((new_line, new_char)) = wrap_map.screen_to_logical(desired_col as u16, new_y as u16, 0, &lines_ref) {
+            let new_pos = wrap_map.screen_to_logical(desired_col as u16, new_y as u16, 0, &lines_ref);
+            {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/dalat_debug.log") {
+                    let _ = writeln!(f, "  desired_col={} cy={} new_y={} new_pos={:?}", desired_col, cy, new_y, new_pos);
+                }
+            }
+
+            if let Some((new_line, new_char)) = new_pos {
                 self.extend_selection(ws_id, new_line, new_char);
                 self.auto_scroll_suppressed.insert(ws_id.to_string());
                 self.ensure_cursor_visible(ws_id);
@@ -1129,6 +1155,13 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             event = reader.next().fuse() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        // Debug: log ALL key events
+                        {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/dalat_debug.log") {
+                                let _ = writeln!(f, "KEY: code={:?} mods={:?} focus={:?}", key.code, key.modifiers, app.focus);
+                            }
+                        }
                         // Help modal: swallow all keys except ?/Esc
                         if app.show_help {
                             match key.code {
@@ -1452,6 +1485,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                     app.extend_selection_vertical(&ws_id, -1);
                                                 }
                                                 (KeyCode::Down, false, true) => {
+                                                    let _ = std::fs::write("/tmp/dalat_debug.log", format!("SHIFT+DOWN hit! ws_id={} sel={:?}\n", ws_id, app.selections.get(&ws_id)));
                                                     app.init_cursor_if_needed(&ws_id);
                                                     app.extend_selection_vertical(&ws_id, 1);
                                                 }
@@ -1541,7 +1575,13 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                     }
                                                 }
 
-                                                _ => {}
+                                                _ => {
+                                                    // Debug: log unmatched keys in Output focus
+                                                    use std::io::Write;
+                                                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/dalat_debug.log") {
+                                                        let _ = writeln!(f, "UNMATCHED key in Output: code={:?} ctrl={} shift={} mods={:?}", key.code, ctrl, shift, key.modifiers);
+                                                    }
+                                                }
                                             }
                                         }
                                     }

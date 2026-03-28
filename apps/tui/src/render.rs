@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use std::time::Instant;
+
 use super::{App, Focus, TreeNode, buttons, help, modal};
 use super::buttons::HitAction;
 use super::selection::SelectionState;
@@ -397,6 +399,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     inner_height,
                     &all_lines,
                     &wrap_map,
+                    app.copy_flash_until,
                 );
             }
             let (cursor_line, cursor_char) = match &selection {
@@ -965,12 +968,17 @@ pub(crate) fn apply_selection_highlight(
     _inner_height: usize,
     _raw_lines: &[&str],
     _wrap_map: &super::wrap_map::WrapMap,
+    copy_flash_until: Option<Instant>,
 ) {
     let Some(((start_line, start_char), (end_line, end_char))) = selection.ordered_range() else {
         return;
     };
 
-    let sel_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+    let sel_style = if copy_flash_until.map_or(false, |until| Instant::now() < until) {
+        Style::default().bg(Color::White).fg(Color::Black)
+    } else {
+        Style::default().bg(Color::Cyan).fg(Color::Black)
+    };
 
     for line_idx in start_line..=end_line.min(lines.len().saturating_sub(1)) {
         if line_idx >= lines.len() {
@@ -1158,6 +1166,7 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
                 inner_height,
                 &all_lines,
                 &wrap_map,
+                app.copy_flash_until,
             );
         }
         let (cursor_line, cursor_char) = match &selection {
