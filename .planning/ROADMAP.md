@@ -59,7 +59,7 @@ Plans:
   2. Ctrl+C with no active selection does nothing -- no side effects, no error, no session stop
   3. Ctrl+Q stops the current session (replacing Ctrl+C's old stop role), and the old Ctrl+C clear/stop behavior is fully removed
   4. User can select text in the composer using Shift+arrow keys and Ctrl+A, and copy it with Ctrl+C
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 
 Plans:
 - [ ] 03-01-PLAN.md — Ctrl+C copy-to-clipboard + Ctrl+Q stop/quit + ClipboardBridge wiring + copy flash
@@ -74,4 +74,4 @@ Phases execute in numeric order: 1 -> 2 -> 3
 |-------|----------------|--------|-----------|
 | 1. Coordinate Translation & Infrastructure | 2/2 | Complete | 2026-03-23 |
 | 2. Output Pane Selection | 1/3 | In progress | - |
-| 3. Clipboard, Keybindings & Composer | 0/2 | Not started | - |
+| 3. Clipboard, Keybindings & Composer | 1/2 | In Progress|  |

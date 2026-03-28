@@ -26,14 +26,14 @@
 
 ### Clipboard
 
-- [ ] **CLIP-01**: User can copy selected text to system clipboard with Ctrl+C or Cmd+C
-- [ ] **CLIP-02**: Ctrl+C with no active selection does nothing (no side effects)
+- [x] **CLIP-01**: User can copy selected text to system clipboard with Ctrl+C or Cmd+C
+- [x] **CLIP-02**: Ctrl+C with no active selection does nothing (no side effects)
 - [x] **CLIP-03**: Clipboard integration works cross-platform via arboard crate
 
 ### Keybindings
 
-- [ ] **KEYS-01**: Ctrl+Q stops the current session (replaces Ctrl+C's old stop role)
-- [ ] **KEYS-02**: Existing Ctrl+C behavior (clear composer, stop session) is fully replaced
+- [x] **KEYS-01**: Ctrl+Q stops the current session (replaces Ctrl+C's old stop role)
+- [x] **KEYS-02**: Existing Ctrl+C behavior (clear composer, stop session) is fully replaced
 
 ### Coordinate Translation
 
@@ -80,11 +80,11 @@
 | OSEL-06 | Phase 2 | Complete |
 | COMP-01 | Phase 3 | Pending |
 | COMP-02 | Phase 3 | Pending |
-| CLIP-01 | Phase 3 | Pending |
-| CLIP-02 | Phase 3 | Pending |
+| CLIP-01 | Phase 3 | Complete |
+| CLIP-02 | Phase 3 | Complete |
 | CLIP-03 | Phase 1 | Complete |
-| KEYS-01 | Phase 3 | Pending |
-| KEYS-02 | Phase 3 | Pending |
+| KEYS-01 | Phase 3 | Complete |
+| KEYS-02 | Phase 3 | Complete |
 | CORD-01 | Phase 1 | Complete |
 | CORD-02 | Phase 1 | Complete |
 | CORD-03 | Phase 1 | Complete |
