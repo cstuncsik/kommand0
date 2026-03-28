@@ -70,7 +70,16 @@ impl Composer {
                 self.textarea = Self::make_textarea(self.active);
                 Some(text)
             }
-            // All other keys
+            // Ctrl+A = select all (override tui-textarea's default "move to line start")
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.textarea.select_all();
+                None
+            }
+            // All other keys (Shift+arrows handled natively by tui-textarea for selection)
             _ => {
                 self.textarea.input(key);
                 None
@@ -198,6 +207,11 @@ impl Composer {
         self.textarea.select_all();
     }
 
+    /// Cancel (clear) any active text selection in the composer.
+    pub fn cancel_selection(&mut self) {
+        self.textarea.cancel_selection();
+    }
+
     fn make_textarea(active: bool) -> TextArea<'static> {
         let mut textarea = TextArea::default();
         textarea.set_block(Self::make_block(active));
@@ -205,5 +219,82 @@ impl Composer {
         textarea.set_cursor_line_style(Style::default());
         textarea.set_selection_style(Style::default().bg(Color::Cyan).fg(Color::Black));
         textarea
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn has_selection_false_by_default() {
+        let c = Composer::new();
+        assert!(!c.has_selection());
+    }
+
+    #[test]
+    fn select_all_then_has_selection() {
+        let mut c = Composer::new();
+        c.set_text("hello world");
+        c.select_all();
+        assert!(c.has_selection());
+    }
+
+    #[test]
+    fn selected_text_after_select_all() {
+        let mut c = Composer::new();
+        c.set_text("hello world");
+        c.select_all();
+        let text = c.selected_text();
+        assert_eq!(text, Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn selected_text_multiline() {
+        let mut c = Composer::new();
+        c.set_text("line one\nline two\nline three");
+        c.select_all();
+        let text = c.selected_text();
+        assert_eq!(text, Some("line one\nline two\nline three".to_string()));
+    }
+
+    #[test]
+    fn selected_text_none_when_no_selection() {
+        let mut c = Composer::new();
+        c.set_text("hello");
+        assert_eq!(c.selected_text(), None);
+    }
+
+    #[test]
+    fn selection_range_col_semantics_multibyte() {
+        // Verify selection works correctly with multi-byte characters
+        let mut c = Composer::new();
+        c.set_text("caf\u{00e9}"); // "cafe" with e-acute as single codepoint
+        c.select_all();
+        assert!(c.has_selection());
+        let text = c.selected_text();
+        assert!(text.is_some());
+        // The text should contain the full multibyte content
+        assert!(text.unwrap().contains("caf"));
+    }
+
+    #[test]
+    fn cancel_selection_clears() {
+        let mut c = Composer::new();
+        c.set_text("hello");
+        c.select_all();
+        assert!(c.has_selection());
+        c.cancel_selection();
+        assert!(!c.has_selection());
+    }
+
+    #[test]
+    fn ctrl_a_in_handle_key_selects_all() {
+        let mut c = Composer::new();
+        c.set_text("test text");
+        let result = c.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(result, None); // Ctrl+A does not send
+        assert!(c.has_selection());
     }
 }

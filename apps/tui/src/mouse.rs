@@ -62,6 +62,11 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
 
     let areas = app.pane_areas;
 
+    // Clear composer selection on any click outside composer (iTerm2-style)
+    if !contains(areas.composer, col, row) && app.composer.has_selection() {
+        app.composer.cancel_selection();
+    }
+
     if contains(areas.tree, col, row) {
         // Click in tree pane
         if app.focus == Focus::Composer {
