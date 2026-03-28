@@ -1282,37 +1282,51 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 break;
                             }
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                match app.focus {
-                                    Focus::Composer => {
-                                        // Ctrl+C in Composer always clears and stays in Composer
-                                        app.composer.clear();
-                                    }
-                                    _ => {
-                                        // Stop session if running, otherwise quit
-                                        let should_quit = if let Some(ws) = app.selected_workspace().cloned() {
-                                            let session_info = app.state.find_session_by_workspace(&ws.id)
-                                                .filter(|s| s.status == SessionStatus::Running)
-                                                .map(|s| s.id.clone());
-                                            if let Some(session_id) = session_info {
-                                                let _ = app.session_manager.stop_session(&session_id).await;
-                                                let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
-                                                app.focus = Focus::Tree;
-                                                app.composer.set_active(false);
-                                                if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
-                                                    buf.push_line("--- Session stopped ---".to_string());
-                                                }
-                                                false
-                                            } else {
-                                                true
+                                // Ctrl+C: copy selection to clipboard (output pane first, then composer)
+                                let mut copied = false;
+                                // Check output pane selection first
+                                if let Some(ws) = app.selected_workspace().cloned() {
+                                    if let Some(sel) = app.selections.get(&ws.id) {
+                                        if let Some((start, end)) = sel.ordered_range() {
+                                            if let Some((owned_lines, inner_width)) = app.output_context(&ws.id) {
+                                                let refs: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+                                                let wm = WrapMap::build(&refs, inner_width);
+                                                let text = wm.extract_text(&refs, start, end);
+                                                let _ = app.clipboard.set_text(&text);
+                                                app.copy_flash_until = Some(Instant::now() + Duration::from_millis(150));
+                                                copied = true;
                                             }
-                                        } else {
-                                            true
-                                        };
-                                        if should_quit {
-                                            app.session_manager.shutdown_all().await?;
-                                            break;
                                         }
                                     }
+                                }
+                                // If no output selection, check composer
+                                if !copied && app.composer.has_selection() {
+                                    if let Some(text) = app.composer.selected_text() {
+                                        let _ = app.clipboard.set_text(&text);
+                                        app.copy_flash_until = Some(Instant::now() + Duration::from_millis(150));
+                                    }
+                                }
+                                // If neither has selection: pure no-op (CLIP-02)
+                            }
+                            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                // Ctrl+Q: stop session if running, otherwise quit (works in ALL panes)
+                                let has_running = app.selected_workspace().cloned()
+                                    .and_then(|ws| {
+                                        app.state.find_session_by_workspace(&ws.id)
+                                            .filter(|s| s.status == SessionStatus::Running)
+                                            .map(|s| (ws.id.clone(), s.id.clone()))
+                                    });
+                                if let Some((ws_id, session_id)) = has_running {
+                                    let _ = app.session_manager.stop_session(&session_id).await;
+                                    let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
+                                        buf.push_line("--- Session stopped ---".to_string());
+                                    }
+                                    app.focus = Focus::Output;
+                                    app.composer.set_active(false);
+                                } else {
+                                    app.session_manager.shutdown_all().await?;
+                                    break;
                                 }
                             }
                             KeyCode::Tab => {
@@ -1394,7 +1408,16 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             KeyCode::Esc => {
                                 if app.zoomed {
                                     app.zoomed = false;
-                                    // Don't change focus when exiting zoom
+                                } else if app.focus == Focus::Output {
+                                    // Clear output selection first; if no selection, return to Tree
+                                    let has_sel = app.selected_workspace().cloned()
+                                        .and_then(|ws| app.selections.get(&ws.id).map(|s| (ws.id.clone(), s.has_range())))
+                                        .filter(|(_, has)| *has);
+                                    if let Some((ws_id, _)) = has_sel {
+                                        app.clear_selection_for_workspace(&ws_id);
+                                    } else {
+                                        app.focus = Focus::Tree;
+                                    }
                                 } else {
                                     if app.focus == Focus::Composer {
                                         app.composer.set_active(false);
