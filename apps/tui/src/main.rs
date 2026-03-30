@@ -30,6 +30,12 @@ use selection::SelectionState;
 use session_manager::{SessionEvent, SessionManager};
 use wrap_map::WrapMap;
 
+/// Check if modifiers contain the "command" key: Ctrl on Linux, Ctrl or Cmd (SUPER) on macOS.
+/// Ghostty and kitty report Cmd as SUPER when enhanced keyboard mode is active.
+fn has_cmd_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) || modifiers.contains(KeyModifiers::SUPER)
+}
+
 #[allow(dead_code)]
 pub(crate) enum Status {
     Idle,
@@ -109,7 +115,7 @@ pub(crate) struct App {
 
     // Clipboard
     pub(crate) clipboard: clipboard::ClipboardBridge,
-    pub(crate) copy_flash_until: Option<Instant>,
+    pub(crate) copy_flash_until: Option<(Focus, Instant)>,
 }
 
 impl App {
@@ -1039,11 +1045,13 @@ async fn main() -> anyhow::Result<()> {
     let supports_enhanced_keys = crossterm::terminal::supports_keyboard_enhancement()
         .unwrap_or(false);
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
     if supports_enhanced_keys {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
             )
         );
     }
@@ -1054,6 +1062,7 @@ async fn main() -> anyhow::Result<()> {
             crossterm::event::PopKeyboardEnhancementFlags
         );
     }
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     result
@@ -1281,34 +1290,38 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                                 break;
                             }
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                // Ctrl+C: copy selection to clipboard (output pane first, then composer)
-                                let mut copied = false;
-                                // Check output pane selection first
-                                if let Some(ws) = app.selected_workspace().cloned() {
-                                    if let Some(sel) = app.selections.get(&ws.id) {
-                                        if let Some((start, end)) = sel.ordered_range() {
-                                            if let Some((owned_lines, inner_width)) = app.output_context(&ws.id) {
-                                                let refs: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
-                                                let wm = WrapMap::build(&refs, inner_width);
-                                                let text = wm.extract_text(&refs, start, end);
+                            KeyCode::Char('c') if has_cmd_modifier(key.modifiers) => {
+                                // Ctrl/Cmd+C: copy selection from the focused pane
+                                match app.focus {
+                                    Focus::Composer => {
+                                        if app.composer.has_selection() {
+                                            if let Some(text) = app.composer.selected_text() {
                                                 let _ = app.clipboard.set_text(&text);
-                                                app.copy_flash_until = Some(Instant::now() + Duration::from_millis(150));
-                                                copied = true;
+                                                app.composer.set_copy_flash(true);
+                                                app.copy_flash_until = Some((app.focus, Instant::now() + Duration::from_millis(150)));
                                             }
                                         }
                                     }
-                                }
-                                // If no output selection, check composer
-                                if !copied && app.composer.has_selection() {
-                                    if let Some(text) = app.composer.selected_text() {
-                                        let _ = app.clipboard.set_text(&text);
-                                        app.copy_flash_until = Some(Instant::now() + Duration::from_millis(150));
+                                    Focus::Output => {
+                                        if let Some(ws) = app.selected_workspace().cloned() {
+                                            if let Some(sel) = app.selections.get(&ws.id) {
+                                                if let Some((start, end)) = sel.ordered_range() {
+                                                    if let Some((owned_lines, inner_width)) = app.output_context(&ws.id) {
+                                                        let refs: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+                                                        let wm = WrapMap::build(&refs, inner_width);
+                                                        let text = wm.extract_text(&refs, start, end);
+                                                        let _ = app.clipboard.set_text(&text);
+                                                        app.copy_flash_until = Some((app.focus, Instant::now() + Duration::from_millis(150)));
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
+                                    _ => {}
                                 }
-                                // If neither has selection: pure no-op (CLIP-02)
+                                // No selection in focused pane: pure no-op (CLIP-02)
                             }
-                            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            KeyCode::Char('q') if has_cmd_modifier(key.modifiers) => {
                                 // Ctrl+Q: stop session if running, otherwise quit (works in ALL panes)
                                 let has_running = app.selected_workspace().cloned()
                                     .and_then(|ws| {
@@ -1418,6 +1431,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     } else {
                                         app.focus = Focus::Tree;
                                     }
+                                } else if app.focus == Focus::Composer && app.composer.has_selection() {
+                                    app.composer.cancel_selection();
                                 } else {
                                     if app.focus == Focus::Composer {
                                         app.composer.set_active(false);
@@ -1465,7 +1480,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         let ws_id = app.selected_workspace().map(|ws| ws.id.clone());
                                         if let Some(ws_id) = ws_id {
                                             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                            let ctrl = has_cmd_modifier(key.modifiers);
 
                                             match (key.code, ctrl, shift) {
                                                 // --- Cursor movement (no modifiers) ---
@@ -1878,6 +1893,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    Some(Ok(Event::Paste(text))) => {
+                        if app.focus == Focus::Composer {
+                            app.composer.insert_paste(&text);
+                        }
+                    }
                     Some(Ok(Event::Mouse(mouse_event))) => {
                         if !app.show_help {
                             mouse::handle_mouse(&mut app, mouse_event);
@@ -2176,6 +2196,15 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 // Cursor blink toggle every 10th tick (~500ms at 50ms interval)
                 if app.tick_counter % 10 == 0 {
                     app.cursor_blink_on = !app.cursor_blink_on;
+                }
+                // Clear copy flash when expired
+                if let Some((pane, until)) = app.copy_flash_until {
+                    if Instant::now() >= until {
+                        app.copy_flash_until = None;
+                        if pane == Focus::Composer {
+                            app.composer.set_copy_flash(false);
+                        }
+                    }
                 }
 
                 // Poll session events

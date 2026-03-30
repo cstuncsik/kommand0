@@ -399,7 +399,8 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     inner_height,
                     &all_lines,
                     &wrap_map,
-                    app.copy_flash_until,
+                    app.copy_flash_until.and_then(|(f, t)| if f == Focus::Output { Some(t) } else { None }),
+                    app.focus == Focus::Output,
                 );
             }
             let (cursor_line, cursor_char) = match &selection {
@@ -969,6 +970,7 @@ pub(crate) fn apply_selection_highlight(
     _raw_lines: &[&str],
     _wrap_map: &super::wrap_map::WrapMap,
     copy_flash_until: Option<Instant>,
+    focused: bool,
 ) {
     let Some(((start_line, start_char), (end_line, end_char))) = selection.ordered_range() else {
         return;
@@ -976,8 +978,10 @@ pub(crate) fn apply_selection_highlight(
 
     let sel_style = if copy_flash_until.map_or(false, |until| Instant::now() < until) {
         Style::default().bg(Color::White).fg(Color::Black)
-    } else {
+    } else if focused {
         Style::default().bg(Color::Cyan).fg(Color::Black)
+    } else {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
     };
 
     for line_idx in start_line..=end_line.min(lines.len().saturating_sub(1)) {
@@ -1166,7 +1170,8 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
                 inner_height,
                 &all_lines,
                 &wrap_map,
-                app.copy_flash_until,
+                app.copy_flash_until.and_then(|(f, t)| if f == Focus::Output { Some(t) } else { None }),
+                app.focus == Focus::Output,
             );
         }
         let (cursor_line, cursor_char) = match &selection {
