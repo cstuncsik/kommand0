@@ -70,12 +70,14 @@ impl Composer {
                 self.textarea = Self::make_textarea(self.active);
                 Some(text)
             }
-            // Ctrl+A = select all (override tui-textarea's default "move to line start")
+            // Ctrl+A / Cmd+A = select all (override tui-textarea's default "move to line start")
             KeyEvent {
                 code: KeyCode::Char('a'),
                 modifiers,
                 ..
-            } if modifiers.contains(KeyModifiers::CONTROL) => {
+            } if modifiers.contains(KeyModifiers::CONTROL)
+                || modifiers.contains(KeyModifiers::SUPER) =>
+            {
                 self.textarea.select_all();
                 None
             }
@@ -108,6 +110,17 @@ impl Composer {
         self.active
     }
 
+    /// Set copy-flash style (white highlight) on the selection.
+    pub fn set_copy_flash(&mut self, flash: bool) {
+        if flash {
+            self.textarea.set_selection_style(Style::default().bg(Color::White).fg(Color::Black));
+        } else if self.active {
+            self.textarea.set_selection_style(Style::default().bg(Color::Cyan).fg(Color::Black));
+        } else {
+            self.textarea.set_selection_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        }
+    }
+
     /// Returns true if the composer has no text content.
     pub fn is_empty(&self) -> bool {
         self.textarea.lines().iter().all(|l| l.is_empty())
@@ -116,6 +129,18 @@ impl Composer {
     /// Get the current draft text.
     pub fn draft_text(&self) -> String {
         self.textarea.lines().join("\n")
+    }
+
+    /// Insert pasted text at cursor, preserving newlines without triggering send.
+    pub fn insert_paste(&mut self, text: &str) {
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                self.textarea.insert_newline();
+            }
+            if !line.is_empty() {
+                self.textarea.insert_str(line);
+            }
+        }
     }
 
     /// Replace the composer content with the given text.
