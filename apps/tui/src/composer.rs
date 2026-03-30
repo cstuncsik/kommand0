@@ -70,7 +70,18 @@ impl Composer {
                 self.textarea = Self::make_textarea(self.active);
                 Some(text)
             }
-            // All other keys
+            // Ctrl+A / Cmd+A = select all (override tui-textarea's default "move to line start")
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL)
+                || modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.textarea.select_all();
+                None
+            }
+            // All other keys (Shift+arrows handled natively by tui-textarea for selection)
             _ => {
                 self.textarea.input(key);
                 None
@@ -83,20 +94,64 @@ impl Composer {
         self.textarea = Self::make_textarea(self.active);
     }
 
-    /// Set active state, updating border styling.
+    /// Set active state, updating border and selection styling.
     pub fn set_active(&mut self, active: bool) {
         self.active = active;
         let block = Self::make_block(active);
         self.textarea.set_block(block);
+        if active {
+            self.textarea.set_selection_style(Style::default().bg(Color::Cyan).fg(Color::Black));
+        } else {
+            self.textarea.set_selection_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        }
     }
 
     pub fn is_active(&self) -> bool {
         self.active
     }
 
+    /// Set copy-flash style (white highlight) on the selection.
+    pub fn set_copy_flash(&mut self, flash: bool) {
+        if flash {
+            self.textarea.set_selection_style(Style::default().bg(Color::White).fg(Color::Black));
+        } else if self.active {
+            self.textarea.set_selection_style(Style::default().bg(Color::Cyan).fg(Color::Black));
+        } else {
+            self.textarea.set_selection_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        }
+    }
+
     /// Returns true if the composer has no text content.
     pub fn is_empty(&self) -> bool {
         self.textarea.lines().iter().all(|l| l.is_empty())
+    }
+
+    /// Get the current draft text.
+    pub fn draft_text(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    /// Insert pasted text at cursor, preserving newlines without triggering send.
+    pub fn insert_paste(&mut self, text: &str) {
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                self.textarea.insert_newline();
+            }
+            if !line.is_empty() {
+                self.textarea.insert_str(line);
+            }
+        }
+    }
+
+    /// Replace the composer content with the given text.
+    pub fn set_text(&mut self, text: &str) {
+        self.textarea = Self::make_textarea(self.active);
+        for (i, line) in text.lines().enumerate() {
+            if i > 0 {
+                self.textarea.insert_newline();
+            }
+            self.textarea.insert_str(line);
+        }
     }
 
     /// Return a reference to the inner TextArea for rendering.
@@ -131,11 +186,140 @@ impl Composer {
             .border_style(border_style)
     }
 
+    /// Returns true if the composer has an active text selection.
+    pub fn has_selection(&self) -> bool {
+        self.textarea.is_selecting()
+    }
+
+    /// Extract the currently selected text from the composer.
+    /// Returns None if no selection is active.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((r1, c1), (r2, c2)) = self.textarea.selection_range()?;
+        let lines = self.textarea.lines();
+        if r1 == r2 {
+            // Single-line selection
+            let line = lines.get(r1)?;
+            let chars: Vec<char> = line.chars().collect();
+            let start = c1.min(chars.len());
+            let end = c2.min(chars.len());
+            Some(chars[start..end].iter().collect())
+        } else {
+            // Multi-line selection
+            let mut result = String::new();
+            for row in r1..=r2 {
+                let line = lines.get(row).map(|s| s.as_str()).unwrap_or("");
+                let chars: Vec<char> = line.chars().collect();
+                if row == r1 {
+                    let start = c1.min(chars.len());
+                    result.extend(&chars[start..]);
+                } else if row == r2 {
+                    let end = c2.min(chars.len());
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.extend(&chars[..end]);
+                } else {
+                    result.push('\n');
+                    result.extend(chars.iter());
+                }
+            }
+            Some(result)
+        }
+    }
+
+    /// Select all text in the composer.
+    pub fn select_all(&mut self) {
+        self.textarea.select_all();
+    }
+
+    /// Cancel (clear) any active text selection in the composer.
+    pub fn cancel_selection(&mut self) {
+        self.textarea.cancel_selection();
+    }
+
     fn make_textarea(active: bool) -> TextArea<'static> {
         let mut textarea = TextArea::default();
         textarea.set_block(Self::make_block(active));
         textarea.set_placeholder_text("Type a message...");
         textarea.set_cursor_line_style(Style::default());
+        textarea.set_selection_style(Style::default().bg(Color::Cyan).fg(Color::Black));
         textarea
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn has_selection_false_by_default() {
+        let c = Composer::new();
+        assert!(!c.has_selection());
+    }
+
+    #[test]
+    fn select_all_then_has_selection() {
+        let mut c = Composer::new();
+        c.set_text("hello world");
+        c.select_all();
+        assert!(c.has_selection());
+    }
+
+    #[test]
+    fn selected_text_after_select_all() {
+        let mut c = Composer::new();
+        c.set_text("hello world");
+        c.select_all();
+        let text = c.selected_text();
+        assert_eq!(text, Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn selected_text_multiline() {
+        let mut c = Composer::new();
+        c.set_text("line one\nline two\nline three");
+        c.select_all();
+        let text = c.selected_text();
+        assert_eq!(text, Some("line one\nline two\nline three".to_string()));
+    }
+
+    #[test]
+    fn selected_text_none_when_no_selection() {
+        let mut c = Composer::new();
+        c.set_text("hello");
+        assert_eq!(c.selected_text(), None);
+    }
+
+    #[test]
+    fn selection_range_col_semantics_multibyte() {
+        // Verify selection works correctly with multi-byte characters
+        let mut c = Composer::new();
+        c.set_text("caf\u{00e9}"); // "cafe" with e-acute as single codepoint
+        c.select_all();
+        assert!(c.has_selection());
+        let text = c.selected_text();
+        assert!(text.is_some());
+        // The text should contain the full multibyte content
+        assert!(text.unwrap().contains("caf"));
+    }
+
+    #[test]
+    fn cancel_selection_clears() {
+        let mut c = Composer::new();
+        c.set_text("hello");
+        c.select_all();
+        assert!(c.has_selection());
+        c.cancel_selection();
+        assert!(!c.has_selection());
+    }
+
+    #[test]
+    fn ctrl_a_in_handle_key_selects_all() {
+        let mut c = Composer::new();
+        c.set_text("test text");
+        let result = c.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(result, None); // Ctrl+A does not send
+        assert!(c.has_selection());
     }
 }
