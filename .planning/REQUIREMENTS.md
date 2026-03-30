@@ -21,8 +21,8 @@
 
 ### Composer Selection
 
-- [ ] **COMP-01**: User can select text in composer using Shift+arrow keys (tui-textarea)
-- [ ] **COMP-02**: User can select all composer text with Ctrl+A when composer is focused
+- [x] **COMP-01**: User can select text in composer using Shift+arrow keys (tui-textarea)
+- [x] **COMP-02**: User can select all composer text with Ctrl+A when composer is focused
 
 ### Clipboard
 
@@ -78,8 +78,8 @@
 | OSEL-04 | Phase 2 | Complete |
 | OSEL-05 | Phase 2 | Complete |
 | OSEL-06 | Phase 2 | Complete |
-| COMP-01 | Phase 3 | Pending |
-| COMP-02 | Phase 3 | Pending |
+| COMP-01 | Phase 3 | Complete |
+| COMP-02 | Phase 3 | Complete |
 | CLIP-01 | Phase 3 | Complete |
 | CLIP-02 | Phase 3 | Complete |
 | CLIP-03 | Phase 1 | Complete |
