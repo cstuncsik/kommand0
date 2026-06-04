@@ -322,4 +322,28 @@ mod tests {
         assert_eq!(result, None); // Ctrl+A does not send
         assert!(c.has_selection());
     }
+
+    #[test]
+    fn insert_paste_into_empty() {
+        let mut c = Composer::new();
+        c.insert_paste("hello");
+        assert_eq!(c.draft_text(), "hello");
+        assert!(!c.is_empty());
+    }
+
+    #[test]
+    fn insert_paste_multiline_preserves_newlines() {
+        let mut c = Composer::new();
+        c.insert_paste("a\nb\nc");
+        assert_eq!(c.draft_text(), "a\nb\nc");
+        assert_eq!(c.widget().lines().len(), 3);
+    }
+
+    #[test]
+    fn insert_paste_appends_at_cursor() {
+        let mut c = Composer::new();
+        c.set_text("start");
+        c.insert_paste(" more");
+        assert_eq!(c.draft_text(), "start more");
+    }
 }

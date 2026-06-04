@@ -51,7 +51,9 @@ const OUTPUT_BINDINGS: &[KeyBinding] = &[
 const COMPOSER_BINDINGS: &[KeyBinding] = &[
     KeyBinding { keys: "[Enter]", description: "Send message" },
     KeyBinding { keys: "[Shift+Enter / Alt+Enter]", description: "New line" },
-    KeyBinding { keys: "[Ctrl+C]", description: "Clear input" },
+    KeyBinding { keys: "[Ctrl+A]", description: "Select all" },
+    KeyBinding { keys: "[Ctrl+C]", description: "Copy selection" },
+    KeyBinding { keys: "[Ctrl+V]", description: "Paste" },
 ];
 
 const SECTIONS: &[KeySection] = &[

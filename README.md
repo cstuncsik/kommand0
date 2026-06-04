@@ -66,7 +66,7 @@ cargo run -p kommand0-tui
 | `R` | Tree | Restart / resume session |
 | `a` | Tree | Add repository (modal) |
 | `w` | Tree | Add workspace to selected repo (modal) |
-| `Ctrl+C` | Tree / Output | Stop running session |
+| `Ctrl+Q` | Any | Stop running session (quit if none running) |
 | `Tab` | Any | Cycle focus: Tree -> Output -> Composer |
 | `Shift+Tab` | Any | Reverse cycle focus |
 | `Esc` | Any | Return focus to Tree / exit zoom |
@@ -77,7 +77,9 @@ cargo run -p kommand0-tui
 | `i` | Output | Switch focus to Composer |
 | `Enter` | Composer | Send message |
 | `Shift+Enter` | Composer | New line (Alt+Enter also works) |
-| `Ctrl+C` | Composer | Clear input |
+| `Ctrl+A` / `Cmd+A` | Composer | Select all |
+| `Ctrl+C` / `Cmd+C` | Composer | Copy selection |
+| `Ctrl+V` / `Cmd+V` | Composer | Paste |
 | `?` | Tree / Output | Toggle help overlay |
 | `q` | Tree / Output | Quit (stops all sessions) |
 
