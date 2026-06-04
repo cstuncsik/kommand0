@@ -1321,6 +1321,15 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                                 // No selection in focused pane: pure no-op (CLIP-02)
                             }
+                            KeyCode::Char('v') if has_cmd_modifier(key.modifiers) => {
+                                // Ctrl/Cmd+V: paste clipboard text into the composer
+                                // (output/tree are read-only, so this is a no-op there)
+                                if app.focus == Focus::Composer {
+                                    if let Ok(text) = app.clipboard.get_text() {
+                                        app.composer.insert_paste(&text);
+                                    }
+                                }
+                            }
                             KeyCode::Char('q') if has_cmd_modifier(key.modifiers) => {
                                 // Ctrl+Q: stop session if running, otherwise quit (works in ALL panes)
                                 let has_running = app.selected_workspace().cloned()
