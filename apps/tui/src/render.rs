@@ -60,7 +60,7 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 
     // Help overlay on top of any layout
     if app.show_help {
-        help::render_help_overlay(frame, app.focus);
+        help::render_help_overlay(frame, app.focus, &mut app.help_scroll);
     }
 
     // Modal overlay on top of everything
