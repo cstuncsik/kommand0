@@ -26,8 +26,9 @@ const GLOBAL_BINDINGS: &[KeyBinding] = &[
 ];
 
 const TREE_BINDINGS: &[KeyBinding] = &[
-    KeyBinding { keys: "[j/k]", description: "Navigate" },
-    KeyBinding { keys: "[Up/Down]", description: "Navigate" },
+    KeyBinding { keys: "[j/k or Up/Down]", description: "Navigate" },
+    KeyBinding { keys: "[h/l or Left/Right]", description: "Collapse / expand" },
+    KeyBinding { keys: "[gg/G]", description: "First / last item" },
     KeyBinding { keys: "[Enter]", description: "Expand/start session" },
     KeyBinding { keys: "[r]", description: "Start session" },
     KeyBinding { keys: "[R]", description: "Restart session" },
@@ -39,11 +40,14 @@ const TREE_BINDINGS: &[KeyBinding] = &[
 ];
 
 const OUTPUT_BINDINGS: &[KeyBinding] = &[
-    KeyBinding { keys: "[j/k]", description: "Scroll line" },
-    KeyBinding { keys: "[Up/Down]", description: "Scroll line" },
+    KeyBinding { keys: "[h/j/k/l or arrows]", description: "Move cursor" },
+    KeyBinding { keys: "[Shift+arrows]", description: "Extend selection" },
+    KeyBinding { keys: "[Ctrl+D/U]", description: "Half page down/up" },
     KeyBinding { keys: "[PgUp/PgDn]", description: "Scroll page" },
-    KeyBinding { keys: "[g/Home]", description: "Top" },
+    KeyBinding { keys: "[gg/Home]", description: "Top" },
     KeyBinding { keys: "[G/End]", description: "Bottom" },
+    KeyBinding { keys: "[Ctrl+A]", description: "Select all" },
+    KeyBinding { keys: "[Ctrl+C]", description: "Copy selection" },
     KeyBinding { keys: "[z]", description: "Zoom toggle" },
     KeyBinding { keys: "[i]", description: "Compose" },
 ];
