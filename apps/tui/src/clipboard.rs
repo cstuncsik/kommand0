@@ -11,7 +11,8 @@ impl ClipboardBridge {
         }
     }
 
-    pub fn is_available(&self) -> bool {
+    #[cfg(test)]
+    fn is_available(&self) -> bool {
         self.clipboard.is_some()
     }
 
