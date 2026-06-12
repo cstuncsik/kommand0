@@ -1,0 +1,37 @@
+apps/tui/Cargo.toml
+  s_fc3d7618d36de0::t_f0f722c870a791 26
+  s_fc3d7618d36de0::t_a1b82e6334d765 25
+  s_fc3d7618d36de0::t_fe945b12655d2a 22-24
+apps/tui/tests/fixtures/claude
+  s_fc3d7618d36de0::t_71978691635bdb 1-6
+README.md
+  s_fc3d7618d36de0::t_d986a1beb2003c 95-100
+Cargo.lock
+  s_fc3d7618d36de0::t_20a821dfa84dc0 103-107,114-119,181-186,296,383,387-392,456-466,767,782,797-798,803,809,812-817,913-924,931,933,961,973,984,1003,1014,1084,1091-1111,1164,1185,1196,1205,1218,1292-1318,1396,1451-1459,1466-1477,1633-1655,1665-1674,1772,1947-1955,2014
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_f01c62f59b1bb8 2467-2554,2556,2560-2618
+  s_fc3d7618d36de0::t_27306ec2f06968 2555,2557-2559
+  s_fc3d7618d36de0::t_3c91169b4e1b3e 1104-1881,2008-2009
+  s_fc3d7618d36de0::t_dd1b8560fee2f8 16
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_40a67c94f4d527 95-100
+  s_fc3d7618d36de0::t_33d2122b52ecdc 196
+  s_fc3d7618d36de0::t_7ea978bca669b1 1-94,101-195,197-243,245-247
+  s_fc3d7618d36de0::t_ae950c2d455869 244
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "11e8ec73720811541472880a1446739e25a11f5b",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
