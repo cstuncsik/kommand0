@@ -134,8 +134,8 @@ impl App {
                 .or_insert_with(|| ScrollbackBuffer::new(50_000));
             // Load log file contents into scrollback
             let log_path = std::path::Path::new(&session.log_file);
-            if log_path.exists() {
-                if let Ok(contents) = std::fs::read_to_string(log_path) {
+            if log_path.exists()
+                && let Ok(contents) = std::fs::read_to_string(log_path) {
                     let mut last_source = String::new();
                     for line in contents.lines() {
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
@@ -162,7 +162,6 @@ impl App {
                     // Ensure scrolled to bottom after loading
                     buf.reset_scroll();
                 }
-            }
         }
 
         let mut app = Self {
@@ -305,12 +304,11 @@ impl App {
             let repo_id = id;
             self.rebuild_tree();
             for (i, node) in self.tree_items.iter().enumerate() {
-                if let TreeNode::Repo { id, .. } = node {
-                    if *id == repo_id {
+                if let TreeNode::Repo { id, .. } = node
+                    && *id == repo_id {
                         self.selected_index = i;
                         break;
                     }
-                }
             }
             if !self.tree_items.is_empty() {
                 self.selected_index = self.selected_index.min(self.tree_items.len() - 1);
@@ -504,15 +502,14 @@ impl App {
 
     /// Initialize cursor to bottom-left if not already set for this workspace.
     fn init_cursor_if_needed(&mut self, ws_id: &str) {
-        if self.selections.get(ws_id).is_none_or(|s| s.is_none()) {
-            if let Some(buf) = self.scrollbacks.get(ws_id) {
+        if self.selections.get(ws_id).is_none_or(|s| s.is_none())
+            && let Some(buf) = self.scrollbacks.get(ws_id) {
                 let total = buf.total_lines();
                 let line = if total > 0 { total - 1 } else { 0 };
                 self.selections.insert(ws_id.to_string(), SelectionState::Cursor { line, char_offset: 0 });
                 self.cursor_desired_col.insert(ws_id.to_string(), 0);
                 self.auto_scroll_suppressed.insert(ws_id.to_string());
             }
-        }
     }
 
     /// Get current cursor position from selection state.
@@ -1197,13 +1194,12 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             .map(|w| w.id.clone())
                             .collect();
                         for ws_id in &ws_ids {
-                            if let Some(s) = app.state.find_session_by_workspace(ws_id) {
-                                if s.status == SessionStatus::Running {
+                            if let Some(s) = app.state.find_session_by_workspace(ws_id)
+                                && s.status == SessionStatus::Running {
                                     let sid = s.id.clone();
                                     let _ = app.session_manager.stop_session(&sid).await;
                                     let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                 }
-                            }
                             app.scrollbacks.remove(ws_id);
                         }
                         let _ = app.state.delete_repo(&id);
@@ -1262,28 +1258,24 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             // Ctrl/Cmd+C: copy selection from the focused pane
             match app.focus {
                 Focus::Composer => {
-                    if app.composer.has_selection() {
-                        if let Some(text) = app.composer.selected_text() {
+                    if app.composer.has_selection()
+                        && let Some(text) = app.composer.selected_text() {
                             let _ = app.clipboard.set_text(&text);
                             app.composer.set_copy_flash(true);
                             app.copy_flash_until = Some((app.focus, Instant::now() + Duration::from_millis(150)));
                         }
-                    }
                 }
                 Focus::Output => {
-                    if let Some(ws) = app.selected_workspace().cloned() {
-                        if let Some(sel) = app.selections.get(&ws.id) {
-                            if let Some((start, end)) = sel.ordered_range() {
-                                if let Some((owned_lines, inner_width)) = app.output_context(&ws.id) {
+                    if let Some(ws) = app.selected_workspace().cloned()
+                        && let Some(sel) = app.selections.get(&ws.id)
+                            && let Some((start, end)) = sel.ordered_range()
+                                && let Some((owned_lines, inner_width)) = app.output_context(&ws.id) {
                                     let refs: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
                                     let wm = WrapMap::build(&refs, inner_width);
                                     let text = wm.extract_text(&refs, start, end);
                                     let _ = app.clipboard.set_text(&text);
                                     app.copy_flash_until = Some((app.focus, Instant::now() + Duration::from_millis(150)));
                                 }
-                            }
-                        }
-                    }
                 }
                 _ => {}
             }
@@ -1292,11 +1284,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         KeyCode::Char('v') if has_cmd_modifier(key.modifiers) => {
             // Ctrl/Cmd+V: paste clipboard text into the composer
             // (output/tree are read-only, so this is a no-op there)
-            if app.focus == Focus::Composer {
-                if let Ok(text) = app.clipboard.get_text() {
+            if app.focus == Focus::Composer
+                && let Ok(text) = app.clipboard.get_text() {
                     app.composer.insert_paste(&text);
                 }
-            }
         }
         KeyCode::Char('q') if has_cmd_modifier(key.modifiers) => {
             // Ctrl+Q: stop session if running, otherwise quit (works in ALL panes)
@@ -1425,8 +1416,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             // Focus-specific keys
             match app.focus {
                 Focus::Composer => {
-                    if let Some(text) = app.composer.handle_key(key) {
-                        if let Some(session_id) = app.active_session_id.clone() {
+                    if let Some(text) = app.composer.handle_key(key)
+                        && let Some(session_id) = app.active_session_id.clone() {
                             let ws_id = app.state.sessions.iter()
                                 .find(|s| s.id == session_id)
                                 .map(|s| s.workspace_id.clone());
@@ -1451,7 +1442,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             app.write_log(&session_id, "user", &text);
                             let _ = app.session_manager.send_message(&session_id, &text).await;
                         }
-                    }
                 }
                 Focus::Output => {
                     // Cursor movement, selection, and navigation
@@ -1690,8 +1680,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                 let has_running = app.state.find_session_by_workspace(&ws.id)
                                     .map(|s| s.status == SessionStatus::Running)
                                     .unwrap_or(false);
-                                if !has_running {
-                                    if let Ok(session) = app.state.create_session(&ws.id) {
+                                if !has_running
+                                    && let Ok(session) = app.state.create_session(&ws.id) {
                                         let session_id = session.id.clone();
                                         let ws_dir = ws.working_dir.clone();
                                         match app.session_manager.start_session(&session_id, &ws_dir, None) {
@@ -1712,7 +1702,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                             }
                                         }
                                     }
-                                }
                             }
                         }
                         KeyCode::Char('x') | KeyCode::Delete => {
@@ -1851,13 +1840,12 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                         .map(|w| w.id.clone())
                                         .collect();
                                     for ws_id in &ws_ids {
-                                        if let Some(s) = app.state.find_session_by_workspace(ws_id) {
-                                            if s.status == SessionStatus::Running {
+                                        if let Some(s) = app.state.find_session_by_workspace(ws_id)
+                                            && s.status == SessionStatus::Running {
                                                 let sid = s.id.clone();
                                                 let _ = app.session_manager.stop_session(&sid).await;
                                                 let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                             }
-                                        }
                                         app.scrollbacks.remove(ws_id);
                                     }
                                     let _ = app.state.delete_repo(&id);
@@ -1984,12 +1972,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         // Select the first resumed workspace in the tree
         let first_ws_id = &resumed_workspace_ids[0];
         for (i, node) in app.tree_items.iter().enumerate() {
-            if let TreeNode::Workspace { ws, .. } = node {
-                if ws.id == *first_ws_id {
+            if let TreeNode::Workspace { ws, .. } = node
+                && ws.id == *first_ws_id {
                     app.selected_index = i;
                     break;
                 }
-            }
         }
         app.update_active_session();
         app.focus = Focus::Tree;
@@ -2087,8 +2074,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                         }
                         buttons::HitAction::StopSession => {
-                            if let Some(ws) = app.selected_workspace().cloned() {
-                                if let Some(session_id) = app.state.find_session_by_workspace(&ws.id)
+                            if let Some(ws) = app.selected_workspace().cloned()
+                                && let Some(session_id) = app.state.find_session_by_workspace(&ws.id)
                                     .filter(|s| s.status == SessionStatus::Running)
                                     .map(|s| s.id.clone())
                                 {
@@ -2100,12 +2087,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.focus = Focus::Tree;
                                     app.composer.set_active(false);
                                 }
-                            }
                         }
                         // Tree-icon buttons (use carried workspace_id, do NOT change focus)
                         buttons::HitAction::StartSessionFor { workspace_id } => {
-                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
-                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned()
+                                && let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
                                     match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
                                         Ok(pid) => {
@@ -2124,7 +2110,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
-                            }
                         }
                         buttons::HitAction::StopSessionFor { workspace_id } => {
                             if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
@@ -2169,8 +2154,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                         }
                         buttons::HitAction::RetrySessionFor { workspace_id } => {
-                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
-                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned()
+                                && let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
                                     match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
                                         Ok(pid) => {
@@ -2189,7 +2174,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
-                            }
                         }
                         buttons::HitAction::FocusComposerFor { workspace_id } => {
                             // Focus the composer for the given workspace's running session
@@ -2200,13 +2184,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 // Navigate selection to this workspace
                                 let old = app.selected_index;
                                 for (i, node) in app.tree_items.iter().enumerate() {
-                                    if let TreeNode::Workspace { ws, .. } = node {
-                                        if ws.id == workspace_id {
+                                    if let TreeNode::Workspace { ws, .. } = node
+                                        && ws.id == workspace_id {
                                             app.swap_composer_draft(old, i);
                                             app.selected_index = i;
                                             break;
                                         }
-                                    }
                                 }
                                 app.update_active_session();
                                 app.focus = Focus::Composer;
@@ -2306,22 +2289,21 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             _ = tick_interval.tick() => {
                 // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
                 app.tick_counter = app.tick_counter.wrapping_add(1);
-                if app.tick_counter % 5 == 0 {
+                if app.tick_counter.is_multiple_of(5) {
                     app.spinner_tick = (app.spinner_tick + 1) % 10;
                 }
                 // Cursor blink toggle every 10th tick (~500ms at 50ms interval)
-                if app.tick_counter % 10 == 0 {
+                if app.tick_counter.is_multiple_of(10) {
                     app.cursor_blink_on = !app.cursor_blink_on;
                 }
                 // Clear copy flash when expired
-                if let Some((pane, until)) = app.copy_flash_until {
-                    if Instant::now() >= until {
+                if let Some((pane, until)) = app.copy_flash_until
+                    && Instant::now() >= until {
                         app.copy_flash_until = None;
                         if pane == Focus::Composer {
                             app.composer.set_copy_flash(false);
                         }
                     }
-                }
 
                 // Poll session events
                 let events = app.session_manager.poll_events();
@@ -2361,14 +2343,13 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 .map(|s| s.workspace_id.clone());
                             if let Some(ws_id) = ws_id {
                                 // Flush any remaining partial line
-                                if let Some(remaining) = app.streaming_text.remove(&ws_id) {
-                                    if !remaining.is_empty() {
+                                if let Some(remaining) = app.streaming_text.remove(&ws_id)
+                                    && !remaining.is_empty() {
                                         let buf = app.scrollbacks
                                             .entry(ws_id)
                                             .or_insert_with(|| ScrollbackBuffer::new(50_000));
                                         buf.push_line(remaining);
                                     }
-                                }
                             }
                         }
                         SessionEvent::Output { session_id, line, source } => {
@@ -2412,11 +2393,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     .find(|s| s.id == session_id)
                                     .map(|s| s.status == SessionStatus::Stopped)
                                     .unwrap_or(false);
-                                if !already_stopped {
-                                    if let Some(s) = app.state.find_session_mut(&session_id) {
+                                if !already_stopped
+                                    && let Some(s) = app.state.find_session_mut(&session_id) {
                                         s.claude_session_id = None;
                                     }
-                                }
                             }
                             let _ = app.state.update_session_status(&session_id, status);
                             // Push exit message to scrollback
@@ -2437,12 +2417,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             app.composer.set_active(false);
                         }
                         SessionEvent::ClaudeSessionId { session_id, claude_session_id } => {
-                            if let Some(s) = app.state.find_session_mut(&session_id) {
-                                if s.claude_session_id.is_none() {
+                            if let Some(s) = app.state.find_session_mut(&session_id)
+                                && s.claude_session_id.is_none() {
                                     s.claude_session_id = Some(claude_session_id);
                                     let _ = app.state.save();
                                 }
-                            }
                         }
                         SessionEvent::Error { session_id, error } => {
                             let ws_id = app.state.sessions.iter()

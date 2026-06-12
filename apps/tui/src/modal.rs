@@ -105,12 +105,11 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                         }
                     }
                     // Apply current completion
-                    if let Some(idx) = *completion_index {
-                        if let Some(path) = completions.get(idx) {
+                    if let Some(idx) = *completion_index
+                        && let Some(path) = completions.get(idx) {
                             *input = path.clone();
                             *cursor = input.len();
                         }
-                    }
                     ModalResult::Consumed
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -291,8 +290,8 @@ fn complete_path(partial: &str) -> Vec<String> {
     let mut results = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_dir() {
+            if let Ok(ft) = entry.file_type()
+                && ft.is_dir() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name.starts_with(&prefix) && !name.starts_with('.') {
                         let full = dir.join(&name);
@@ -301,7 +300,6 @@ fn complete_path(partial: &str) -> Vec<String> {
                         results.push(display);
                     }
                 }
-            }
             if results.len() >= 20 {
                 break;
             }

@@ -364,11 +364,10 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             let mut lines: Vec<String> = app.scrollbacks.get(&ws.id)
                 .map(|buf| buf.all_lines().into_iter().map(|s| s.to_string()).collect())
                 .unwrap_or_default();
-            if let Some(partial) = app.streaming_text.get(&ws.id) {
-                if !partial.is_empty() {
+            if let Some(partial) = app.streaming_text.get(&ws.id)
+                && !partial.is_empty() {
                     lines.push(partial.clone());
                 }
-            }
             lines
         };
         let all_lines: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
@@ -425,8 +424,8 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         }
 
         // New lines indicator when scrolled up
-        if let Some(buf) = app.scrollbacks.get(&ws.id) {
-            if !buf.is_at_bottom() {
+        if let Some(buf) = app.scrollbacks.get(&ws.id)
+            && !buf.is_at_bottom() {
                 let new_count = buf.new_lines_count();
                 if new_count > 0 {
                     let indicator = format!(" \u{2193} {new_count} new lines ");
@@ -442,7 +441,6 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     frame.render_widget(indicator_widget, indicator_area);
                 }
             }
-        }
 
         // Composer area
         let composer_area = right_chunks[1];
@@ -831,8 +829,8 @@ fn style_markdown_line(line: &str, inner_width: usize, in_code_block: &mut bool)
     }
 
     // Numbered lists
-    if let Some(rest) = line.strip_prefix(|c: char| c.is_ascii_digit()) {
-        if let Some(rest) = rest.strip_prefix(". ") {
+    if let Some(rest) = line.strip_prefix(|c: char| c.is_ascii_digit())
+        && let Some(rest) = rest.strip_prefix(". ") {
             let prefix_len = line.len() - rest.len();
             let mut spans = vec![Span::styled(
                 line[..prefix_len].to_string(),
@@ -841,7 +839,6 @@ fn style_markdown_line(line: &str, inner_width: usize, in_code_block: &mut bool)
             spans.extend(parse_inline_markdown(rest, Style::default()));
             return Line::from(spans);
         }
-    }
 
     // Default: parse inline markdown
     let _ = code_style; // suppress warning
@@ -1133,11 +1130,10 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
         let mut lines: Vec<String> = app.scrollbacks.get(&ws.id)
             .map(|buf| buf.all_lines().into_iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
-        if let Some(partial) = app.streaming_text.get(&ws.id) {
-            if !partial.is_empty() {
+        if let Some(partial) = app.streaming_text.get(&ws.id)
+            && !partial.is_empty() {
                 lines.push(partial.clone());
             }
-        }
         lines
     };
     let all_lines: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();

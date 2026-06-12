@@ -141,11 +141,10 @@ fn collect_output_lines(app: &App, ws_id: &str) -> Vec<String> {
     let mut lines: Vec<String> = app.scrollbacks.get(ws_id)
         .map(|buf| buf.all_lines().into_iter().map(|s| s.to_string()).collect())
         .unwrap_or_default();
-    if let Some(partial) = app.streaming_text.get(ws_id) {
-        if !partial.is_empty() {
+    if let Some(partial) = app.streaming_text.get(ws_id)
+        && !partial.is_empty() {
             lines.push(partial.clone());
         }
-    }
     lines
 }
 
