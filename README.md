@@ -92,6 +92,12 @@ cargo run -p kommand0-tui
 cargo test --workspace
 ```
 
+This runs three layers:
+
+- Unit tests in `crates/core` and the TUI modules
+- In-process TUI tests (`key_tests` in `apps/tui/src/main.rs`): drive `handle_key` directly and assert rendering via ratatui's `TestBackend`
+- PTY end-to-end tests (`apps/tui/tests/e2e.rs`): spawn the real binary in a pseudo-terminal, send keystrokes, and assert the vt100-parsed screen. Claude sessions are served by the fake `claude` script in `apps/tui/tests/fixtures/`, and each test gets an isolated state dir via `KOMMAND0_STATE_DIR`
+
 ## Project Structure
 
 - `apps/cli` - Command-line interface (`kommand0-cli`)
