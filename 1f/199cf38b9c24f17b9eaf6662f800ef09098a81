@@ -1,0 +1,50 @@
+apps/tui/src/composer.rs
+  s_fc3d7618d36de0::t_2be15edf5254ef 174
+apps/tui/src/modal.rs
+  s_fc3d7618d36de0::t_2be15edf5254ef 319,410,453,503,510,516
+  s_fc3d7618d36de0::t_2e5d4e4c9d5152 404
+apps/tui/src/scrollback.rs
+  s_fc3d7618d36de0::t_2be15edf5254ef 189,199,210,231,244,254,266,280,292,301,323,333,345
+crates/core/src/id.rs
+  s_fc3d7618d36de0::t_bd575b61d92275 8
+crates/core/src/repo.rs
+  s_fc3d7618d36de0::t_bd575b61d92275 14,17,23
+apps/cli/src/main.rs
+  s_fc3d7618d36de0::t_bd575b61d92275 229,231,241,263,268,310-312,316,326,349,403,405
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_2be15edf5254ef 151,452,485,507,675,757-762,764,1147,1558,1810-1816,1818-1827,2415,2439
+  s_fc3d7618d36de0::t_22e4401057c732 2219
+  s_fc3d7618d36de0::t_ad158a38d55239 2254
+crates/core/src/workspace.rs
+  s_fc3d7618d36de0::t_bd575b61d92275 20
+crates/core/src/lib.rs
+  s_fc3d7618d36de0::t_bd575b61d92275 90,94,98,211,254,332,346,371,388,409,419,432,479
+apps/tui/src/buttons.rs
+  s_fc3d7618d36de0::t_2be15edf5254ef 42
+crates/core/src/worktree.rs
+  s_fc3d7618d36de0::t_bd575b61d92275 37,42,52,70,95,128,166,237,279,283
+apps/tui/src/render.rs
+  s_fc3d7618d36de0::t_e5dd188b1341b1 961,963
+  s_fc3d7618d36de0::t_0ccace0a03c9dd 1067
+  s_fc3d7618d36de0::t_2be15edf5254ef 124,185,196,323,432,479,504,531,605,639,780,784,804,807,810,880,976,1246,1253,1360,1610
+  s_fc3d7618d36de0::t_61588c54a67664 1015
+  s_fc3d7618d36de0::t_5a653f815f5da1 758,762
+apps/tui/src/wrap_map.rs
+  s_fc3d7618d36de0::t_d820476888f992 155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "1f199cf38b9c24f17b9eaf6662f800ef09098a81",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
