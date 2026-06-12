@@ -152,6 +152,7 @@ impl WrapMap {
 
     /// Flush pending whitespace + word onto current row, wrapping if needed.
     /// Handles overlong words (exceeding pane_width) with character-level breaks.
+    #[allow(clippy::too_many_arguments)]
     fn flush_word(
         line_idx: usize,
         pane_width: usize,
