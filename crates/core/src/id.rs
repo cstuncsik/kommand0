@@ -5,5 +5,5 @@ pub fn generate_id() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("time went backwards")
         .as_millis();
-    format!("{:x}", millis)
+    format!("{millis:x}")
 }

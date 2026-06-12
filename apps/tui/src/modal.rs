@@ -316,11 +316,7 @@ fn dirs_home(partial: &str) -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
     if partial == "~" {
         Some(std::path::PathBuf::from(&home))
-    } else if let Some(rest) = partial.strip_prefix("~/") {
-        Some(std::path::PathBuf::from(home).join(rest))
-    } else {
-        None
-    }
+    } else { partial.strip_prefix("~/").map(|rest| std::path::PathBuf::from(home).join(rest)) }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -405,13 +401,13 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
                     .enumerate()
                     .take(inner[3].height as usize)
                     .map(|(i, path)| {
-                        let selected = completion_index.map_or(false, |idx| idx == i);
+                        let selected = *completion_index == Some(i);
                         let style = if selected {
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::DarkGray)
                         };
-                        Line::styled(format!("  {}", path), style)
+                        Line::styled(format!("  {path}"), style)
                     })
                     .collect();
                 frame.render_widget(Paragraph::new(comp_lines), inner[3]);
@@ -454,7 +450,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
                 area.height.saturating_sub(2),
             ));
 
-            let title = format!(" Add Workspace to {} ", repo_name);
+            let title = format!(" Add Workspace to {repo_name} ");
             let block = Block::default()
                 .title(title)
                 .borders(Borders::ALL)
@@ -504,21 +500,20 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             let (title, message) = match target {
                 DeleteTarget::Workspace { name } => (
                     " Delete Workspace ".to_string(),
-                    format!("Delete workspace '{}'?", name),
+                    format!("Delete workspace '{name}'?"),
                 ),
                 DeleteTarget::Repo { name, workspace_count, .. } => {
                     if *workspace_count > 0 {
                         (
                             " Delete Repository ".to_string(),
                             format!(
-                                "Delete repo '{}' and its {} workspace(s)?",
-                                name, workspace_count
+                                "Delete repo '{name}' and its {workspace_count} workspace(s)?"
                             ),
                         )
                     } else {
                         (
                             " Delete Repository ".to_string(),
-                            format!("Delete repo '{}'?", name),
+                            format!("Delete repo '{name}'?"),
                         )
                     }
                 }

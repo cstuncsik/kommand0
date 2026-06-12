@@ -226,9 +226,9 @@ fn main() -> anyhow::Result<()> {
                 let status = if ws.active { "active" } else { "archived" };
                 println!("Name:    {}", ws.name);
                 println!("ID:      {}", ws.id);
-                println!("Repo:    {} ({})", repo_name, repo_path);
+                println!("Repo:    {repo_name} ({repo_path})");
                 println!("Dir:     {}", ws.working_dir);
-                println!("Status:  {}", status);
+                println!("Status:  {status}");
                 println!("Created: {}", format_timestamp(ws.created_at));
             }
             WorkspaceAction::Delete { name, force } => {
@@ -238,7 +238,7 @@ fn main() -> anyhow::Result<()> {
                         eprintln!("error: refusing to delete without --force in non-interactive mode");
                         std::process::exit(1);
                     }
-                    print!("Delete workspace '{}'? [y/N] ", name);
+                    print!("Delete workspace '{name}'? [y/N] ");
                     std::io::stdout().flush()?;
                     let mut input = String::new();
                     stdin.read_line(&mut input)?;
@@ -260,12 +260,12 @@ fn main() -> anyhow::Result<()> {
             WorkspaceAction::Archive { name } => {
                 let mut state = AppState::load()?;
                 state.archive_workspace(&name)?;
-                println!("Archived workspace: {}", name);
+                println!("Archived workspace: {name}");
             }
             WorkspaceAction::Activate { name } => {
                 let mut state = AppState::load()?;
                 state.activate_workspace(&name)?;
-                println!("Activated workspace: {}", name);
+                println!("Activated workspace: {name}");
             }
         },
         Commands::Session { action } => match action {
@@ -307,13 +307,13 @@ fn main() -> anyhow::Result<()> {
                             s.pid = Some(pid);
                         }
                         state.save()?;
-                        println!("Started session for workspace: {}", workspace);
-                        println!("Session ID: {}", session_id);
-                        println!("PID: {}", pid);
+                        println!("Started session for workspace: {workspace}");
+                        println!("Session ID: {session_id}");
+                        println!("PID: {pid}");
                     }
                     Err(e) => {
                         let _ = state.update_session_status(&session_id, SessionStatus::Failed);
-                        anyhow::bail!("Failed to start claude process: {}", e);
+                        anyhow::bail!("Failed to start claude process: {e}");
                     }
                 }
             }
@@ -323,7 +323,7 @@ fn main() -> anyhow::Result<()> {
 
                 let session = state.find_session_by_workspace(&ws.id)
                     .filter(|s| s.status == SessionStatus::Running)
-                    .ok_or_else(|| anyhow::anyhow!("No running session for workspace: {}", workspace))?;
+                    .ok_or_else(|| anyhow::anyhow!("No running session for workspace: {workspace}"))?;
 
                 let session_id = session.id.clone();
                 let pid = session.pid;
@@ -346,7 +346,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 state.update_session_status(&session_id, SessionStatus::Stopped)?;
-                println!("Stopped session for workspace: {}", workspace);
+                println!("Stopped session for workspace: {workspace}");
             }
             SessionAction::List => {
                 let state = AppState::load()?;
@@ -400,9 +400,9 @@ fn main() -> anyhow::Result<()> {
 
                 if cleared > 0 {
                     state.save()?;
-                    println!("Cleared {} session(s) for workspace: {}", cleared, workspace);
+                    println!("Cleared {cleared} session(s) for workspace: {workspace}");
                 } else {
-                    println!("No session found for workspace: {}", workspace);
+                    println!("No session found for workspace: {workspace}");
                 }
             }
         },
