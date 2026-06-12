@@ -121,7 +121,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         // Build repo line icons: ✕ (delete) + (add workspace)
                         let icons = repo_line_icons(id, name, pane_inner_width);
 
-                        let prefix = format!("{}{}", indicator, name);
+                        let prefix = format!("{indicator}{name}");
                         let prefix_width = UnicodeWidthStr::width(prefix.as_str());
                         let fill_width = pane_inner_width.saturating_sub(prefix_width + icons.total_width as usize);
 
@@ -182,7 +182,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         let mut spans = vec![
                             Span::styled(prefix, style),
                             Span::styled(dot, Style::default().fg(dot_color)),
-                            Span::styled(format!(" {}", display_name), style),
+                            Span::styled(format!(" {display_name}"), style),
                             Span::raw(" ".repeat(fill_width)),
                         ];
                         spans.extend(icons.spans.clone());
@@ -193,7 +193,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         ListItem::new(Line::from(spans))
                     }
                     TreeNode::Hint { text } => {
-                        let display = format!("     {}", text);
+                        let display = format!("     {text}");
                         let style = Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC);
@@ -320,7 +320,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 .find_session_by_workspace(&ws.id)
                 .filter(|s| {
                     s.status == SessionStatus::Running
-                        || app.scrollbacks.get(&ws.id).map_or(false, |b| !b.is_empty())
+                        || app.scrollbacks.get(&ws.id).is_some_and(|b| !b.is_empty())
                 })
                 .map(|s| (ws.clone(), s.id.clone(), s.status.clone()))
         }
@@ -429,7 +429,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             if !buf.is_at_bottom() {
                 let new_count = buf.new_lines_count();
                 if new_count > 0 {
-                    let indicator = format!(" \u{2193} {} new lines ", new_count);
+                    let indicator = format!(" \u{2193} {new_count} new lines ");
                     let indicator_width = indicator.len() as u16;
                     let indicator_area = Rect::new(
                         output_area.x + output_area.width.saturating_sub(indicator_width + 2),
@@ -476,7 +476,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             } else {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             };
-            let hint = Paragraph::new(Line::styled(format!("[{}]", btn_label), btn_style))
+            let hint = Paragraph::new(Line::styled(format!("[{btn_label}]"), btn_style))
                 .block(Block::default().title(" Composer ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
             frame.render_widget(hint, composer_area);
             app.hit_regions.push(buttons::HitRegion {
@@ -501,7 +501,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     .filter(|w| w.repo_id == *id && w.active)
                     .count();
 
-                let title = format!(" Repo: {} ", name);
+                let title = format!(" Repo: {name} ");
                 let lines = vec![
                     Line::from(vec![
                         Span::styled(
@@ -528,7 +528,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::raw(format!("{} active, {} total", active, total)),
+                        Span::raw(format!("{active} active, {total} total")),
                     ]),
                 ];
                 (title, lines)
@@ -602,7 +602,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     } else {
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                     };
-                    lines.push(Line::styled(format!("[{}]", btn_label), style));
+                    lines.push(Line::styled(format!("[{btn_label}]"), style));
                     app.hit_regions.push(buttons::HitRegion {
                         area: btn_rect,
                         action: buttons::HitAction::StartSession,
@@ -636,7 +636,7 @@ fn wrapped_line_height(display_width: usize, width: usize) -> usize {
     if width == 0 || display_width == 0 {
         return 1;
     }
-    (display_width + width - 1) / width
+    display_width.div_ceil(width)
 }
 
 /// Parse inline markdown into styled spans.
@@ -755,11 +755,11 @@ fn style_markdown_line(line: &str, inner_width: usize, in_code_block: &mut bool)
     let code_block_style = Style::default().fg(Color::Green);
 
     // Fenced code block toggle
-    if line.starts_with("```") {
+    if let Some(fence_rest) = line.strip_prefix("```") {
         *in_code_block = !*in_code_block;
         if *in_code_block {
             // Opening fence — show language hint if present
-            let lang = line[3..].trim();
+            let lang = fence_rest.trim();
             if lang.is_empty() {
                 return Line::styled("───", Style::default().fg(Color::DarkGray));
             } else {
@@ -777,12 +777,11 @@ fn style_markdown_line(line: &str, inner_width: usize, in_code_block: &mut bool)
 
     // Inside code block — render as code
     if *in_code_block {
-        return Line::styled(format!("  {}", line), code_block_style);
+        return Line::styled(format!("  {line}"), code_block_style);
     }
 
     // User message (chat bubble)
-    if line.starts_with("> ") {
-        let content = &line[2..];
+    if let Some(content) = line.strip_prefix("> ") {
         let content_len = content.len();
         let avail = inner_width.saturating_sub(1);
         if content_len <= avail {
@@ -802,16 +801,13 @@ fn style_markdown_line(line: &str, inner_width: usize, in_code_block: &mut bool)
     }
 
     // Headers
-    if line.starts_with("### ") {
-        let text = &line[4..];
+    if let Some(text) = line.strip_prefix("### ") {
         return Line::from(parse_inline_markdown(text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     }
-    if line.starts_with("## ") {
-        let text = &line[3..];
+    if let Some(text) = line.strip_prefix("## ") {
         return Line::from(parse_inline_markdown(text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     }
-    if line.starts_with("# ") {
-        let text = &line[2..];
+    if let Some(text) = line.strip_prefix("# ") {
         return Line::from(parse_inline_markdown(text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     }
 
@@ -881,7 +877,7 @@ fn build_output_lines(
     if let Some(tick) = spinner {
         let frame_char = SPINNER_FRAMES[tick as usize % SPINNER_FRAMES.len()];
         lines.push(Line::styled(
-            format!(" {} Thinking...", frame_char),
+            format!(" {frame_char} Thinking..."),
             Style::default().fg(Color::Cyan),
         ));
     }
@@ -962,8 +958,9 @@ pub(crate) fn overlay_style_on_line(
 /// Operates on pre-wrap styled Lines using logical line indices and character offsets.
 /// The styled Lines from build_output_lines correspond 1:1 with the logical raw_lines.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_selection_highlight(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut [Line<'static>],
     selection: &SelectionState,
     _scroll_from_top: usize,
     _inner_height: usize,
@@ -976,7 +973,7 @@ pub(crate) fn apply_selection_highlight(
         return;
     };
 
-    let sel_style = if copy_flash_until.map_or(false, |until| Instant::now() < until) {
+    let sel_style = if copy_flash_until.is_some_and(|until| Instant::now() < until) {
         Style::default().bg(Color::White).fg(Color::Black)
     } else if focused {
         Style::default().bg(Color::Cyan).fg(Color::Black)
@@ -1015,7 +1012,7 @@ pub(crate) fn apply_selection_highlight(
 /// - unfocused: dim modifier on cursor character
 /// - cursor past end of line: append a styled space
 pub(crate) fn apply_cursor_highlight(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut [Line<'static>],
     cursor_line: usize,
     cursor_char: usize,
     blink_on: bool,
@@ -1067,6 +1064,7 @@ pub(crate) fn compute_scroll_from_top(scroll_offset: usize, total_visual: usize,
     max_scroll.saturating_sub(clamped)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_output_content(
     frame: &mut ratatui::Frame,
     output_area: Rect,
@@ -1245,14 +1243,14 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
 
     let scroll_info = if app.scrollbacks.contains_key(&ws.id) {
         let current_line = total_visual.saturating_sub(scroll_offset);
-        format!("line {}/{}", current_line, total_visual)
+        format!("line {current_line}/{total_visual}")
     } else {
         String::new()
     };
 
     let status_line = Line::from(vec![
         Span::styled(format!(" {} ", ws.name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {} ", bar_icon), Style::default().fg(bar_color)),
+        Span::styled(format!(" {bar_icon} "), Style::default().fg(bar_color)),
         Span::raw(" "),
         Span::styled(scroll_info, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
@@ -1359,7 +1357,7 @@ pub(crate) fn workspace_icon_cluster(
             if is_thinking {
                 // Spinner for thinking state + delete
                 let frame = SPINNER_FRAMES[spinner_tick as usize % SPINNER_FRAMES.len()];
-                let text = format!(" {}", frame);
+                let text = format!(" {frame}");
                 let hover_text = " \u{25A0}".to_string(); // " ■" on hover
                 let mut spans = vec![
                     Span::styled(text.clone(), icon_style),
@@ -1609,7 +1607,7 @@ mod tests {
         // Should contain a braille spinner character
         let text = &cluster.spans[0].content;
         assert!(SPINNER_FRAMES.iter().any(|f| text.contains(f)),
-            "Spinner span should contain a braille frame, got: {:?}", text);
+            "Spinner span should contain a braille frame, got: {text:?}");
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }

@@ -186,7 +186,7 @@ mod tests {
     fn scroll_up_increases_offset() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..20 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         buf.scroll_up(5);
         assert!(!buf.is_at_bottom());
@@ -196,7 +196,7 @@ mod tests {
     fn scroll_down_decreases_offset_to_bottom() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..20 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         buf.scroll_up(5);
         buf.scroll_down(5);
@@ -207,7 +207,7 @@ mod tests {
     fn push_line_while_scrolled_increments_new_lines() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..10 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         buf.scroll_up(3);
         assert_eq!(buf.new_lines_count(), 0);
@@ -228,7 +228,7 @@ mod tests {
     fn reset_scroll_clears_offset_and_new_lines() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..10 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         buf.scroll_up(3);
         buf.push_line("extra".to_string());
@@ -241,7 +241,7 @@ mod tests {
     fn visible_lines_returns_correct_slice() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..10 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         let visible = buf.visible_lines(3);
         assert_eq!(visible, vec!["line 7", "line 8", "line 9"]);
@@ -251,7 +251,7 @@ mod tests {
     fn visible_lines_with_scroll_offset() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..10 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         buf.scroll_up(5);
         let visible = buf.visible_lines(3);
@@ -263,7 +263,7 @@ mod tests {
     fn scroll_offset_clamped_to_keep_viewport_full() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..10 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         // Scroll way past the top
         buf.scroll_up(100);
@@ -277,7 +277,7 @@ mod tests {
     fn scroll_to_top_shows_first_lines() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..20 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         buf.scroll_to_top();
         let visible = buf.visible_lines(5);
@@ -289,7 +289,7 @@ mod tests {
         let mut buf = ScrollbackBuffer::new(100);
         assert_eq!(buf.total_lines(), 0);
         for i in 0..7 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         assert_eq!(buf.total_lines(), 7);
     }
@@ -298,7 +298,7 @@ mod tests {
     fn clamped_offset_returns_min_of_offset_and_max() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..10 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         // No scroll -- offset is 0
         assert_eq!(buf.clamped_offset(5), 0);
@@ -320,7 +320,7 @@ mod tests {
     fn set_scroll_offset_sets_value() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..20 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         buf.set_scroll_offset(7);
         assert_eq!(buf.scroll_offset(), 7);
@@ -330,7 +330,7 @@ mod tests {
     fn set_scroll_offset_zero_is_at_bottom() {
         let mut buf = ScrollbackBuffer::new(100);
         for i in 0..20 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         buf.scroll_up(5);
         assert!(!buf.is_at_bottom());
@@ -342,7 +342,7 @@ mod tests {
     fn capacity_50000_works() {
         let mut buf = ScrollbackBuffer::new(50_000);
         for i in 0..50_000 {
-            buf.push_line(format!("line {}", i));
+            buf.push_line(format!("line {i}"));
         }
         assert_eq!(buf.len(), 50_000);
         // Adding one more should drop oldest
