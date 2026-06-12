@@ -90,7 +90,7 @@ fn focus_to_section(focus: Focus) -> &'static str {
     }
 }
 
-pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus) {
+pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus, scroll: &mut u16) {
     let area = centered_rect(60, 70, frame.area());
 
     // Clear the area behind the overlay
@@ -144,9 +144,14 @@ pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus) {
 
     // Dismiss hint at bottom
     lines.push(Line::styled(
-        "  Press ? or Esc to close",
+        "  Press ? or Esc to close, j/k to scroll",
         Style::default().fg(Color::DarkGray),
     ));
+
+    // Clamp scroll so the last line stays at the bottom edge
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_height) as u16;
+    *scroll = (*scroll).min(max_scroll);
 
     let block = Block::default()
         .title(" Help ")
@@ -155,7 +160,8 @@ pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus) {
 
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((*scroll, 0));
 
     frame.render_widget(paragraph, area);
 }

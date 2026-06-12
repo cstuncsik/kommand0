@@ -87,6 +87,7 @@ pub(crate) struct App {
     // UX state
     pub(crate) last_output_height: u16,
     pub(crate) show_help: bool,
+    pub(crate) help_scroll: u16,
     pub(crate) zoomed: bool,
     /// True when a `g` was pressed and we're waiting for a second `g` (vim `gg`).
     pub(crate) pending_g: bool,
@@ -179,6 +180,7 @@ impl App {
             focus: Focus::Tree,
             last_output_height: 0,
             show_help: false,
+            help_scroll: 0,
             zoomed: false,
             pending_g: false,
             waiting_response: HashSet::new(),
@@ -1227,17 +1229,35 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             event = reader.next().fuse() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        // Debug: log ALL key events
-                        {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/dalat_debug.log") {
-                                let _ = writeln!(f, "KEY: code={:?} mods={:?} focus={:?}", key.code, key.modifiers, app.focus);
-                            }
-                        }
-                        // Help modal: swallow all keys except ?/Esc
+                        // Help modal: scrollable, dismissed with ?/Esc, swallows other keys
                         if app.show_help {
+                            let g_was_pending = std::mem::take(&mut app.pending_g);
                             match key.code {
                                 KeyCode::Char('?') | KeyCode::Esc => app.show_help = false,
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    app.help_scroll = app.help_scroll.saturating_add(1);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.help_scroll = app.help_scroll.saturating_sub(1);
+                                }
+                                KeyCode::PageDown => {
+                                    app.help_scroll = app.help_scroll.saturating_add(10);
+                                }
+                                KeyCode::PageUp => {
+                                    app.help_scroll = app.help_scroll.saturating_sub(10);
+                                }
+                                KeyCode::Char('g') => {
+                                    if g_was_pending {
+                                        app.help_scroll = 0;
+                                    } else {
+                                        app.pending_g = true;
+                                    }
+                                }
+                                KeyCode::Char('G') | KeyCode::End => {
+                                    // Clamped to actual content height at render time
+                                    app.help_scroll = u16::MAX;
+                                }
+                                KeyCode::Home => app.help_scroll = 0,
                                 _ => {} // swallow all other keys
                             }
                             continue;
@@ -1517,6 +1537,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                             KeyCode::Char('?') if app.focus != Focus::Composer => {
                                 app.show_help = !app.show_help;
+                                app.help_scroll = 0;
                             }
                             _ => {
                                 // Focus-specific keys
