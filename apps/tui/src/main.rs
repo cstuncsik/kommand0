@@ -87,7 +87,10 @@ pub(crate) struct App {
     // UX state
     pub(crate) last_output_height: u16,
     pub(crate) show_help: bool,
+    pub(crate) help_scroll: u16,
     pub(crate) zoomed: bool,
+    /// True when a `g` was pressed and we're waiting for a second `g` (vim `gg`).
+    pub(crate) pending_g: bool,
     pub(crate) waiting_response: HashSet<String>,
     pub(crate) spinner_tick: u8,
     pub(crate) pane_areas: mouse::PaneAreas,
@@ -177,7 +180,9 @@ impl App {
             focus: Focus::Tree,
             last_output_height: 0,
             show_help: false,
+            help_scroll: 0,
             zoomed: false,
+            pending_g: false,
             waiting_response: HashSet::new(),
             spinner_tick: 0,
             pane_areas: mouse::PaneAreas::default(),
@@ -310,6 +315,60 @@ impl App {
             if !self.tree_items.is_empty() {
                 self.selected_index = self.selected_index.min(self.tree_items.len() - 1);
             }
+        }
+    }
+
+    /// Vim `h`: collapse the selected repo, or jump from a workspace to its parent repo.
+    pub(crate) fn tree_collapse_or_parent(&mut self) {
+        match self.tree_items.get(self.selected_index) {
+            Some(TreeNode::Repo { id, .. }) => {
+                if self.expanded.contains(id) {
+                    self.toggle_expand();
+                }
+            }
+            Some(TreeNode::Workspace { ws, .. }) => {
+                let repo_id = ws.repo_id.clone();
+                let old = self.selected_index;
+                if let Some(i) = self.tree_items.iter().position(|n| {
+                    matches!(n, TreeNode::Repo { id, .. } if *id == repo_id)
+                }) {
+                    self.swap_composer_draft(old, i);
+                    self.selected_index = i;
+                    self.update_active_session();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Vim `l`: expand the selected repo, or step into its first child when already expanded.
+    pub(crate) fn tree_expand_or_enter(&mut self) {
+        if let Some(TreeNode::Repo { id, .. }) = self.tree_items.get(self.selected_index) {
+            if self.expanded.contains(id) {
+                self.move_down();
+            } else {
+                self.toggle_expand();
+            }
+        }
+    }
+
+    /// Vim `gg`: select the first non-hint tree item.
+    pub(crate) fn tree_select_first(&mut self) {
+        let old = self.selected_index;
+        if let Some(i) = (0..self.tree_items.len()).find(|&i| !self.is_hint(i)) {
+            self.swap_composer_draft(old, i);
+            self.selected_index = i;
+            self.update_active_session();
+        }
+    }
+
+    /// Vim `G`: select the last non-hint tree item.
+    pub(crate) fn tree_select_last(&mut self) {
+        let old = self.selected_index;
+        if let Some(i) = (0..self.tree_items.len()).rev().find(|&i| !self.is_hint(i)) {
+            self.swap_composer_draft(old, i);
+            self.selected_index = i;
+            self.update_active_session();
         }
     }
 
@@ -884,14 +943,27 @@ impl App {
         }
     }
 
-    /// Page up: move cursor and viewport up by page size.
-    fn move_cursor_page_up(&mut self, ws_id: &str) {
-        let page_size = if self.last_output_height > 2 {
+    fn output_page_size(&self) -> usize {
+        if self.last_output_height > 2 {
             (self.last_output_height - 2) as usize
         } else {
             20
-        };
+        }
+    }
 
+    /// Page up: move cursor and viewport up by page size.
+    fn move_cursor_page_up(&mut self, ws_id: &str) {
+        let rows = self.output_page_size();
+        self.move_cursor_rows_up(ws_id, rows);
+    }
+
+    /// Vim Ctrl+U: move cursor and viewport up by half a page.
+    fn move_cursor_half_page_up(&mut self, ws_id: &str) {
+        let rows = (self.output_page_size() / 2).max(1);
+        self.move_cursor_rows_up(ws_id, rows);
+    }
+
+    fn move_cursor_rows_up(&mut self, ws_id: &str, page_size: usize) {
         let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
             Some(pos) => pos,
             None => return,
@@ -922,12 +994,17 @@ impl App {
 
     /// Page down: move cursor and viewport down by page size.
     fn move_cursor_page_down(&mut self, ws_id: &str) {
-        let page_size = if self.last_output_height > 2 {
-            (self.last_output_height - 2) as usize
-        } else {
-            20
-        };
+        let rows = self.output_page_size();
+        self.move_cursor_rows_down(ws_id, rows);
+    }
 
+    /// Vim Ctrl+D: move cursor and viewport down by half a page.
+    fn move_cursor_half_page_down(&mut self, ws_id: &str) {
+        let rows = (self.output_page_size() / 2).max(1);
+        self.move_cursor_rows_down(ws_id, rows);
+    }
+
+    fn move_cursor_rows_down(&mut self, ws_id: &str, page_size: usize) {
         let (cursor_line, cursor_char) = match self.cursor_pos(ws_id) {
             Some(pos) => pos,
             None => return,
@@ -973,18 +1050,6 @@ impl App {
                 cursor_char: last_char,
             });
         }
-    }
-
-    /// Scroll and clear selection (for j/k scroll shortcuts).
-    fn scroll_and_clear_selection(&mut self, ws_id: &str, up: bool) {
-        if let Some(buf) = self.scrollbacks.get_mut(ws_id) {
-            if up {
-                buf.scroll_up(1);
-            } else {
-                buf.scroll_down(1);
-            }
-        }
-        self.clear_selection_for_workspace(ws_id);
     }
 
     /// Clear selection for a workspace.
@@ -1164,17 +1229,35 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             event = reader.next().fuse() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        // Debug: log ALL key events
-                        {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/dalat_debug.log") {
-                                let _ = writeln!(f, "KEY: code={:?} mods={:?} focus={:?}", key.code, key.modifiers, app.focus);
-                            }
-                        }
-                        // Help modal: swallow all keys except ?/Esc
+                        // Help modal: scrollable, dismissed with ?/Esc, swallows other keys
                         if app.show_help {
+                            let g_was_pending = std::mem::take(&mut app.pending_g);
                             match key.code {
                                 KeyCode::Char('?') | KeyCode::Esc => app.show_help = false,
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    app.help_scroll = app.help_scroll.saturating_add(1);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.help_scroll = app.help_scroll.saturating_sub(1);
+                                }
+                                KeyCode::PageDown => {
+                                    app.help_scroll = app.help_scroll.saturating_add(10);
+                                }
+                                KeyCode::PageUp => {
+                                    app.help_scroll = app.help_scroll.saturating_sub(10);
+                                }
+                                KeyCode::Char('g') => {
+                                    if g_was_pending {
+                                        app.help_scroll = 0;
+                                    } else {
+                                        app.pending_g = true;
+                                    }
+                                }
+                                KeyCode::Char('G') | KeyCode::End => {
+                                    // Clamped to actual content height at render time
+                                    app.help_scroll = u16::MAX;
+                                }
+                                KeyCode::Home => app.help_scroll = 0,
                                 _ => {} // swallow all other keys
                             }
                             continue;
@@ -1276,6 +1359,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                             continue;
                         }
+
+                        // Vim `gg`: consume the pending flag; only a bare `g` below re-arms it
+                        let g_was_pending = std::mem::take(&mut app.pending_g);
 
                         // Global keys (work in any focus)
                         match key.code {
@@ -1451,6 +1537,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                             KeyCode::Char('?') if app.focus != Focus::Composer => {
                                 app.show_help = !app.show_help;
+                                app.help_scroll = 0;
                             }
                             _ => {
                                 // Focus-specific keys
@@ -1493,22 +1580,22 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
 
                                             match (key.code, ctrl, shift) {
                                                 // --- Cursor movement (no modifiers) ---
-                                                (KeyCode::Up, false, false) => {
+                                                (KeyCode::Up, false, false) | (KeyCode::Char('k'), false, false) => {
                                                     app.init_cursor_if_needed(&ws_id);
                                                     app.collapse_selection_to_cursor(&ws_id);
                                                     app.move_cursor_vertical(&ws_id, -1);
                                                 }
-                                                (KeyCode::Down, false, false) => {
+                                                (KeyCode::Down, false, false) | (KeyCode::Char('j'), false, false) => {
                                                     app.init_cursor_if_needed(&ws_id);
                                                     app.collapse_selection_to_cursor(&ws_id);
                                                     app.move_cursor_vertical(&ws_id, 1);
                                                 }
-                                                (KeyCode::Left, false, false) => {
+                                                (KeyCode::Left, false, false) | (KeyCode::Char('h'), false, false) => {
                                                     app.init_cursor_if_needed(&ws_id);
                                                     app.collapse_selection_to_cursor(&ws_id);
                                                     app.move_cursor_horizontal(&ws_id, -1);
                                                 }
-                                                (KeyCode::Right, false, false) => {
+                                                (KeyCode::Right, false, false) | (KeyCode::Char('l'), false, false) => {
                                                     app.init_cursor_if_needed(&ws_id);
                                                     app.collapse_selection_to_cursor(&ws_id);
                                                     app.move_cursor_horizontal(&ws_id, 1);
@@ -1532,7 +1619,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                     app.extend_selection_vertical(&ws_id, -1);
                                                 }
                                                 (KeyCode::Down, false, true) => {
-                                                    let _ = std::fs::write("/tmp/dalat_debug.log", format!("SHIFT+DOWN hit! ws_id={} sel={:?}\n", ws_id, app.selections.get(&ws_id)));
                                                     app.init_cursor_if_needed(&ws_id);
                                                     app.extend_selection_vertical(&ws_id, 1);
                                                 }
@@ -1588,18 +1674,24 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                     app.select_all(&ws_id);
                                                 }
 
-                                                // --- Scroll-only shortcuts (j/k remain for scrolling) ---
-                                                (KeyCode::Char('k'), false, false) => {
-                                                    app.scroll_and_clear_selection(&ws_id, true);
+                                                // --- Half-page scroll (vim Ctrl+D / Ctrl+U) ---
+                                                (KeyCode::Char('u'), true, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.move_cursor_half_page_up(&ws_id);
                                                 }
-                                                (KeyCode::Char('j'), false, false) => {
-                                                    app.scroll_and_clear_selection(&ws_id, false);
+                                                (KeyCode::Char('d'), true, false) => {
+                                                    app.init_cursor_if_needed(&ws_id);
+                                                    app.move_cursor_half_page_down(&ws_id);
                                                 }
 
-                                                // --- Legacy shortcuts remapped ---
+                                                // --- Document jumps (vim gg / G) ---
                                                 (KeyCode::Char('g'), false, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.move_cursor_to_document_start(&ws_id);
+                                                    if g_was_pending {
+                                                        app.init_cursor_if_needed(&ws_id);
+                                                        app.move_cursor_to_document_start(&ws_id);
+                                                    } else {
+                                                        app.pending_g = true;
+                                                    }
                                                 }
                                                 (KeyCode::Char('G'), false, false) => {
                                                     app.init_cursor_if_needed(&ws_id);
@@ -1622,13 +1714,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                     }
                                                 }
 
-                                                _ => {
-                                                    // Debug: log unmatched keys in Output focus
-                                                    use std::io::Write;
-                                                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/dalat_debug.log") {
-                                                        let _ = writeln!(f, "UNMATCHED key in Output: code={:?} ctrl={} shift={} mods={:?}", key.code, ctrl, shift, key.modifiers);
-                                                    }
-                                                }
+                                                _ => {}
                                             }
                                         }
                                     }
@@ -1636,6 +1722,16 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         match key.code {
                                             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                                             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                                            KeyCode::Left | KeyCode::Char('h') => app.tree_collapse_or_parent(),
+                                            KeyCode::Right | KeyCode::Char('l') => app.tree_expand_or_enter(),
+                                            KeyCode::Char('g') => {
+                                                if g_was_pending {
+                                                    app.tree_select_first();
+                                                } else {
+                                                    app.pending_g = true;
+                                                }
+                                            }
+                                            KeyCode::Char('G') => app.tree_select_last(),
                                             KeyCode::Enter => {
                                                 match app.tree_items.get(app.selected_index).cloned() {
                                                     Some(TreeNode::Repo { .. }) => app.toggle_expand(),

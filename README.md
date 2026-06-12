@@ -61,6 +61,8 @@ cargo run -p kommand0-tui
 | Key | Context | Action |
 |-----|---------|--------|
 | `j` / `k` / `Up` / `Down` | Tree | Navigate workspaces |
+| `h` / `l` / `Left` / `Right` | Tree | Collapse repo (or jump to parent) / expand repo |
+| `gg` / `G` | Tree | Jump to first / last item |
 | `Enter` | Tree | Select / start / resume workspace session |
 | `r` | Tree | Start Claude session in selected workspace |
 | `R` | Tree | Restart / resume session |
@@ -71,8 +73,9 @@ cargo run -p kommand0-tui
 | `Shift+Tab` | Any | Reverse cycle focus |
 | `Esc` | Any | Return focus to Tree / exit zoom |
 | `z` | Output | Toggle zoom mode |
-| `j` / `k` | Output | Scroll output 1 line |
-| `g` / `G` | Output | Jump to top / bottom |
+| `h` / `j` / `k` / `l` / arrows | Output | Move cursor |
+| `gg` / `G` | Output | Jump to top / bottom |
+| `Ctrl+D` / `Ctrl+U` | Output | Half page down / up |
 | `PageUp` / `PageDown` | Output | Scroll output by page |
 | `i` | Output | Switch focus to Composer |
 | `Enter` | Composer | Send message |
