@@ -100,4 +100,10 @@ cargo test --workspace
 
 ## State
 
-State is stored in `.kommand0-dev/state.json` relative to the current directory. Session logs are written as JSON lines files in `.kommand0-dev/logs/`.
+The state directory is resolved in this order:
+
+1. `KOMMAND0_STATE_DIR` environment variable, if set
+2. Debug builds: `.kommand0-dev/` relative to the current directory
+3. Release builds: the platform data directory (`~/Library/Application Support/kommand0` on macOS)
+
+`state.json` (repos, workspaces, sessions) lives at the root of that directory; session logs are written as JSON lines files in its `sessions/` subdirectory.
