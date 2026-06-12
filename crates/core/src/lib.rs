@@ -29,8 +29,24 @@ impl AppState {
     const STATE_DIR: &str = ".kommand0-dev";
     const STATE_FILE: &str = "state.json";
 
-    fn state_dir() -> PathBuf {
-        PathBuf::from(Self::STATE_DIR)
+    /// Resolve the state directory.
+    ///
+    /// Priority: `KOMMAND0_STATE_DIR` env var, then `.kommand0-dev/` relative
+    /// to the current directory in debug builds, then the platform data dir
+    /// (`~/Library/Application Support/kommand0` on macOS) in release builds.
+    pub fn state_dir() -> PathBuf {
+        if let Some(dir) = std::env::var_os("KOMMAND0_STATE_DIR") {
+            if !dir.is_empty() {
+                return PathBuf::from(dir);
+            }
+        }
+        if cfg!(debug_assertions) {
+            PathBuf::from(Self::STATE_DIR)
+        } else {
+            dirs::data_dir()
+                .map(|d| d.join("kommand0"))
+                .unwrap_or_else(|| PathBuf::from(Self::STATE_DIR))
+        }
     }
 
     /// Load state from the given base directory. Returns default if no state file exists.
@@ -413,7 +429,11 @@ impl AppState {
             .as_secs();
 
         let session = Session {
-            log_file: format!(".kommand0-dev/sessions/{}.log", id),
+            log_file: base
+                .join("sessions")
+                .join(format!("{}.log", id))
+                .to_string_lossy()
+                .into_owned(),
             id,
             workspace_id: workspace_id.to_string(),
             claude_session_id: None,

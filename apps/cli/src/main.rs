@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
                     state.create_workspace_with_options(
                         name.as_deref(),
                         &repo,
-                        std::path::Path::new(".kommand0-dev"),
+                        AppState::state_dir().as_path(),
                         false,
                     )?
                 } else {

@@ -26,4 +26,5 @@ uuid = { version = "1", features = ["v4"] }
 unicode-width = "0.2"
 unicode-segmentation = "1"
 arboard = "3.6"
+dirs = "6"
 kommand0-core = { path = "crates/core" }
