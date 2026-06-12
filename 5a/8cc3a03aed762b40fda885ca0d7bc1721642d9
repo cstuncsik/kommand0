@@ -1,0 +1,20 @@
+crates/core/src/lib.rs
+  s_fc3d7618d36de0::t_8dcc3bff6f4ca6 350-353
+  s_fc3d7618d36de0::t_0b7eaf25a2f61b 38-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "5a8cc3a03aed762b40fda885ca0d7bc1721642d9",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
