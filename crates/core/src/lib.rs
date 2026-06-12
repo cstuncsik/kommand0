@@ -35,10 +35,10 @@ impl AppState {
     /// to the current directory in debug builds, then the platform data dir
     /// (`~/Library/Application Support/kommand0` on macOS) in release builds.
     pub fn state_dir() -> PathBuf {
-        if let Some(dir) = std::env::var_os("KOMMAND0_STATE_DIR") {
-            if !dir.is_empty() {
-                return PathBuf::from(dir);
-            }
+        if let Some(dir) = std::env::var_os("KOMMAND0_STATE_DIR")
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir);
         }
         if cfg!(debug_assertions) {
             PathBuf::from(Self::STATE_DIR)
@@ -347,10 +347,10 @@ impl AppState {
         let removed = self.workspaces.remove(idx);
 
         // Clean up worktree if present
-        if let Some(wt_path) = &removed.worktree_path {
-            if let Some(repo) = self.repos.iter().find(|r| r.id == removed.repo_id) {
-                let _ = worktree::remove_worktree(&repo.path, wt_path);
-            }
+        if let Some(wt_path) = &removed.worktree_path
+            && let Some(repo) = self.repos.iter().find(|r| r.id == removed.repo_id)
+        {
+            let _ = worktree::remove_worktree(&repo.path, wt_path);
         }
 
         self.save_to(base)?;
