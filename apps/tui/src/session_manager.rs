@@ -324,13 +324,12 @@ impl SessionManager {
 
         // SIGKILL any still running
         for (sid, pid) in &pids {
-            if let Some(session) = self.sessions.get_mut(sid) {
-                if session.child.id().is_some() {
+            if let Some(session) = self.sessions.get_mut(sid)
+                && session.child.id().is_some() {
                     let pgid = *pid as i32;
                     let _ = kill(Pid::from_raw(-pgid), Signal::SIGKILL);
                     let _ = session.child.wait().await;
                 }
-            }
         }
 
         self.sessions.clear();
@@ -350,13 +349,10 @@ impl SessionManager {
                         ref session_id,
                         ref claude_session_id,
                     } = event
-                    {
-                        if let Some(session) = self.sessions.get_mut(session_id) {
-                            if session.claude_session_id.is_none() {
+                        && let Some(session) = self.sessions.get_mut(session_id)
+                            && session.claude_session_id.is_none() {
                                 session.claude_session_id = Some(claude_session_id.clone());
                             }
-                        }
-                    }
                     events.push(event);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,

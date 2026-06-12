@@ -274,11 +274,10 @@ fn main() -> anyhow::Result<()> {
                 let ws = state.show_workspace(&workspace)?.clone();
 
                 // Check no running session
-                if let Some(s) = state.find_session_by_workspace(&ws.id) {
-                    if s.status == SessionStatus::Running {
+                if let Some(s) = state.find_session_by_workspace(&ws.id)
+                    && s.status == SessionStatus::Running {
                         anyhow::bail!("Workspace '{}' already has a running session ({})", workspace, s.id);
                     }
-                }
 
                 // Create session record
                 let session = state.create_session(&ws.id)?;
