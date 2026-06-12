@@ -26,8 +26,9 @@ const GLOBAL_BINDINGS: &[KeyBinding] = &[
 ];
 
 const TREE_BINDINGS: &[KeyBinding] = &[
-    KeyBinding { keys: "[j/k]", description: "Navigate" },
-    KeyBinding { keys: "[Up/Down]", description: "Navigate" },
+    KeyBinding { keys: "[j/k or Up/Down]", description: "Navigate" },
+    KeyBinding { keys: "[h/l or Left/Right]", description: "Collapse / expand" },
+    KeyBinding { keys: "[gg/G]", description: "First / last item" },
     KeyBinding { keys: "[Enter]", description: "Expand/start session" },
     KeyBinding { keys: "[r]", description: "Start session" },
     KeyBinding { keys: "[R]", description: "Restart session" },
@@ -39,11 +40,14 @@ const TREE_BINDINGS: &[KeyBinding] = &[
 ];
 
 const OUTPUT_BINDINGS: &[KeyBinding] = &[
-    KeyBinding { keys: "[j/k]", description: "Scroll line" },
-    KeyBinding { keys: "[Up/Down]", description: "Scroll line" },
+    KeyBinding { keys: "[h/j/k/l or arrows]", description: "Move cursor" },
+    KeyBinding { keys: "[Shift+arrows]", description: "Extend selection" },
+    KeyBinding { keys: "[Ctrl+D/U]", description: "Half page down/up" },
     KeyBinding { keys: "[PgUp/PgDn]", description: "Scroll page" },
-    KeyBinding { keys: "[g/Home]", description: "Top" },
+    KeyBinding { keys: "[gg/Home]", description: "Top" },
     KeyBinding { keys: "[G/End]", description: "Bottom" },
+    KeyBinding { keys: "[Ctrl+A]", description: "Select all" },
+    KeyBinding { keys: "[Ctrl+C]", description: "Copy selection" },
     KeyBinding { keys: "[z]", description: "Zoom toggle" },
     KeyBinding { keys: "[i]", description: "Compose" },
 ];
@@ -86,7 +90,7 @@ fn focus_to_section(focus: Focus) -> &'static str {
     }
 }
 
-pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus) {
+pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus, scroll: &mut u16) {
     let area = centered_rect(60, 70, frame.area());
 
     // Clear the area behind the overlay
@@ -140,9 +144,14 @@ pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus) {
 
     // Dismiss hint at bottom
     lines.push(Line::styled(
-        "  Press ? or Esc to close",
+        "  Press ? or Esc to close, j/k to scroll",
         Style::default().fg(Color::DarkGray),
     ));
+
+    // Clamp scroll so the last line stays at the bottom edge
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_height) as u16;
+    *scroll = (*scroll).min(max_scroll);
 
     let block = Block::default()
         .title(" Help ")
@@ -151,7 +160,8 @@ pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus) {
 
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((*scroll, 0));
 
     frame.render_widget(paragraph, area);
 }
