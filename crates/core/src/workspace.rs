@@ -17,7 +17,7 @@ pub fn format_timestamp(unix_secs: u64) -> String {
     use chrono::{Local, TimeZone};
     match Local.timestamp_opt(unix_secs as i64, 0) {
         chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
-        _ => format!("{}", unix_secs),
+        _ => format!("{unix_secs}"),
     }
 }
 

@@ -39,7 +39,7 @@ pub(crate) fn button_span(
     area_y: u16,
     hovered: bool,
 ) -> (Span<'static>, Rect) {
-    let text = format!("[{}]", label);
+    let text = format!("[{label}]");
     let width = text.len() as u16;
     let style = if hovered {
         Style::default()

@@ -87,15 +87,15 @@ impl AppState {
     pub fn add_repo_with_base(&mut self, path: &str, base: &Path) -> anyhow::Result<RepoEntry> {
         let dir = Path::new(path);
         if !dir.is_dir() {
-            bail!("path does not exist or is not a directory: {}", path);
+            bail!("path does not exist or is not a directory: {path}");
         }
 
         let canonical = fs::canonicalize(dir)
-            .with_context(|| format!("failed to canonicalize {}", path))?;
+            .with_context(|| format!("failed to canonicalize {path}"))?;
         let canonical_str = canonical.to_string_lossy().to_string();
 
         if self.repos.iter().any(|r| r.path == canonical_str) {
-            bail!("repo already tracked: {}", canonical_str);
+            bail!("repo already tracked: {canonical_str}");
         }
 
         let name = canonical
@@ -208,8 +208,7 @@ impl AppState {
         }
 
         bail!(
-            "No repo found matching '{}'. Checked: name, path, id. Use `kmd repo list` to see tracked repos.",
-            reference
+            "No repo found matching '{reference}'. Checked: name, path, id. Use `kmd repo list` to see tracked repos."
         )
     }
 
@@ -252,7 +251,7 @@ impl AppState {
         };
 
         if self.workspaces.iter().any(|w| w.name == ws_name) {
-            bail!("workspace already exists: {}", ws_name);
+            bail!("workspace already exists: {ws_name}");
         }
 
         let now = SystemTime::now()
@@ -330,7 +329,7 @@ impl AppState {
         self.workspaces
             .iter()
             .find(|w| w.name == name)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {}", name))
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))
     }
 
     /// Delete a workspace by name, saving to custom base directory.
@@ -344,7 +343,7 @@ impl AppState {
             .workspaces
             .iter()
             .position(|w| w.name == name)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {}", name))?;
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))?;
         let removed = self.workspaces.remove(idx);
 
         // Clean up worktree if present
@@ -369,7 +368,7 @@ impl AppState {
             .workspaces
             .iter_mut()
             .find(|w| w.name == name)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {}", name))?;
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))?;
         ws.active = false;
         self.save_to(base)?;
         Ok(())
@@ -386,7 +385,7 @@ impl AppState {
             .workspaces
             .iter_mut()
             .find(|w| w.name == name)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {}", name))?;
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))?;
         ws.active = true;
         self.save_to(base)?;
         Ok(())
@@ -407,7 +406,7 @@ impl AppState {
     ) -> anyhow::Result<Session> {
         // Validate workspace exists
         if !self.workspaces.iter().any(|w| w.id == workspace_id) {
-            bail!("workspace not found: {}", workspace_id);
+            bail!("workspace not found: {workspace_id}");
         }
 
         // Check no running session for this workspace
@@ -417,8 +416,7 @@ impl AppState {
             .any(|s| s.workspace_id == workspace_id && s.status == SessionStatus::Running)
         {
             bail!(
-                "workspace {} already has a running session",
-                workspace_id
+                "workspace {workspace_id} already has a running session"
             );
         }
 
@@ -431,7 +429,7 @@ impl AppState {
         let session = Session {
             log_file: base
                 .join("sessions")
-                .join(format!("{}.log", id))
+                .join(format!("{id}.log"))
                 .to_string_lossy()
                 .into_owned(),
             id,
@@ -478,7 +476,7 @@ impl AppState {
             .sessions
             .iter_mut()
             .find(|s| s.id == session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
 
         session.status = status.clone();
 

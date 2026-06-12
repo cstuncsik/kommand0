@@ -148,7 +148,7 @@ impl App {
                                 }
                                 if source == "user" {
                                     for segment in content.split('\n') {
-                                        buf.push_line(format!("> {}", segment));
+                                        buf.push_line(format!("> {segment}"));
                                     }
                                 } else {
                                     for segment in content.split('\n') {
@@ -449,7 +449,7 @@ impl App {
                 SessionStatus::Running => {
                     if self.waiting_response.contains(workspace_id) {
                         let frame = SPINNER[self.spinner_tick as usize % SPINNER.len()];
-                        (format!(" {}", frame), Color::Cyan)
+                        (format!(" {frame}"), Color::Cyan)
                     } else {
                         (" \u{25B6}".to_string(), Color::Green) // ▶
                     }
@@ -482,7 +482,7 @@ impl App {
                 .append(true)
                 .open(log_path)
             {
-                let _ = writeln!(f, "{}", entry);
+                let _ = writeln!(f, "{entry}");
             }
         }
     }
@@ -504,7 +504,7 @@ impl App {
 
     /// Initialize cursor to bottom-left if not already set for this workspace.
     fn init_cursor_if_needed(&mut self, ws_id: &str) {
-        if self.selections.get(ws_id).map_or(true, |s| s.is_none()) {
+        if self.selections.get(ws_id).is_none_or(|s| s.is_none()) {
             if let Some(buf) = self.scrollbacks.get(ws_id) {
                 let total = buf.total_lines();
                 let line = if total > 0 { total - 1 } else { 0 };
@@ -672,7 +672,7 @@ impl App {
             {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/dalat_debug.log") {
-                    let _ = writeln!(f, "  desired_col={} cy={} new_y={} new_pos={:?}", desired_col, cy, new_y, new_pos);
+                    let _ = writeln!(f, "  desired_col={desired_col} cy={cy} new_y={new_y} new_pos={new_pos:?}");
                 }
             }
 
@@ -754,16 +754,14 @@ impl App {
             } else {
                 (cursor_line, cursor_char)
             }
+        } else if cursor_char > 0 {
+            (cursor_line, cursor_char - 1)
+        } else if cursor_line > 0 {
+            let prev_text = lines_ref.get(cursor_line - 1).copied().unwrap_or("");
+            let prev_count = prev_text.graphemes(true).count();
+            (cursor_line - 1, prev_count.saturating_sub(1))
         } else {
-            if cursor_char > 0 {
-                (cursor_line, cursor_char - 1)
-            } else if cursor_line > 0 {
-                let prev_text = lines_ref.get(cursor_line - 1).copied().unwrap_or("");
-                let prev_count = prev_text.graphemes(true).count();
-                (cursor_line - 1, prev_count.saturating_sub(1))
-            } else {
-                (cursor_line, cursor_char)
-            }
+            (cursor_line, cursor_char)
         };
 
         self.extend_selection(ws_id, new_line, new_char);
@@ -1146,7 +1144,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         .filter(|s| {
             app.scrollbacks
                 .get(&s.workspace_id)
-                .map_or(false, |b| !b.is_empty())
+                .is_some_and(|b| !b.is_empty())
         })
         .map(|s| {
             let ws_dir = app
@@ -1557,7 +1555,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                         buf.push_line("---".to_string());
                                                     }
                                                     for line in text.split('\n') {
-                                                        buf.push_line(format!("> {}", line));
+                                                        buf.push_line(format!("> {line}"));
                                                     }
                                                     buf.push_line("---".to_string());
                                                     buf.reset_scroll(); // pin to bottom so response is visible
@@ -1809,29 +1807,26 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                                         .map(|s| s.status == SessionStatus::Running)
                                                         .unwrap_or(false);
                                                     if !has_running {
-                                                        match app.state.create_session(&ws.id) {
-                                                            Ok(session) => {
-                                                                let session_id = session.id.clone();
-                                                                let ws_dir = ws.working_dir.clone();
-                                                                match app.session_manager.start_session(&session_id, &ws_dir, None) {
-                                                                    Ok(pid) => {
-                                                                        if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                                            s.pid = Some(pid);
-                                                                        }
-                                                                        let _ = app.state.save();
-                                                                        app.scrollbacks
-                                                                            .entry(ws.id.clone())
-                                                                            .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                                                        app.active_session_id = Some(session_id);
-                                                                        // Stay in tree focus -- don't auto-focus composer
-                                                                        app.focus = Focus::Output;
+                                                        if let Ok(session) = app.state.create_session(&ws.id) {
+                                                            let session_id = session.id.clone();
+                                                            let ws_dir = ws.working_dir.clone();
+                                                            match app.session_manager.start_session(&session_id, &ws_dir, None) {
+                                                                Ok(pid) => {
+                                                                    if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                                        s.pid = Some(pid);
                                                                     }
-                                                                    Err(_e) => {
-                                                                        let _ = app.state.update_session_status(&session_id, SessionStatus::Failed);
-                                                                    }
+                                                                    let _ = app.state.save();
+                                                                    app.scrollbacks
+                                                                        .entry(ws.id.clone())
+                                                                        .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                                                    app.active_session_id = Some(session_id);
+                                                                    // Stay in tree focus -- don't auto-focus composer
+                                                                    app.focus = Focus::Output;
+                                                                }
+                                                                Err(_e) => {
+                                                                    let _ = app.state.update_session_status(&session_id, SessionStatus::Failed);
                                                                 }
                                                             }
-                                                            Err(_) => {}
                                                         }
                                                     }
                                                 }
@@ -2221,7 +2216,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     let _ = app.session_manager.stop_session(&session_id).await;
                                     let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                 }
-                                if let Ok(_) = app.state.delete_workspace(&ws.name) {
+                                if app.state.delete_workspace(&ws.name).is_ok() {
                                     app.scrollbacks.remove(&workspace_id);
                                     app.waiting_response.remove(&workspace_id);
                                     app.expanded_icon_rows.remove(&workspace_id);
@@ -2256,7 +2251,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.expanded_icon_rows.remove(ws_id);
                                     app.composer_drafts.remove(ws_id);
                                 }
-                                if let Ok(_) = app.state.delete_repo(&repo_name) {
+                                if app.state.delete_repo(&repo_name).is_ok() {
                                     app.expanded.remove(&repo.id);
                                     app.repos = app.state.repos.clone();
                                     app.workspaces = app.state.workspaces.clone();
@@ -2417,7 +2412,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     .entry(ws_id)
                                     .or_insert_with(|| ScrollbackBuffer::new(50_000));
                                 let msg = match exit_code {
-                                    Some(code) => format!("--- Session exited (code: {}) ---", code),
+                                    Some(code) => format!("--- Session exited (code: {code}) ---"),
                                     None => "--- Session exited ---".to_string(),
                                 };
                                 buf.push_line(msg);
@@ -2441,7 +2436,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 let buf = app.scrollbacks
                                     .entry(ws_id)
                                     .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                buf.push_line(format!("[ERROR] {}", error));
+                                buf.push_line(format!("[ERROR] {error}"));
                             }
                         }
                     }

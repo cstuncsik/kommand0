@@ -171,7 +171,7 @@ impl Composer {
         let lines = self.textarea.lines();
         let line_count = lines.len();
         let char_count: usize = lines.iter().map(|l| l.len()).sum::<usize>() + line_count.saturating_sub(1); // +newlines
-        format!("{}:{}", line_count, char_count)
+        format!("{line_count}:{char_count}")
     }
 
     fn make_block(active: bool) -> Block<'static> {

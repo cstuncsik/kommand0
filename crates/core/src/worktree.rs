@@ -34,12 +34,12 @@ fn branch_exists(repo_path: &str, branch: &str) -> bool {
 
 /// Find a unique branch name by appending -2, -3, etc.
 fn unique_branch_name(repo_path: &str, base: &str) -> String {
-    let candidate = format!("kommand0/{}", base);
+    let candidate = format!("kommand0/{base}");
     if !branch_exists(repo_path, &candidate) {
         return candidate;
     }
     for i in 2..100 {
-        let name = format!("kommand0/{}-{}", base, i);
+        let name = format!("kommand0/{base}-{i}");
         if !branch_exists(repo_path, &name) {
             return name;
         }
@@ -49,7 +49,7 @@ fn unique_branch_name(repo_path: &str, base: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    format!("kommand0/{}-{}", base, ts)
+    format!("kommand0/{base}-{ts}")
 }
 
 /// Create a git worktree for a workspace.
@@ -67,7 +67,7 @@ pub fn create_worktree(
     // Validate git repo
     if !is_git_repo(repo_path) {
         return WorktreeResult::Fallback {
-            reason: format!("{} is not a git repository", repo_path),
+            reason: format!("{repo_path} is not a git repository"),
         };
     }
 
@@ -92,7 +92,7 @@ pub fn create_worktree(
         // If directory still exists after removal attempt, bail
         if worktree_dir.exists() {
             return WorktreeResult::Fallback {
-                reason: format!("worktree path already exists: {}", worktree_path),
+                reason: format!("worktree path already exists: {worktree_path}"),
             };
         }
     }
@@ -125,7 +125,7 @@ pub fn create_worktree(
             }
         }
         Err(e) => WorktreeResult::Fallback {
-            reason: format!("failed to run git: {}", e),
+            reason: format!("failed to run git: {e}"),
         },
     }
 }
@@ -163,8 +163,7 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<()> {
         }
         Err(e) => {
             eprintln!(
-                "warning: failed to run git worktree remove for {}: {}",
-                worktree_path, e
+                "warning: failed to run git worktree remove for {worktree_path}: {e}"
             );
             Ok(())
         }
@@ -235,7 +234,7 @@ mod tests {
                 assert!(!Path::new(&worktree_path).exists());
             }
             WorktreeResult::Fallback { reason } => {
-                panic!("expected Created, got Fallback: {}", reason);
+                panic!("expected Created, got Fallback: {reason}");
             }
         }
     }
@@ -277,12 +276,11 @@ mod tests {
                 // Should get a suffixed branch name
                 assert!(
                     branch_name == "kommand0/feature-2" || branch_name.starts_with("kommand0/feature-"),
-                    "expected suffixed branch, got: {}",
-                    branch_name
+                    "expected suffixed branch, got: {branch_name}"
                 );
             }
             WorktreeResult::Fallback { reason } => {
-                panic!("expected Created, got Fallback: {}", reason);
+                panic!("expected Created, got Fallback: {reason}");
             }
         }
     }
