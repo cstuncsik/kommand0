@@ -13,7 +13,7 @@ mod wrap_map;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{EventStream, KeyEventKind};
+use crossterm::event::{EventStream, KeyEvent, KeyEventKind};
 use futures::{FutureExt, StreamExt};
 use kommand0_core::{AppState, RepoEntry, SessionStatus, Workspace};
 use ratatui::{
@@ -134,8 +134,8 @@ impl App {
                 .or_insert_with(|| ScrollbackBuffer::new(50_000));
             // Load log file contents into scrollback
             let log_path = std::path::Path::new(&session.log_file);
-            if log_path.exists() {
-                if let Ok(contents) = std::fs::read_to_string(log_path) {
+            if log_path.exists()
+                && let Ok(contents) = std::fs::read_to_string(log_path) {
                     let mut last_source = String::new();
                     for line in contents.lines() {
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
@@ -162,7 +162,6 @@ impl App {
                     // Ensure scrolled to bottom after loading
                     buf.reset_scroll();
                 }
-            }
         }
 
         let mut app = Self {
@@ -305,12 +304,11 @@ impl App {
             let repo_id = id;
             self.rebuild_tree();
             for (i, node) in self.tree_items.iter().enumerate() {
-                if let TreeNode::Repo { id, .. } = node {
-                    if *id == repo_id {
+                if let TreeNode::Repo { id, .. } = node
+                    && *id == repo_id {
                         self.selected_index = i;
                         break;
                     }
-                }
             }
             if !self.tree_items.is_empty() {
                 self.selected_index = self.selected_index.min(self.tree_items.len() - 1);
@@ -504,15 +502,14 @@ impl App {
 
     /// Initialize cursor to bottom-left if not already set for this workspace.
     fn init_cursor_if_needed(&mut self, ws_id: &str) {
-        if self.selections.get(ws_id).is_none_or(|s| s.is_none()) {
-            if let Some(buf) = self.scrollbacks.get(ws_id) {
+        if self.selections.get(ws_id).is_none_or(|s| s.is_none())
+            && let Some(buf) = self.scrollbacks.get(ws_id) {
                 let total = buf.total_lines();
                 let line = if total > 0 { total - 1 } else { 0 };
                 self.selections.insert(ws_id.to_string(), SelectionState::Cursor { line, char_offset: 0 });
                 self.cursor_desired_col.insert(ws_id.to_string(), 0);
                 self.auto_scroll_suppressed.insert(ws_id.to_string());
             }
-        }
     }
 
     /// Get current cursor position from selection state.
@@ -1101,6 +1098,775 @@ fn prev_word_boundary(line: &str, char_offset: usize) -> usize {
     i
 }
 
+/// Outcome of handling a single key event.
+#[derive(PartialEq)]
+enum KeyOutcome {
+    Continue,
+    Quit,
+}
+
+/// Handle one key press. Extracted from the main event loop so tests can
+/// drive the app without a real terminal.
+async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> {
+    // Help modal: scrollable, dismissed with ?/Esc, swallows other keys
+    if app.show_help {
+        let g_was_pending = std::mem::take(&mut app.pending_g);
+        match key.code {
+            KeyCode::Char('?') | KeyCode::Esc => app.show_help = false,
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.help_scroll = app.help_scroll.saturating_add(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                app.help_scroll = app.help_scroll.saturating_add(10);
+            }
+            KeyCode::PageUp => {
+                app.help_scroll = app.help_scroll.saturating_sub(10);
+            }
+            KeyCode::Char('g') => {
+                if g_was_pending {
+                    app.help_scroll = 0;
+                } else {
+                    app.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                // Clamped to actual content height at render time
+                app.help_scroll = u16::MAX;
+            }
+            KeyCode::Home => app.help_scroll = 0,
+            _ => {} // swallow all other keys
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
+    // Modal dialog: swallow all keys
+    if app.modal.is_active() {
+        match modal::handle_modal_key(&mut app.modal, key) {
+            modal::ModalResult::Consumed | modal::ModalResult::Cancelled => {}
+            modal::ModalResult::SubmitRepo(path) => {
+                match app.state.add_repo(&path) {
+                    Ok(_) => {
+                        app.repos = app.state.repos.clone();
+                        app.rebuild_tree();
+                    }
+                    Err(e) => {
+                        app.modal = modal::ModalState::AddRepo {
+                            input: path,
+                            cursor: 0,
+                            error: Some(e.to_string()),
+                            completions: Vec::new(),
+                            completion_index: None,
+                        };
+                    }
+                }
+            }
+            modal::ModalResult::ConfirmDelete(target) => {
+                match target {
+                    modal::DeleteTarget::Workspace { name } => {
+                        // Gather IDs before mutating
+                        let ws_info = app.state.workspaces.iter()
+                            .find(|w| w.name == name)
+                            .map(|w| {
+                                let sid = app.state.find_session_by_workspace(&w.id)
+                                    .filter(|s| s.status == SessionStatus::Running)
+                                    .map(|s| s.id.clone());
+                                (w.id.clone(), sid)
+                            });
+                        if let Some((ws_id, running_sid)) = ws_info {
+                            if let Some(sid) = running_sid {
+                                let _ = app.session_manager.stop_session(&sid).await;
+                                let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+                            }
+                            app.scrollbacks.remove(&ws_id);
+                        }
+                        let _ = app.state.delete_workspace(&name);
+                        app.workspaces = app.state.workspaces.clone();
+                        app.rebuild_tree();
+                        app.update_active_session();
+                    }
+                    modal::DeleteTarget::Repo { id, .. } => {
+                        // Stop all running sessions for this repo's workspaces
+                        let ws_ids: Vec<String> = app.state.workspaces.iter()
+                            .filter(|w| w.repo_id == id)
+                            .map(|w| w.id.clone())
+                            .collect();
+                        for ws_id in &ws_ids {
+                            if let Some(s) = app.state.find_session_by_workspace(ws_id)
+                                && s.status == SessionStatus::Running {
+                                    let sid = s.id.clone();
+                                    let _ = app.session_manager.stop_session(&sid).await;
+                                    let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+                                }
+                            app.scrollbacks.remove(ws_id);
+                        }
+                        let _ = app.state.delete_repo(&id);
+                        app.repos = app.state.repos.clone();
+                        app.workspaces = app.state.workspaces.clone();
+                        app.expanded.remove(&id);
+                        app.rebuild_tree();
+                        app.update_active_session();
+                    }
+                }
+            }
+            modal::ModalResult::SubmitWorkspace(repo_id, name) => {
+                let repo_name = app.repos.iter()
+                    .find(|r| r.id == repo_id)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                match app.state.create_workspace(Some(&name), &repo_name) {
+                    Ok(_) => {
+                        app.workspaces = app.state.workspaces.clone();
+                        // Auto-expand the repo
+                        app.expanded.insert(repo_id);
+                        app.rebuild_tree();
+                    }
+                    Err(e) => {
+                        app.modal = modal::ModalState::AddWorkspace {
+                            repo_id,
+                            repo_name,
+                            input: name,
+                            cursor: 0,
+                            error: Some(e.to_string()),
+                        };
+                    }
+                }
+            }
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
+    // Vim `gg`: consume the pending flag; only a bare `g` below re-arms it
+    let g_was_pending = std::mem::take(&mut app.pending_g);
+
+    // Global keys (work in any focus)
+    match key.code {
+        KeyCode::Char('q') if app.focus != Focus::Composer => {
+            app.session_manager.shutdown_all().await?;
+            let running_ids: Vec<String> = app.state.sessions.iter()
+                .filter(|s| s.status == SessionStatus::Running)
+                .map(|s| s.id.clone())
+                .collect();
+            for sid in running_ids {
+                let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+            }
+            return Ok(KeyOutcome::Quit);
+        }
+        KeyCode::Char('c') if has_cmd_modifier(key.modifiers) => {
+            // Ctrl/Cmd+C: copy selection from the focused pane
+            match app.focus {
+                Focus::Composer => {
+                    if app.composer.has_selection()
+                        && let Some(text) = app.composer.selected_text() {
+                            let _ = app.clipboard.set_text(&text);
+                            app.composer.set_copy_flash(true);
+                            app.copy_flash_until = Some((app.focus, Instant::now() + Duration::from_millis(150)));
+                        }
+                }
+                Focus::Output => {
+                    if let Some(ws) = app.selected_workspace().cloned()
+                        && let Some(sel) = app.selections.get(&ws.id)
+                            && let Some((start, end)) = sel.ordered_range()
+                                && let Some((owned_lines, inner_width)) = app.output_context(&ws.id) {
+                                    let refs: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+                                    let wm = WrapMap::build(&refs, inner_width);
+                                    let text = wm.extract_text(&refs, start, end);
+                                    let _ = app.clipboard.set_text(&text);
+                                    app.copy_flash_until = Some((app.focus, Instant::now() + Duration::from_millis(150)));
+                                }
+                }
+                _ => {}
+            }
+            // No selection in focused pane: pure no-op (CLIP-02)
+        }
+        KeyCode::Char('v') if has_cmd_modifier(key.modifiers) => {
+            // Ctrl/Cmd+V: paste clipboard text into the composer
+            // (output/tree are read-only, so this is a no-op there)
+            if app.focus == Focus::Composer
+                && let Ok(text) = app.clipboard.get_text() {
+                    app.composer.insert_paste(&text);
+                }
+        }
+        KeyCode::Char('q') if has_cmd_modifier(key.modifiers) => {
+            // Ctrl+Q: stop session if running, otherwise quit (works in ALL panes)
+            let has_running = app.selected_workspace().cloned()
+                .and_then(|ws| {
+                    app.state.find_session_by_workspace(&ws.id)
+                        .filter(|s| s.status == SessionStatus::Running)
+                        .map(|s| (ws.id.clone(), s.id.clone()))
+                });
+            if let Some((ws_id, session_id)) = has_running {
+                let _ = app.session_manager.stop_session(&session_id).await;
+                let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
+                    buf.push_line("--- Session stopped ---".to_string());
+                }
+                app.focus = Focus::Output;
+                app.composer.set_active(false);
+            } else {
+                app.session_manager.shutdown_all().await?;
+                return Ok(KeyOutcome::Quit);
+            }
+        }
+        KeyCode::Tab => {
+            let has_session = app.selected_workspace()
+                .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                .is_some();
+            let has_running = app.selected_workspace()
+                .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                .map(|s| s.status == SessionStatus::Running)
+                .unwrap_or(false);
+            if app.zoomed {
+                // In zoom mode, only cycle Output <-> Composer
+                app.focus = match app.focus {
+                    Focus::Output if has_running => {
+                        app.composer.set_active(true);
+                        Focus::Composer
+                    }
+                    Focus::Composer => {
+                        app.composer.set_active(false);
+                        Focus::Output
+                    }
+                    _ => Focus::Output,
+                };
+            } else {
+                // Normal cycle: Tree -> Output -> Composer -> Tree
+                app.focus = match app.focus {
+                    Focus::Tree if has_session => Focus::Output,
+                    Focus::Output if has_running => {
+                        app.composer.set_active(true);
+                        Focus::Composer
+                    }
+                    Focus::Output => Focus::Tree,
+                    Focus::Composer => {
+                        app.composer.set_active(false);
+                        Focus::Tree
+                    }
+                    _ => Focus::Tree,
+                };
+            }
+        }
+        KeyCode::BackTab => {
+            let has_session = app.selected_workspace()
+                .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                .is_some();
+            let has_running = app.selected_workspace()
+                .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                .map(|s| s.status == SessionStatus::Running)
+                .unwrap_or(false);
+            if app.zoomed {
+                // In zoom mode, only cycle Output <-> Composer
+                app.focus = match app.focus {
+                    Focus::Composer => {
+                        app.composer.set_active(false);
+                        Focus::Output
+                    }
+                    Focus::Output if has_running => {
+                        app.composer.set_active(true);
+                        Focus::Composer
+                    }
+                    _ => Focus::Output,
+                };
+            } else {
+                // Reverse cycle: Tree -> Composer -> Output -> Tree
+                app.focus = match app.focus {
+                    Focus::Tree if has_running => {
+                        app.composer.set_active(true);
+                        Focus::Composer
+                    }
+                    Focus::Tree if has_session => Focus::Output,
+                    Focus::Output => Focus::Tree,
+                    Focus::Composer => {
+                        app.composer.set_active(false);
+                        Focus::Output
+                    }
+                    _ => Focus::Tree,
+                };
+            }
+        }
+        KeyCode::Esc => {
+            if app.zoomed {
+                app.zoomed = false;
+            } else if app.focus == Focus::Output {
+                // Clear output selection first; if no selection, return to Tree
+                let has_sel = app.selected_workspace().cloned()
+                    .and_then(|ws| app.selections.get(&ws.id).map(|s| (ws.id.clone(), s.has_range())))
+                    .filter(|(_, has)| *has);
+                if let Some((ws_id, _)) = has_sel {
+                    app.clear_selection_for_workspace(&ws_id);
+                } else {
+                    app.focus = Focus::Tree;
+                }
+            } else if app.focus == Focus::Composer && app.composer.has_selection() {
+                app.composer.cancel_selection();
+            } else {
+                if app.focus == Focus::Composer {
+                    app.composer.set_active(false);
+                }
+                app.focus = Focus::Tree;
+            }
+        }
+        KeyCode::Char('?') if app.focus != Focus::Composer => {
+            app.show_help = !app.show_help;
+            app.help_scroll = 0;
+        }
+        _ => {
+            // Focus-specific keys
+            match app.focus {
+                Focus::Composer => {
+                    if let Some(text) = app.composer.handle_key(key)
+                        && let Some(session_id) = app.active_session_id.clone() {
+                            let ws_id = app.state.sessions.iter()
+                                .find(|s| s.id == session_id)
+                                .map(|s| s.workspace_id.clone());
+                            if let Some(ws_id) = ws_id {
+                                let buf = app.scrollbacks
+                                    .entry(ws_id.clone())
+                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                // Add separator before user message if there's prior content
+                                if !buf.is_empty() {
+                                    buf.push_line("---".to_string());
+                                }
+                                for line in text.split('\n') {
+                                    buf.push_line(format!("> {line}"));
+                                }
+                                buf.push_line("---".to_string());
+                                buf.reset_scroll(); // pin to bottom so response is visible
+                                // Sending a message re-enables auto-scroll and clears selection
+                                app.auto_scroll_suppressed.remove(&ws_id);
+                                app.clear_selection_for_workspace(&ws_id);
+                                app.waiting_response.insert(ws_id);
+                            }
+                            app.write_log(&session_id, "user", &text);
+                            let _ = app.session_manager.send_message(&session_id, &text).await;
+                        }
+                }
+                Focus::Output => {
+                    // Cursor movement, selection, and navigation
+                    let ws_id = app.selected_workspace().map(|ws| ws.id.clone());
+                    if let Some(ws_id) = ws_id {
+                        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                        let ctrl = has_cmd_modifier(key.modifiers);
+
+                        match (key.code, ctrl, shift) {
+                            // --- Cursor movement (no modifiers) ---
+                            (KeyCode::Up, false, false) | (KeyCode::Char('k'), false, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.collapse_selection_to_cursor(&ws_id);
+                                app.move_cursor_vertical(&ws_id, -1);
+                            }
+                            (KeyCode::Down, false, false) | (KeyCode::Char('j'), false, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.collapse_selection_to_cursor(&ws_id);
+                                app.move_cursor_vertical(&ws_id, 1);
+                            }
+                            (KeyCode::Left, false, false) | (KeyCode::Char('h'), false, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.collapse_selection_to_cursor(&ws_id);
+                                app.move_cursor_horizontal(&ws_id, -1);
+                            }
+                            (KeyCode::Right, false, false) | (KeyCode::Char('l'), false, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.collapse_selection_to_cursor(&ws_id);
+                                app.move_cursor_horizontal(&ws_id, 1);
+                            }
+
+                            // --- Word jump (Ctrl+arrow) ---
+                            (KeyCode::Left, true, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.collapse_selection_to_cursor(&ws_id);
+                                app.move_cursor_word_left(&ws_id);
+                            }
+                            (KeyCode::Right, true, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.collapse_selection_to_cursor(&ws_id);
+                                app.move_cursor_word_right(&ws_id);
+                            }
+
+                            // --- Selection extend (Shift+arrow) ---
+                            (KeyCode::Up, false, true) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.extend_selection_vertical(&ws_id, -1);
+                            }
+                            (KeyCode::Down, false, true) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.extend_selection_vertical(&ws_id, 1);
+                            }
+                            (KeyCode::Left, false, true) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.extend_selection_horizontal(&ws_id, -1);
+                            }
+                            (KeyCode::Right, false, true) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.extend_selection_horizontal(&ws_id, 1);
+                            }
+
+                            // --- Word-extend selection (Shift+Ctrl+arrow) ---
+                            (KeyCode::Left, true, true) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.extend_selection_word_left(&ws_id);
+                            }
+                            (KeyCode::Right, true, true) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.extend_selection_word_right(&ws_id);
+                            }
+
+                            // --- Document navigation ---
+                            (KeyCode::Home, _, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.move_cursor_to_document_start(&ws_id);
+                            }
+                            (KeyCode::End, _, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.move_cursor_to_document_end(&ws_id);
+                            }
+                            (KeyCode::Home, _, true) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.extend_selection_to_document_start(&ws_id);
+                            }
+                            (KeyCode::End, _, true) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.extend_selection_to_document_end(&ws_id);
+                            }
+
+                            // --- Page navigation ---
+                            (KeyCode::PageUp, false, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.move_cursor_page_up(&ws_id);
+                            }
+                            (KeyCode::PageDown, false, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.move_cursor_page_down(&ws_id);
+                            }
+
+                            // --- Select all ---
+                            (KeyCode::Char('a'), true, _) => {
+                                app.select_all(&ws_id);
+                            }
+
+                            // --- Half-page scroll (vim Ctrl+D / Ctrl+U) ---
+                            (KeyCode::Char('u'), true, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.move_cursor_half_page_up(&ws_id);
+                            }
+                            (KeyCode::Char('d'), true, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.move_cursor_half_page_down(&ws_id);
+                            }
+
+                            // --- Document jumps (vim gg / G) ---
+                            (KeyCode::Char('g'), false, false) => {
+                                if g_was_pending {
+                                    app.init_cursor_if_needed(&ws_id);
+                                    app.move_cursor_to_document_start(&ws_id);
+                                } else {
+                                    app.pending_g = true;
+                                }
+                            }
+                            (KeyCode::Char('G'), false, false) => {
+                                app.init_cursor_if_needed(&ws_id);
+                                app.move_cursor_to_document_end(&ws_id);
+                            }
+
+                            // --- Existing ---
+                            (KeyCode::Char('z'), false, false) => {
+                                app.zoomed = !app.zoomed;
+                            }
+                            (KeyCode::Char('i'), false, false) => {
+                                // Enter composer from output
+                                let has_running = app.selected_workspace()
+                                    .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
+                                    .map(|s| s.status == SessionStatus::Running)
+                                    .unwrap_or(false);
+                                if has_running {
+                                    app.focus = Focus::Composer;
+                                    app.composer.set_active(true);
+                                }
+                            }
+
+                            _ => {}
+                        }
+                    }
+                }
+                Focus::Tree => {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+                        KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                        KeyCode::Left | KeyCode::Char('h') => app.tree_collapse_or_parent(),
+                        KeyCode::Right | KeyCode::Char('l') => app.tree_expand_or_enter(),
+                        KeyCode::Char('g') => {
+                            if g_was_pending {
+                                app.tree_select_first();
+                            } else {
+                                app.pending_g = true;
+                            }
+                        }
+                        KeyCode::Char('G') => app.tree_select_last(),
+                        KeyCode::Enter => {
+                            match app.tree_items.get(app.selected_index).cloned() {
+                                Some(TreeNode::Repo { .. }) => app.toggle_expand(),
+                                Some(TreeNode::Workspace { ws, .. }) => {
+                                    // Enter on workspace: start/resume session + focus Composer
+                                    let session = app.state.find_session_by_workspace(&ws.id)
+                                        .map(|s| (s.id.clone(), s.status.clone(), s.claude_session_id.clone()));
+                                    match session {
+                                        Some((_, SessionStatus::Running, _)) => {
+                                            // Already running: just focus Composer
+                                            app.focus = Focus::Composer;
+                                            app.composer.set_active(true);
+                                        }
+                                        Some((old_id, _, claude_sid)) => {
+                                            // Stopped/exited/failed: restart (same as R key)
+                                            let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
+                                            if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                                let session_id = new_session.id.clone();
+                                                match app.session_manager.start_session(
+                                                    &session_id,
+                                                    &ws.working_dir,
+                                                    claude_sid.as_deref(),
+                                                ) {
+                                                    Ok(pid) => {
+                                                        if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                            s.pid = Some(pid);
+                                                            s.claude_session_id = claude_sid;
+                                                        }
+                                                        let _ = app.state.save();
+                                                        app.active_session_id = Some(session_id);
+                                                        app.scrollbacks
+                                                            .entry(ws.id.clone())
+                                                            .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                            .reset_scroll();
+                                                        app.focus = Focus::Composer;
+                                                        app.composer.set_active(true);
+                                                    }
+                                                    Err(_) => {
+                                                        let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            // No session: create + start (same as r key)
+                                            if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                                let session_id = new_session.id.clone();
+                                                match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
+                                                    Ok(pid) => {
+                                                        if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                            s.pid = Some(pid);
+                                                        }
+                                                        let _ = app.state.save();
+                                                        app.scrollbacks
+                                                            .entry(ws.id.clone())
+                                                            .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                                        app.active_session_id = Some(session_id);
+                                                        app.focus = Focus::Composer;
+                                                        app.composer.set_active(true);
+                                                    }
+                                                    Err(_) => {
+                                                        let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(TreeNode::Hint { .. }) | None => {}
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            if let Some(ws) = app.selected_workspace().cloned() {
+                                let has_running = app.state.find_session_by_workspace(&ws.id)
+                                    .map(|s| s.status == SessionStatus::Running)
+                                    .unwrap_or(false);
+                                if !has_running
+                                    && let Ok(session) = app.state.create_session(&ws.id) {
+                                        let session_id = session.id.clone();
+                                        let ws_dir = ws.working_dir.clone();
+                                        match app.session_manager.start_session(&session_id, &ws_dir, None) {
+                                            Ok(pid) => {
+                                                if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                    s.pid = Some(pid);
+                                                }
+                                                let _ = app.state.save();
+                                                app.scrollbacks
+                                                    .entry(ws.id.clone())
+                                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                                                app.active_session_id = Some(session_id);
+                                                // Stay in tree focus -- don't auto-focus composer
+                                                app.focus = Focus::Output;
+                                            }
+                                            Err(_e) => {
+                                                let _ = app.state.update_session_status(&session_id, SessionStatus::Failed);
+                                            }
+                                        }
+                                    }
+                            }
+                        }
+                        KeyCode::Char('x') | KeyCode::Delete => {
+                            if let Some(ws) = app.selected_workspace().cloned() {
+                                let session_info = app.state.find_session_by_workspace(&ws.id)
+                                    .filter(|s| s.status == SessionStatus::Running)
+                                    .map(|s| s.id.clone());
+                                if let Some(session_id) = session_info {
+                                    let _ = app.session_manager.stop_session(&session_id).await;
+                                    let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
+                                    if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
+                                        buf.push_line("--- Session stopped ---".to_string());
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('R') => {
+                            if let Some(ws) = app.selected_workspace().cloned() {
+                                let session_info = app.state.find_session_by_workspace(&ws.id)
+                                    .filter(|s| s.status != SessionStatus::Running)
+                                    .map(|s| (s.id.clone(), s.claude_session_id.clone()));
+                                if let Some((old_session_id, claude_sid)) = session_info {
+                                    // Stop old, create new state session, start with its ID
+                                    let _ = app.state.update_session_status(&old_session_id, SessionStatus::Stopped);
+                                    if let Ok(new_session) = app.state.create_session(&ws.id) {
+                                        let session_id = new_session.id.clone();
+                                        match app.session_manager.start_session(
+                                            &session_id,
+                                            &ws.working_dir,
+                                            claude_sid.as_deref(),
+                                        ) {
+                                            Ok(pid) => {
+                                                if let Some(s) = app.state.find_session_mut(&session_id) {
+                                                    s.pid = Some(pid);
+                                                    s.claude_session_id = claude_sid.clone();
+                                                }
+                                                let _ = app.state.save();
+                                                app.active_session_id = Some(session_id);
+                                                app.scrollbacks
+                                                    .entry(ws.id.clone())
+                                                    .or_insert_with(|| ScrollbackBuffer::new(50_000))
+                                                    .reset_scroll();
+                                                app.focus = Focus::Output;
+                                            }
+                                            Err(_) => {
+                                                let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('a') => {
+                            // Open Add Repo modal
+                            app.modal = modal::ModalState::AddRepo {
+                                input: String::new(),
+                                cursor: 0,
+                                error: None,
+                                completions: Vec::new(),
+                                completion_index: None,
+                            };
+                        }
+                        KeyCode::Char('w') => {
+                            // Open Add Workspace modal for selected repo
+                            let repo_info = match app.tree_items.get(app.selected_index) {
+                                Some(TreeNode::Repo { id, name, .. }) => {
+                                    Some((id.clone(), name.clone()))
+                                }
+                                Some(TreeNode::Workspace { ws, repo_name }) => {
+                                    Some((ws.repo_id.clone(), repo_name.clone()))
+                                }
+                                _ => None,
+                            };
+                            if let Some((repo_id, repo_name)) = repo_info {
+                                app.modal = modal::ModalState::AddWorkspace {
+                                    repo_id,
+                                    repo_name,
+                                    input: String::new(),
+                                    cursor: 0,
+                                    error: None,
+                                };
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            // Delete selected item with confirmation
+                            match app.tree_items.get(app.selected_index).cloned() {
+                                Some(TreeNode::Workspace { ws, .. }) => {
+                                    app.modal = modal::ModalState::ConfirmDelete {
+                                        target: modal::DeleteTarget::Workspace {
+                                            name: ws.name.clone(),
+                                        },
+                                    };
+                                }
+                                Some(TreeNode::Repo { id, name, .. }) => {
+                                    let ws_count = app.workspaces.iter()
+                                        .filter(|w| w.repo_id == id)
+                                        .count();
+                                    app.modal = modal::ModalState::ConfirmDelete {
+                                        target: modal::DeleteTarget::Repo {
+                                            id,
+                                            name,
+                                            workspace_count: ws_count,
+                                        },
+                                    };
+                                }
+                                _ => {}
+                            }
+                        }
+                        KeyCode::Char('D') => {
+                            // Force delete without confirmation
+                            match app.tree_items.get(app.selected_index).cloned() {
+                                Some(TreeNode::Workspace { ws, .. }) => {
+                                    let ws_info = app.state.workspaces.iter()
+                                        .find(|w| w.name == ws.name)
+                                        .map(|w| {
+                                            let sid = app.state.find_session_by_workspace(&w.id)
+                                                .filter(|s| s.status == SessionStatus::Running)
+                                                .map(|s| s.id.clone());
+                                            (w.id.clone(), sid)
+                                        });
+                                    if let Some((ws_id, running_sid)) = ws_info {
+                                        if let Some(sid) = running_sid {
+                                            let _ = app.session_manager.stop_session(&sid).await;
+                                            let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+                                        }
+                                        app.scrollbacks.remove(&ws_id);
+                                    }
+                                    let _ = app.state.delete_workspace(&ws.name);
+                                    app.workspaces = app.state.workspaces.clone();
+                                    app.rebuild_tree();
+                                    app.update_active_session();
+                                }
+                                Some(TreeNode::Repo { id, .. }) => {
+                                    let ws_ids: Vec<String> = app.state.workspaces.iter()
+                                        .filter(|w| w.repo_id == id)
+                                        .map(|w| w.id.clone())
+                                        .collect();
+                                    for ws_id in &ws_ids {
+                                        if let Some(s) = app.state.find_session_by_workspace(ws_id)
+                                            && s.status == SessionStatus::Running {
+                                                let sid = s.id.clone();
+                                                let _ = app.session_manager.stop_session(&sid).await;
+                                                let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+                                            }
+                                        app.scrollbacks.remove(ws_id);
+                                    }
+                                    let _ = app.state.delete_repo(&id);
+                                    app.repos = app.state.repos.clone();
+                                    app.workspaces = app.state.workspaces.clone();
+                                    app.expanded.remove(&id);
+                                    app.rebuild_tree();
+                                    app.update_active_session();
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    Ok(KeyOutcome::Continue)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
@@ -1206,12 +1972,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         // Select the first resumed workspace in the tree
         let first_ws_id = &resumed_workspace_ids[0];
         for (i, node) in app.tree_items.iter().enumerate() {
-            if let TreeNode::Workspace { ws, .. } = node {
-                if ws.id == *first_ws_id {
+            if let TreeNode::Workspace { ws, .. } = node
+                && ws.id == *first_ws_id {
                     app.selected_index = i;
                     break;
                 }
-            }
         }
         app.update_active_session();
         app.focus = Focus::Tree;
@@ -1227,770 +1992,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             event = reader.next().fuse() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        // Help modal: scrollable, dismissed with ?/Esc, swallows other keys
-                        if app.show_help {
-                            let g_was_pending = std::mem::take(&mut app.pending_g);
-                            match key.code {
-                                KeyCode::Char('?') | KeyCode::Esc => app.show_help = false,
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    app.help_scroll = app.help_scroll.saturating_add(1);
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    app.help_scroll = app.help_scroll.saturating_sub(1);
-                                }
-                                KeyCode::PageDown => {
-                                    app.help_scroll = app.help_scroll.saturating_add(10);
-                                }
-                                KeyCode::PageUp => {
-                                    app.help_scroll = app.help_scroll.saturating_sub(10);
-                                }
-                                KeyCode::Char('g') => {
-                                    if g_was_pending {
-                                        app.help_scroll = 0;
-                                    } else {
-                                        app.pending_g = true;
-                                    }
-                                }
-                                KeyCode::Char('G') | KeyCode::End => {
-                                    // Clamped to actual content height at render time
-                                    app.help_scroll = u16::MAX;
-                                }
-                                KeyCode::Home => app.help_scroll = 0,
-                                _ => {} // swallow all other keys
-                            }
-                            continue;
-                        }
-
-                        // Modal dialog: swallow all keys
-                        if app.modal.is_active() {
-                            match modal::handle_modal_key(&mut app.modal, key) {
-                                modal::ModalResult::Consumed | modal::ModalResult::Cancelled => {}
-                                modal::ModalResult::SubmitRepo(path) => {
-                                    match app.state.add_repo(&path) {
-                                        Ok(_) => {
-                                            app.repos = app.state.repos.clone();
-                                            app.rebuild_tree();
-                                        }
-                                        Err(e) => {
-                                            app.modal = modal::ModalState::AddRepo {
-                                                input: path,
-                                                cursor: 0,
-                                                error: Some(e.to_string()),
-                                                completions: Vec::new(),
-                                                completion_index: None,
-                                            };
-                                        }
-                                    }
-                                }
-                                modal::ModalResult::ConfirmDelete(target) => {
-                                    match target {
-                                        modal::DeleteTarget::Workspace { name } => {
-                                            // Gather IDs before mutating
-                                            let ws_info = app.state.workspaces.iter()
-                                                .find(|w| w.name == name)
-                                                .map(|w| {
-                                                    let sid = app.state.find_session_by_workspace(&w.id)
-                                                        .filter(|s| s.status == SessionStatus::Running)
-                                                        .map(|s| s.id.clone());
-                                                    (w.id.clone(), sid)
-                                                });
-                                            if let Some((ws_id, running_sid)) = ws_info {
-                                                if let Some(sid) = running_sid {
-                                                    let _ = app.session_manager.stop_session(&sid).await;
-                                                    let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
-                                                }
-                                                app.scrollbacks.remove(&ws_id);
-                                            }
-                                            let _ = app.state.delete_workspace(&name);
-                                            app.workspaces = app.state.workspaces.clone();
-                                            app.rebuild_tree();
-                                            app.update_active_session();
-                                        }
-                                        modal::DeleteTarget::Repo { id, .. } => {
-                                            // Stop all running sessions for this repo's workspaces
-                                            let ws_ids: Vec<String> = app.state.workspaces.iter()
-                                                .filter(|w| w.repo_id == id)
-                                                .map(|w| w.id.clone())
-                                                .collect();
-                                            for ws_id in &ws_ids {
-                                                if let Some(s) = app.state.find_session_by_workspace(ws_id) {
-                                                    if s.status == SessionStatus::Running {
-                                                        let sid = s.id.clone();
-                                                        let _ = app.session_manager.stop_session(&sid).await;
-                                                        let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
-                                                    }
-                                                }
-                                                app.scrollbacks.remove(ws_id);
-                                            }
-                                            let _ = app.state.delete_repo(&id);
-                                            app.repos = app.state.repos.clone();
-                                            app.workspaces = app.state.workspaces.clone();
-                                            app.expanded.remove(&id);
-                                            app.rebuild_tree();
-                                            app.update_active_session();
-                                        }
-                                    }
-                                }
-                                modal::ModalResult::SubmitWorkspace(repo_id, name) => {
-                                    let repo_name = app.repos.iter()
-                                        .find(|r| r.id == repo_id)
-                                        .map(|r| r.name.clone())
-                                        .unwrap_or_default();
-                                    match app.state.create_workspace(Some(&name), &repo_name) {
-                                        Ok(_) => {
-                                            app.workspaces = app.state.workspaces.clone();
-                                            // Auto-expand the repo
-                                            app.expanded.insert(repo_id);
-                                            app.rebuild_tree();
-                                        }
-                                        Err(e) => {
-                                            app.modal = modal::ModalState::AddWorkspace {
-                                                repo_id,
-                                                repo_name,
-                                                input: name,
-                                                cursor: 0,
-                                                error: Some(e.to_string()),
-                                            };
-                                        }
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-
-                        // Vim `gg`: consume the pending flag; only a bare `g` below re-arms it
-                        let g_was_pending = std::mem::take(&mut app.pending_g);
-
-                        // Global keys (work in any focus)
-                        match key.code {
-                            KeyCode::Char('q') if app.focus != Focus::Composer => {
-                                app.session_manager.shutdown_all().await?;
-                                let running_ids: Vec<String> = app.state.sessions.iter()
-                                    .filter(|s| s.status == SessionStatus::Running)
-                                    .map(|s| s.id.clone())
-                                    .collect();
-                                for sid in running_ids {
-                                    let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
-                                }
-                                break;
-                            }
-                            KeyCode::Char('c') if has_cmd_modifier(key.modifiers) => {
-                                // Ctrl/Cmd+C: copy selection from the focused pane
-                                match app.focus {
-                                    Focus::Composer => {
-                                        if app.composer.has_selection() {
-                                            if let Some(text) = app.composer.selected_text() {
-                                                let _ = app.clipboard.set_text(&text);
-                                                app.composer.set_copy_flash(true);
-                                                app.copy_flash_until = Some((app.focus, Instant::now() + Duration::from_millis(150)));
-                                            }
-                                        }
-                                    }
-                                    Focus::Output => {
-                                        if let Some(ws) = app.selected_workspace().cloned() {
-                                            if let Some(sel) = app.selections.get(&ws.id) {
-                                                if let Some((start, end)) = sel.ordered_range() {
-                                                    if let Some((owned_lines, inner_width)) = app.output_context(&ws.id) {
-                                                        let refs: Vec<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
-                                                        let wm = WrapMap::build(&refs, inner_width);
-                                                        let text = wm.extract_text(&refs, start, end);
-                                                        let _ = app.clipboard.set_text(&text);
-                                                        app.copy_flash_until = Some((app.focus, Instant::now() + Duration::from_millis(150)));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                // No selection in focused pane: pure no-op (CLIP-02)
-                            }
-                            KeyCode::Char('v') if has_cmd_modifier(key.modifiers) => {
-                                // Ctrl/Cmd+V: paste clipboard text into the composer
-                                // (output/tree are read-only, so this is a no-op there)
-                                if app.focus == Focus::Composer {
-                                    if let Ok(text) = app.clipboard.get_text() {
-                                        app.composer.insert_paste(&text);
-                                    }
-                                }
-                            }
-                            KeyCode::Char('q') if has_cmd_modifier(key.modifiers) => {
-                                // Ctrl+Q: stop session if running, otherwise quit (works in ALL panes)
-                                let has_running = app.selected_workspace().cloned()
-                                    .and_then(|ws| {
-                                        app.state.find_session_by_workspace(&ws.id)
-                                            .filter(|s| s.status == SessionStatus::Running)
-                                            .map(|s| (ws.id.clone(), s.id.clone()))
-                                    });
-                                if let Some((ws_id, session_id)) = has_running {
-                                    let _ = app.session_manager.stop_session(&session_id).await;
-                                    let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
-                                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
-                                        buf.push_line("--- Session stopped ---".to_string());
-                                    }
-                                    app.focus = Focus::Output;
-                                    app.composer.set_active(false);
-                                } else {
-                                    app.session_manager.shutdown_all().await?;
-                                    break;
-                                }
-                            }
-                            KeyCode::Tab => {
-                                let has_session = app.selected_workspace()
-                                    .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
-                                    .is_some();
-                                let has_running = app.selected_workspace()
-                                    .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
-                                    .map(|s| s.status == SessionStatus::Running)
-                                    .unwrap_or(false);
-                                if app.zoomed {
-                                    // In zoom mode, only cycle Output <-> Composer
-                                    app.focus = match app.focus {
-                                        Focus::Output if has_running => {
-                                            app.composer.set_active(true);
-                                            Focus::Composer
-                                        }
-                                        Focus::Composer => {
-                                            app.composer.set_active(false);
-                                            Focus::Output
-                                        }
-                                        _ => Focus::Output,
-                                    };
-                                } else {
-                                    // Normal cycle: Tree -> Output -> Composer -> Tree
-                                    app.focus = match app.focus {
-                                        Focus::Tree if has_session => Focus::Output,
-                                        Focus::Output if has_running => {
-                                            app.composer.set_active(true);
-                                            Focus::Composer
-                                        }
-                                        Focus::Output => Focus::Tree,
-                                        Focus::Composer => {
-                                            app.composer.set_active(false);
-                                            Focus::Tree
-                                        }
-                                        _ => Focus::Tree,
-                                    };
-                                }
-                            }
-                            KeyCode::BackTab => {
-                                let has_session = app.selected_workspace()
-                                    .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
-                                    .is_some();
-                                let has_running = app.selected_workspace()
-                                    .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
-                                    .map(|s| s.status == SessionStatus::Running)
-                                    .unwrap_or(false);
-                                if app.zoomed {
-                                    // In zoom mode, only cycle Output <-> Composer
-                                    app.focus = match app.focus {
-                                        Focus::Composer => {
-                                            app.composer.set_active(false);
-                                            Focus::Output
-                                        }
-                                        Focus::Output if has_running => {
-                                            app.composer.set_active(true);
-                                            Focus::Composer
-                                        }
-                                        _ => Focus::Output,
-                                    };
-                                } else {
-                                    // Reverse cycle: Tree -> Composer -> Output -> Tree
-                                    app.focus = match app.focus {
-                                        Focus::Tree if has_running => {
-                                            app.composer.set_active(true);
-                                            Focus::Composer
-                                        }
-                                        Focus::Tree if has_session => Focus::Output,
-                                        Focus::Output => Focus::Tree,
-                                        Focus::Composer => {
-                                            app.composer.set_active(false);
-                                            Focus::Output
-                                        }
-                                        _ => Focus::Tree,
-                                    };
-                                }
-                            }
-                            KeyCode::Esc => {
-                                if app.zoomed {
-                                    app.zoomed = false;
-                                } else if app.focus == Focus::Output {
-                                    // Clear output selection first; if no selection, return to Tree
-                                    let has_sel = app.selected_workspace().cloned()
-                                        .and_then(|ws| app.selections.get(&ws.id).map(|s| (ws.id.clone(), s.has_range())))
-                                        .filter(|(_, has)| *has);
-                                    if let Some((ws_id, _)) = has_sel {
-                                        app.clear_selection_for_workspace(&ws_id);
-                                    } else {
-                                        app.focus = Focus::Tree;
-                                    }
-                                } else if app.focus == Focus::Composer && app.composer.has_selection() {
-                                    app.composer.cancel_selection();
-                                } else {
-                                    if app.focus == Focus::Composer {
-                                        app.composer.set_active(false);
-                                    }
-                                    app.focus = Focus::Tree;
-                                }
-                            }
-                            KeyCode::Char('?') if app.focus != Focus::Composer => {
-                                app.show_help = !app.show_help;
-                                app.help_scroll = 0;
-                            }
-                            _ => {
-                                // Focus-specific keys
-                                match app.focus {
-                                    Focus::Composer => {
-                                        if let Some(text) = app.composer.handle_key(key) {
-                                            if let Some(session_id) = app.active_session_id.clone() {
-                                                let ws_id = app.state.sessions.iter()
-                                                    .find(|s| s.id == session_id)
-                                                    .map(|s| s.workspace_id.clone());
-                                                if let Some(ws_id) = ws_id {
-                                                    let buf = app.scrollbacks
-                                                        .entry(ws_id.clone())
-                                                        .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                                    // Add separator before user message if there's prior content
-                                                    if !buf.is_empty() {
-                                                        buf.push_line("---".to_string());
-                                                    }
-                                                    for line in text.split('\n') {
-                                                        buf.push_line(format!("> {line}"));
-                                                    }
-                                                    buf.push_line("---".to_string());
-                                                    buf.reset_scroll(); // pin to bottom so response is visible
-                                                    // Sending a message re-enables auto-scroll and clears selection
-                                                    app.auto_scroll_suppressed.remove(&ws_id);
-                                                    app.clear_selection_for_workspace(&ws_id);
-                                                    app.waiting_response.insert(ws_id);
-                                                }
-                                                app.write_log(&session_id, "user", &text);
-                                                let _ = app.session_manager.send_message(&session_id, &text).await;
-                                            }
-                                        }
-                                    }
-                                    Focus::Output => {
-                                        // Cursor movement, selection, and navigation
-                                        let ws_id = app.selected_workspace().map(|ws| ws.id.clone());
-                                        if let Some(ws_id) = ws_id {
-                                            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                                            let ctrl = has_cmd_modifier(key.modifiers);
-
-                                            match (key.code, ctrl, shift) {
-                                                // --- Cursor movement (no modifiers) ---
-                                                (KeyCode::Up, false, false) | (KeyCode::Char('k'), false, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.collapse_selection_to_cursor(&ws_id);
-                                                    app.move_cursor_vertical(&ws_id, -1);
-                                                }
-                                                (KeyCode::Down, false, false) | (KeyCode::Char('j'), false, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.collapse_selection_to_cursor(&ws_id);
-                                                    app.move_cursor_vertical(&ws_id, 1);
-                                                }
-                                                (KeyCode::Left, false, false) | (KeyCode::Char('h'), false, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.collapse_selection_to_cursor(&ws_id);
-                                                    app.move_cursor_horizontal(&ws_id, -1);
-                                                }
-                                                (KeyCode::Right, false, false) | (KeyCode::Char('l'), false, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.collapse_selection_to_cursor(&ws_id);
-                                                    app.move_cursor_horizontal(&ws_id, 1);
-                                                }
-
-                                                // --- Word jump (Ctrl+arrow) ---
-                                                (KeyCode::Left, true, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.collapse_selection_to_cursor(&ws_id);
-                                                    app.move_cursor_word_left(&ws_id);
-                                                }
-                                                (KeyCode::Right, true, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.collapse_selection_to_cursor(&ws_id);
-                                                    app.move_cursor_word_right(&ws_id);
-                                                }
-
-                                                // --- Selection extend (Shift+arrow) ---
-                                                (KeyCode::Up, false, true) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.extend_selection_vertical(&ws_id, -1);
-                                                }
-                                                (KeyCode::Down, false, true) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.extend_selection_vertical(&ws_id, 1);
-                                                }
-                                                (KeyCode::Left, false, true) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.extend_selection_horizontal(&ws_id, -1);
-                                                }
-                                                (KeyCode::Right, false, true) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.extend_selection_horizontal(&ws_id, 1);
-                                                }
-
-                                                // --- Word-extend selection (Shift+Ctrl+arrow) ---
-                                                (KeyCode::Left, true, true) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.extend_selection_word_left(&ws_id);
-                                                }
-                                                (KeyCode::Right, true, true) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.extend_selection_word_right(&ws_id);
-                                                }
-
-                                                // --- Document navigation ---
-                                                (KeyCode::Home, _, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.move_cursor_to_document_start(&ws_id);
-                                                }
-                                                (KeyCode::End, _, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.move_cursor_to_document_end(&ws_id);
-                                                }
-                                                (KeyCode::Home, _, true) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.extend_selection_to_document_start(&ws_id);
-                                                }
-                                                (KeyCode::End, _, true) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.extend_selection_to_document_end(&ws_id);
-                                                }
-
-                                                // --- Page navigation ---
-                                                (KeyCode::PageUp, false, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.move_cursor_page_up(&ws_id);
-                                                }
-                                                (KeyCode::PageDown, false, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.move_cursor_page_down(&ws_id);
-                                                }
-
-                                                // --- Select all ---
-                                                (KeyCode::Char('a'), true, _) => {
-                                                    app.select_all(&ws_id);
-                                                }
-
-                                                // --- Half-page scroll (vim Ctrl+D / Ctrl+U) ---
-                                                (KeyCode::Char('u'), true, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.move_cursor_half_page_up(&ws_id);
-                                                }
-                                                (KeyCode::Char('d'), true, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.move_cursor_half_page_down(&ws_id);
-                                                }
-
-                                                // --- Document jumps (vim gg / G) ---
-                                                (KeyCode::Char('g'), false, false) => {
-                                                    if g_was_pending {
-                                                        app.init_cursor_if_needed(&ws_id);
-                                                        app.move_cursor_to_document_start(&ws_id);
-                                                    } else {
-                                                        app.pending_g = true;
-                                                    }
-                                                }
-                                                (KeyCode::Char('G'), false, false) => {
-                                                    app.init_cursor_if_needed(&ws_id);
-                                                    app.move_cursor_to_document_end(&ws_id);
-                                                }
-
-                                                // --- Existing ---
-                                                (KeyCode::Char('z'), false, false) => {
-                                                    app.zoomed = !app.zoomed;
-                                                }
-                                                (KeyCode::Char('i'), false, false) => {
-                                                    // Enter composer from output
-                                                    let has_running = app.selected_workspace()
-                                                        .and_then(|ws| app.state.find_session_by_workspace(&ws.id))
-                                                        .map(|s| s.status == SessionStatus::Running)
-                                                        .unwrap_or(false);
-                                                    if has_running {
-                                                        app.focus = Focus::Composer;
-                                                        app.composer.set_active(true);
-                                                    }
-                                                }
-
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                    Focus::Tree => {
-                                        match key.code {
-                                            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                                            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                                            KeyCode::Left | KeyCode::Char('h') => app.tree_collapse_or_parent(),
-                                            KeyCode::Right | KeyCode::Char('l') => app.tree_expand_or_enter(),
-                                            KeyCode::Char('g') => {
-                                                if g_was_pending {
-                                                    app.tree_select_first();
-                                                } else {
-                                                    app.pending_g = true;
-                                                }
-                                            }
-                                            KeyCode::Char('G') => app.tree_select_last(),
-                                            KeyCode::Enter => {
-                                                match app.tree_items.get(app.selected_index).cloned() {
-                                                    Some(TreeNode::Repo { .. }) => app.toggle_expand(),
-                                                    Some(TreeNode::Workspace { ws, .. }) => {
-                                                        // Enter on workspace: start/resume session + focus Composer
-                                                        let session = app.state.find_session_by_workspace(&ws.id)
-                                                            .map(|s| (s.id.clone(), s.status.clone(), s.claude_session_id.clone()));
-                                                        match session {
-                                                            Some((_, SessionStatus::Running, _)) => {
-                                                                // Already running: just focus Composer
-                                                                app.focus = Focus::Composer;
-                                                                app.composer.set_active(true);
-                                                            }
-                                                            Some((old_id, _, claude_sid)) => {
-                                                                // Stopped/exited/failed: restart (same as R key)
-                                                                let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
-                                                                if let Ok(new_session) = app.state.create_session(&ws.id) {
-                                                                    let session_id = new_session.id.clone();
-                                                                    match app.session_manager.start_session(
-                                                                        &session_id,
-                                                                        &ws.working_dir,
-                                                                        claude_sid.as_deref(),
-                                                                    ) {
-                                                                        Ok(pid) => {
-                                                                            if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                                                s.pid = Some(pid);
-                                                                                s.claude_session_id = claude_sid;
-                                                                            }
-                                                                            let _ = app.state.save();
-                                                                            app.active_session_id = Some(session_id);
-                                                                            app.scrollbacks
-                                                                                .entry(ws.id.clone())
-                                                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
-                                                                                .reset_scroll();
-                                                                            app.focus = Focus::Composer;
-                                                                            app.composer.set_active(true);
-                                                                        }
-                                                                        Err(_) => {
-                                                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            None => {
-                                                                // No session: create + start (same as r key)
-                                                                if let Ok(new_session) = app.state.create_session(&ws.id) {
-                                                                    let session_id = new_session.id.clone();
-                                                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
-                                                                        Ok(pid) => {
-                                                                            if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                                                s.pid = Some(pid);
-                                                                            }
-                                                                            let _ = app.state.save();
-                                                                            app.scrollbacks
-                                                                                .entry(ws.id.clone())
-                                                                                .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                                                            app.active_session_id = Some(session_id);
-                                                                            app.focus = Focus::Composer;
-                                                                            app.composer.set_active(true);
-                                                                        }
-                                                                        Err(_) => {
-                                                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    Some(TreeNode::Hint { .. }) | None => {}
-                                                }
-                                            }
-                                            KeyCode::Char('r') => {
-                                                if let Some(ws) = app.selected_workspace().cloned() {
-                                                    let has_running = app.state.find_session_by_workspace(&ws.id)
-                                                        .map(|s| s.status == SessionStatus::Running)
-                                                        .unwrap_or(false);
-                                                    if !has_running {
-                                                        if let Ok(session) = app.state.create_session(&ws.id) {
-                                                            let session_id = session.id.clone();
-                                                            let ws_dir = ws.working_dir.clone();
-                                                            match app.session_manager.start_session(&session_id, &ws_dir, None) {
-                                                                Ok(pid) => {
-                                                                    if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                                        s.pid = Some(pid);
-                                                                    }
-                                                                    let _ = app.state.save();
-                                                                    app.scrollbacks
-                                                                        .entry(ws.id.clone())
-                                                                        .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                                                    app.active_session_id = Some(session_id);
-                                                                    // Stay in tree focus -- don't auto-focus composer
-                                                                    app.focus = Focus::Output;
-                                                                }
-                                                                Err(_e) => {
-                                                                    let _ = app.state.update_session_status(&session_id, SessionStatus::Failed);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            KeyCode::Char('x') | KeyCode::Delete => {
-                                                if let Some(ws) = app.selected_workspace().cloned() {
-                                                    let session_info = app.state.find_session_by_workspace(&ws.id)
-                                                        .filter(|s| s.status == SessionStatus::Running)
-                                                        .map(|s| s.id.clone());
-                                                    if let Some(session_id) = session_info {
-                                                        let _ = app.session_manager.stop_session(&session_id).await;
-                                                        let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
-                                                        if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
-                                                            buf.push_line("--- Session stopped ---".to_string());
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            KeyCode::Char('R') => {
-                                                if let Some(ws) = app.selected_workspace().cloned() {
-                                                    let session_info = app.state.find_session_by_workspace(&ws.id)
-                                                        .filter(|s| s.status != SessionStatus::Running)
-                                                        .map(|s| (s.id.clone(), s.claude_session_id.clone()));
-                                                    if let Some((old_session_id, claude_sid)) = session_info {
-                                                        // Stop old, create new state session, start with its ID
-                                                        let _ = app.state.update_session_status(&old_session_id, SessionStatus::Stopped);
-                                                        if let Ok(new_session) = app.state.create_session(&ws.id) {
-                                                            let session_id = new_session.id.clone();
-                                                            match app.session_manager.start_session(
-                                                                &session_id,
-                                                                &ws.working_dir,
-                                                                claude_sid.as_deref(),
-                                                            ) {
-                                                                Ok(pid) => {
-                                                                    if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                                        s.pid = Some(pid);
-                                                                        s.claude_session_id = claude_sid.clone();
-                                                                    }
-                                                                    let _ = app.state.save();
-                                                                    app.active_session_id = Some(session_id);
-                                                                    app.scrollbacks
-                                                                        .entry(ws.id.clone())
-                                                                        .or_insert_with(|| ScrollbackBuffer::new(50_000))
-                                                                        .reset_scroll();
-                                                                    app.focus = Focus::Output;
-                                                                }
-                                                                Err(_) => {
-                                                                    let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            KeyCode::Char('a') => {
-                                                // Open Add Repo modal
-                                                app.modal = modal::ModalState::AddRepo {
-                                                    input: String::new(),
-                                                    cursor: 0,
-                                                    error: None,
-                                                    completions: Vec::new(),
-                                                    completion_index: None,
-                                                };
-                                            }
-                                            KeyCode::Char('w') => {
-                                                // Open Add Workspace modal for selected repo
-                                                let repo_info = match app.tree_items.get(app.selected_index) {
-                                                    Some(TreeNode::Repo { id, name, .. }) => {
-                                                        Some((id.clone(), name.clone()))
-                                                    }
-                                                    Some(TreeNode::Workspace { ws, repo_name }) => {
-                                                        Some((ws.repo_id.clone(), repo_name.clone()))
-                                                    }
-                                                    _ => None,
-                                                };
-                                                if let Some((repo_id, repo_name)) = repo_info {
-                                                    app.modal = modal::ModalState::AddWorkspace {
-                                                        repo_id,
-                                                        repo_name,
-                                                        input: String::new(),
-                                                        cursor: 0,
-                                                        error: None,
-                                                    };
-                                                }
-                                            }
-                                            KeyCode::Char('d') => {
-                                                // Delete selected item with confirmation
-                                                match app.tree_items.get(app.selected_index).cloned() {
-                                                    Some(TreeNode::Workspace { ws, .. }) => {
-                                                        app.modal = modal::ModalState::ConfirmDelete {
-                                                            target: modal::DeleteTarget::Workspace {
-                                                                name: ws.name.clone(),
-                                                            },
-                                                        };
-                                                    }
-                                                    Some(TreeNode::Repo { id, name, .. }) => {
-                                                        let ws_count = app.workspaces.iter()
-                                                            .filter(|w| w.repo_id == id)
-                                                            .count();
-                                                        app.modal = modal::ModalState::ConfirmDelete {
-                                                            target: modal::DeleteTarget::Repo {
-                                                                id,
-                                                                name,
-                                                                workspace_count: ws_count,
-                                                            },
-                                                        };
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            KeyCode::Char('D') => {
-                                                // Force delete without confirmation
-                                                match app.tree_items.get(app.selected_index).cloned() {
-                                                    Some(TreeNode::Workspace { ws, .. }) => {
-                                                        let ws_info = app.state.workspaces.iter()
-                                                            .find(|w| w.name == ws.name)
-                                                            .map(|w| {
-                                                                let sid = app.state.find_session_by_workspace(&w.id)
-                                                                    .filter(|s| s.status == SessionStatus::Running)
-                                                                    .map(|s| s.id.clone());
-                                                                (w.id.clone(), sid)
-                                                            });
-                                                        if let Some((ws_id, running_sid)) = ws_info {
-                                                            if let Some(sid) = running_sid {
-                                                                let _ = app.session_manager.stop_session(&sid).await;
-                                                                let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
-                                                            }
-                                                            app.scrollbacks.remove(&ws_id);
-                                                        }
-                                                        let _ = app.state.delete_workspace(&ws.name);
-                                                        app.workspaces = app.state.workspaces.clone();
-                                                        app.rebuild_tree();
-                                                        app.update_active_session();
-                                                    }
-                                                    Some(TreeNode::Repo { id, .. }) => {
-                                                        let ws_ids: Vec<String> = app.state.workspaces.iter()
-                                                            .filter(|w| w.repo_id == id)
-                                                            .map(|w| w.id.clone())
-                                                            .collect();
-                                                        for ws_id in &ws_ids {
-                                                            if let Some(s) = app.state.find_session_by_workspace(ws_id) {
-                                                                if s.status == SessionStatus::Running {
-                                                                    let sid = s.id.clone();
-                                                                    let _ = app.session_manager.stop_session(&sid).await;
-                                                                    let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
-                                                                }
-                                                            }
-                                                            app.scrollbacks.remove(ws_id);
-                                                        }
-                                                        let _ = app.state.delete_repo(&id);
-                                                        app.repos = app.state.repos.clone();
-                                                        app.workspaces = app.state.workspaces.clone();
-                                                        app.expanded.remove(&id);
-                                                        app.rebuild_tree();
-                                                        app.update_active_session();
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
+                        if handle_key(&mut app, key).await? == KeyOutcome::Quit {
+                            break;
                         }
                     }
                     Some(Ok(Event::Paste(text))) => {
@@ -2071,8 +2074,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                         }
                         buttons::HitAction::StopSession => {
-                            if let Some(ws) = app.selected_workspace().cloned() {
-                                if let Some(session_id) = app.state.find_session_by_workspace(&ws.id)
+                            if let Some(ws) = app.selected_workspace().cloned()
+                                && let Some(session_id) = app.state.find_session_by_workspace(&ws.id)
                                     .filter(|s| s.status == SessionStatus::Running)
                                     .map(|s| s.id.clone())
                                 {
@@ -2084,12 +2087,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.focus = Focus::Tree;
                                     app.composer.set_active(false);
                                 }
-                            }
                         }
                         // Tree-icon buttons (use carried workspace_id, do NOT change focus)
                         buttons::HitAction::StartSessionFor { workspace_id } => {
-                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
-                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned()
+                                && let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
                                     match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
                                         Ok(pid) => {
@@ -2108,7 +2110,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
-                            }
                         }
                         buttons::HitAction::StopSessionFor { workspace_id } => {
                             if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
@@ -2153,8 +2154,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                         }
                         buttons::HitAction::RetrySessionFor { workspace_id } => {
-                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
-                                if let Ok(new_session) = app.state.create_session(&ws.id) {
+                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned()
+                                && let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
                                     match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
                                         Ok(pid) => {
@@ -2173,7 +2174,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
-                            }
                         }
                         buttons::HitAction::FocusComposerFor { workspace_id } => {
                             // Focus the composer for the given workspace's running session
@@ -2184,13 +2184,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 // Navigate selection to this workspace
                                 let old = app.selected_index;
                                 for (i, node) in app.tree_items.iter().enumerate() {
-                                    if let TreeNode::Workspace { ws, .. } = node {
-                                        if ws.id == workspace_id {
+                                    if let TreeNode::Workspace { ws, .. } = node
+                                        && ws.id == workspace_id {
                                             app.swap_composer_draft(old, i);
                                             app.selected_index = i;
                                             break;
                                         }
-                                    }
                                 }
                                 app.update_active_session();
                                 app.focus = Focus::Composer;
@@ -2290,22 +2289,21 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             _ = tick_interval.tick() => {
                 // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
                 app.tick_counter = app.tick_counter.wrapping_add(1);
-                if app.tick_counter % 5 == 0 {
+                if app.tick_counter.is_multiple_of(5) {
                     app.spinner_tick = (app.spinner_tick + 1) % 10;
                 }
                 // Cursor blink toggle every 10th tick (~500ms at 50ms interval)
-                if app.tick_counter % 10 == 0 {
+                if app.tick_counter.is_multiple_of(10) {
                     app.cursor_blink_on = !app.cursor_blink_on;
                 }
                 // Clear copy flash when expired
-                if let Some((pane, until)) = app.copy_flash_until {
-                    if Instant::now() >= until {
+                if let Some((pane, until)) = app.copy_flash_until
+                    && Instant::now() >= until {
                         app.copy_flash_until = None;
                         if pane == Focus::Composer {
                             app.composer.set_copy_flash(false);
                         }
                     }
-                }
 
                 // Poll session events
                 let events = app.session_manager.poll_events();
@@ -2345,14 +2343,13 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 .map(|s| s.workspace_id.clone());
                             if let Some(ws_id) = ws_id {
                                 // Flush any remaining partial line
-                                if let Some(remaining) = app.streaming_text.remove(&ws_id) {
-                                    if !remaining.is_empty() {
+                                if let Some(remaining) = app.streaming_text.remove(&ws_id)
+                                    && !remaining.is_empty() {
                                         let buf = app.scrollbacks
                                             .entry(ws_id)
                                             .or_insert_with(|| ScrollbackBuffer::new(50_000));
                                         buf.push_line(remaining);
                                     }
-                                }
                             }
                         }
                         SessionEvent::Output { session_id, line, source } => {
@@ -2396,11 +2393,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     .find(|s| s.id == session_id)
                                     .map(|s| s.status == SessionStatus::Stopped)
                                     .unwrap_or(false);
-                                if !already_stopped {
-                                    if let Some(s) = app.state.find_session_mut(&session_id) {
+                                if !already_stopped
+                                    && let Some(s) = app.state.find_session_mut(&session_id) {
                                         s.claude_session_id = None;
                                     }
-                                }
                             }
                             let _ = app.state.update_session_status(&session_id, status);
                             // Push exit message to scrollback
@@ -2421,12 +2417,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             app.composer.set_active(false);
                         }
                         SessionEvent::ClaudeSessionId { session_id, claude_session_id } => {
-                            if let Some(s) = app.state.find_session_mut(&session_id) {
-                                if s.claude_session_id.is_none() {
+                            if let Some(s) = app.state.find_session_mut(&session_id)
+                                && s.claude_session_id.is_none() {
                                     s.claude_session_id = Some(claude_session_id);
                                     let _ = app.state.save();
                                 }
-                            }
                         }
                         SessionEvent::Error { session_id, error } => {
                             let ws_id = app.state.sessions.iter()
@@ -2448,3 +2443,155 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn test_app() -> App {
+        let mut state = AppState::default();
+        state.repos.push(RepoEntry {
+            id: "r1".into(),
+            name: "alpha".into(),
+            path: "/tmp/alpha".into(),
+        });
+        state.repos.push(RepoEntry {
+            id: "r2".into(),
+            name: "beta".into(),
+            path: "/tmp/beta".into(),
+        });
+        state.workspaces.push(Workspace {
+            id: "w1".into(),
+            name: "ws-one".into(),
+            repo_id: "r1".into(),
+            working_dir: "/tmp/alpha".into(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+        });
+        App::new(state)
+    }
+
+    async fn press(app: &mut App, code: KeyCode) -> KeyOutcome {
+        handle_key(app, key(code)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn j_k_and_arrows_navigate_tree() {
+        let mut app = test_app();
+        assert_eq!(app.selected_index, 0);
+        press(&mut app, KeyCode::Char('j')).await;
+        assert_eq!(app.selected_index, 1);
+        press(&mut app, KeyCode::Char('k')).await;
+        assert_eq!(app.selected_index, 0);
+        press(&mut app, KeyCode::Down).await;
+        assert_eq!(app.selected_index, 1);
+        press(&mut app, KeyCode::Up).await;
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[tokio::test]
+    async fn l_expands_repo_and_h_collapses() {
+        let mut app = test_app();
+        assert_eq!(app.tree_items.len(), 2);
+        press(&mut app, KeyCode::Char('l')).await;
+        assert!(app.expanded.contains("r1"));
+        assert_eq!(app.tree_items.len(), 3);
+        // l on an expanded repo steps into its first child
+        press(&mut app, KeyCode::Char('l')).await;
+        assert_eq!(app.selected_index, 1);
+        // h on a workspace jumps back to the parent repo
+        press(&mut app, KeyCode::Char('h')).await;
+        assert_eq!(app.selected_index, 0);
+        // h on an expanded repo collapses it
+        press(&mut app, KeyCode::Char('h')).await;
+        assert!(!app.expanded.contains("r1"));
+        assert_eq!(app.tree_items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn gg_and_shift_g_jump_to_first_and_last() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('G')).await;
+        assert_eq!(app.selected_index, app.tree_items.len() - 1);
+        press(&mut app, KeyCode::Char('g')).await;
+        assert!(app.pending_g);
+        press(&mut app, KeyCode::Char('g')).await;
+        assert_eq!(app.selected_index, 0);
+        assert!(!app.pending_g);
+    }
+
+    #[tokio::test]
+    async fn pending_g_is_cancelled_by_other_keys() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('G')).await;
+        press(&mut app, KeyCode::Char('g')).await;
+        press(&mut app, KeyCode::Esc).await; // any other key cancels the pending g
+        press(&mut app, KeyCode::Char('g')).await;
+        // gg never completed: still at the bottom, g is re-armed
+        assert_eq!(app.selected_index, app.tree_items.len() - 1);
+        assert!(app.pending_g);
+    }
+
+    #[tokio::test]
+    async fn help_overlay_toggles_and_scrolls() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('?')).await;
+        assert!(app.show_help);
+        press(&mut app, KeyCode::Char('j')).await;
+        press(&mut app, KeyCode::Char('j')).await;
+        assert_eq!(app.help_scroll, 2);
+        press(&mut app, KeyCode::Char('k')).await;
+        assert_eq!(app.help_scroll, 1);
+        press(&mut app, KeyCode::Esc).await;
+        assert!(!app.show_help);
+        // Reopening resets scroll
+        press(&mut app, KeyCode::Char('?')).await;
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn q_quits() {
+        let mut app = test_app();
+        assert!(press(&mut app, KeyCode::Char('q')).await == KeyOutcome::Quit);
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn renders_repo_tree() {
+        let mut app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("alpha"), "tree should list repo alpha:\n{text}");
+        assert!(text.contains("beta"), "tree should list repo beta:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn renders_help_overlay_after_question_mark() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('?')).await;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Help"), "help overlay should render:\n{text}");
+        assert!(text.contains("Navigate"), "help should list bindings:\n{text}");
+    }
+}
