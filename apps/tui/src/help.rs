@@ -32,6 +32,7 @@ const TREE_BINDINGS: &[KeyBinding] = &[
     KeyBinding { keys: "[Enter]", description: "Expand/start session" },
     KeyBinding { keys: "[r]", description: "Start session" },
     KeyBinding { keys: "[R]", description: "Restart session" },
+    KeyBinding { keys: "[e]", description: "Embed interactive claude (Ctrl+] leaves)" },
     KeyBinding { keys: "[x]", description: "Stop session" },
     KeyBinding { keys: "[a]", description: "Add repository" },
     KeyBinding { keys: "[w]", description: "Add workspace" },
@@ -91,6 +92,7 @@ fn focus_to_section(focus: Focus) -> &'static str {
         Focus::Tree => "Tree Pane",
         Focus::Output => "Output Pane",
         Focus::Composer => "Composer",
+        Focus::Embedded => "Tree Pane",
     }
 }
 

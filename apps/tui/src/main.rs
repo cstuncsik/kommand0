@@ -52,6 +52,8 @@ pub(crate) enum Focus {
     Tree,
     Output,
     Composer,
+    /// An embedded interactive `claude` pane (PTY passthrough) owns the keyboard.
+    Embedded,
 }
 
 #[derive(Clone)]
@@ -156,6 +158,12 @@ pub(crate) struct App {
     // Clipboard
     pub(crate) clipboard: clipboard::ClipboardBridge,
     pub(crate) copy_flash_until: Option<(Focus, Instant)>,
+
+    // Embedded PTY panes (migration Phase 2, experimental): per-workspace
+    // interactive `claude` sessions composited into the right pane.
+    pub(crate) embedded: HashMap<String, pane::Pane>,
+    /// Reader-thread → event-loop repaint signal (set in `main` before the loop).
+    pub(crate) embedded_wake: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 impl App {
@@ -238,6 +246,8 @@ impl App {
             auto_scroll_suppressed: HashSet::new(),
             clipboard: clipboard::ClipboardBridge::new(),
             copy_flash_until: None,
+            embedded: HashMap::new(),
+            embedded_wake: None,
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -493,6 +503,90 @@ impl App {
             self.waiting_response.remove(ws_id);
             if let Some(buf) = self.scrollbacks.get_mut(ws_id) {
                 buf.push_line(format!("[ERROR] failed to send message: {e}"));
+            }
+        }
+    }
+
+    /// Enter (spawning if needed) the embedded interactive `claude` pane for the
+    /// selected workspace. Experimental PTY-passthrough toggle (Phase 2).
+    fn toggle_embedded(&mut self) {
+        let Some(ws) = self.selected_workspace() else {
+            return;
+        };
+        let ws_id = ws.id.clone();
+        let ws_dir = ws.working_dir.clone();
+        if !self.embedded.contains_key(&ws_id) {
+            let bin =
+                std::env::var("KOMMAND0_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+            let wake: Option<Box<dyn Fn() + Send>> = self.embedded_wake.clone().map(|tx| {
+                Box::new(move || {
+                    let _ = tx.send(());
+                }) as Box<dyn Fn() + Send>
+            });
+            match pane::Pane::spawn_with_wake(
+                &bin,
+                &[],
+                std::path::Path::new(&ws_dir),
+                24,
+                80,
+                wake,
+            ) {
+                Ok(p) => {
+                    self.embedded.insert(ws_id.clone(), p);
+                }
+                Err(e) => {
+                    let buf = self
+                        .scrollbacks
+                        .entry(ws_id)
+                        .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                    buf.push_line(format!("[ERROR] failed to start embedded session: {e}"));
+                    return;
+                }
+            }
+        }
+        self.focus = Focus::Embedded;
+        self.composer.set_active(false);
+    }
+
+    /// Forward a key to the selected workspace's embedded pane.
+    /// Returns false when there is no pane to forward to.
+    fn forward_to_embedded(&mut self, key: KeyEvent) -> bool {
+        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
+            return false;
+        };
+        match self.embedded.get_mut(&ws_id) {
+            Some(pane) => {
+                let _ = pane.send_key(key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop embedded panes whose child has exited or whose workspace was deleted
+    /// (the latter centrally covers every delete path). If the focused pane went
+    /// away, leave Embedded focus. Pane's `Drop` terminates the child.
+    fn reap_embedded(&mut self) {
+        let mut dead: Vec<String> = self
+            .embedded
+            .iter_mut()
+            .filter_map(|(k, p)| p.try_wait().map(|_| k.clone()))
+            .collect();
+        for k in self.embedded.keys() {
+            if !self.workspaces.iter().any(|w| &w.id == k) && !dead.contains(k) {
+                dead.push(k.clone());
+            }
+        }
+        for k in &dead {
+            self.embedded.remove(k);
+        }
+        if self.focus == Focus::Embedded {
+            let gone = self
+                .selected_workspace()
+                .map(|w| !self.embedded.contains_key(&w.id))
+                .unwrap_or(true);
+            if gone {
+                self.focus = Focus::Tree;
             }
         }
     }
@@ -1207,6 +1301,23 @@ enum KeyOutcome {
 /// Handle one key press. Extracted from the main event loop so tests can
 /// drive the app without a real terminal.
 async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> {
+    // Embedded pane owns the keyboard: forward everything (incl. Ctrl+C, Tab, q,
+    // slash commands) to the real claude, except Ctrl+] which leaves the pane.
+    // Byte 0x1d is Ctrl+]; a Kitty/CSI-u terminal reports it as Char(']')+CTRL,
+    // a legacy terminal as Char('5')+CTRL — accept both so leave works either way.
+    if app.focus == Focus::Embedded {
+        let leave = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'));
+        if leave {
+            app.focus = Focus::Tree;
+            return Ok(KeyOutcome::Continue);
+        }
+        if !app.forward_to_embedded(key) {
+            app.focus = Focus::Tree; // pane vanished — bail to the tree
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
     // Help modal: scrollable, dismissed with ?/Esc, swallows other keys
     if app.show_help {
         let g_was_pending = std::mem::take(&mut app.pending_g);
@@ -1530,6 +1641,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         _ => {
             // Focus-specific keys
             match app.focus {
+                // Embedded keys are intercepted at the top of handle_key.
+                Focus::Embedded => {}
                 Focus::Composer => {
                     if let Some(text) = app.composer.handle_key(key) {
                         app.submit_message(text).await;
@@ -1696,6 +1809,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             }
                         }
                         KeyCode::Char('G') => app.tree_select_last(),
+                        KeyCode::Char('e') => app.toggle_embedded(),
                         KeyCode::Enter => {
                             match app.tree_items.get(app.selected_index).cloned() {
                                 Some(TreeNode::Repo { .. }) => app.toggle_expand(),
@@ -2077,10 +2191,19 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut reader = EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
 
+    // Embedded panes' reader threads ping this to force a coalesced repaint, so
+    // keystroke echo in an embedded `claude` stays responsive (not 50ms-laggy).
+    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    app.embedded_wake = Some(wake_tx);
+
     loop {
         terminal.draw(|frame| render::ui(frame, &mut app))?;
 
         tokio::select! {
+            _ = wake_rx.recv() => {
+                // Drain any backlog so we coalesce into a single redraw.
+                while wake_rx.try_recv().is_ok() {}
+            }
             event = reader.next().fuse() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -2089,12 +2212,30 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         }
                     }
                     Some(Ok(Event::Paste(text))) => {
-                        if app.focus == Focus::Composer {
-                            app.composer.insert_paste(&text);
+                        match app.focus {
+                            Focus::Composer => app.composer.insert_paste(&text),
+                            Focus::Embedded => {
+                                // Forward to the embedded child as a bracketed paste
+                                // (it enables bracketed paste, so multi-line stays one block).
+                                let ws_id = app.selected_workspace().map(|w| w.id.clone());
+                                let sent = ws_id.and_then(|id| app.embedded.get_mut(&id)).map(|pane| {
+                                    let mut bytes = b"\x1b[200~".to_vec();
+                                    bytes.extend_from_slice(text.as_bytes());
+                                    bytes.extend_from_slice(b"\x1b[201~");
+                                    let _ = pane.send(&bytes);
+                                });
+                                if sent.is_none() {
+                                    app.focus = Focus::Tree;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     Some(Ok(Event::Mouse(mouse_event))) => {
-                        if !app.show_help {
+                        // Embedded focus owns all input (keyboard already captured);
+                        // drop mouse too so a click can't strand the pane by flipping
+                        // focus to Output. (Forwarding mouse to the PTY is Phase 3.)
+                        if !app.show_help && app.focus != Focus::Embedded {
                             mouse::handle_mouse(&mut app, mouse_event);
                         }
                     }
@@ -2379,6 +2520,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 }
             }
             _ = tick_interval.tick() => {
+                // Reap embedded panes whose claude exited (leaves Embedded focus).
+                app.reap_embedded();
                 // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
                 app.tick_counter = app.tick_counter.wrapping_add(1);
                 if app.tick_counter.is_multiple_of(5) {

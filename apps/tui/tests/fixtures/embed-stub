@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fake INTERACTIVE claude for embedded-pane e2e tests: enters the alternate
+# screen, prints a recognizable banner + prompt, then echoes typed input.
+stty -echo 2>/dev/null              # raw-ish like a real TUI: we echo, not the tty
+printf '\033[?1049h\033[2J\033[H'   # alt-screen + clear
+printf 'EMBED-STUB-READY\r\n> '
+while IFS= read -r -n1 ch; do
+  printf '%s' "$ch"                 # echo each typed char
+done
