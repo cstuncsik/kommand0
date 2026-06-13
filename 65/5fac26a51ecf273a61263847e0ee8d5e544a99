@@ -1,0 +1,37 @@
+apps/tui/Cargo.toml
+  s_fc3d7618d36de0::t_81c3b8fc938eda 21-22
+apps/tui/src/pane.rs
+  s_fc3d7618d36de0::t_8c35576cb71acd 260-287,289,295-299
+  s_fc3d7618d36de0::t_843548fcca0cb2 424-449
+  s_fc3d7618d36de0::t_ab89d370a25aa1 30-34
+  s_fc3d7618d36de0::t_a4dd9518d1262a 460-479
+  s_fc3d7618d36de0::t_4243fba23f4388 205-206
+  s_fc3d7618d36de0::t_7d1bb2df0e18b3 89,96-99
+  s_fc3d7618d36de0::t_8075f68d516332 212-217,230-231,240-243
+  s_fc3d7618d36de0::t_19a7c85f7c1062 300
+  s_fc3d7618d36de0::t_a37205e082cfb9 1-17,19-29,35-88,90-95,100-204,207-211,218-229,232-234,244-259,288,290-294,301-316,323-324,326-327,338-345,349-423,450-459,480-524,559-570
+  s_fc3d7618d36de0::t_0e6d8f86742bea 525-558
+  s_fc3d7618d36de0::t_020d2acf74858d 18
+  s_fc3d7618d36de0::t_bdcc11f6876b6c 317-322,325,328-337,346-348
+  s_fc3d7618d36de0::t_5b5ac960d4599e 235-239
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_bd41947e0c45c0 7-10
+Cargo.toml
+  s_fc3d7618d36de0::t_df5f79f5c97376 30-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "655fac26a51ecf273a61263847e0ee8d5e544a99",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
