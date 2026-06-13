@@ -1,0 +1,19 @@
+apps/tui/examples/pty_passthrough_spike.rs
+  s_fc3d7618d36de0::t_7ff1340caa2cbd 1,3-6,8-9,11-14,20,32,45-104,127,134-136,142-178,184,214,224-269,277-281,284-304,309-311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "c9647da2b43f72281dd0e2eda62ba4392adb71e9",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
