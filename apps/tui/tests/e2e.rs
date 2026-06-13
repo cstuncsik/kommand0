@@ -247,7 +247,9 @@ fn fake_claude_session_round_trip() {
 }
 
 #[test]
-fn slash_command_popup_appears_and_completes() {
+fn slash_popup_uses_defaults_before_first_message() {
+    // The real CLI advertises slash_commands only after the first message, so the
+    // popup must work from built-in defaults immediately (the cold-start fix).
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());
     let mut tui = Tui::launch(Some(state));
@@ -256,24 +258,47 @@ fn slash_command_popup_appears_and_completes() {
     tui.send("l"); // expand repo
     tui.wait_for("demo-ws");
     tui.send("j"); // select workspace
-    tui.send("\r"); // start session, focus composer
+    tui.send("\r"); // start session, focus composer — NO message sent yet
 
-    // Gate on observable readiness rather than a blind sleep: a probe round trip
-    // proves the session is live and its init (carrying slash_commands) has been
-    // processed. The probe also clears the composer, leaving it empty to type in.
-    tui.send("ping");
-    tui.send("\r");
-    tui.wait_for("FAKE-REPLY pong");
+    tui.send("/comp"); // matches the built-in default "compact"
+    tui.wait_for("/commands");
+    tui.wait_for("/compact");
 
-    tui.send("/c"); // open the popup and filter to commands containing 'c'
-    tui.wait_for("/commands"); // popup title
-    tui.wait_for("/compact"); // a matching command row
-
-    tui.send("\t"); // Tab accepts the highlighted command
-    tui.wait_gone("/commands"); // popup closed
+    tui.send("\t"); // Tab accepts
+    tui.wait_gone("/commands");
     tui.wait_for("/compact"); // accepted text remains in the composer
 
     tui.send_esc();
     tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn slash_popup_enriches_with_session_commands_after_first_message() {
+    // "deploy-demo" is only in the session's init list, never in the defaults,
+    // so it must not appear until after the first message triggers init.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch(Some(state));
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("\r");
+
+    // Probe round trip: proves the session is live and the init event (with the
+    // extended command list) has been processed.
+    tui.send("ping");
+    tui.send("\r");
+    tui.wait_for("FAKE-REPLY pong");
+
+    tui.send("/deploy"); // only present in the session's advertised commands
+    tui.wait_for("/deploy-demo");
+
+    tui.send("\t"); // accept, closing the popup
+    tui.wait_gone("/commands");
+    tui.send_esc(); // composer -> tree
+    tui.send("q"); // quit
     tui.wait_exit();
 }

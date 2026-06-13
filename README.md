@@ -55,7 +55,7 @@ cargo run -p kommand0-tui
 - **Activity indicator**: Animated spinner on workspace tree item while Claude is thinking
 - **Zoom mode**: Full-screen output with `z`, status bar shows workspace/session info
 - **Session resume**: Sessions auto-resume on TUI restart with full scrollback history
-- **Slash commands**: Type `/` in the composer for a filtered popup of the session's commands (built-ins like `/compact` plus custom `.claude/commands/*.md`); `Tab`/`Enter` accepts, then `Enter` sends it like any message
+- **Slash commands**: Type `/` in the composer for a filtered popup; `Tab`/`Enter` accepts, then `Enter` sends it like any message. The popup starts with common built-ins (`/compact`, `/clear`, …) and fills in the session's full command list — including custom `.claude/commands/*.md` — after the first message (when the CLI advertises them); the list is cached per workspace so later sessions are fully populated from the first keystroke. Interactive-only commands (`/model`, `/config`, …) aren't available in headless sessions
 
 ### Keybindings
 
