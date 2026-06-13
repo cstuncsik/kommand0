@@ -27,6 +27,11 @@ impl Tui {
     /// Launch the TUI in a fresh PTY with an isolated state dir.
     /// `state_json`: optional pre-seeded state.json content.
     fn launch(state_json: Option<String>) -> Self {
+        Self::launch_with(state_json, &[])
+    }
+
+    /// Like [`Tui::launch`] but sets additional environment variables.
+    fn launch_with(state_json: Option<String>, extra_env: &[(&str, &str)]) -> Self {
         let state_dir = tempfile::tempdir().unwrap();
         if let Some(json) = state_json {
             std::fs::write(state_dir.path().join("state.json"), json).unwrap();
@@ -55,6 +60,9 @@ impl Tui {
         cmd.env("KOMMAND0_STATE_DIR", state_dir.path());
         cmd.env("PATH", path_env);
         cmd.env("TERM", "xterm-256color");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
         cmd.cwd(state_dir.path());
 
         let child = pair.slave.spawn_command(cmd).unwrap();
@@ -300,5 +308,62 @@ fn slash_popup_enriches_with_session_commands_after_first_message() {
     tui.wait_gone("/commands");
     tui.send_esc(); // composer -> tree
     tui.send("q"); // quit
+    tui.wait_exit();
+}
+
+#[test]
+fn embedded_pane_renders_real_terminal_and_forwards_keys() {
+    // Phase 2: pressing 'e' embeds an interactive child (here a stub claude) in
+    // the right pane; its terminal renders, and typed keys are forwarded to it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l"); // expand repo
+    tui.wait_for("demo-ws");
+    tui.send("j"); // select the workspace
+    tui.send("e"); // toggle embedded pane
+
+    // The embedded child's own terminal output is composited into the pane.
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("claude (embedded"); // the pane border title
+
+    // Keys go to the embedded child, which echoes them.
+    tui.send("hi");
+    tui.wait_for("hi");
+
+    tui.send("\x1d"); // Ctrl+] leaves the embedded pane (back to the tree)
+    tui.send("q"); // quit (kills the embedded child on teardown)
+    tui.wait_exit();
+}
+
+
+#[test]
+fn embedded_pane_not_stranded_by_mouse_click() {
+    // A click inside the embedded pane must not flip focus out of it (which would
+    // silently stop forwarding keys to the live child).
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+
+    // SGR left-click (press+release) well inside the right (embedded) pane.
+    tui.send("\x1b[<0;60;12M");
+    tui.send("\x1b[<0;60;12m");
+
+    // If focus were stranded to Output, these keys would drive the scrollback
+    // cursor and never reach the child; the stub only echoes what it receives.
+    tui.send("MARKER");
+    tui.wait_for("MARKER");
+
+    tui.send("\x1d"); // Ctrl+] leaves
+    tui.send("q");
     tui.wait_exit();
 }

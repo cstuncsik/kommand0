@@ -375,6 +375,30 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    // Embedded interactive claude (Phase 2): if the selected workspace has a live
+    // pane, it owns the whole right area (claude renders its own input box).
+    let sel_ws = match app.tree_items.get(app.selected_index) {
+        Some(TreeNode::Workspace { ws, .. }) => Some((ws.id.clone(), ws.name.clone())),
+        _ => None,
+    };
+    if let Some((ws_id, ws_name)) = &sel_ws
+        && app.embedded.contains_key(ws_id)
+    {
+        let border = if app.focus == Focus::Embedded { Color::Cyan } else { Color::DarkGray };
+        let block = Block::default()
+            .title(format!(" {ws_name} — claude (embedded, Ctrl+] to leave) "))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border));
+        let inner = block.inner(area);
+        app.pane_areas.output = area;
+        frame.render_widget(block, area);
+        if let Some(p) = app.embedded.get_mut(ws_id) {
+            let _ = p.resize(inner.height, inner.width);
+            p.blit(frame.buffer_mut(), inner);
+        }
+        return;
+    }
+
     let right_width = area.width.saturating_sub(4) as usize;
 
     // Check if selected workspace has an active session (running, or stopped/exited with scrollback)

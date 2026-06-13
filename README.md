@@ -67,6 +67,7 @@ cargo run -p kommand0-tui
 | `Enter` | Tree | Select / start / resume workspace session |
 | `r` | Tree | Start Claude session in selected workspace |
 | `R` | Tree | Restart / resume session |
+| `e` | Tree | Embed an interactive Claude session in the pane (experimental); `Ctrl+]` leaves |
 | `a` | Tree | Add repository (modal) |
 | `w` | Tree | Add workspace to selected repo (modal) |
 | `Ctrl+Q` | Any | Stop running session (quit if none running) |
