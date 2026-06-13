@@ -18,9 +18,9 @@ uuid.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
 arboard.workspace = true
+portable-pty.workspace = true
+vt100.workspace = true
 kommand0-core.workspace = true
 
 [dev-dependencies]
-portable-pty = "0.9.0"
-vt100 = "0.15"
 tempfile.workspace = true
