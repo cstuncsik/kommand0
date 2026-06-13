@@ -1,0 +1,72 @@
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_07b317f37236cb 2630-2632
+  s_fc3d7618d36de0::t_f1d58696a9c0db 2420-2421
+  s_fc3d7618d36de0::t_596df7b9e727f2 2445-2446
+  s_fc3d7618d36de0::t_560b8a535f9796 2379-2380
+  s_fc3d7618d36de0::t_f5f4420304f9e5 108-118,124-125,127
+  s_fc3d7618d36de0::t_79aa1a07359cf1 1927-1928
+  s_fc3d7618d36de0::t_9593fbf8fb2745 30
+  s_fc3d7618d36de0::t_d44c2b3ea7fe0d 2304-2305
+  s_fc3d7618d36de0::t_1c54bd3dffd6d5 2599-2601
+  s_fc3d7618d36de0::t_0f5542d14c2cde 2850,2854-2859,2861-2886,2891-2932
+  s_fc3d7618d36de0::t_9ff5f6e78110dd 2949-2967
+  s_fc3d7618d36de0::t_ff3d31fe560509 1498,1513-1514
+  s_fc3d7618d36de0::t_bc90e20843daed 1499-1512
+  s_fc3d7618d36de0::t_39796464eae769 476-480
+  s_fc3d7618d36de0::t_873542f385f01a 2851-2853,2860,2887-2890,2933-2948
+  s_fc3d7618d36de0::t_00b02be2238d36 519-523
+  s_fc3d7618d36de0::t_d3160fde01d26a 2648-2650
+  s_fc3d7618d36de0::t_20f9c6394769c4 2006,2011
+  s_fc3d7618d36de0::t_cfb29af1a2010b 1530,1714
+  s_fc3d7618d36de0::t_0c20e1a8bd941a 500,506-512,516-518,524-570,587-617
+  s_fc3d7618d36de0::t_b8580435e9909a 1961-1962
+  s_fc3d7618d36de0::t_262a3d65d2931b 2283-2286
+  s_fc3d7618d36de0::t_2d77147ebe4077 101-107,119-123,126,128-135
+  s_fc3d7618d36de0::t_841e1db72f9df3 2336-2337
+  s_fc3d7618d36de0::t_cbc5ac5f3ee1e8 2675-2682,2691-2697
+  s_fc3d7618d36de0::t_c0c2eb5d92ae4f 571-586
+  s_fc3d7618d36de0::t_b8ca854dba6d58 2219,2221
+  s_fc3d7618d36de0::t_e95beaf5cc7c38 1896,1901
+  s_fc3d7618d36de0::t_4f2f9132f6904c 481-492
+  s_fc3d7618d36de0::t_4a7b9bbd403896 176-177
+  s_fc3d7618d36de0::t_6fa9c180f2e150 268
+apps/tui/src/modal.rs
+  s_fc3d7618d36de0::t_6732dcd810306d 83-89
+  s_fc3d7618d36de0::t_86844821bec993 291-324
+  s_fc3d7618d36de0::t_6938ad5bfddc75 621-669
+  s_fc3d7618d36de0::t_68608d1db79660 55-62
+  s_fc3d7618d36de0::t_4f31001cecdb7d 17,19-32
+  s_fc3d7618d36de0::t_c4f39b8e89a167 18
+apps/tui/src/help.rs
+  s_fc3d7618d36de0::t_733c332e316b71 59
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_59d2a18a623e9b 332-333,336-339
+  s_fc3d7618d36de0::t_49097d04743dba 305-331,334-335,340-344
+README.md
+  s_fc3d7618d36de0::t_430d3342bd57ff 58-59
+apps/tui/tests/fixtures/claude
+  s_fc3d7618d36de0::t_070b1d36fbc3ca 3-5
+apps/tui/src/session_manager.rs
+  s_fc3d7618d36de0::t_ab80c05411a106 318,324
+  s_fc3d7618d36de0::t_6749ee3600f23f 103-104,110
+  s_fc3d7618d36de0::t_c144828a153249 12-21
+  s_fc3d7618d36de0::t_39d1525e150060 558-572
+  s_fc3d7618d36de0::t_b23a22138eb48e 121
+  s_fc3d7618d36de0::t_44ed49b70b567a 681-702
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "7936ae0a503c4b39244a2551db3d38438806efbf",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
