@@ -68,6 +68,36 @@ pub(crate) enum TreeNode {
 }
 
 #[allow(dead_code)]
+/// Common dispatchable built-in commands, offered before the session's real
+/// command list (which only arrives with the init event after the first
+/// message). Kept to commands verified to exist in headless `-p` mode.
+fn default_slash_commands() -> Vec<String> {
+    ["compact", "clear", "context", "review", "usage"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Path to the per-workspace slash-command cache within the state directory.
+fn slash_cache_path() -> std::path::PathBuf {
+    AppState::state_dir().join("slash_commands.json")
+}
+
+/// Load the cached per-workspace slash commands, if any.
+fn load_slash_cache() -> HashMap<String, Vec<String>> {
+    std::fs::read_to_string(slash_cache_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the per-workspace slash-command cache (best effort).
+fn save_slash_cache(cache: &HashMap<String, Vec<String>>) {
+    if let Ok(json) = serde_json::to_string(cache) {
+        let _ = std::fs::write(slash_cache_path(), json);
+    }
+}
+
 pub(crate) struct App {
     pub(crate) repos: Vec<RepoEntry>,
     pub(crate) workspaces: Vec<Workspace>,
@@ -75,6 +105,7 @@ pub(crate) struct App {
     pub(crate) expanded: HashSet<String>,
     pub(crate) tree_items: Vec<TreeNode>,
     pub(crate) selected_index: usize,
+    #[allow(dead_code)]
     pub(crate) status: Status,
 
     // Session fields
@@ -196,7 +227,7 @@ impl App {
             streaming_text: HashMap::new(),
             tick_counter: 0,
             composer_drafts: HashMap::new(),
-            slash_commands: HashMap::new(),
+            slash_commands: load_slash_cache(),
             selections: HashMap::new(),
             cursor_desired_col: HashMap::new(),
             cursor_blink_on: true,
@@ -208,6 +239,8 @@ impl App {
         if !app.tree_items.is_empty() {
             app.selected_index = 0;
         }
+        // Seed the composer's command list (defaults or cached) up front.
+        app.sync_composer_slash_commands();
         app
     }
 
@@ -404,12 +437,17 @@ impl App {
 
     /// Push the selected workspace's known slash commands into the composer so
     /// the completion popup offers the right set for the focused session.
+    ///
+    /// Falls back to a small built-in default set so the popup is usable
+    /// immediately — the real per-session list (custom commands included) only
+    /// arrives with the init event after the first message is sent.
     fn sync_composer_slash_commands(&mut self) {
         let cmds = self
             .selected_workspace()
             .and_then(|ws| self.slash_commands.get(&ws.id))
+            .filter(|v| !v.is_empty())
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(default_slash_commands);
         self.composer.set_slash_commands(cmds);
     }
 
@@ -2491,6 +2529,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 .map(|s| s.workspace_id.clone())
                             {
                                 app.slash_commands.insert(ws_id.clone(), commands);
+                                // Cache so the popup is fully populated from the
+                                // first keystroke next time this workspace is used.
+                                save_slash_cache(&app.slash_commands);
                                 // If this is the focused workspace, refresh the composer now.
                                 if app.selected_workspace().map(|ws| ws.id == ws_id).unwrap_or(false) {
                                     app.sync_composer_slash_commands();
@@ -2597,6 +2638,20 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn popup_uses_defaults_when_no_session_commands() {
+        // Before init delivers the real list, the popup must work from defaults.
+        let mut app = test_app();
+        app.slash_commands.clear();
+        app.focus = Focus::Composer;
+        app.composer.set_active(true);
+        app.sync_composer_slash_commands();
+
+        press(&mut app, KeyCode::Char('/')).await;
+        assert!(app.composer.slash_popup_open());
+        assert!(app.composer.slash_matches().iter().any(|c| c == "compact"));
+    }
+
+    #[tokio::test]
     async fn closed_popup_lets_tab_cycle_focus() {
         // With the composer focused but NO popup open, the guard must be inert so
         // Tab reaches the global focus-cycle (Composer -> Tree).
@@ -2628,27 +2683,28 @@ mod key_tests {
         app.expanded.insert("r1".into());
         app.expanded.insert("r2".into());
         app.rebuild_tree();
+        // w1 has a distinctive session list; w2 has none (falls back to defaults).
         app.slash_commands
-            .insert("w1".into(), vec!["compact".into(), "clear".into()]);
+            .insert("w1".into(), vec!["alpha-cmd".into(), "beta-cmd".into()]);
         app.composer.set_active(true);
 
         // Tree is [Repo r1, Ws w1, Repo r2, Ws w2].
-        app.selected_index = 1; // w1 (has commands)
+        app.selected_index = 1; // w1
         app.sync_composer_slash_commands();
         app.composer
             .handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         assert!(app.composer.slash_popup_open());
-        assert_eq!(
-            app.composer.slash_matches(),
-            &["compact".to_string(), "clear".to_string()]
-        );
+        assert!(app.composer.slash_matches().iter().any(|c| c == "alpha-cmd"));
+        assert!(!app.composer.slash_matches().iter().any(|c| c == "compact"));
 
         app.composer.clear();
-        app.selected_index = 3; // w2 (no commands)
+        app.selected_index = 3; // w2 -> defaults
         app.sync_composer_slash_commands();
         app.composer
             .handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert!(!app.composer.slash_popup_open());
+        assert!(app.composer.slash_popup_open());
+        assert!(app.composer.slash_matches().iter().any(|c| c == "compact"));
+        assert!(!app.composer.slash_matches().iter().any(|c| c == "alpha-cmd"));
     }
 
     #[tokio::test]

@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Fake `claude` CLI for e2e tests: speaks just enough stream-json for the TUI.
-# The init event advertises slash_commands, mirroring the real CLI.
-echo '{"type":"system","subtype":"init","session_id":"fake-session-1","slash_commands":["compact","clear","context","review"]}'
+# Like the real CLI, the init event (with slash_commands) is emitted only after
+# the first user message arrives — not on startup. "deploy-demo" is a marker
+# command present only in this init list (never in the built-in defaults).
+first=1
 while IFS= read -r _line; do
+  if [ "$first" -eq 1 ]; then
+    echo '{"type":"system","subtype":"init","session_id":"fake-session-1","slash_commands":["compact","clear","context","review","deploy-demo"]}'
+    first=0
+  fi
   echo '{"type":"assistant","message":{"content":[{"type":"text","text":"FAKE-REPLY pong"}]}}'
 done
