@@ -1,0 +1,64 @@
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_92935bee9bb5da 199
+  s_fc3d7618d36de0::t_3b195a1daf9baf 1308-1313
+  s_fc3d7618d36de0::t_c3d807669313df 2481,2488-2497
+  s_fc3d7618d36de0::t_216f614b38b480 2600-2653
+  s_fc3d7618d36de0::t_17d765a600e68b 2581-2599
+  s_fc3d7618d36de0::t_16072cf944787b 108-109
+  s_fc3d7618d36de0::t_2a76db84d2873c 402-455
+  s_fc3d7618d36de0::t_14fbea823d8be9 1492-1494
+  s_fc3d7618d36de0::t_fb2c630ea00276 1298-1307
+apps/tui/src/session_manager.rs
+  s_fc3d7618d36de0::t_e840f509a99c78 613-651
+  s_fc3d7618d36de0::t_57732abb4f20fb 50-56
+  s_fc3d7618d36de0::t_e49003026614ae 394
+  s_fc3d7618d36de0::t_8c3be92cc51ee1 481-502
+  s_fc3d7618d36de0::t_c18fa426fbdee5 544-558
+  s_fc3d7618d36de0::t_77ac3945e2ebcb 441-445
+  s_fc3d7618d36de0::t_d70ed4cb9f24d8 191-198
+  s_fc3d7618d36de0::t_8ced99b346c71b 402-405
+  s_fc3d7618d36de0::t_a4f3f2f7750e7a 566-612,652-659
+  s_fc3d7618d36de0::t_dd5a18ef5a2fdc 422-440,446
+apps/tui/tests/fixtures/claude
+  s_fc3d7618d36de0::t_5e987deecf0902 3-4
+apps/tui/src/help.rs
+  s_fc3d7618d36de0::t_8a14e4bae4efb2 58-61
+apps/tui/src/composer.rs
+  s_fc3d7618d36de0::t_df5d93d9706959 226
+  s_fc3d7618d36de0::t_0e73905664c971 232-236
+  s_fc3d7618d36de0::t_2bd06c136463b3 601-652
+  s_fc3d7618d36de0::t_2543b319ace088 122-124,126-162
+  s_fc3d7618d36de0::t_8600e60857bf87 13-24,34-39,43-44,46-115
+  s_fc3d7618d36de0::t_47b0cad5cfb611 487-600
+  s_fc3d7618d36de0::t_7cfcdfa636051e 285
+  s_fc3d7618d36de0::t_eb9a5e70a11b25 40-42,45
+apps/tui/src/render.rs
+  s_fc3d7618d36de0::t_532a2b4d8d1208 1581-1616
+  s_fc3d7618d36de0::t_fe3880b09bfb9e 8,14
+  s_fc3d7618d36de0::t_5720dc2f038521 42-51,57-59,61-63,69-104
+  s_fc3d7618d36de0::t_654e1de067a1b5 52-56,60,64-68
+  s_fc3d7618d36de0::t_cdc6c5a4c9bb94 514-516
+  s_fc3d7618d36de0::t_ea9dc1fc962003 1276-1278
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_4d87678ee61139 261-266,268
+  s_fc3d7618d36de0::t_66657329bc78a6 248-260,267,269-279
+README.md
+  s_fc3d7618d36de0::t_f4d221be2b626a 58
+  s_fc3d7618d36de0::t_b6b880b0019226 84-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "08f84159a16c425e4d5c549b978a0ff3c7863366",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
