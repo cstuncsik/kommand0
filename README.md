@@ -55,6 +55,7 @@ cargo run -p kommand0-tui
 - **Activity indicator**: Animated spinner on workspace tree item while Claude is thinking
 - **Zoom mode**: Full-screen output with `z`, status bar shows workspace/session info
 - **Session resume**: Sessions auto-resume on TUI restart with full scrollback history
+- **Slash commands**: Type `/` in the composer for a filtered popup of the session's commands (built-ins like `/compact` plus custom `.claude/commands/*.md`); `Tab`/`Enter` accepts, then `Enter` sends it like any message
 
 ### Keybindings
 
@@ -80,6 +81,10 @@ cargo run -p kommand0-tui
 | `i` | Output | Switch focus to Composer |
 | `Enter` | Composer | Send message |
 | `Shift+Enter` | Composer | New line (Alt+Enter also works) |
+| `/` | Composer | Open slash-command popup (type to filter) |
+| `Up` / `Down` | Composer | Move popup selection (while open) |
+| `Tab` / `Enter` | Composer | Accept highlighted command (while popup open) |
+| `Esc` | Composer | Dismiss popup (while open) |
 | `Ctrl+A` / `Cmd+A` | Composer | Select all |
 | `Ctrl+C` / `Cmd+C` | Composer | Copy selection |
 | `Ctrl+V` / `Cmd+V` | Composer | Paste |

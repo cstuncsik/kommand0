@@ -245,3 +245,35 @@ fn fake_claude_session_round_trip() {
     tui.send("q"); // quit (stops sessions)
     tui.wait_exit();
 }
+
+#[test]
+fn slash_command_popup_appears_and_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch(Some(state));
+
+    tui.wait_for("demo");
+    tui.send("l"); // expand repo
+    tui.wait_for("demo-ws");
+    tui.send("j"); // select workspace
+    tui.send("\r"); // start session, focus composer
+
+    // Gate on observable readiness rather than a blind sleep: a probe round trip
+    // proves the session is live and its init (carrying slash_commands) has been
+    // processed. The probe also clears the composer, leaving it empty to type in.
+    tui.send("ping");
+    tui.send("\r");
+    tui.wait_for("FAKE-REPLY pong");
+
+    tui.send("/c"); // open the popup and filter to commands containing 'c'
+    tui.wait_for("/commands"); // popup title
+    tui.wait_for("/compact"); // a matching command row
+
+    tui.send("\t"); // Tab accepts the highlighted command
+    tui.wait_gone("/commands"); // popup closed
+    tui.wait_for("/compact"); // accepted text remains in the composer
+
+    tui.send_esc();
+    tui.send("q");
+    tui.wait_exit();
+}
