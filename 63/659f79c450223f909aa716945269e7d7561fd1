@@ -1,0 +1,20 @@
+MIGRATION.md
+  s_fc3d7618d36de0::t_2cd3b41df8bfef 240-244
+  s_fc3d7618d36de0::t_6658f6681740a2 25-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "63659f79c450223f909aa716945269e7d7561fd1",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
