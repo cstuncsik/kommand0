@@ -4,6 +4,10 @@ mod composer;
 mod help;
 mod modal;
 mod mouse;
+// PTY-passthrough foundation (MIGRATION.md Phase 1). Not yet wired into the app
+// event loop — that is Phase 2; allow dead_code until then.
+#[allow(dead_code)]
+mod pane;
 mod render;
 mod scrollback;
 mod selection;
