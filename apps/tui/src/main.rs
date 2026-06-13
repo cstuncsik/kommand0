@@ -68,6 +68,36 @@ pub(crate) enum TreeNode {
 }
 
 #[allow(dead_code)]
+/// Common dispatchable built-in commands, offered before the session's real
+/// command list (which only arrives with the init event after the first
+/// message). Kept to commands verified to exist in headless `-p` mode.
+fn default_slash_commands() -> Vec<String> {
+    ["compact", "clear", "context", "review", "usage"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Path to the per-workspace slash-command cache within the state directory.
+fn slash_cache_path() -> std::path::PathBuf {
+    AppState::state_dir().join("slash_commands.json")
+}
+
+/// Load the cached per-workspace slash commands, if any.
+fn load_slash_cache() -> HashMap<String, Vec<String>> {
+    std::fs::read_to_string(slash_cache_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the per-workspace slash-command cache (best effort).
+fn save_slash_cache(cache: &HashMap<String, Vec<String>>) {
+    if let Ok(json) = serde_json::to_string(cache) {
+        let _ = std::fs::write(slash_cache_path(), json);
+    }
+}
+
 pub(crate) struct App {
     pub(crate) repos: Vec<RepoEntry>,
     pub(crate) workspaces: Vec<Workspace>,
@@ -75,6 +105,7 @@ pub(crate) struct App {
     pub(crate) expanded: HashSet<String>,
     pub(crate) tree_items: Vec<TreeNode>,
     pub(crate) selected_index: usize,
+    #[allow(dead_code)]
     pub(crate) status: Status,
 
     // Session fields
@@ -105,6 +136,8 @@ pub(crate) struct App {
     tick_counter: u8,
     /// Per-workspace composer drafts so switching workspaces preserves unsent text.
     pub(crate) composer_drafts: HashMap<String, String>,
+    /// Per-workspace slash commands advertised by each session's init event.
+    pub(crate) slash_commands: HashMap<String, Vec<String>>,
 
     // Selection/cursor state
     /// Per-workspace selection state (cursor position or range).
@@ -194,6 +227,7 @@ impl App {
             streaming_text: HashMap::new(),
             tick_counter: 0,
             composer_drafts: HashMap::new(),
+            slash_commands: load_slash_cache(),
             selections: HashMap::new(),
             cursor_desired_col: HashMap::new(),
             cursor_blink_on: true,
@@ -205,6 +239,8 @@ impl App {
         if !app.tree_items.is_empty() {
             app.selected_index = 0;
         }
+        // Seed the composer's command list (defaults or cached) up front.
+        app.sync_composer_slash_commands();
         app
     }
 
@@ -395,6 +431,65 @@ impl App {
                 self.focus = Focus::Tree;
             }
             self.composer.set_active(false);
+        }
+        self.sync_composer_slash_commands();
+    }
+
+    /// Push the selected workspace's known slash commands into the composer so
+    /// the completion popup offers the right set for the focused session.
+    ///
+    /// Falls back to a small built-in default set so the popup is usable
+    /// immediately — the real per-session list (custom commands included) only
+    /// arrives with the init event after the first message is sent.
+    fn sync_composer_slash_commands(&mut self) {
+        let cmds = self
+            .selected_workspace()
+            .and_then(|ws| self.slash_commands.get(&ws.id))
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or_else(default_slash_commands);
+        self.composer.set_slash_commands(cmds);
+    }
+
+    /// Send the composer's text to the active session: echo it into scrollback,
+    /// log it, and write it to the child's stdin. Surfaces send failures.
+    async fn submit_message(&mut self, text: String) {
+        let Some(session_id) = self.active_session_id.clone() else {
+            return;
+        };
+        let ws_id = self
+            .state
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.workspace_id.clone());
+        if let Some(ws_id) = &ws_id {
+            let buf = self
+                .scrollbacks
+                .entry(ws_id.clone())
+                .or_insert_with(|| ScrollbackBuffer::new(50_000));
+            // Add separator before user message if there's prior content
+            if !buf.is_empty() {
+                buf.push_line("---".to_string());
+            }
+            for line in text.split('\n') {
+                buf.push_line(format!("> {line}"));
+            }
+            buf.push_line("---".to_string());
+            buf.reset_scroll(); // pin to bottom so response is visible
+            // Sending a message re-enables auto-scroll and clears selection
+            self.auto_scroll_suppressed.remove(ws_id);
+            self.clear_selection_for_workspace(ws_id);
+            self.waiting_response.insert(ws_id.clone());
+        }
+        self.write_log(&session_id, "user", &text);
+        if let Err(e) = self.session_manager.send_message(&session_id, &text).await
+            && let Some(ws_id) = &ws_id
+        {
+            self.waiting_response.remove(ws_id);
+            if let Some(buf) = self.scrollbacks.get_mut(ws_id) {
+                buf.push_line(format!("[ERROR] failed to send message: {e}"));
+            }
         }
     }
 
@@ -1238,6 +1333,22 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         return Ok(KeyOutcome::Continue);
     }
 
+    // While the slash-command popup is open, the composer owns plain keys so
+    // Tab/Esc (otherwise consumed by the global focus handlers below) drive the
+    // popup. Modifier-bearing keys (Cmd/Ctrl/Alt) still fall through to the
+    // global handlers so copy/paste/stop keep working; Ctrl+P/N reach the popup
+    // via the composer focus arm further down.
+    if app.focus == Focus::Composer
+        && app.composer.slash_popup_open()
+        && !has_cmd_modifier(key.modifiers)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
+        if let Some(text) = app.composer.handle_key(key) {
+            app.submit_message(text).await;
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
     // Vim `gg`: consume the pending flag; only a bare `g` below re-arms it
     let g_was_pending = std::mem::take(&mut app.pending_g);
 
@@ -1416,32 +1527,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             // Focus-specific keys
             match app.focus {
                 Focus::Composer => {
-                    if let Some(text) = app.composer.handle_key(key)
-                        && let Some(session_id) = app.active_session_id.clone() {
-                            let ws_id = app.state.sessions.iter()
-                                .find(|s| s.id == session_id)
-                                .map(|s| s.workspace_id.clone());
-                            if let Some(ws_id) = ws_id {
-                                let buf = app.scrollbacks
-                                    .entry(ws_id.clone())
-                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                // Add separator before user message if there's prior content
-                                if !buf.is_empty() {
-                                    buf.push_line("---".to_string());
-                                }
-                                for line in text.split('\n') {
-                                    buf.push_line(format!("> {line}"));
-                                }
-                                buf.push_line("---".to_string());
-                                buf.reset_scroll(); // pin to bottom so response is visible
-                                // Sending a message re-enables auto-scroll and clears selection
-                                app.auto_scroll_suppressed.remove(&ws_id);
-                                app.clear_selection_for_workspace(&ws_id);
-                                app.waiting_response.insert(ws_id);
-                            }
-                            app.write_log(&session_id, "user", &text);
-                            let _ = app.session_manager.send_message(&session_id, &text).await;
-                        }
+                    if let Some(text) = app.composer.handle_key(key) {
+                        app.submit_message(text).await;
+                    }
                 }
                 Focus::Output => {
                     // Cursor movement, selection, and navigation
@@ -2428,10 +2516,26 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 .find(|s| s.id == session_id)
                                 .map(|s| s.workspace_id.clone());
                             if let Some(ws_id) = ws_id {
+                                app.waiting_response.remove(&ws_id);
                                 let buf = app.scrollbacks
                                     .entry(ws_id)
                                     .or_insert_with(|| ScrollbackBuffer::new(50_000));
                                 buf.push_line(format!("[ERROR] {error}"));
+                            }
+                        }
+                        SessionEvent::SlashCommands { session_id, commands } => {
+                            if let Some(ws_id) = app.state.sessions.iter()
+                                .find(|s| s.id == session_id)
+                                .map(|s| s.workspace_id.clone())
+                            {
+                                app.slash_commands.insert(ws_id.clone(), commands);
+                                // Cache so the popup is fully populated from the
+                                // first keystroke next time this workspace is used.
+                                save_slash_cache(&app.slash_commands);
+                                // If this is the focused workspace, refresh the composer now.
+                                if app.selected_workspace().map(|ws| ws.id == ws_id).unwrap_or(false) {
+                                    app.sync_composer_slash_commands();
+                                }
                             }
                         }
                     }
@@ -2512,6 +2616,95 @@ mod key_tests {
         press(&mut app, KeyCode::Char('h')).await;
         assert!(!app.expanded.contains("r1"));
         assert_eq!(app.tree_items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn slash_popup_opens_and_tab_accepts_via_event_loop() {
+        // Drives the real handle_key dispatch, proving the popup guard re-routes
+        // Tab to the composer instead of the global focus-cycle handler.
+        let mut app = test_app();
+        app.focus = Focus::Composer;
+        app.composer.set_active(true);
+        app.composer
+            .set_slash_commands(vec!["compact".into(), "clear".into()]);
+
+        press(&mut app, KeyCode::Char('/')).await;
+        assert!(app.composer.slash_popup_open());
+
+        press(&mut app, KeyCode::Tab).await; // accept (not focus-cycle)
+        assert!(!app.composer.slash_popup_open());
+        assert_eq!(app.composer.draft_text(), "/compact ");
+        assert_eq!(app.focus, Focus::Composer); // focus unchanged by the Tab
+    }
+
+    #[tokio::test]
+    async fn popup_uses_defaults_when_no_session_commands() {
+        // Before init delivers the real list, the popup must work from defaults.
+        let mut app = test_app();
+        app.slash_commands.clear();
+        app.focus = Focus::Composer;
+        app.composer.set_active(true);
+        app.sync_composer_slash_commands();
+
+        press(&mut app, KeyCode::Char('/')).await;
+        assert!(app.composer.slash_popup_open());
+        assert!(app.composer.slash_matches().iter().any(|c| c == "compact"));
+    }
+
+    #[tokio::test]
+    async fn closed_popup_lets_tab_cycle_focus() {
+        // With the composer focused but NO popup open, the guard must be inert so
+        // Tab reaches the global focus-cycle (Composer -> Tree).
+        let mut app = test_app();
+        app.focus = Focus::Composer;
+        app.composer.set_active(true);
+        app.composer
+            .set_slash_commands(vec!["compact".into(), "clear".into()]);
+        assert!(!app.composer.slash_popup_open());
+
+        press(&mut app, KeyCode::Tab).await;
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(!app.composer.slash_popup_open());
+    }
+
+    #[tokio::test]
+    async fn slash_commands_are_per_workspace() {
+        let mut app = test_app();
+        // Second workspace under repo r2, with no commands of its own.
+        app.workspaces.push(Workspace {
+            id: "w2".into(),
+            name: "ws-two".into(),
+            repo_id: "r2".into(),
+            working_dir: "/tmp/beta".into(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+        });
+        app.expanded.insert("r1".into());
+        app.expanded.insert("r2".into());
+        app.rebuild_tree();
+        // w1 has a distinctive session list; w2 has none (falls back to defaults).
+        app.slash_commands
+            .insert("w1".into(), vec!["alpha-cmd".into(), "beta-cmd".into()]);
+        app.composer.set_active(true);
+
+        // Tree is [Repo r1, Ws w1, Repo r2, Ws w2].
+        app.selected_index = 1; // w1
+        app.sync_composer_slash_commands();
+        app.composer
+            .handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.composer.slash_popup_open());
+        assert!(app.composer.slash_matches().iter().any(|c| c == "alpha-cmd"));
+        assert!(!app.composer.slash_matches().iter().any(|c| c == "compact"));
+
+        app.composer.clear();
+        app.selected_index = 3; // w2 -> defaults
+        app.sync_composer_slash_commands();
+        app.composer
+            .handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.composer.slash_popup_open());
+        assert!(app.composer.slash_matches().iter().any(|c| c == "compact"));
+        assert!(!app.composer.slash_matches().iter().any(|c| c == "alpha-cmd"));
     }
 
     #[tokio::test]
