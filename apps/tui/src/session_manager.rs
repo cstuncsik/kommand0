@@ -47,6 +47,13 @@ pub enum SessionEvent {
         session_id: String,
         claude_session_id: String,
     },
+    /// Slash commands advertised by the CLI's system/init event. Names have no
+    /// leading '/'. The init list omits interactive-only built-ins (e.g. /model,
+    /// /config) that no-op in headless `-p` mode, so it is safe to offer as-is.
+    SlashCommands {
+        session_id: String,
+        commands: Vec<String>,
+    },
 }
 
 /// Internal state for a running child process.
@@ -181,6 +188,14 @@ impl SessionManager {
                             source: OutputSource::Stdout,
                         }
                     }
+                    JsonEvent::SlashCommands(commands) => SessionEvent::SlashCommands {
+                        session_id: sid_stdout.clone(),
+                        commands,
+                    },
+                    JsonEvent::ErrorMsg(error) => SessionEvent::Error {
+                        session_id: sid_stdout.clone(),
+                        error,
+                    },
                     JsonEvent::Empty => continue,
                 };
                 if tx_stdout.send(event).is_err() {
@@ -376,6 +391,7 @@ impl SessionManager {
 }
 
 /// Classified JSON event from Claude CLI stream-json output.
+#[derive(Debug)]
 enum JsonEvent {
     /// Streaming text chunk (content_block_delta).
     Delta(String),
@@ -383,6 +399,10 @@ enum JsonEvent {
     StreamEnd,
     /// Complete text from assistant/message/result (may duplicate deltas).
     Complete(String),
+    /// Slash commands advertised by the system/init event (names without '/').
+    SlashCommands(Vec<String>),
+    /// An error event surfaced from the stream (e.g. auth/API failures).
+    ErrorMsg(String),
     /// Non-content event or empty.
     Empty,
 }
@@ -399,7 +419,31 @@ fn classify_json_event(line: &str) -> JsonEvent {
             let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             match event_type {
-                "system" | "start" | "ping" | "error" => JsonEvent::Empty,
+                "system" => {
+                    // The init event advertises the session's dispatchable slash
+                    // commands in a flat array of names (no leading '/').
+                    if val.get("subtype").and_then(|s| s.as_str()) == Some("init")
+                        && let Some(arr) = val.get("slash_commands").and_then(|c| c.as_array())
+                    {
+                        let cmds: Vec<String> = arr
+                            .iter()
+                            .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                            .collect();
+                        if !cmds.is_empty() {
+                            return JsonEvent::SlashCommands(cmds);
+                        }
+                    }
+                    JsonEvent::Empty
+                }
+                "start" | "ping" => JsonEvent::Empty,
+
+                "error" => {
+                    // A dedicated error event is not observed in current CLI output
+                    // (failures arrive as a `result` with is_error=true, handled
+                    // below) but accept it as a secondary catch-all. Shape is
+                    // undocumented; try a few plausible layouts, else keep the raw.
+                    JsonEvent::ErrorMsg(extract_error_message(&val, trimmed))
+                }
 
                 "content_block_delta" => {
                     if let Some(text) = val
@@ -434,6 +478,28 @@ fn classify_json_event(line: &str) -> JsonEvent {
                 }
 
                 "result" => {
+                    // A failed turn arrives as a result with is_error=true and the
+                    // detail in the top-level `result` string (the success text is
+                    // already surfaced via the preceding assistant event, so only
+                    // the error case needs to be turned into output here).
+                    let is_error = val.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let subtype = val.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+                    let api_error = val.get("api_error_status").and_then(|s| s.as_str());
+                    if is_error || subtype.contains("error") || api_error.is_some() {
+                        let msg = val
+                            .get("result")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| api_error.map(|s| s.to_string()))
+                            .unwrap_or_else(|| {
+                                if subtype.is_empty() {
+                                    "unknown error".to_string()
+                                } else {
+                                    subtype.to_string()
+                                }
+                            });
+                        return JsonEvent::ErrorMsg(msg);
+                    }
                     // result.content as string
                     if let Some(content) = val
                         .get("result")
@@ -475,10 +541,119 @@ fn classify_json_event(line: &str) -> JsonEvent {
     }
 }
 
+/// Extract a human-readable message from an error event of unknown shape,
+/// falling back to a truncated copy of the raw line so detail is never lost.
+fn extract_error_message(val: &Value, raw: &str) -> String {
+    val.get("error")
+        .and_then(|e| e.as_str())
+        .or_else(|| val.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()))
+        .or_else(|| val.get("message").and_then(|m| m.as_str()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            // char-boundary safe truncation (byte slicing could split a codepoint)
+            let snippet: String = raw.chars().take(500).collect();
+            format!("unrecognized error event: {snippet}")
+        })
+}
+
 /// Try to extract `session_id` from a JSON output line.
 fn extract_claude_session_id(line: &str) -> Option<String> {
     let val: Value = serde_json::from_str(line.trim()).ok()?;
     val.get("session_id")
         .and_then(|s| s.as_str())
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_event_extracts_slash_commands() {
+        let line = r#"{"type":"system","subtype":"init","slash_commands":["compact","context","clear"]}"#;
+        match classify_json_event(line) {
+            JsonEvent::SlashCommands(cmds) => {
+                assert_eq!(cmds, vec!["compact", "context", "clear"]);
+            }
+            other => panic!("expected SlashCommands, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_init_system_event_is_empty() {
+        let line = r#"{"type":"system","subtype":"hook_started","hook_id":"x"}"#;
+        assert!(matches!(classify_json_event(line), JsonEvent::Empty));
+    }
+
+    #[test]
+    fn init_without_slash_commands_is_empty() {
+        let line = r#"{"type":"system","subtype":"init","session_id":"s1"}"#;
+        assert!(matches!(classify_json_event(line), JsonEvent::Empty));
+    }
+
+    #[test]
+    fn error_event_extracts_string_message() {
+        let line = r#"{"type":"error","error":"boom"}"#;
+        match classify_json_event(line) {
+            JsonEvent::ErrorMsg(m) => assert_eq!(m, "boom"),
+            other => panic!("expected ErrorMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_event_extracts_nested_message() {
+        let line = r#"{"type":"error","error":{"message":"nested boom"}}"#;
+        match classify_json_event(line) {
+            JsonEvent::ErrorMsg(m) => assert_eq!(m, "nested boom"),
+            other => panic!("expected ErrorMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_event_unknown_shape_keeps_raw() {
+        let line = r#"{"type":"error","unexpected":123}"#;
+        match classify_json_event(line) {
+            JsonEvent::ErrorMsg(m) => {
+                assert!(m.starts_with("unrecognized error event:"), "got {m}");
+                assert!(m.contains("unexpected"));
+            }
+            other => panic!("expected ErrorMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_with_is_error_becomes_error_message() {
+        // The real-world failure shape: a result event, not a type:"error" event.
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"API failure: overloaded"}"#;
+        match classify_json_event(line) {
+            JsonEvent::ErrorMsg(m) => assert_eq!(m, "API failure: overloaded"),
+            other => panic!("expected ErrorMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn successful_result_is_empty_not_duplicated() {
+        // The assistant event already surfaced the text; a success result must
+        // not re-emit it as Complete.
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"pong"}"#;
+        assert!(matches!(classify_json_event(line), JsonEvent::Empty));
+    }
+
+    #[test]
+    fn api_error_status_without_is_error_still_errors() {
+        let line = r#"{"type":"result","subtype":"success","api_error_status":"overloaded_error","result":"partial"}"#;
+        match classify_json_event(line) {
+            JsonEvent::ErrorMsg(m) => assert_eq!(m, "partial"),
+            other => panic!("expected ErrorMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_text_is_complete() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"pong"}]}}"#;
+        match classify_json_event(line) {
+            JsonEvent::Complete(t) => assert_eq!(t, "pong"),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
 }

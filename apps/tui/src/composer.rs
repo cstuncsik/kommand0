@@ -10,6 +10,18 @@ use tui_textarea::TextArea;
 pub struct Composer {
     textarea: TextArea<'static>,
     active: bool,
+    /// Slash commands available this session (names without a leading '/').
+    commands: Vec<String>,
+    /// Active slash-command popup, when the first line is a lone `/token`.
+    popup: Option<SlashPopup>,
+}
+
+/// State of the slash-command completion popup.
+struct SlashPopup {
+    /// Commands matching the current `/token`, prefix matches ranked first.
+    matches: Vec<String>,
+    /// Index into `matches` of the highlighted row.
+    selected: usize,
 }
 
 #[allow(dead_code)]
@@ -19,16 +31,135 @@ impl Composer {
         Self {
             textarea,
             active: false,
+            commands: Vec::new(),
+            popup: None,
+        }
+    }
+
+    /// Set the slash commands offered by completion (names without '/').
+    ///
+    /// Re-evaluates the popup unconditionally so a command list that arrives
+    /// *after* the user has already typed `/` still opens the popup.
+    pub fn set_slash_commands(&mut self, commands: Vec<String>) {
+        self.commands = commands;
+        self.refresh_popup();
+    }
+
+    /// True while the slash-command popup is open.
+    pub fn slash_popup_open(&self) -> bool {
+        self.popup.is_some()
+    }
+
+    /// Filtered command names shown in the popup (empty when closed).
+    pub fn slash_matches(&self) -> &[String] {
+        self.popup.as_ref().map(|p| p.matches.as_slice()).unwrap_or(&[])
+    }
+
+    /// Index of the highlighted popup row.
+    pub fn slash_selected(&self) -> usize {
+        self.popup.as_ref().map(|p| p.selected).unwrap_or(0)
+    }
+
+    /// Move the popup selection by `delta`, wrapping around.
+    fn slash_move(&mut self, delta: i32) {
+        if let Some(p) = &mut self.popup {
+            let len = p.matches.len() as i32;
+            if len > 0 {
+                p.selected = (p.selected as i32 + delta).rem_euclid(len) as usize;
+            }
+        }
+    }
+
+    /// Replace the composer text with the highlighted command and close the popup.
+    fn accept_slash(&mut self) {
+        let chosen = self
+            .popup
+            .as_ref()
+            .and_then(|p| p.matches.get(p.selected).cloned());
+        if let Some(name) = chosen {
+            self.set_text(&format!("/{name} "));
+        }
+        self.popup = None;
+    }
+
+    /// Recompute the popup from the current text. Opens it when the first (only)
+    /// line is a lone `/token` with matches; closes it otherwise.
+    fn refresh_popup(&mut self) {
+        let lines = self.textarea.lines();
+        let single_line = lines.len() == 1;
+        let first = lines.first().map(|s| s.as_str()).unwrap_or("");
+        if single_line
+            && let Some(rest) = first.strip_prefix('/')
+            && !rest.contains(char::is_whitespace)
+        {
+            let filter = rest.to_lowercase();
+            let mut prefix: Vec<String> = Vec::new();
+            let mut other: Vec<String> = Vec::new();
+            for c in &self.commands {
+                let cl = c.to_lowercase();
+                if cl.starts_with(&filter) {
+                    prefix.push(c.clone());
+                } else if cl.contains(&filter) {
+                    other.push(c.clone());
+                }
+            }
+            prefix.extend(other);
+            if prefix.is_empty() {
+                self.popup = None;
+            } else {
+                let prev = self.popup.as_ref().map(|p| p.selected).unwrap_or(0);
+                let selected = prev.min(prefix.len() - 1);
+                self.popup = Some(SlashPopup { matches: prefix, selected });
+            }
+        } else {
+            self.popup = None;
         }
     }
 
     /// Handle a key event. Returns `Some(text)` if Enter is pressed to send,
     /// `None` otherwise.
     ///
-    /// - `Shift+Enter` inserts a newline
-    /// - `Enter` extracts text, clears the composer, returns the text
-    /// - All other keys are forwarded to the underlying TextArea
+    /// While the slash-command popup is open, navigation/accept/dismiss keys
+    /// drive the popup instead of the text area. Otherwise the key is processed
+    /// normally and the popup is recomputed from the new text.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
+        if self.popup.is_some() {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Up => return self.slash_nav_none(-1),
+                KeyCode::Down => return self.slash_nav_none(1),
+                KeyCode::Char('p') if ctrl => return self.slash_nav_none(-1),
+                KeyCode::Char('n') if ctrl => return self.slash_nav_none(1),
+                KeyCode::Tab => {
+                    self.accept_slash();
+                    return None;
+                }
+                KeyCode::Enter
+                    if !key.modifiers.contains(KeyModifiers::SHIFT)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.accept_slash();
+                    return None;
+                }
+                KeyCode::Esc => {
+                    self.popup = None;
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        let result = self.handle_key_inner(key);
+        self.refresh_popup();
+        result
+    }
+
+    /// Move the popup selection and return None (helper to keep match arms tidy).
+    fn slash_nav_none(&mut self, delta: i32) -> Option<String> {
+        self.slash_move(delta);
+        None
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> Option<String> {
         match key {
             // Shift+Enter or Alt+Enter = newline
             // iTerm2 sends Shift+Enter as "\n" (Char('\n')), so catch that too.
@@ -92,11 +223,17 @@ impl Composer {
     /// Clear the composer, resetting to an empty textarea.
     pub fn clear(&mut self) {
         self.textarea = Self::make_textarea(self.active);
+        self.popup = None;
     }
 
     /// Set active state, updating border and selection styling.
     pub fn set_active(&mut self, active: bool) {
         self.active = active;
+        // Leaving the composer dismisses the popup so it can't render or capture
+        // keys once focus has moved elsewhere.
+        if !active {
+            self.popup = None;
+        }
         let block = Self::make_block(active);
         self.textarea.set_block(block);
         if active {
@@ -145,6 +282,7 @@ impl Composer {
 
     /// Replace the composer content with the given text.
     pub fn set_text(&mut self, text: &str) {
+        self.popup = None;
         self.textarea = Self::make_textarea(self.active);
         for (i, line) in text.lines().enumerate() {
             if i > 0 {
@@ -345,5 +483,171 @@ mod tests {
         c.set_text("start");
         c.insert_paste(" more");
         assert_eq!(c.draft_text(), "start more");
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn slash_composer() -> Composer {
+        let mut c = Composer::new();
+        c.set_slash_commands(vec![
+            "compact".into(),
+            "context".into(),
+            "clear".into(),
+            "review".into(),
+        ]);
+        c
+    }
+
+    #[test]
+    fn slash_opens_popup_with_all_commands() {
+        let mut c = slash_composer();
+        assert!(!c.slash_popup_open());
+        c.handle_key(ch('/'));
+        assert!(c.slash_popup_open());
+        assert_eq!(c.slash_matches().len(), 4);
+    }
+
+    #[test]
+    fn typing_filters_popup_prefix_first() {
+        let mut c = slash_composer();
+        c.handle_key(ch('/'));
+        c.handle_key(ch('c')); // compact, context, clear (review has no 'c')
+        assert_eq!(
+            c.slash_matches(),
+            &["compact".to_string(), "context".to_string(), "clear".to_string()]
+        );
+        c.handle_key(ch('o')); // "co" -> compact, context
+        assert_eq!(c.slash_matches(), &["compact".to_string(), "context".to_string()]);
+    }
+
+    #[test]
+    fn tab_accepts_highlighted_command() {
+        let mut c = slash_composer();
+        c.handle_key(ch('/'));
+        c.handle_key(ch('c'));
+        c.handle_key(ch('o'));
+        c.handle_key(ch('n')); // "con" -> context only
+        assert_eq!(c.slash_matches(), &["context".to_string()]);
+        let sent = c.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(sent, None);
+        assert!(!c.slash_popup_open());
+        assert_eq!(c.draft_text(), "/context ");
+    }
+
+    #[test]
+    fn enter_accepts_does_not_send_while_popup_open() {
+        let mut c = slash_composer();
+        c.handle_key(ch('/'));
+        c.handle_key(ch('c'));
+        c.handle_key(ch('o'));
+        c.handle_key(ch('m')); // compact only
+        let sent = c.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(sent, None);
+        assert_eq!(c.draft_text(), "/compact ");
+        assert!(!c.slash_popup_open());
+    }
+
+    #[test]
+    fn esc_dismisses_popup_but_keeps_text() {
+        let mut c = slash_composer();
+        c.handle_key(ch('/'));
+        assert!(c.slash_popup_open());
+        c.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!c.slash_popup_open());
+        assert_eq!(c.draft_text(), "/");
+    }
+
+    #[test]
+    fn popup_closes_when_no_command_matches() {
+        let mut c = slash_composer();
+        c.handle_key(ch('/'));
+        for x in "zzz".chars() {
+            c.handle_key(ch(x));
+        }
+        assert!(!c.slash_popup_open());
+    }
+
+    #[test]
+    fn popup_closes_after_space() {
+        let mut c = slash_composer();
+        c.handle_key(ch('/'));
+        assert!(c.slash_popup_open());
+        c.handle_key(ch(' '));
+        assert!(!c.slash_popup_open());
+    }
+
+    #[test]
+    fn arrow_keys_move_selection_and_wrap() {
+        let mut c = Composer::new();
+        c.set_slash_commands(vec!["a".into(), "ab".into(), "abc".into()]);
+        c.handle_key(ch('/'));
+        assert_eq!(c.slash_selected(), 0);
+        c.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(c.slash_selected(), 1);
+        c.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(c.slash_selected(), 0);
+        c.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)); // wrap to last
+        assert_eq!(c.slash_selected(), 2);
+    }
+
+    #[test]
+    fn no_popup_without_commands() {
+        let mut c = Composer::new();
+        c.handle_key(ch('/'));
+        assert!(!c.slash_popup_open());
+    }
+
+    #[test]
+    fn prefix_matches_rank_before_substring_matches() {
+        let mut c = Composer::new();
+        c.set_slash_commands(vec!["redeploy".into(), "deploy".into()]);
+        for x in "/deploy".chars() {
+            c.handle_key(ch(x));
+        }
+        // "deploy" is a prefix match, "redeploy" only a substring match.
+        assert_eq!(c.slash_matches(), &["deploy".to_string(), "redeploy".to_string()]);
+    }
+
+    #[test]
+    fn filtering_is_case_insensitive() {
+        let mut c = Composer::new();
+        c.set_slash_commands(vec!["compact".into(), "context".into()]);
+        c.handle_key(ch('/'));
+        c.handle_key(ch('C'));
+        c.handle_key(ch('O'));
+        assert!(c.slash_popup_open());
+        assert_eq!(c.slash_matches(), &["compact".to_string(), "context".to_string()]);
+    }
+
+    #[test]
+    fn selection_clamps_when_matches_shrink() {
+        let mut c = slash_composer();
+        c.handle_key(ch('/'));
+        c.handle_key(ch('c')); // compact, context, clear
+        c.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        c.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // selected = 2 (clear)
+        assert_eq!(c.slash_selected(), 2);
+        c.handle_key(ch('o')); // "co" -> compact, context (len 2)
+        assert!(c.slash_selected() < c.slash_matches().len());
+    }
+
+    #[test]
+    fn set_active_false_dismisses_popup() {
+        let mut c = slash_composer();
+        c.handle_key(ch('/'));
+        assert!(c.slash_popup_open());
+        c.set_active(false);
+        assert!(!c.slash_popup_open());
+    }
+
+    #[test]
+    fn commands_arriving_after_slash_open_the_popup() {
+        let mut c = Composer::new();
+        c.handle_key(ch('/')); // no commands yet -> no popup
+        assert!(!c.slash_popup_open());
+        c.set_slash_commands(vec!["compact".into()]); // arrives late
+        assert!(c.slash_popup_open());
     }
 }
