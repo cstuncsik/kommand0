@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fake `claude` CLI for e2e tests: speaks just enough stream-json for the TUI.
-echo '{"type":"system","subtype":"init","session_id":"fake-session-1"}'
+# The init event advertises slash_commands, mirroring the real CLI.
+echo '{"type":"system","subtype":"init","session_id":"fake-session-1","slash_commands":["compact","clear","context","review"]}'
 while IFS= read -r _line; do
   echo '{"type":"assistant","message":{"content":[{"type":"text","text":"FAKE-REPLY pong"}]}}'
 done

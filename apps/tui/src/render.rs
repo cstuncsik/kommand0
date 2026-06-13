@@ -5,12 +5,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use std::time::Instant;
 
 use super::{App, Focus, TreeNode, buttons, help, modal};
+use super::composer::Composer;
 use super::buttons::HitAction;
 use super::selection::SelectionState;
 
@@ -36,6 +37,69 @@ fn truncate_path(path: &str, max_width: usize) -> String {
         start_byte -= ch.len_utf8();
     }
     format!("...{}", &path[start_byte..])
+}
+
+/// Render the slash-command completion popup anchored above the composer.
+///
+/// Shows up to 8 rows, windowed around the selection so longer lists scroll,
+/// with a count in the title. Drawn over (Clear) whatever sits above the
+/// composer (normally the output pane).
+fn render_slash_popup(frame: &mut ratatui::Frame, composer_area: Rect, composer: &Composer) {
+    let matches = composer.slash_matches();
+    if matches.is_empty() {
+        return;
+    }
+    // Need room above the composer for a bordered list, and a usable width.
+    let avail_above = composer_area.y;
+    if avail_above < 3 || composer_area.width < 4 {
+        return;
+    }
+    let max_rows = 8usize;
+    let visible = matches.len().min(max_rows);
+    // Never overlap the composer: cap height to the room above it.
+    let height = ((visible as u16) + 2).min(avail_above);
+    let visible = (height.saturating_sub(2)) as usize;
+
+    let longest = matches.iter().map(|m| m.len() + 1).max().unwrap_or(0); // +1 for '/'
+    // Order-safe: cap to the pane width, raise to a 20-col minimum only when the
+    // pane can afford it (clamp() would panic if min > max on a narrow pane).
+    let width = ((longest as u16) + 4)
+        .max(20)
+        .min(composer_area.width);
+    let y = composer_area.y.saturating_sub(height);
+    let area = Rect::new(composer_area.x, y, width, height);
+
+    // Window the rows so the selected entry stays visible.
+    let selected = composer.slash_selected();
+    let start = if selected >= visible {
+        selected + 1 - visible
+    } else {
+        0
+    };
+    let items: Vec<ListItem> = matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, name)| {
+            let style = if i == selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(Line::styled(format!(" /{name}"), style))
+        })
+        .collect();
+
+    let title = format!(" /commands ({}) ", matches.len());
+    let list = List::new(items).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
 }
 
 pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
@@ -447,6 +511,9 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         app.pane_areas.composer = composer_area;
         if session_status == SessionStatus::Running {
             frame.render_widget(app.composer.widget(), composer_area);
+            if app.composer.slash_popup_open() {
+                render_slash_popup(frame, composer_area, &app.composer);
+            }
             // Char/line count overlay in bottom-right corner
             let status = app.composer.status_text();
             let status_width = status.len() as u16 + 1;
@@ -1206,6 +1273,9 @@ fn render_zoomed(frame: &mut ratatui::Frame, app: &mut App) {
     app.pane_areas.composer = composer_area;
     if session_status == SessionStatus::Running {
         frame.render_widget(app.composer.widget(), composer_area);
+        if app.composer.slash_popup_open() {
+            render_slash_popup(frame, composer_area, &app.composer);
+        }
         // Char/line count overlay
         let status = app.composer.status_text();
         let status_width = status.len() as u16 + 1;
@@ -1508,6 +1578,42 @@ pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn open_popup_composer() -> Composer {
+        let mut c = Composer::new();
+        c.set_slash_commands(vec!["compact".into(), "context".into(), "clear".into()]);
+        c.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(c.slash_popup_open());
+        c
+    }
+
+    #[test]
+    fn slash_popup_renders_without_panic_on_narrow_pane() {
+        // A pane narrower than the 20-col minimum used to panic in clamp().
+        let composer = open_popup_composer();
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 15, 10, 5); // width 10 < 20
+                render_slash_popup(frame, area, &composer);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn slash_popup_skips_when_no_room_above() {
+        let composer = open_popup_composer();
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 1, 30, 5); // only 1 row above -> skip, no panic
+                render_slash_popup(frame, area, &composer);
+            })
+            .unwrap();
+    }
 
     #[test]
     fn truncate_path_fits() {
