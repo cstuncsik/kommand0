@@ -302,3 +302,43 @@ fn slash_popup_enriches_with_session_commands_after_first_message() {
     tui.send("q"); // quit
     tui.wait_exit();
 }
+
+#[test]
+fn model_picker_restarts_session_with_model_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch(Some(state));
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("\r");
+
+    // Make the session live before opening the picker.
+    tui.send("ping");
+    tui.send("\r");
+    tui.wait_for("FAKE-REPLY pong");
+
+    // Trailing space closes the slash popup, so Enter submits "/model".
+    tui.send("/model ");
+    tui.send("\r");
+    tui.wait_for("Set model"); // picker opened
+
+    tui.send("j"); // default -> opus
+    tui.send("\r"); // select opus
+    tui.wait_for("Restarted (model: opus"); // restart status line
+
+    // The restart must have re-spawned claude with --model opus AND resumed the
+    // same conversation (one invocation line carrying both flags).
+    let args = std::fs::read_to_string(dir.path().join("claude-args.log")).unwrap_or_default();
+    assert!(args.contains("--model opus"), "claude-args.log = {args:?}");
+    assert!(
+        args.lines().any(|l| l.contains("--model opus") && l.contains("--resume fake-session-1")),
+        "expected one spawn with both --model opus and --resume; claude-args.log = {args:?}"
+    );
+
+    tui.send_esc(); // composer -> tree
+    tui.send("q");
+    tui.wait_exit();
+}

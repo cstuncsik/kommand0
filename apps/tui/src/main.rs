@@ -27,7 +27,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use composer::Composer;
 use scrollback::ScrollbackBuffer;
 use selection::SelectionState;
-use session_manager::{SessionEvent, SessionManager};
+use session_manager::{SessionConfig, SessionEvent, SessionManager};
 use wrap_map::WrapMap;
 
 /// Check if modifiers contain the "command" key: Ctrl on Linux, Ctrl or Cmd (SUPER) on macOS.
@@ -98,6 +98,41 @@ fn save_slash_cache(cache: &HashMap<String, Vec<String>>) {
     }
 }
 
+/// Path to the per-workspace session-config store within the state directory.
+fn session_config_path() -> std::path::PathBuf {
+    AppState::state_dir().join("session_config.json")
+}
+
+/// Load persisted per-workspace session configs, if any.
+fn load_session_configs() -> HashMap<String, SessionConfig> {
+    load_session_configs_from(&session_config_path())
+}
+
+/// Persist the per-workspace session configs (best effort).
+fn save_session_configs(configs: &HashMap<String, SessionConfig>) {
+    save_session_configs_to(configs, &session_config_path());
+}
+
+/// Load session configs from a specific path (tolerates missing/corrupt files).
+fn load_session_configs_from(path: &std::path::Path) -> HashMap<String, SessionConfig> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist session configs to a specific path (best effort).
+fn save_session_configs_to(configs: &HashMap<String, SessionConfig>, path: &std::path::Path) {
+    if let Ok(json) = serde_json::to_string(configs) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Available `--model` choices offered in the picker.
+const MODEL_CHOICES: &[&str] = &["default", "opus", "sonnet", "fable", "haiku"];
+/// Available `--effort` choices offered in the picker.
+const EFFORT_CHOICES: &[&str] = &["default", "low", "medium", "high", "xhigh", "max"];
+
 pub(crate) struct App {
     pub(crate) repos: Vec<RepoEntry>,
     pub(crate) workspaces: Vec<Workspace>,
@@ -138,6 +173,8 @@ pub(crate) struct App {
     pub(crate) composer_drafts: HashMap<String, String>,
     /// Per-workspace slash commands advertised by each session's init event.
     pub(crate) slash_commands: HashMap<String, Vec<String>>,
+    /// Per-workspace session launch config (model/effort), persisted.
+    pub(crate) session_configs: HashMap<String, SessionConfig>,
 
     // Selection/cursor state
     /// Per-workspace selection state (cursor position or range).
@@ -228,6 +265,7 @@ impl App {
             tick_counter: 0,
             composer_drafts: HashMap::new(),
             slash_commands: load_slash_cache(),
+            session_configs: load_session_configs(),
             selections: HashMap::new(),
             cursor_desired_col: HashMap::new(),
             cursor_blink_on: true,
@@ -435,6 +473,23 @@ impl App {
         self.sync_composer_slash_commands();
     }
 
+    /// The launch config (model/effort) for a workspace, or defaults.
+    fn ws_config(&self, ws_id: &str) -> SessionConfig {
+        self.session_configs.get(ws_id).cloned().unwrap_or_default()
+    }
+
+    /// True if a streaming event's session is no longer the live (Running) one —
+    /// e.g. buffered output from a session killed by a config restart. Such
+    /// events must be dropped so they don't bleed into the resumed session.
+    fn is_stale_session_event(&self, session_id: &str) -> bool {
+        self.state
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.status != SessionStatus::Running)
+            .unwrap_or(true)
+    }
+
     /// Push the selected workspace's known slash commands into the composer so
     /// the completion popup offers the right set for the focused session.
     ///
@@ -442,13 +497,124 @@ impl App {
     /// immediately — the real per-session list (custom commands included) only
     /// arrives with the init event after the first message is sent.
     fn sync_composer_slash_commands(&mut self) {
-        let cmds = self
+        let mut cmds = self
             .selected_workspace()
             .and_then(|ws| self.slash_commands.get(&ws.id))
             .filter(|v| !v.is_empty())
             .cloned()
             .unwrap_or_else(default_slash_commands);
+        // kommand0-owned commands that open a picker instead of being sent to
+        // claude (interactive built-ins like /model/effort don't work headlessly).
+        for kc in ["effort", "model"] {
+            if !cmds.iter().any(|c| c == kc) {
+                cmds.insert(0, kc.to_string());
+            }
+        }
         self.composer.set_slash_commands(cmds);
+    }
+
+    /// Handle a composer submission: intercept kommand0-owned commands
+    /// (`/model`, `/effort`) to open a picker; otherwise send to the session.
+    async fn handle_composer_submit(&mut self, text: String) {
+        // Match the leading token so "/model" and "/model opus" both open the
+        // picker rather than leaking to claude as an unknown command.
+        match text.split_whitespace().next() {
+            Some("/model") => self.open_config_picker(modal::ConfigSetting::Model),
+            Some("/effort") => self.open_config_picker(modal::ConfigSetting::Effort),
+            _ => self.submit_message(text).await,
+        }
+    }
+
+    /// Open the model/effort picker for the selected workspace, preselecting the
+    /// current value. Clears the `/model`-style text from the composer.
+    fn open_config_picker(&mut self, setting: modal::ConfigSetting) {
+        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
+            return;
+        };
+        let current = self.ws_config(&ws_id);
+        let (choices, current_val) = match setting {
+            modal::ConfigSetting::Model => (MODEL_CHOICES, current.model),
+            modal::ConfigSetting::Effort => (EFFORT_CHOICES, current.effort),
+        };
+        let options: Vec<String> = choices.iter().map(|s| s.to_string()).collect();
+        let selected = current_val
+            .as_deref()
+            .and_then(|v| options.iter().position(|o| o == v))
+            .unwrap_or(0); // index 0 == "default"
+        self.composer.clear();
+        self.modal = modal::ModalState::ConfigPicker {
+            workspace_id: ws_id,
+            setting,
+            options,
+            selected,
+        };
+    }
+
+    /// Restart the running session for a workspace so a changed model/effort
+    /// takes effect, resuming the same Claude conversation via `--resume`.
+    async fn restart_workspace_session(&mut self, ws_id: &str) {
+        let info = self
+            .state
+            .find_session_by_workspace(ws_id)
+            .filter(|s| s.status == SessionStatus::Running)
+            .map(|s| (s.id.clone(), s.claude_session_id.clone()));
+        let Some((old_id, claude_sid)) = info else {
+            return; // no running session: new config applies on next start
+        };
+        let ws_dir = self
+            .workspaces
+            .iter()
+            .find(|w| w.id == ws_id)
+            .map(|w| w.working_dir.clone());
+        let Some(ws_dir) = ws_dir else { return };
+
+        // Interrupt any in-flight turn cleanly: flush the partial stream line so
+        // the resumed session doesn't concatenate onto it, and clear the spinner
+        // so it doesn't stick (the killed turn produces no StreamEnd).
+        let was_streaming = self.waiting_response.remove(ws_id);
+        if let Some(remaining) = self.streaming_text.remove(ws_id)
+            && !remaining.is_empty()
+            && let Some(buf) = self.scrollbacks.get_mut(ws_id)
+        {
+            buf.push_line(remaining);
+        }
+        if was_streaming
+            && let Some(buf) = self.scrollbacks.get_mut(ws_id)
+        {
+            buf.push_line("--- response interrupted to switch session config ---".to_string());
+        }
+
+        let _ = self.session_manager.stop_session(&old_id).await;
+        let _ = self.state.update_session_status(&old_id, SessionStatus::Stopped);
+        let cfg = self.ws_config(ws_id);
+        if let Ok(new_session) = self.state.create_session(ws_id) {
+            let session_id = new_session.id.clone();
+            match self
+                .session_manager
+                .start_session(&session_id, &ws_dir, claude_sid.as_deref(), &cfg)
+            {
+                Ok(pid) => {
+                    if let Some(s) = self.state.find_session_mut(&session_id) {
+                        s.pid = Some(pid);
+                        s.claude_session_id = claude_sid;
+                    }
+                    let _ = self.state.save();
+                    self.active_session_id = Some(session_id);
+                    let model = cfg.model.as_deref().unwrap_or("default");
+                    let effort = cfg.effort.as_deref().unwrap_or("default");
+                    if let Some(buf) = self.scrollbacks.get_mut(ws_id) {
+                        buf.push_line(format!(
+                            "--- Restarted (model: {model}, effort: {effort}) ---"
+                        ));
+                    }
+                }
+                Err(_) => {
+                    let _ = self
+                        .state
+                        .update_session_status(&new_session.id, SessionStatus::Failed);
+                }
+            }
+        }
     }
 
     /// Send the composer's text to the active session: echo it into scrollback,
@@ -1329,6 +1495,23 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     }
                 }
             }
+            modal::ModalResult::SetConfig { workspace_id, setting, value } => {
+                let current = app.ws_config(&workspace_id);
+                let changed = match setting {
+                    modal::ConfigSetting::Model => current.model != value,
+                    modal::ConfigSetting::Effort => current.effort != value,
+                };
+                if changed {
+                    let cfg = app.session_configs.entry(workspace_id.clone()).or_default();
+                    match setting {
+                        modal::ConfigSetting::Model => cfg.model = value,
+                        modal::ConfigSetting::Effort => cfg.effort = value,
+                    }
+                    save_session_configs(&app.session_configs);
+                    // Apply immediately by restarting a running session (resumes context).
+                    app.restart_workspace_session(&workspace_id).await;
+                }
+            }
         }
         return Ok(KeyOutcome::Continue);
     }
@@ -1344,7 +1527,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         && !key.modifiers.contains(KeyModifiers::ALT)
     {
         if let Some(text) = app.composer.handle_key(key) {
-            app.submit_message(text).await;
+            app.handle_composer_submit(text).await;
         }
         return Ok(KeyOutcome::Continue);
     }
@@ -1528,7 +1711,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             match app.focus {
                 Focus::Composer => {
                     if let Some(text) = app.composer.handle_key(key) {
-                        app.submit_message(text).await;
+                        app.handle_composer_submit(text).await;
                     }
                 }
                 Focus::Output => {
@@ -1710,10 +1893,12 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                             let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
                                             if let Ok(new_session) = app.state.create_session(&ws.id) {
                                                 let session_id = new_session.id.clone();
+                                                let cfg = app.ws_config(&ws.id);
                                                 match app.session_manager.start_session(
                                                     &session_id,
                                                     &ws.working_dir,
                                                     claude_sid.as_deref(),
+                                                    &cfg,
                                                 ) {
                                                     Ok(pid) => {
                                                         if let Some(s) = app.state.find_session_mut(&session_id) {
@@ -1739,7 +1924,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                             // No session: create + start (same as r key)
                                             if let Ok(new_session) = app.state.create_session(&ws.id) {
                                                 let session_id = new_session.id.clone();
-                                                match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
+                                                let cfg = app.ws_config(&ws.id);
+                                                match app.session_manager.start_session(&session_id, &ws.working_dir, None, &cfg) {
                                                     Ok(pid) => {
                                                         if let Some(s) = app.state.find_session_mut(&session_id) {
                                                             s.pid = Some(pid);
@@ -1772,7 +1958,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                     && let Ok(session) = app.state.create_session(&ws.id) {
                                         let session_id = session.id.clone();
                                         let ws_dir = ws.working_dir.clone();
-                                        match app.session_manager.start_session(&session_id, &ws_dir, None) {
+                                        let cfg = app.ws_config(&ws.id);
+                                        match app.session_manager.start_session(&session_id, &ws_dir, None, &cfg) {
                                             Ok(pid) => {
                                                 if let Some(s) = app.state.find_session_mut(&session_id) {
                                                     s.pid = Some(pid);
@@ -1816,10 +2003,12 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                     let _ = app.state.update_session_status(&old_session_id, SessionStatus::Stopped);
                                     if let Ok(new_session) = app.state.create_session(&ws.id) {
                                         let session_id = new_session.id.clone();
+                                        let cfg = app.ws_config(&ws.id);
                                         match app.session_manager.start_session(
                                             &session_id,
                                             &ws.working_dir,
                                             claude_sid.as_deref(),
+                                            &cfg,
                                         ) {
                                             Ok(pid) => {
                                                 if let Some(s) = app.state.find_session_mut(&session_id) {
@@ -2027,8 +2216,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         // Create new state session first to get the canonical ID
         if let Ok(new_session) = app.state.create_session(&ws_id) {
             let session_id = new_session.id.clone();
+            let cfg = app.ws_config(&ws_id);
             // Start process using the state session's ID
-            match app.session_manager.start_session(&session_id, &ws_dir, claude_sid.as_deref()) {
+            match app.session_manager.start_session(&session_id, &ws_dir, claude_sid.as_deref(), &cfg) {
                 Ok(pid) => {
                     if let Some(s) = app.state.find_session_mut(&session_id) {
                         s.pid = Some(pid);
@@ -2090,7 +2280,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         }
                     }
                     Some(Ok(Event::Mouse(mouse_event))) => {
-                        if !app.show_help {
+                        // Mouse is inert while an overlay/modal is open, matching key
+                        // handling — otherwise a click could re-select a workspace
+                        // underneath the picker and desync the active session.
+                        if !app.show_help && !app.modal.is_active() {
                             mouse::handle_mouse(&mut app, mouse_event);
                         }
                     }
@@ -2108,7 +2301,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 let claude_sid: Option<String> = None;
                                 if let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
+                                    let cfg = app.ws_config(&ws.id);
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref(), &cfg) {
                                         Ok(pid) => {
                                             if let Some(s) = app.state.find_session_mut(&session_id) {
                                                 s.pid = Some(pid);
@@ -2139,7 +2333,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                                 if let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
+                                    let cfg = app.ws_config(&ws.id);
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref(), &cfg) {
                                         Ok(pid) => {
                                             if let Some(s) = app.state.find_session_mut(&session_id) {
                                                 s.pid = Some(pid);
@@ -2181,7 +2376,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned()
                                 && let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
+                                    let cfg = app.ws_config(&ws.id);
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None, &cfg) {
                                         Ok(pid) => {
                                             if let Some(s) = app.state.find_session_mut(&session_id) {
                                                 s.pid = Some(pid);
@@ -2221,7 +2417,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                                 if let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
+                                    let cfg = app.ws_config(&ws.id);
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref(), &cfg) {
                                         Ok(pid) => {
                                             if let Some(s) = app.state.find_session_mut(&session_id) {
                                                 s.pid = Some(pid);
@@ -2245,7 +2442,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned()
                                 && let Ok(new_session) = app.state.create_session(&ws.id) {
                                     let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
+                                    let cfg = app.ws_config(&ws.id);
+                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None, &cfg) {
                                         Ok(pid) => {
                                             if let Some(s) = app.state.find_session_mut(&session_id) {
                                                 s.pid = Some(pid);
@@ -2398,6 +2596,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 for event in events {
                     match event {
                         SessionEvent::StreamDelta { session_id, text } => {
+                            if app.is_stale_session_event(&session_id) {
+                                continue; // drop output from a killed/old session
+                            }
                             let ws_id = app.state.sessions.iter()
                                 .find(|s| s.id == session_id)
                                 .map(|s| s.workspace_id.clone());
@@ -2426,6 +2627,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             app.write_log(&session_id, "claude", &text);
                         }
                         SessionEvent::StreamEnd { session_id } => {
+                            if app.is_stale_session_event(&session_id) {
+                                continue;
+                            }
                             let ws_id = app.state.sessions.iter()
                                 .find(|s| s.id == session_id)
                                 .map(|s| s.workspace_id.clone());
@@ -2441,6 +2645,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                         }
                         SessionEvent::Output { session_id, line, source } => {
+                            if app.is_stale_session_event(&session_id) {
+                                continue; // drop output from a killed/old session
+                            }
                             // Complete message (non-streaming content or stderr).
                             let ws_id = app.state.sessions.iter()
                                 .find(|s| s.id == session_id)
@@ -2465,26 +2672,29 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 Some(0) | None => SessionStatus::Exited,
                                 Some(_) => SessionStatus::Failed,
                             };
+                            // A session deliberately stopped (e.g. by a config restart or the
+                            // stop key) is already marked Stopped before its delayed Exited
+                            // arrives. Such an Exited must not steal focus or push a spurious
+                            // "exited" line over the freshly-restarted session.
+                            let already_stopped = app.state.sessions.iter()
+                                .find(|s| s.id == session_id)
+                                .map(|s| s.status == SessionStatus::Stopped)
+                                .unwrap_or(false);
                             // Update claude_session_id from session_manager before removing.
                             // If the process never produced a session_id (e.g. --resume with a
                             // stale ID caused immediate exit), clear the stored one so the next
                             // attempt starts fresh instead of repeating the same failure.
-                            // BUT: don't clear if session was explicitly stopped (status already
-                            // Stopped) — stop_session() removes from manager before Exited arrives,
-                            // so get_claude_session_id() returns None even though the ID is valid.
                             if let Some(csid) = app.session_manager.get_claude_session_id(&session_id) {
                                 if let Some(s) = app.state.find_session_mut(&session_id) {
                                     s.claude_session_id = Some(csid);
                                 }
-                            } else {
-                                let already_stopped = app.state.sessions.iter()
-                                    .find(|s| s.id == session_id)
-                                    .map(|s| s.status == SessionStatus::Stopped)
-                                    .unwrap_or(false);
-                                if !already_stopped
-                                    && let Some(s) = app.state.find_session_mut(&session_id) {
-                                        s.claude_session_id = None;
-                                    }
+                            } else if !already_stopped
+                                && let Some(s) = app.state.find_session_mut(&session_id) {
+                                    s.claude_session_id = None;
+                                }
+                            if already_stopped {
+                                // Defunct old session: leave focus/scrollback alone.
+                                continue;
                             }
                             let _ = app.state.update_session_status(&session_id, status);
                             // Push exit message to scrollback
@@ -2635,6 +2845,124 @@ mod key_tests {
         assert!(!app.composer.slash_popup_open());
         assert_eq!(app.composer.draft_text(), "/compact ");
         assert_eq!(app.focus, Focus::Composer); // focus unchanged by the Tab
+    }
+
+    fn select_workspace(app: &mut App) {
+        app.expanded.insert("r1".into());
+        app.rebuild_tree();
+        app.selected_index = 1; // w1
+    }
+
+    #[tokio::test]
+    async fn slash_model_opens_config_picker() {
+        let mut app = test_app();
+        select_workspace(&mut app);
+        app.handle_composer_submit("/model".to_string()).await;
+        assert!(matches!(
+            app.modal,
+            modal::ModalState::ConfigPicker { setting: modal::ConfigSetting::Model, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn slash_effort_opens_config_picker_with_effort_choices() {
+        let mut app = test_app();
+        select_workspace(&mut app);
+        app.handle_composer_submit("/effort".to_string()).await;
+        match &app.modal {
+            modal::ModalState::ConfigPicker { setting, options, .. } => {
+                assert_eq!(*setting, modal::ConfigSetting::Effort);
+                assert_eq!(options.as_slice(), EFFORT_CHOICES);
+            }
+            _ => panic!("expected an effort ConfigPicker"),
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_model_with_arg_still_opens_picker() {
+        // "/model opus" must not leak to the session as an unknown command.
+        let mut app = test_app();
+        select_workspace(&mut app);
+        app.handle_composer_submit("/model opus".to_string()).await;
+        assert!(matches!(
+            app.modal,
+            modal::ModalState::ConfigPicker { setting: modal::ConfigSetting::Model, .. }
+        ));
+    }
+
+    #[test]
+    fn picker_enter_returns_chosen_effort() {
+        let mut modal = modal::ModalState::ConfigPicker {
+            workspace_id: "w1".into(),
+            setting: modal::ConfigSetting::Effort,
+            options: EFFORT_CHOICES.iter().map(|s| s.to_string()).collect(),
+            selected: 0,
+        };
+        // move from "default" (0) to "low" (1) and confirm
+        modal::handle_modal_key(&mut modal, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let r = modal::handle_modal_key(&mut modal, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match r {
+            modal::ModalResult::SetConfig { setting, value, .. } => {
+                assert_eq!(setting, modal::ConfigSetting::Effort);
+                assert_eq!(value, Some("low".to_string()));
+            }
+            _ => panic!("expected SetConfig"),
+        }
+    }
+
+    #[tokio::test]
+    async fn picker_default_selection_clears_existing_flag() {
+        let mut app = test_app();
+        select_workspace(&mut app);
+        app.session_configs.insert(
+            "w1".into(),
+            SessionConfig { model: Some("opus".into()), effort: None },
+        );
+        app.open_config_picker(modal::ConfigSetting::Model);
+        // preselect should land on "opus" (index 1), not "default"
+        match &app.modal {
+            modal::ModalState::ConfigPicker { selected, options, .. } => {
+                assert_eq!(options[*selected], "opus");
+            }
+            _ => panic!("expected picker"),
+        }
+        // navigate back to "default" (index 0) and confirm -> None
+        modal::handle_modal_key(&mut app.modal, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let r = modal::handle_modal_key(&mut app.modal, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(r, modal::ModalResult::SetConfig { value: None, .. }));
+    }
+
+    #[tokio::test]
+    async fn model_and_effort_injected_into_popup() {
+        let mut app = test_app();
+        app.expanded.insert("r1".into());
+        app.rebuild_tree();
+        app.selected_index = 1;
+        app.composer.set_active(true);
+        app.sync_composer_slash_commands();
+        app.composer
+            .handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.composer.slash_matches().iter().any(|c| c == "model"));
+        assert!(app.composer.slash_matches().iter().any(|c| c == "effort"));
+    }
+
+    #[test]
+    fn session_configs_round_trip_and_tolerate_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session_config.json");
+
+        let mut configs = HashMap::new();
+        configs.insert(
+            "w1".to_string(),
+            SessionConfig { model: Some("opus".into()), effort: Some("high".into()) },
+        );
+        save_session_configs_to(&configs, &path);
+        assert_eq!(load_session_configs_from(&path), configs);
+
+        // Corrupt / absent files load as empty rather than panicking.
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(load_session_configs_from(&path).is_empty());
+        assert!(load_session_configs_from(dir.path().join("missing.json").as_path()).is_empty());
     }
 
     #[tokio::test]

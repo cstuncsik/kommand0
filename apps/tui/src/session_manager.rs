@@ -9,6 +9,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
+/// Per-session launch options applied as `claude` flags at spawn time.
+/// `None` fields are omitted, preserving the CLI's defaults.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionConfig {
+    /// `--model` value (alias like "opus"/"sonnet"/"fable" or a full model id).
+    pub model: Option<String>,
+    /// `--effort` value ("low"|"medium"|"high"|"xhigh"|"max").
+    pub effort: Option<String>,
+}
+
 /// Where an Output event originated from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutputSource {
@@ -90,12 +100,14 @@ impl SessionManager {
     /// Spawn a new Claude CLI session for the given workspace directory.
     ///
     /// If `resume_id` is provided, passes `--resume <id>` to continue a previous
-    /// Claude session. Returns the child process PID.
+    /// Claude session. `config` adds `--model`/`--effort` flags when set.
+    /// Returns the child process PID.
     pub fn start_session(
         &mut self,
         session_id: &str,
         workspace_dir: &str,
         resume_id: Option<&str>,
+        config: &SessionConfig,
     ) -> Result<u32> {
         let mut cmd = Command::new("claude");
         cmd.args([
@@ -106,6 +118,7 @@ impl SessionManager {
             "--output-format",
             "stream-json",
         ]);
+        cmd.args(config_flags(config));
         cmd.current_dir(workspace_dir);
 
         if let Some(rid) = resume_id {
@@ -302,12 +315,13 @@ impl SessionManager {
         session_id: &str,
         workspace_dir: &str,
         claude_session_id: Option<&str>,
+        config: &SessionConfig,
     ) -> Result<(String, u32)> {
         // Remove old session if it exists (best-effort stop via drop + kill_on_drop)
         self.sessions.remove(session_id);
 
         let new_session_id = uuid::Uuid::new_v4().to_string();
-        let pid = self.start_session(&new_session_id, workspace_dir, claude_session_id)?;
+        let pid = self.start_session(&new_session_id, workspace_dir, claude_session_id, config)?;
         Ok((new_session_id, pid))
     }
 
@@ -541,6 +555,21 @@ fn classify_json_event(line: &str) -> JsonEvent {
     }
 }
 
+/// Build the `--model`/`--effort` flag args for a session config (empty when
+/// both are unset, preserving the CLI defaults).
+fn config_flags(config: &SessionConfig) -> Vec<String> {
+    let mut flags = Vec::new();
+    if let Some(model) = &config.model {
+        flags.push("--model".to_string());
+        flags.push(model.clone());
+    }
+    if let Some(effort) = &config.effort {
+        flags.push("--effort".to_string());
+        flags.push(effort.clone());
+    }
+    flags
+}
+
 /// Extract a human-readable message from an error event of unknown shape,
 /// falling back to a truncated copy of the raw line so detail is never lost.
 fn extract_error_message(val: &Value, raw: &str) -> String {
@@ -646,6 +675,29 @@ mod tests {
             JsonEvent::ErrorMsg(m) => assert_eq!(m, "partial"),
             other => panic!("expected ErrorMsg, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn config_flags_omitted_by_default() {
+        assert!(config_flags(&SessionConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn config_flags_includes_set_values() {
+        let cfg = SessionConfig {
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+        };
+        assert_eq!(
+            config_flags(&cfg),
+            vec!["--model", "opus", "--effort", "high"]
+        );
+    }
+
+    #[test]
+    fn config_flags_partial() {
+        let cfg = SessionConfig { model: Some("sonnet".into()), effort: None };
+        assert_eq!(config_flags(&cfg), vec!["--model", "sonnet"]);
     }
 
     #[test]

@@ -56,6 +56,7 @@ const COMPOSER_BINDINGS: &[KeyBinding] = &[
     KeyBinding { keys: "[Enter]", description: "Send message" },
     KeyBinding { keys: "[Shift+Enter / Alt+Enter]", description: "New line" },
     KeyBinding { keys: "[/]", description: "Slash-command popup" },
+    KeyBinding { keys: "[/model] [/effort]", description: "Model / effort picker" },
     KeyBinding { keys: "[Up/Down]", description: "Popup: move selection" },
     KeyBinding { keys: "[Tab/Enter]", description: "Popup: accept command" },
     KeyBinding { keys: "[Esc]", description: "Popup: dismiss" },

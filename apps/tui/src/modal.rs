@@ -14,6 +14,22 @@ pub(crate) enum DeleteTarget {
     Repo { id: String, name: String, workspace_count: usize },
 }
 
+/// Which per-session launch setting a picker is editing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum ConfigSetting {
+    Model,
+    Effort,
+}
+
+impl ConfigSetting {
+    pub fn label(self) -> &'static str {
+        match self {
+            ConfigSetting::Model => "model",
+            ConfigSetting::Effort => "effort",
+        }
+    }
+}
+
 /// Modal dialog state.
 #[derive(Default)]
 pub(crate) enum ModalState {
@@ -36,6 +52,14 @@ pub(crate) enum ModalState {
     ConfirmDelete {
         target: DeleteTarget,
     },
+    /// Pick a value for a per-session setting (model/effort). The first option
+    /// is always "default" (meaning: omit the flag, use the CLI default).
+    ConfigPicker {
+        workspace_id: String,
+        setting: ConfigSetting,
+        options: Vec<String>,
+        selected: usize,
+    },
 }
 
 impl ModalState {
@@ -56,6 +80,13 @@ pub(crate) enum ModalResult {
     SubmitWorkspace(String, String),
     /// Delete confirmed.
     ConfirmDelete(DeleteTarget),
+    /// A per-session setting was chosen: (workspace_id, setting, value).
+    /// `value` is None when "default" was selected.
+    SetConfig {
+        workspace_id: String,
+        setting: ConfigSetting,
+        value: Option<String>,
+    },
 }
 
 /// Handle a key event when a modal is active.
@@ -247,6 +278,40 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                     ModalResult::ConfirmDelete(t)
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
+                }
+                _ => ModalResult::Consumed,
+            }
+        }
+        ModalState::ConfigPicker { workspace_id, setting, options, selected } => {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if !options.is_empty() {
+                        *selected = (*selected + options.len() - 1) % options.len();
+                    }
+                    ModalResult::Consumed
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !options.is_empty() {
+                        *selected = (*selected + 1) % options.len();
+                    }
+                    ModalResult::Consumed
+                }
+                KeyCode::Enter => {
+                    let ws = workspace_id.clone();
+                    let setting = *setting;
+                    let choice = options.get(*selected).cloned().unwrap_or_default();
+                    // Option index 0 is "default" -> clear the flag.
+                    let value = if *selected == 0 { None } else { Some(choice) };
+                    *modal = ModalState::None;
+                    ModalResult::SetConfig { workspace_id: ws, setting, value }
+                }
+                KeyCode::Esc => {
                     *modal = ModalState::None;
                     ModalResult::Cancelled
                 }
@@ -551,6 +616,55 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
                     Span::raw(": cancel"),
                 ])),
                 inner[2],
+            );
+        }
+        ModalState::ConfigPicker { setting, options, selected, .. } => {
+            let area = centered_rect(40, 60, frame.area());
+            frame.render_widget(Clear, area);
+
+            let block = Block::default()
+                .title(format!(" Set {} ", setting.label()))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+            frame.render_widget(block, area);
+
+            let inner = Layout::vertical([
+                Constraint::Min(0),    // options
+                Constraint::Length(1), // footer
+            ])
+            .split(Rect::new(
+                area.x + 2,
+                area.y + 1,
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(2),
+            ));
+
+            let lines: Vec<Line> = options
+                .iter()
+                .enumerate()
+                .map(|(i, opt)| {
+                    if i == *selected {
+                        Line::styled(
+                            format!("> {opt}"),
+                            Style::default().fg(Color::Black).bg(Color::Cyan),
+                        )
+                    } else {
+                        Line::styled(format!("  {opt}"), Style::default().fg(Color::White))
+                    }
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines), inner[0]);
+
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("j/k", Style::default().fg(Color::Cyan)),
+                    Span::raw(": move  "),
+                    Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                    Span::raw(": select  "),
+                    Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                    Span::raw(": cancel"),
+                ])),
+                inner[1],
             );
         }
     }

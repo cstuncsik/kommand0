@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Fake `claude` CLI for e2e tests: speaks just enough stream-json for the TUI.
+# Record the args of each invocation (cwd = the workspace dir) so tests can
+# assert which flags (e.g. --model) were forwarded.
+echo "$@" >> claude-args.log
 # Like the real CLI, the init event (with slash_commands) is emitted only after
 # the first user message arrives — not on startup. "deploy-demo" is a marker
 # command present only in this init list (never in the built-in defaults).
