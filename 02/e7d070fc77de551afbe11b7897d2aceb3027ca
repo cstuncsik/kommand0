@@ -1,0 +1,36 @@
+apps/tui/src/render.rs
+  s_fc3d7618d36de0::t_3750cfbf5b7c12 1761
+  s_fc3d7618d36de0::t_b8a5f95ec04743 234
+  s_fc3d7618d36de0::t_e04aa599f072cf 1850
+  s_fc3d7618d36de0::t_270a885dfb22e6 1863
+  s_fc3d7618d36de0::t_1f61241299fe3b 689-692
+  s_fc3d7618d36de0::t_bae5ace306a5ad 1837
+  s_fc3d7618d36de0::t_99980194df690b 1911
+  s_fc3d7618d36de0::t_3b7460003263e8 1411,1429-1462
+  s_fc3d7618d36de0::t_c1c712157d9aab 1775-1794
+  s_fc3d7618d36de0::t_ee1c298b879c0e 1813,1874,1889,1899
+  s_fc3d7618d36de0::t_2f0e3cb63a95fb 1798
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_c195a06401cb3c 1975,1995
+  s_fc3d7618d36de0::t_3701a13a7dcd22 1446-1449
+  s_fc3d7618d36de0::t_273aa36f4c7575 1470
+  s_fc3d7618d36de0::t_90844fc56108c8 2253
+  s_fc3d7618d36de0::t_ef130be8da3641 2283
+  s_fc3d7618d36de0::t_db51b6e233d5f4 2050-2068
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "02e7d070fc77de551afbe11b7897d2aceb3027ca",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
