@@ -229,89 +229,6 @@ fn tree_navigation_expands_repo_with_l() {
 }
 
 #[test]
-fn fake_claude_session_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = seeded_state(dir.path().to_str().unwrap());
-    let mut tui = Tui::launch(Some(state));
-
-    tui.wait_for("demo");
-    tui.send("l"); // expand repo
-    tui.wait_for("demo-ws");
-    tui.send("j"); // select workspace
-    tui.send("\r"); // Enter: start session (spawns fake claude), focus composer
-
-    // Type a message and send it
-    std::thread::sleep(Duration::from_millis(300));
-    tui.send("ping");
-    tui.wait_for("ping");
-    tui.send("\r");
-
-    // Fake claude replies with a fixed string that must reach the output pane
-    tui.wait_for("FAKE-REPLY pong");
-
-    tui.send_esc(); // Esc back to tree
-    tui.send("q"); // quit (stops sessions)
-    tui.wait_exit();
-}
-
-#[test]
-fn slash_popup_uses_defaults_before_first_message() {
-    // The real CLI advertises slash_commands only after the first message, so the
-    // popup must work from built-in defaults immediately (the cold-start fix).
-    let dir = tempfile::tempdir().unwrap();
-    let state = seeded_state(dir.path().to_str().unwrap());
-    let mut tui = Tui::launch(Some(state));
-
-    tui.wait_for("demo");
-    tui.send("l"); // expand repo
-    tui.wait_for("demo-ws");
-    tui.send("j"); // select workspace
-    tui.send("\r"); // start session, focus composer — NO message sent yet
-
-    tui.send("/comp"); // matches the built-in default "compact"
-    tui.wait_for("/commands");
-    tui.wait_for("/compact");
-
-    tui.send("\t"); // Tab accepts
-    tui.wait_gone("/commands");
-    tui.wait_for("/compact"); // accepted text remains in the composer
-
-    tui.send_esc();
-    tui.send("q");
-    tui.wait_exit();
-}
-
-#[test]
-fn slash_popup_enriches_with_session_commands_after_first_message() {
-    // "deploy-demo" is only in the session's init list, never in the defaults,
-    // so it must not appear until after the first message triggers init.
-    let dir = tempfile::tempdir().unwrap();
-    let state = seeded_state(dir.path().to_str().unwrap());
-    let mut tui = Tui::launch(Some(state));
-
-    tui.wait_for("demo");
-    tui.send("l");
-    tui.wait_for("demo-ws");
-    tui.send("j");
-    tui.send("\r");
-
-    // Probe round trip: proves the session is live and the init event (with the
-    // extended command list) has been processed.
-    tui.send("ping");
-    tui.send("\r");
-    tui.wait_for("FAKE-REPLY pong");
-
-    tui.send("/deploy"); // only present in the session's advertised commands
-    tui.wait_for("/deploy-demo");
-
-    tui.send("\t"); // accept, closing the popup
-    tui.wait_gone("/commands");
-    tui.send_esc(); // composer -> tree
-    tui.send("q"); // quit
-    tui.wait_exit();
-}
-
-#[test]
 fn embedded_pane_renders_real_terminal_and_forwards_keys() {
     // Phase 2: pressing 'e' embeds an interactive child (here a stub claude) in
     // the right pane; its terminal renders, and typed keys are forwarded to it.
@@ -405,5 +322,26 @@ fn embedded_prefix_q_quits_directly() {
 
     tui.send("\x01"); // Ctrl+A (prefix)
     tui.send("q"); // quit directly from the embedded pane
+    tui.wait_exit();
+}
+
+#[test]
+fn enter_opens_embedded_claude_by_default() {
+    // Phase 3: opening a workspace (Enter) launches the embedded claude — no more
+    // old stream output+composer.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("\r"); // Enter opens the embedded claude (not the old stream view)
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("Ctrl+A then"); // embedded pane border
+
+    tui.send("\x01"); // Ctrl+A
+    tui.send("q"); // quit
     tui.wait_exit();
 }

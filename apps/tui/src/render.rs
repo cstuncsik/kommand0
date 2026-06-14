@@ -405,15 +405,13 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let right_width = area.width.saturating_sub(4) as usize;
 
-    // Check if selected workspace has an active session (running, or stopped/exited with scrollback)
+    // The interactive embedded pane is the default session view; only a *running*
+    // legacy stream session falls back to the old output+composer layout.
     let session_info = match app.tree_items.get(app.selected_index) {
         Some(TreeNode::Workspace { ws, .. }) => {
             app.state
                 .find_session_by_workspace(&ws.id)
-                .filter(|s| {
-                    s.status == SessionStatus::Running
-                        || app.scrollbacks.get(&ws.id).is_some_and(|b| !b.is_empty())
-                })
+                .filter(|s| s.status == SessionStatus::Running)
                 .map(|s| (ws.clone(), s.id.clone(), s.status.clone()))
         }
         _ => None,
@@ -680,14 +678,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         Span::raw(format_timestamp(ws.created_at)),
                     ]),
                 ];
-                // Button for starting session
+                // Hint + button to open the embedded interactive claude.
                 lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "Press Enter to open Claude here",
+                    Style::default().fg(Color::DarkGray),
+                ));
                 {
-                    // Button area: inside the right pane, on the line after the details
-                    // 6 detail lines + 1 empty + 1 border = line offset 8 from area.y
-                    let btn_y = area.y + 8;
+                    // Button area: 6 detail lines + 1 empty + 1 hint + 1 border = offset 9.
+                    let btn_y = area.y + 9;
                     let btn_x = area.x + 2; // inside border + 1 padding
-                    let btn_label = "Start Session";
+                    let btn_label = "Open Claude";
                     let btn_rect = Rect::new(btn_x, btn_y, (btn_label.len() + 2) as u16, 1);
                     let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
                     let style = if hovered {
