@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -352,10 +352,8 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let right_width = area.width.saturating_sub(4) as usize;
 
-    // The interactive embedded pane is the default session view; only a *running*
-    // legacy stream session falls back to the old output+composer layout.
-    // The embedded claude pane is the only session view now; otherwise show
-    // workspace/repo details.
+    // The embedded claude pane is the only session view (handled above); here we
+    // show workspace/repo details for the current selection.
     let (right_title, mut right_content) = match app.tree_items.get(app.selected_index) {
         Some(TreeNode::Repo { id, name, .. }) => {
             let repo_path = app
@@ -500,21 +498,30 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         }
     };
 
-    // Surface the most recent embedded-pane spawn failure, if any.
-    if let Some(err) = &app.embed_error {
+    // Surface a spawn failure only in the detail pane of the workspace it
+    // happened in (keyed by id, so navigating away doesn't show it elsewhere).
+    let selected_ws_id = match app.tree_items.get(app.selected_index) {
+        Some(TreeNode::Workspace { ws, .. }) => Some(ws.id.as_str()),
+        _ => None,
+    };
+    if let (Some(sel), Some((err_ws, msg))) = (selected_ws_id, &app.embed_error)
+        && sel == err_ws.as_str()
+    {
         right_content.push(Line::raw(""));
         right_content.push(Line::styled(
-            err.clone(),
+            msg.clone(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
 
-    let paragraph = Paragraph::new(right_content).block(
-        Block::default()
-            .title(right_title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
+    let paragraph = Paragraph::new(right_content)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(right_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
     frame.render_widget(paragraph, area);
 }
 /// Icon cluster for a workspace or repo line in the tree view.
