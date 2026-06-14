@@ -390,7 +390,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     {
         let border = if app.focus == Focus::Embedded { Color::Cyan } else { Color::DarkGray };
         let block = Block::default()
-            .title(format!(" {ws_name} — claude (embedded, Ctrl+] to leave) "))
+            .title(format!(" {ws_name} — claude · Ctrl+A then: q quit · t tree "))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border));
         let inner = block.inner(area);

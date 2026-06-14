@@ -168,6 +168,9 @@ pub(crate) struct App {
     /// size (a resize-after-spawn makes claude drop its first screen, e.g. the
     /// trust prompt).
     pub(crate) right_pane_area: ratatui::layout::Rect,
+    /// True when the embedded-pane prefix (Ctrl+A) was pressed and the next key
+    /// is a kommand0 command rather than forwarded to claude.
+    pub(crate) embedded_prefix: bool,
 }
 
 impl App {
@@ -253,6 +256,7 @@ impl App {
             embedded: HashMap::new(),
             embedded_wake: None,
             right_pane_area: ratatui::layout::Rect::default(),
+            embedded_prefix: false,
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -556,6 +560,7 @@ impl App {
             }
         }
         self.focus = Focus::Embedded;
+        self.embedded_prefix = false;
         self.composer.set_active(false);
     }
 
@@ -1312,14 +1317,37 @@ enum KeyOutcome {
 /// Handle one key press. Extracted from the main event loop so tests can
 /// drive the app without a real terminal.
 async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> {
-    // Embedded pane owns the keyboard: forward everything (incl. Ctrl+C, Tab, q,
-    // slash commands) to the real claude, except Ctrl+] which leaves the pane.
-    // Byte 0x1d is Ctrl+]; a Kitty/CSI-u terminal reports it as Char(']')+CTRL,
-    // a legacy terminal as Char('5')+CTRL — accept both so leave works either way.
+    // Embedded pane owns the keyboard: every key forwards to the real claude
+    // (incl. Ctrl+C, Tab, q, slash commands). kommand0 commands are reached via a
+    // tmux-style prefix (Ctrl+A) so there's always a reliable way out:
+    //   Ctrl+A then  q = quit · t/Tab/Esc = back to tree · Ctrl+A = literal Ctrl+A
     if app.focus == Focus::Embedded {
-        let leave = key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'));
-        if leave {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if app.embedded_prefix {
+            app.embedded_prefix = false;
+            match key.code {
+                KeyCode::Char('q') => {
+                    app.session_manager.shutdown_all().await?;
+                    return Ok(KeyOutcome::Quit);
+                }
+                KeyCode::Char('t') | KeyCode::Tab | KeyCode::Esc => {
+                    app.focus = Focus::Tree;
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('a') if ctrl => {
+                    app.forward_to_embedded(key); // literal Ctrl+A to claude
+                    return Ok(KeyOutcome::Continue);
+                }
+                _ => return Ok(KeyOutcome::Continue), // unknown command: swallow
+            }
+        }
+        if ctrl && key.code == KeyCode::Char('a') {
+            app.embedded_prefix = true; // start a prefix sequence
+            return Ok(KeyOutcome::Continue);
+        }
+        // Direct leave alias: Ctrl+] (Kitty CSI-u reports Char(']')+CTRL, a legacy
+        // terminal reports Char('5')+CTRL since both are byte 0x1d).
+        if ctrl && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')) {
             app.focus = Focus::Tree;
             return Ok(KeyOutcome::Continue);
         }
