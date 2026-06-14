@@ -2,14 +2,15 @@
 //!
 //! Spawns the real `kommand0-tui` binary in a pseudo-terminal, sends
 //! keystrokes as raw bytes, and asserts against the rendered screen
-//! (parsed with vt100). Claude sessions are served by the fake `claude`
-//! script in `tests/fixtures/`, which is put first on PATH.
+//! (parsed with vt100). The embedded `claude` pane is driven by the
+//! `embed-stub` fixture in `tests/fixtures/`, selected via the
+//! `KOMMAND0_CLAUDE_BIN` env var (see the embedded-pane tests).
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
+use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
@@ -149,7 +150,10 @@ impl Tui {
             }
             if Instant::now() > deadline {
                 let _ = self.killer.kill();
-                panic!("timed out waiting for TUI to exit; screen:\n{}", self.screen());
+                panic!(
+                    "timed out waiting for TUI to exit; screen:\n{}",
+                    self.screen()
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -255,7 +259,6 @@ fn embedded_pane_renders_real_terminal_and_forwards_keys() {
     tui.wait_exit();
 }
 
-
 #[test]
 fn embedded_pane_not_stranded_by_mouse_click() {
     // A click inside the embedded pane must not flip focus out of it (which would
@@ -284,7 +287,6 @@ fn embedded_pane_not_stranded_by_mouse_click() {
     tui.send("q");
     tui.wait_exit();
 }
-
 
 #[test]
 fn embedded_prefix_quits_and_returns_to_tree() {
