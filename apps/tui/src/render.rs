@@ -231,6 +231,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             app.spinner_tick,
                             pane_inner_width,
                             is_expanded_narrow,
+                            app.embedded.contains_key(&ws.id),
                         );
 
                         // Fill-span layout: prefix + dot + space + name + fill + icons
@@ -685,8 +686,10 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 ));
                 {
-                    // Button area: 6 detail lines + 1 empty + 1 hint + 1 border = offset 9.
-                    let btn_y = area.y + 9;
+                    // Derive the button row from the line count so the hit
+                    // region can never drift from the rendered text: +1 for the
+                    // top border, lines.len() lines precede the button text.
+                    let btn_y = area.y + 1 + lines.len() as u16;
                     let btn_x = area.x + 2; // inside border + 1 padding
                     let btn_label = "Open Claude";
                     let btn_rect = Rect::new(btn_x, btn_y, (btn_label.len() + 2) as u16, 1);
@@ -1405,6 +1408,7 @@ pub(crate) fn workspace_icon_cluster(
     spinner_tick: u8,
     pane_inner_width: usize,
     is_expanded_narrow: bool,
+    embedded: bool,
 ) -> IconCluster {
     let ws_id = workspace_id.to_string();
     let icon_style = Style::default().fg(Color::Cyan);
@@ -1419,6 +1423,43 @@ pub(crate) fn workspace_icon_cluster(
             total_width: 2,
             texts: vec![text.clone()],
             hover_texts: vec![text],
+        };
+    }
+
+    // A live embedded claude pane takes priority over any persisted stream
+    // session status: opening a workspace creates a pane but no stream session,
+    // so without this the row would advertise "start" while claude is running.
+    if embedded {
+        let prompt_text = " \u{276F}".to_string(); // " ❯"
+        let stop_text = " \u{25A0}".to_string(); // " ■"
+        let mut spans = vec![
+            Span::styled(prompt_text.clone(), icon_style),
+            Span::styled(stop_text.clone(), icon_style),
+            Span::styled(delete_text.clone(), icon_style),
+        ];
+        let mut regions = vec![
+            (HitAction::FocusComposerFor { workspace_id: ws_id.clone() }, 2),
+            (HitAction::StopSessionFor { workspace_id: ws_id.clone() }, 2),
+            (HitAction::DeleteWorkspaceFor { workspace_id: ws_id }, 2),
+        ];
+        let mut texts_v = vec![prompt_text.clone(), stop_text.clone(), delete_text.clone()];
+        let mut hover_v = vec![prompt_text, stop_text, delete_text];
+        let total = if pane_inner_width < 20 {
+            // Narrow: keep stop only
+            spans = vec![spans.remove(1)];
+            regions = vec![regions.remove(1)];
+            texts_v = vec![texts_v.remove(1)];
+            hover_v = vec![hover_v.remove(1)];
+            2
+        } else {
+            6
+        };
+        return IconCluster {
+            spans,
+            hit_regions: regions,
+            total_width: total,
+            texts: texts_v,
+            hover_texts: hover_v,
         };
     }
 
@@ -1717,7 +1758,7 @@ mod tests {
 
     #[test]
     fn icon_cluster_no_session() {
-        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 40, false);
+        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // start + delete
         assert_eq!(cluster.hit_regions.len(), 2);
         assert_eq!(
@@ -1731,9 +1772,30 @@ mod tests {
     }
 
     #[test]
+    fn icon_cluster_embedded_overrides_no_session() {
+        // A live embedded pane (no stream session) must show the running
+        // prompt/stop/delete cluster, never the green "start" affordance.
+        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 40, false, true);
+        assert_eq!(cluster.total_width, 6); // prompt + stop + delete
+        assert_eq!(cluster.hit_regions.len(), 3);
+        assert_eq!(
+            cluster.hit_regions[0].0,
+            HitAction::FocusComposerFor { workspace_id: "ws-1".to_string() }
+        );
+        assert_eq!(
+            cluster.hit_regions[1].0,
+            HitAction::StopSessionFor { workspace_id: "ws-1".to_string() }
+        );
+        assert!(!cluster.hit_regions.iter().any(|(a, _)| matches!(
+            a,
+            HitAction::StartSessionFor { .. } | HitAction::ResumeSessionFor { .. }
+        )));
+    }
+
+    #[test]
     fn icon_cluster_running_thinking_returns_spinner() {
         let session = make_session(SessionStatus::Running);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", true, 0, 40, false);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", true, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // spinner + delete
         // Should contain a braille spinner character
         let text = &cluster.spans[0].content;
@@ -1748,7 +1810,7 @@ mod tests {
     #[test]
     fn icon_cluster_running_idle_returns_prompt_stop_delete() {
         let session = make_session(SessionStatus::Running);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false, false);
         assert_eq!(cluster.total_width, 6); // prompt + stop + delete
         assert_eq!(cluster.spans.len(), 3);
         assert_eq!(cluster.hit_regions.len(), 3);
@@ -1772,7 +1834,7 @@ mod tests {
     fn icon_cluster_running_narrow_drops_to_stop_only() {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 20 but >= 12: keep stop only
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 15, false);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 15, false, false);
         assert_eq!(cluster.total_width, 2);
         assert_eq!(cluster.hit_regions.len(), 1);
         assert_eq!(
@@ -1785,7 +1847,7 @@ mod tests {
     fn icon_cluster_very_narrow_shows_ellipsis() {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 12, not expanded: ellipsis
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, false);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, false, false);
         assert_eq!(cluster.total_width, 2);
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1798,7 +1860,7 @@ mod tests {
     fn icon_cluster_very_narrow_expanded_shows_normal() {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 12, but is_expanded_narrow=true: normal icons
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, true);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, true, false);
         // Should NOT be ellipsis -- should be stop icon (narrow < 20 drops others)
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1809,7 +1871,7 @@ mod tests {
     #[test]
     fn icon_cluster_stopped() {
         let session = make_session(SessionStatus::Stopped);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // resume + delete
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1824,7 +1886,7 @@ mod tests {
     #[test]
     fn icon_cluster_exited() {
         let session = make_session(SessionStatus::Exited);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false, false);
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::ResumeSessionFor { workspace_id: "ws-1".to_string() }
@@ -1834,7 +1896,7 @@ mod tests {
     #[test]
     fn icon_cluster_failed() {
         let session = make_session(SessionStatus::Failed);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false);
+        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // retry + delete
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1846,7 +1908,7 @@ mod tests {
 
     #[test]
     fn icon_cluster_no_session_narrow_drops_delete() {
-        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 15, false);
+        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 15, false, false);
         assert_eq!(cluster.total_width, 2); // start only
         assert_eq!(cluster.hit_regions.len(), 1);
     }

@@ -1443,6 +1443,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                 let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                             }
                             app.scrollbacks.remove(&ws_id);
+                            // Tear the embedded pane down here (at user-action
+                            // time) rather than letting reap_embedded block the
+                            // 50ms tick on the pane's Drop.
+                            app.embedded.remove(&ws_id);
                         }
                         let _ = app.state.delete_workspace(&name);
                         app.workspaces = app.state.workspaces.clone();
@@ -1463,6 +1467,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                     let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                 }
                             app.scrollbacks.remove(ws_id);
+                            app.embedded.remove(ws_id);
                         }
                         let _ = app.state.delete_repo(&id);
                         app.repos = app.state.repos.clone();
@@ -1967,6 +1972,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                             let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                         }
                                         app.scrollbacks.remove(&ws_id);
+                                        app.embedded.remove(&ws_id);
                                     }
                                     let _ = app.state.delete_workspace(&ws.name);
                                     app.workspaces = app.state.workspaces.clone();
@@ -1986,6 +1992,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                                 let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                             }
                                         app.scrollbacks.remove(ws_id);
+                                        app.embedded.remove(ws_id);
                                     }
                                     let _ = app.state.delete_repo(&id);
                                     app.repos = app.state.repos.clone();
@@ -2039,6 +2046,25 @@ async fn main() -> anyhow::Result<()> {
 async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let state = AppState::load()?;
     let mut app = App::new(state);
+
+    // Reconcile persisted status with the (empty) session_manager. No stream
+    // session is ever resurrected now, so a persisted `Running` is stale — left
+    // behind by a crash/SIGKILL that skipped the clean-quit normalization.
+    // Flipping it to Stopped prevents a phantom (silently-failing) legacy
+    // composer and a stale "running" tree icon on the first launch after upgrade.
+    let stale_running: Vec<String> = app
+        .state
+        .sessions
+        .iter()
+        .filter(|s| s.status == SessionStatus::Running)
+        .map(|s| s.id.clone())
+        .collect();
+    if !stale_running.is_empty() {
+        for sid in stale_running {
+            let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+        }
+        let _ = app.state.save();
+    }
 
     // Auto-resume of legacy stream sessions is disabled: workspaces now open as
     // the embedded interactive claude (press Enter). The loop below is retained
@@ -2224,6 +2250,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                                 if app.state.delete_workspace(&ws.name).is_ok() {
                                     app.scrollbacks.remove(&workspace_id);
+                                    app.embedded.remove(&workspace_id);
                                     app.waiting_response.remove(&workspace_id);
                                     app.expanded_icon_rows.remove(&workspace_id);
                                     app.composer_drafts.remove(&workspace_id);
@@ -2253,6 +2280,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                     }
                                     app.scrollbacks.remove(ws_id);
+                                    app.embedded.remove(ws_id);
                                     app.waiting_response.remove(ws_id);
                                     app.expanded_icon_rows.remove(ws_id);
                                     app.composer_drafts.remove(ws_id);
