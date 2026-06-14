@@ -27,6 +27,11 @@ impl Tui {
     /// Launch the TUI in a fresh PTY with an isolated state dir.
     /// `state_json`: optional pre-seeded state.json content.
     fn launch(state_json: Option<String>) -> Self {
+        Self::launch_with(state_json, &[])
+    }
+
+    /// Like [`Tui::launch`] but sets additional environment variables.
+    fn launch_with(state_json: Option<String>, extra_env: &[(&str, &str)]) -> Self {
         let state_dir = tempfile::tempdir().unwrap();
         if let Some(json) = state_json {
             std::fs::write(state_dir.path().join("state.json"), json).unwrap();
@@ -55,6 +60,9 @@ impl Tui {
         cmd.env("KOMMAND0_STATE_DIR", state_dir.path());
         cmd.env("PATH", path_env);
         cmd.env("TERM", "xterm-256color");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
         cmd.cwd(state_dir.path());
 
         let child = pair.slave.spawn_command(cmd).unwrap();
@@ -221,84 +229,119 @@ fn tree_navigation_expands_repo_with_l() {
 }
 
 #[test]
-fn fake_claude_session_round_trip() {
+fn embedded_pane_renders_real_terminal_and_forwards_keys() {
+    // Phase 2: pressing 'e' embeds an interactive child (here a stub claude) in
+    // the right pane; its terminal renders, and typed keys are forwarded to it.
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());
-    let mut tui = Tui::launch(Some(state));
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
 
     tui.wait_for("demo");
     tui.send("l"); // expand repo
     tui.wait_for("demo-ws");
-    tui.send("j"); // select workspace
-    tui.send("\r"); // Enter: start session (spawns fake claude), focus composer
+    tui.send("j"); // select the workspace
+    tui.send("e"); // toggle embedded pane
 
-    // Type a message and send it
-    std::thread::sleep(Duration::from_millis(300));
-    tui.send("ping");
-    tui.wait_for("ping");
-    tui.send("\r");
+    // The embedded child's own terminal output is composited into the pane.
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("Ctrl+A then"); // the pane border title
 
-    // Fake claude replies with a fixed string that must reach the output pane
-    tui.wait_for("FAKE-REPLY pong");
+    // Keys go to the embedded child, which echoes them.
+    tui.send("hi");
+    tui.wait_for("hi");
 
-    tui.send_esc(); // Esc back to tree
-    tui.send("q"); // quit (stops sessions)
+    tui.send("\x1d"); // Ctrl+] leaves the embedded pane (back to the tree)
+    tui.send("q"); // quit (kills the embedded child on teardown)
     tui.wait_exit();
 }
 
-#[test]
-fn slash_popup_uses_defaults_before_first_message() {
-    // The real CLI advertises slash_commands only after the first message, so the
-    // popup must work from built-in defaults immediately (the cold-start fix).
-    let dir = tempfile::tempdir().unwrap();
-    let state = seeded_state(dir.path().to_str().unwrap());
-    let mut tui = Tui::launch(Some(state));
-
-    tui.wait_for("demo");
-    tui.send("l"); // expand repo
-    tui.wait_for("demo-ws");
-    tui.send("j"); // select workspace
-    tui.send("\r"); // start session, focus composer — NO message sent yet
-
-    tui.send("/comp"); // matches the built-in default "compact"
-    tui.wait_for("/commands");
-    tui.wait_for("/compact");
-
-    tui.send("\t"); // Tab accepts
-    tui.wait_gone("/commands");
-    tui.wait_for("/compact"); // accepted text remains in the composer
-
-    tui.send_esc();
-    tui.send("q");
-    tui.wait_exit();
-}
 
 #[test]
-fn slash_popup_enriches_with_session_commands_after_first_message() {
-    // "deploy-demo" is only in the session's init list, never in the defaults,
-    // so it must not appear until after the first message triggers init.
+fn embedded_pane_not_stranded_by_mouse_click() {
+    // A click inside the embedded pane must not flip focus out of it (which would
+    // silently stop forwarding keys to the live child).
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());
-    let mut tui = Tui::launch(Some(state));
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
 
     tui.wait_for("demo");
     tui.send("l");
     tui.wait_for("demo-ws");
     tui.send("j");
-    tui.send("\r");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
 
-    // Probe round trip: proves the session is live and the init event (with the
-    // extended command list) has been processed.
-    tui.send("ping");
-    tui.send("\r");
-    tui.wait_for("FAKE-REPLY pong");
+    // SGR left-click (press+release) well inside the right (embedded) pane.
+    tui.send("\x1b[<0;60;12M");
+    tui.send("\x1b[<0;60;12m");
 
-    tui.send("/deploy"); // only present in the session's advertised commands
-    tui.wait_for("/deploy-demo");
+    // If focus were stranded to Output, these keys would drive the scrollback
+    // cursor and never reach the child; the stub only echoes what it receives.
+    tui.send("MARKER");
+    tui.wait_for("MARKER");
 
-    tui.send("\t"); // accept, closing the popup
-    tui.wait_gone("/commands");
-    tui.send_esc(); // composer -> tree
+    tui.send("\x1d"); // Ctrl+] leaves
+    tui.send("q");
+    tui.wait_exit();
+}
+
+
+#[test]
+fn embedded_prefix_quits_and_returns_to_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+
+    // Ctrl+A then 't' returns to the tree, where normal nav works again.
+    tui.send("\x01"); // Ctrl+A (prefix)
+    tui.send("t");
+    // Back in the tree: 'q' quits (would otherwise be swallowed by the pane).
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn embedded_prefix_q_quits_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+
+    tui.send("\x01"); // Ctrl+A (prefix)
+    tui.send("q"); // quit directly from the embedded pane
+    tui.wait_exit();
+}
+
+#[test]
+fn enter_opens_embedded_claude_by_default() {
+    // Phase 3: opening a workspace (Enter) launches the embedded claude — no more
+    // old stream output+composer.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("\r"); // Enter opens the embedded claude (not the old stream view)
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("Ctrl+A then"); // embedded pane border
+
+    tui.send("\x01"); // Ctrl+A
     tui.send("q"); // quit
     tui.wait_exit();
 }

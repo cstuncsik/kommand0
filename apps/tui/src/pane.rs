@@ -49,12 +49,20 @@ pub struct Pane {
 impl Pane {
     /// Spawn `program` (with `args`) in a fresh PTY of `rows`×`cols`, running in
     /// `cwd`, and start pumping its output into a vt100 emulator.
-    pub fn spawn(
+    pub fn spawn(program: &str, args: &[&str], cwd: &Path, rows: u16, cols: u16) -> Result<Pane> {
+        Self::spawn_with_wake(program, args, cwd, rows, cols, None)
+    }
+
+    /// Like [`Pane::spawn`], but `wake` is invoked (off the UI thread) after each
+    /// chunk of child output, so an event loop can schedule a coalesced repaint
+    /// instead of polling — keystroke echo stays responsive.
+    pub fn spawn_with_wake(
         program: &str,
         args: &[&str],
         cwd: &Path,
         rows: u16,
         cols: u16,
+        wake: Option<Box<dyn Fn() + Send>>,
     ) -> Result<Pane> {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -68,6 +76,10 @@ impl Pane {
         }
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
+        // Don't let an embedded CLI think it's nested inside its parent (a claude
+        // launched from kommand0-run-under-claude must start a real session).
+        cmd.env_remove("CLAUDECODE");
+        cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
 
         let child = pair.slave.spawn_command(cmd).context("spawn in pty failed")?;
         drop(pair.slave); // close our handle to the slave so EOF propagates on exit
@@ -92,6 +104,9 @@ impl Pane {
                             p.process(&buf[..n]);
                         }
                         seq_t.fetch_add(1, Ordering::Relaxed);
+                        if let Some(w) = &wake {
+                            w();
+                        }
                     }
                     // A signal (e.g. SIGWINCH on resize) can interrupt the read;
                     // resume rather than treating it as EOF.
