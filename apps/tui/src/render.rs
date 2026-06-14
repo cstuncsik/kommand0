@@ -375,6 +375,10 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    // Remember the right-pane geometry so a newly-toggled embedded pane spawns at
+    // its final size (avoids a resize-after-spawn that loses claude's first screen).
+    app.right_pane_area = area;
+
     // Embedded interactive claude (Phase 2): if the selected workspace has a live
     // pane, it owns the whole right area (claude renders its own input box).
     let sel_ws = match app.tree_items.get(app.selected_index) {

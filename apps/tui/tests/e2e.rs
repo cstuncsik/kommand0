@@ -367,3 +367,4 @@ fn embedded_pane_not_stranded_by_mouse_click() {
     tui.send("q");
     tui.wait_exit();
 }
+
