@@ -2,8 +2,9 @@ mod buttons;
 mod help;
 mod modal;
 mod mouse;
-// PTY-passthrough foundation (MIGRATION.md Phase 1). Not yet wired into the app
-// event loop — that is Phase 2; allow dead_code until then.
+// PTY-passthrough embedded `claude` pane — the app's only session view. The
+// module exposes a small terminal API (resize/blit/send/…); a few accessors are
+// kept for tests and future wiring, hence the module-level allow.
 #[allow(dead_code)]
 mod pane;
 mod render;
@@ -93,8 +94,9 @@ pub(crate) struct App {
     /// True when the embedded-pane prefix (Ctrl+A) was pressed and the next key
     /// is a kommand0 command rather than forwarded to claude.
     pub(crate) embedded_prefix: bool,
-    /// Last embedded-pane spawn failure, surfaced in the detail pane.
-    pub(crate) embed_error: Option<String>,
+    /// Last embedded-pane spawn failure as `(workspace_id, message)`, surfaced
+    /// in that workspace's detail pane only.
+    pub(crate) embed_error: Option<(String, String)>,
 }
 
 impl App {
@@ -309,6 +311,7 @@ impl App {
             return;
         };
         let ws_id = ws.id.clone();
+        let ws_name = ws.name.clone();
         let ws_dir = ws.working_dir.clone();
         if !self.embedded.contains_key(&ws_id) {
             let bin = std::env::var("KOMMAND0_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
@@ -338,9 +341,10 @@ impl App {
                     self.embed_error = None;
                 }
                 Err(e) => {
-                    // Surface the failure in the detail pane (the old scrollback
-                    // chat surface is gone); stay on the tree.
-                    self.embed_error = Some(format!("Failed to start claude: {e}"));
+                    // Surface the failure in this workspace's detail pane (the old
+                    // scrollback chat surface is gone); stay on the tree.
+                    self.embed_error =
+                        Some((ws_id.clone(), format!("Failed to start claude in {ws_name}: {e}")));
                     return;
                 }
             }
@@ -919,19 +923,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 // Process pending button actions (from mouse clicks)
                 if let Some(action) = app.pending_button_action.take() {
                     match action {
-                        // Detail-pane buttons (use selected workspace)
-                        buttons::HitAction::StartSession | buttons::HitAction::ResumeSession => {
+                        // Detail-pane [Open Claude] button (uses selected workspace)
+                        buttons::HitAction::StartSession => {
                             app.toggle_embedded();
-                        }
-                        buttons::HitAction::StopSession => {
-                            if let Some(ws) = app.selected_workspace().cloned()
-                                && let Some(session_id) = app.state.find_session_by_workspace(&ws.id)
-                                    .filter(|s| s.status == SessionStatus::Running)
-                                    .map(|s| s.id.clone())
-                                {
-                                    let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
-                                    app.focus = Focus::Tree;
-                                }
                         }
                         // Tree-icon start/resume/retry buttons: open the embedded claude.
                         buttons::HitAction::StartSessionFor { workspace_id }
@@ -1197,6 +1191,37 @@ mod key_tests {
             "tree should list repo alpha:\n{text}"
         );
         assert!(text.contains("beta"), "tree should list repo beta:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn embed_error_only_shows_for_its_workspace() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        // tree: [Repo alpha, Workspace ws-one, Repo beta]
+        app.embed_error = Some((
+            "w1".to_string(),
+            "Failed to start claude in ws-one: boom".to_string(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        // On the failing workspace's own row, the error is shown.
+        app.selected_index = 1;
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let on_ws = buffer_text(&terminal);
+        assert!(
+            on_ws.contains("Failed to start claude"),
+            "error should show on its own workspace:\n{on_ws}"
+        );
+
+        // On an unrelated node (the beta repo) it must NOT bleed through.
+        app.selected_index = 2;
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let on_other = buffer_text(&terminal);
+        assert!(
+            !on_other.contains("Failed to start claude"),
+            "error must not show under an unrelated entity:\n{on_other}"
+        );
     }
 
     #[tokio::test]
