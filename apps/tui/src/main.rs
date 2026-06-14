@@ -52,6 +52,8 @@ pub(crate) enum Focus {
     Tree,
     Output,
     Composer,
+    /// An embedded interactive `claude` pane (PTY passthrough) owns the keyboard.
+    Embedded,
 }
 
 #[derive(Clone)]
@@ -156,6 +158,19 @@ pub(crate) struct App {
     // Clipboard
     pub(crate) clipboard: clipboard::ClipboardBridge,
     pub(crate) copy_flash_until: Option<(Focus, Instant)>,
+
+    // Embedded PTY panes (migration Phase 2, experimental): per-workspace
+    // interactive `claude` sessions composited into the right pane.
+    pub(crate) embedded: HashMap<String, pane::Pane>,
+    /// Reader-thread → event-loop repaint signal (set in `main` before the loop).
+    pub(crate) embedded_wake: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// Last-rendered right-pane rect, so a new embedded pane spawns at its final
+    /// size (a resize-after-spawn makes claude drop its first screen, e.g. the
+    /// trust prompt).
+    pub(crate) right_pane_area: ratatui::layout::Rect,
+    /// True when the embedded-pane prefix (Ctrl+A) was pressed and the next key
+    /// is a kommand0 command rather than forwarded to claude.
+    pub(crate) embedded_prefix: bool,
 }
 
 impl App {
@@ -238,6 +253,10 @@ impl App {
             auto_scroll_suppressed: HashSet::new(),
             clipboard: clipboard::ClipboardBridge::new(),
             copy_flash_until: None,
+            embedded: HashMap::new(),
+            embedded_wake: None,
+            right_pane_area: ratatui::layout::Rect::default(),
+            embedded_prefix: false,
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -493,6 +512,110 @@ impl App {
             self.waiting_response.remove(ws_id);
             if let Some(buf) = self.scrollbacks.get_mut(ws_id) {
                 buf.push_line(format!("[ERROR] failed to send message: {e}"));
+            }
+        }
+    }
+
+    /// Enter (spawning if needed) the embedded interactive `claude` pane for the
+    /// selected workspace. Experimental PTY-passthrough toggle (Phase 2).
+    fn toggle_embedded(&mut self) {
+        let Some(ws) = self.selected_workspace() else {
+            return;
+        };
+        let ws_id = ws.id.clone();
+        let ws_dir = ws.working_dir.clone();
+        if !self.embedded.contains_key(&ws_id) {
+            let bin =
+                std::env::var("KOMMAND0_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+            let wake: Option<Box<dyn Fn() + Send>> = self.embedded_wake.clone().map(|tx| {
+                Box::new(move || {
+                    let _ = tx.send(());
+                }) as Box<dyn Fn() + Send>
+            });
+            // Spawn at the pane's final inner size so the first render needs no
+            // resize — claude drops its initial screen (e.g. the trust prompt) on
+            // a SIGWINCH that arrives mid-render.
+            let inner = self.right_pane_area.inner(ratatui::layout::Margin::new(1, 1));
+            let rows = if inner.height > 0 { inner.height } else { 24 };
+            let cols = if inner.width > 0 { inner.width } else { 80 };
+            match pane::Pane::spawn_with_wake(
+                &bin,
+                &[],
+                std::path::Path::new(&ws_dir),
+                rows,
+                cols,
+                wake,
+            ) {
+                Ok(p) => {
+                    self.embedded.insert(ws_id.clone(), p);
+                }
+                Err(e) => {
+                    let buf = self
+                        .scrollbacks
+                        .entry(ws_id)
+                        .or_insert_with(|| ScrollbackBuffer::new(50_000));
+                    buf.push_line(format!("[ERROR] failed to start embedded session: {e}"));
+                    return;
+                }
+            }
+        }
+        self.focus = Focus::Embedded;
+        self.embedded_prefix = false;
+        self.composer.set_active(false);
+    }
+
+    /// Select a workspace by id (if present in the tree) and open its embedded
+    /// claude pane.
+    fn embed_workspace_by_id(&mut self, ws_id: &str) {
+        if let Some(i) = self
+            .tree_items
+            .iter()
+            .position(|n| matches!(n, TreeNode::Workspace { ws, .. } if ws.id == ws_id))
+        {
+            self.selected_index = i;
+        }
+        self.toggle_embedded();
+    }
+
+    /// Forward a key to the selected workspace's embedded pane.
+    /// Returns false when there is no pane to forward to.
+    fn forward_to_embedded(&mut self, key: KeyEvent) -> bool {
+        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
+            return false;
+        };
+        match self.embedded.get_mut(&ws_id) {
+            Some(pane) => {
+                let _ = pane.send_key(key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop embedded panes whose child has exited or whose workspace was deleted
+    /// (the latter centrally covers every delete path). If the focused pane went
+    /// away, leave Embedded focus. Pane's `Drop` terminates the child.
+    fn reap_embedded(&mut self) {
+        let mut dead: Vec<String> = self
+            .embedded
+            .iter_mut()
+            .filter_map(|(k, p)| p.try_wait().map(|_| k.clone()))
+            .collect();
+        for k in self.embedded.keys() {
+            if !self.workspaces.iter().any(|w| &w.id == k) && !dead.contains(k) {
+                dead.push(k.clone());
+            }
+        }
+        for k in &dead {
+            self.embedded.remove(k);
+        }
+        if self.focus == Focus::Embedded {
+            let gone = self
+                .selected_workspace()
+                .map(|w| !self.embedded.contains_key(&w.id))
+                .unwrap_or(true);
+            if gone {
+                self.focus = Focus::Tree;
             }
         }
     }
@@ -1207,6 +1330,46 @@ enum KeyOutcome {
 /// Handle one key press. Extracted from the main event loop so tests can
 /// drive the app without a real terminal.
 async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> {
+    // Embedded pane owns the keyboard: every key forwards to the real claude
+    // (incl. Ctrl+C, Tab, q, slash commands). kommand0 commands are reached via a
+    // tmux-style prefix (Ctrl+A) so there's always a reliable way out:
+    //   Ctrl+A then  q = quit · t/Tab/Esc = back to tree · Ctrl+A = literal Ctrl+A
+    if app.focus == Focus::Embedded {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if app.embedded_prefix {
+            app.embedded_prefix = false;
+            match key.code {
+                KeyCode::Char('q') => {
+                    app.session_manager.shutdown_all().await?;
+                    return Ok(KeyOutcome::Quit);
+                }
+                KeyCode::Char('t') | KeyCode::Tab | KeyCode::Esc => {
+                    app.focus = Focus::Tree;
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('a') if ctrl => {
+                    app.forward_to_embedded(key); // literal Ctrl+A to claude
+                    return Ok(KeyOutcome::Continue);
+                }
+                _ => return Ok(KeyOutcome::Continue), // unknown command: swallow
+            }
+        }
+        if ctrl && key.code == KeyCode::Char('a') {
+            app.embedded_prefix = true; // start a prefix sequence
+            return Ok(KeyOutcome::Continue);
+        }
+        // Direct leave alias: Ctrl+] (Kitty CSI-u reports Char(']')+CTRL, a legacy
+        // terminal reports Char('5')+CTRL since both are byte 0x1d).
+        if ctrl && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')) {
+            app.focus = Focus::Tree;
+            return Ok(KeyOutcome::Continue);
+        }
+        if !app.forward_to_embedded(key) {
+            app.focus = Focus::Tree; // pane vanished — bail to the tree
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
     // Help modal: scrollable, dismissed with ?/Esc, swallows other keys
     if app.show_help {
         let g_was_pending = std::mem::take(&mut app.pending_g);
@@ -1280,6 +1443,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                 let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                             }
                             app.scrollbacks.remove(&ws_id);
+                            // Tear the embedded pane down here (at user-action
+                            // time) rather than letting reap_embedded block the
+                            // 50ms tick on the pane's Drop.
+                            app.embedded.remove(&ws_id);
                         }
                         let _ = app.state.delete_workspace(&name);
                         app.workspaces = app.state.workspaces.clone();
@@ -1300,6 +1467,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                     let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                 }
                             app.scrollbacks.remove(ws_id);
+                            app.embedded.remove(ws_id);
                         }
                         let _ = app.state.delete_repo(&id);
                         app.repos = app.state.repos.clone();
@@ -1530,6 +1698,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         _ => {
             // Focus-specific keys
             match app.focus {
+                // Embedded keys are intercepted at the top of handle_key.
+                Focus::Embedded => {}
                 Focus::Composer => {
                     if let Some(text) = app.composer.handle_key(key) {
                         app.submit_message(text).await;
@@ -1696,108 +1866,24 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             }
                         }
                         KeyCode::Char('G') => app.tree_select_last(),
+                        KeyCode::Char('e') => app.toggle_embedded(),
                         KeyCode::Enter => {
-                            match app.tree_items.get(app.selected_index).cloned() {
+                            match app.tree_items.get(app.selected_index) {
+                                // Enter on a repo expands it; on a workspace it
+                                // opens the embedded interactive claude (the
+                                // default session experience).
                                 Some(TreeNode::Repo { .. }) => app.toggle_expand(),
-                                Some(TreeNode::Workspace { ws, .. }) => {
-                                    // Enter on workspace: start/resume session + focus Composer
-                                    let session = app.state.find_session_by_workspace(&ws.id)
-                                        .map(|s| (s.id.clone(), s.status.clone(), s.claude_session_id.clone()));
-                                    match session {
-                                        Some((_, SessionStatus::Running, _)) => {
-                                            // Already running: just focus Composer
-                                            app.focus = Focus::Composer;
-                                            app.composer.set_active(true);
-                                        }
-                                        Some((old_id, _, claude_sid)) => {
-                                            // Stopped/exited/failed: restart (same as R key)
-                                            let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
-                                            if let Ok(new_session) = app.state.create_session(&ws.id) {
-                                                let session_id = new_session.id.clone();
-                                                match app.session_manager.start_session(
-                                                    &session_id,
-                                                    &ws.working_dir,
-                                                    claude_sid.as_deref(),
-                                                ) {
-                                                    Ok(pid) => {
-                                                        if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                            s.pid = Some(pid);
-                                                            s.claude_session_id = claude_sid;
-                                                        }
-                                                        let _ = app.state.save();
-                                                        app.active_session_id = Some(session_id);
-                                                        app.scrollbacks
-                                                            .entry(ws.id.clone())
-                                                            .or_insert_with(|| ScrollbackBuffer::new(50_000))
-                                                            .reset_scroll();
-                                                        app.focus = Focus::Composer;
-                                                        app.composer.set_active(true);
-                                                    }
-                                                    Err(_) => {
-                                                        let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            // No session: create + start (same as r key)
-                                            if let Ok(new_session) = app.state.create_session(&ws.id) {
-                                                let session_id = new_session.id.clone();
-                                                match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
-                                                    Ok(pid) => {
-                                                        if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                            s.pid = Some(pid);
-                                                        }
-                                                        let _ = app.state.save();
-                                                        app.scrollbacks
-                                                            .entry(ws.id.clone())
-                                                            .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                                        app.active_session_id = Some(session_id);
-                                                        app.focus = Focus::Composer;
-                                                        app.composer.set_active(true);
-                                                    }
-                                                    Err(_) => {
-                                                        let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                Some(TreeNode::Workspace { .. }) => app.toggle_embedded(),
                                 Some(TreeNode::Hint { .. }) | None => {}
                             }
                         }
-                        KeyCode::Char('r') => {
-                            if let Some(ws) = app.selected_workspace().cloned() {
-                                let has_running = app.state.find_session_by_workspace(&ws.id)
-                                    .map(|s| s.status == SessionStatus::Running)
-                                    .unwrap_or(false);
-                                if !has_running
-                                    && let Ok(session) = app.state.create_session(&ws.id) {
-                                        let session_id = session.id.clone();
-                                        let ws_dir = ws.working_dir.clone();
-                                        match app.session_manager.start_session(&session_id, &ws_dir, None) {
-                                            Ok(pid) => {
-                                                if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                    s.pid = Some(pid);
-                                                }
-                                                let _ = app.state.save();
-                                                app.scrollbacks
-                                                    .entry(ws.id.clone())
-                                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                                app.active_session_id = Some(session_id);
-                                                // Stay in tree focus -- don't auto-focus composer
-                                                app.focus = Focus::Output;
-                                            }
-                                            Err(_e) => {
-                                                let _ = app.state.update_session_status(&session_id, SessionStatus::Failed);
-                                            }
-                                        }
-                                    }
-                            }
-                        }
+                        // 'r' is an alias for Enter/'e': open the embedded claude.
+                        KeyCode::Char('r') => app.toggle_embedded(),
                         KeyCode::Char('x') | KeyCode::Delete => {
                             if let Some(ws) = app.selected_workspace().cloned() {
+                                // Close an embedded claude pane (Pane's Drop kills it).
+                                app.embedded.remove(&ws.id);
+                                // Also stop any legacy stream session.
                                 let session_info = app.state.find_session_by_workspace(&ws.id)
                                     .filter(|s| s.status == SessionStatus::Running)
                                     .map(|s| s.id.clone());
@@ -1810,42 +1896,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                 }
                             }
                         }
-                        KeyCode::Char('R') => {
-                            if let Some(ws) = app.selected_workspace().cloned() {
-                                let session_info = app.state.find_session_by_workspace(&ws.id)
-                                    .filter(|s| s.status != SessionStatus::Running)
-                                    .map(|s| (s.id.clone(), s.claude_session_id.clone()));
-                                if let Some((old_session_id, claude_sid)) = session_info {
-                                    // Stop old, create new state session, start with its ID
-                                    let _ = app.state.update_session_status(&old_session_id, SessionStatus::Stopped);
-                                    if let Ok(new_session) = app.state.create_session(&ws.id) {
-                                        let session_id = new_session.id.clone();
-                                        match app.session_manager.start_session(
-                                            &session_id,
-                                            &ws.working_dir,
-                                            claude_sid.as_deref(),
-                                        ) {
-                                            Ok(pid) => {
-                                                if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                    s.pid = Some(pid);
-                                                    s.claude_session_id = claude_sid.clone();
-                                                }
-                                                let _ = app.state.save();
-                                                app.active_session_id = Some(session_id);
-                                                app.scrollbacks
-                                                    .entry(ws.id.clone())
-                                                    .or_insert_with(|| ScrollbackBuffer::new(50_000))
-                                                    .reset_scroll();
-                                                app.focus = Focus::Output;
-                                            }
-                                            Err(_) => {
-                                                let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // 'R' is an alias for Enter/'e': open the embedded claude.
+                        KeyCode::Char('R') => app.toggle_embedded(),
                         KeyCode::Char('a') => {
                             // Open Add Repo modal
                             app.modal = modal::ModalState::AddRepo {
@@ -1920,6 +1972,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                             let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                         }
                                         app.scrollbacks.remove(&ws_id);
+                                        app.embedded.remove(&ws_id);
                                     }
                                     let _ = app.state.delete_workspace(&ws.name);
                                     app.workspaces = app.state.workspaces.clone();
@@ -1939,6 +1992,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                                 let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                             }
                                         app.scrollbacks.remove(ws_id);
+                                        app.embedded.remove(ws_id);
                                     }
                                     let _ = app.state.delete_repo(&id);
                                     app.repos = app.state.repos.clone();
@@ -1993,32 +2047,29 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let state = AppState::load()?;
     let mut app = App::new(state);
 
-    // Auto-resume sessions that have history (stopped/exited with log files)
-    let sessions_to_resume: Vec<(String, String, String, Option<String>)> = app
+    // Reconcile persisted status with the (empty) session_manager. No stream
+    // session is ever resurrected now, so a persisted `Running` is stale — left
+    // behind by a crash/SIGKILL that skipped the clean-quit normalization.
+    // Flipping it to Stopped prevents a phantom (silently-failing) legacy
+    // composer and a stale "running" tree icon on the first launch after upgrade.
+    let stale_running: Vec<String> = app
         .state
         .sessions
         .iter()
-        .filter(|s| s.status != SessionStatus::Running)
-        .filter(|s| {
-            app.scrollbacks
-                .get(&s.workspace_id)
-                .is_some_and(|b| !b.is_empty())
-        })
-        .map(|s| {
-            let ws_dir = app
-                .workspaces
-                .iter()
-                .find(|w| w.id == s.workspace_id)
-                .map(|w| w.working_dir.clone())
-                .unwrap_or_default();
-            (
-                s.id.clone(),
-                s.workspace_id.clone(),
-                ws_dir,
-                s.claude_session_id.clone(),
-            )
-        })
+        .filter(|s| s.status == SessionStatus::Running)
+        .map(|s| s.id.clone())
         .collect();
+    if !stale_running.is_empty() {
+        for sid in stale_running {
+            let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
+        }
+        let _ = app.state.save();
+    }
+
+    // Auto-resume of legacy stream sessions is disabled: workspaces now open as
+    // the embedded interactive claude (press Enter). The loop below is retained
+    // (and compiles) but iterates over an empty list.
+    let sessions_to_resume: Vec<(String, String, String, Option<String>)> = Vec::new();
 
     let mut resumed_workspace_ids: Vec<String> = Vec::new();
 
@@ -2077,10 +2128,19 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut reader = EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
 
+    // Embedded panes' reader threads ping this to force a coalesced repaint, so
+    // keystroke echo in an embedded `claude` stays responsive (not 50ms-laggy).
+    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    app.embedded_wake = Some(wake_tx);
+
     loop {
         terminal.draw(|frame| render::ui(frame, &mut app))?;
 
         tokio::select! {
+            _ = wake_rx.recv() => {
+                // Drain any backlog so we coalesce into a single redraw.
+                while wake_rx.try_recv().is_ok() {}
+            }
             event = reader.next().fuse() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -2089,12 +2149,30 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         }
                     }
                     Some(Ok(Event::Paste(text))) => {
-                        if app.focus == Focus::Composer {
-                            app.composer.insert_paste(&text);
+                        match app.focus {
+                            Focus::Composer => app.composer.insert_paste(&text),
+                            Focus::Embedded => {
+                                // Forward to the embedded child as a bracketed paste
+                                // (it enables bracketed paste, so multi-line stays one block).
+                                let ws_id = app.selected_workspace().map(|w| w.id.clone());
+                                let sent = ws_id.and_then(|id| app.embedded.get_mut(&id)).map(|pane| {
+                                    let mut bytes = b"\x1b[200~".to_vec();
+                                    bytes.extend_from_slice(text.as_bytes());
+                                    bytes.extend_from_slice(b"\x1b[201~");
+                                    let _ = pane.send(&bytes);
+                                });
+                                if sent.is_none() {
+                                    app.focus = Focus::Tree;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     Some(Ok(Event::Mouse(mouse_event))) => {
-                        if !app.show_help {
+                        // Embedded focus owns all input (keyboard already captured);
+                        // drop mouse too so a click can't strand the pane by flipping
+                        // focus to Output. (Forwarding mouse to the PTY is Phase 3.)
+                        if !app.show_help && app.focus != Focus::Embedded {
                             mouse::handle_mouse(&mut app, mouse_event);
                         }
                     }
@@ -2107,63 +2185,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 if let Some(action) = app.pending_button_action.take() {
                     match action {
                         // Detail-pane buttons (use selected workspace)
-                        buttons::HitAction::StartSession => {
-                            if let Some(ws) = app.selected_workspace().cloned() {
-                                let claude_sid: Option<String> = None;
-                                if let Ok(new_session) = app.state.create_session(&ws.id) {
-                                    let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
-                                        Ok(pid) => {
-                                            if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                s.pid = Some(pid);
-                                                s.claude_session_id = claude_sid;
-                                            }
-                                            let _ = app.state.save();
-                                            app.active_session_id = Some(session_id);
-                                            app.scrollbacks
-                                                .entry(ws.id.clone())
-                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
-                                                .reset_scroll();
-                                            app.focus = Focus::Composer;
-                                            app.composer.set_active(true);
-                                        }
-                                        Err(_) => {
-                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        buttons::HitAction::ResumeSession => {
-                            if let Some(ws) = app.selected_workspace().cloned() {
-                                let claude_sid = app.state.find_session_by_workspace(&ws.id)
-                                    .and_then(|s| s.claude_session_id.clone());
-                                if let Some(old_id) = app.state.find_session_by_workspace(&ws.id).map(|s| s.id.clone()) {
-                                    let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
-                                }
-                                if let Ok(new_session) = app.state.create_session(&ws.id) {
-                                    let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
-                                        Ok(pid) => {
-                                            if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                s.pid = Some(pid);
-                                                s.claude_session_id = claude_sid;
-                                            }
-                                            let _ = app.state.save();
-                                            app.active_session_id = Some(session_id);
-                                            app.scrollbacks
-                                                .entry(ws.id.clone())
-                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
-                                                .reset_scroll();
-                                            app.focus = Focus::Composer;
-                                            app.composer.set_active(true);
-                                        }
-                                        Err(_) => {
-                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                        }
-                                    }
-                                }
-                            }
+                        buttons::HitAction::StartSession | buttons::HitAction::ResumeSession => {
+                            app.toggle_embedded();
                         }
                         buttons::HitAction::StopSession => {
                             if let Some(ws) = app.selected_workspace().cloned()
@@ -2180,30 +2203,14 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.composer.set_active(false);
                                 }
                         }
-                        // Tree-icon buttons (use carried workspace_id, do NOT change focus)
-                        buttons::HitAction::StartSessionFor { workspace_id } => {
-                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned()
-                                && let Ok(new_session) = app.state.create_session(&ws.id) {
-                                    let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
-                                        Ok(pid) => {
-                                            if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                s.pid = Some(pid);
-                                            }
-                                            let _ = app.state.save();
-                                            app.scrollbacks
-                                                .entry(ws.id.clone())
-                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
-                                                .reset_scroll();
-                                            app.update_active_session();
-                                        }
-                                        Err(_) => {
-                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                        }
-                                    }
-                                }
+                        // Tree-icon start/resume/retry buttons: open the embedded claude.
+                        buttons::HitAction::StartSessionFor { workspace_id }
+                        | buttons::HitAction::ResumeSessionFor { workspace_id }
+                        | buttons::HitAction::RetrySessionFor { workspace_id } => {
+                            app.embed_workspace_by_id(&workspace_id);
                         }
                         buttons::HitAction::StopSessionFor { workspace_id } => {
+                            app.embedded.remove(&workspace_id);
                             if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
                                 .filter(|s| s.status == SessionStatus::Running)
                                 .map(|s| s.id.clone())
@@ -2216,76 +2223,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 app.update_active_session();
                             }
                         }
-                        buttons::HitAction::ResumeSessionFor { workspace_id } => {
-                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
-                                let claude_sid = app.state.find_session_by_workspace(&ws.id)
-                                    .and_then(|s| s.claude_session_id.clone());
-                                if let Some(old_id) = app.state.find_session_by_workspace(&ws.id).map(|s| s.id.clone()) {
-                                    let _ = app.state.update_session_status(&old_id, SessionStatus::Stopped);
-                                }
-                                if let Ok(new_session) = app.state.create_session(&ws.id) {
-                                    let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, claude_sid.as_deref()) {
-                                        Ok(pid) => {
-                                            if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                s.pid = Some(pid);
-                                                s.claude_session_id = claude_sid;
-                                            }
-                                            let _ = app.state.save();
-                                            app.scrollbacks
-                                                .entry(ws.id.clone())
-                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
-                                                .reset_scroll();
-                                            app.update_active_session();
-                                        }
-                                        Err(_) => {
-                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        buttons::HitAction::RetrySessionFor { workspace_id } => {
-                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned()
-                                && let Ok(new_session) = app.state.create_session(&ws.id) {
-                                    let session_id = new_session.id.clone();
-                                    match app.session_manager.start_session(&session_id, &ws.working_dir, None) {
-                                        Ok(pid) => {
-                                            if let Some(s) = app.state.find_session_mut(&session_id) {
-                                                s.pid = Some(pid);
-                                            }
-                                            let _ = app.state.save();
-                                            app.scrollbacks
-                                                .entry(ws.id.clone())
-                                                .or_insert_with(|| ScrollbackBuffer::new(50_000))
-                                                .reset_scroll();
-                                            app.update_active_session();
-                                        }
-                                        Err(_) => {
-                                            let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                                        }
-                                    }
-                                }
-                        }
                         buttons::HitAction::FocusComposerFor { workspace_id } => {
-                            // Focus the composer for the given workspace's running session
-                            if app.state.find_session_by_workspace(&workspace_id)
-                                .map(|s| s.status == SessionStatus::Running)
-                                .unwrap_or(false)
-                            {
-                                // Navigate selection to this workspace
-                                let old = app.selected_index;
-                                for (i, node) in app.tree_items.iter().enumerate() {
-                                    if let TreeNode::Workspace { ws, .. } = node
-                                        && ws.id == workspace_id {
-                                            app.swap_composer_draft(old, i);
-                                            app.selected_index = i;
-                                            break;
-                                        }
-                                }
-                                app.update_active_session();
-                                app.focus = Focus::Composer;
-                                app.composer.set_active(true);
+                            // Focus the embedded claude for the given workspace.
+                            if app.embedded.contains_key(&workspace_id) {
+                                app.embed_workspace_by_id(&workspace_id);
                             }
                         }
                         buttons::HitAction::ToggleIconsFor { workspace_id } => {
@@ -2309,6 +2250,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                                 if app.state.delete_workspace(&ws.name).is_ok() {
                                     app.scrollbacks.remove(&workspace_id);
+                                    app.embedded.remove(&workspace_id);
                                     app.waiting_response.remove(&workspace_id);
                                     app.expanded_icon_rows.remove(&workspace_id);
                                     app.composer_drafts.remove(&workspace_id);
@@ -2338,6 +2280,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                     }
                                     app.scrollbacks.remove(ws_id);
+                                    app.embedded.remove(ws_id);
                                     app.waiting_response.remove(ws_id);
                                     app.expanded_icon_rows.remove(ws_id);
                                     app.composer_drafts.remove(ws_id);
@@ -2379,6 +2322,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 }
             }
             _ = tick_interval.tick() => {
+                // Reap embedded panes whose claude exited (leaves Embedded focus).
+                app.reap_embedded();
                 // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
                 app.tick_counter = app.tick_counter.wrapping_add(1);
                 if app.tick_counter.is_multiple_of(5) {
