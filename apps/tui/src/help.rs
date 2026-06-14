@@ -32,7 +32,7 @@ const TREE_BINDINGS: &[KeyBinding] = &[
     KeyBinding { keys: "[Enter]", description: "Expand/start session" },
     KeyBinding { keys: "[r]", description: "Start session" },
     KeyBinding { keys: "[R]", description: "Restart session" },
-    KeyBinding { keys: "[e]", description: "Embed interactive claude (Ctrl+] leaves)" },
+    KeyBinding { keys: "[e]", description: "Embed claude (then Ctrl+A: t=tree q=quit)" },
     KeyBinding { keys: "[x]", description: "Stop session" },
     KeyBinding { keys: "[a]", description: "Add repository" },
     KeyBinding { keys: "[w]", description: "Add workspace" },

@@ -327,7 +327,7 @@ fn embedded_pane_renders_real_terminal_and_forwards_keys() {
 
     // The embedded child's own terminal output is composited into the pane.
     tui.wait_for("EMBED-STUB-READY");
-    tui.wait_for("claude (embedded"); // the pane border title
+    tui.wait_for("Ctrl+A then"); // the pane border title
 
     // Keys go to the embedded child, which echoes them.
     tui.send("hi");
@@ -368,3 +368,42 @@ fn embedded_pane_not_stranded_by_mouse_click() {
     tui.wait_exit();
 }
 
+
+#[test]
+fn embedded_prefix_quits_and_returns_to_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+
+    // Ctrl+A then 't' returns to the tree, where normal nav works again.
+    tui.send("\x01"); // Ctrl+A (prefix)
+    tui.send("t");
+    // Back in the tree: 'q' quits (would otherwise be swallowed by the pane).
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn embedded_prefix_q_quits_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+
+    tui.send("\x01"); // Ctrl+A (prefix)
+    tui.send("q"); // quit directly from the embedded pane
+    tui.wait_exit();
+}
