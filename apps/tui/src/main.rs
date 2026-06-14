@@ -164,6 +164,10 @@ pub(crate) struct App {
     pub(crate) embedded: HashMap<String, pane::Pane>,
     /// Reader-thread → event-loop repaint signal (set in `main` before the loop).
     pub(crate) embedded_wake: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// Last-rendered right-pane rect, so a new embedded pane spawns at its final
+    /// size (a resize-after-spawn makes claude drop its first screen, e.g. the
+    /// trust prompt).
+    pub(crate) right_pane_area: ratatui::layout::Rect,
 }
 
 impl App {
@@ -248,6 +252,7 @@ impl App {
             copy_flash_until: None,
             embedded: HashMap::new(),
             embedded_wake: None,
+            right_pane_area: ratatui::layout::Rect::default(),
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -523,12 +528,18 @@ impl App {
                     let _ = tx.send(());
                 }) as Box<dyn Fn() + Send>
             });
+            // Spawn at the pane's final inner size so the first render needs no
+            // resize — claude drops its initial screen (e.g. the trust prompt) on
+            // a SIGWINCH that arrives mid-render.
+            let inner = self.right_pane_area.inner(ratatui::layout::Margin::new(1, 1));
+            let rows = if inner.height > 0 { inner.height } else { 24 };
+            let cols = if inner.width > 0 { inner.width } else { 80 };
             match pane::Pane::spawn_with_wake(
                 &bin,
                 &[],
                 std::path::Path::new(&ws_dir),
-                24,
-                80,
+                rows,
+                cols,
                 wake,
             ) {
                 Ok(p) => {
