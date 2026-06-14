@@ -10,17 +10,11 @@ crossterm.workspace = true
 tokio.workspace = true
 futures.workspace = true
 nix.workspace = true
-tui-textarea.workspace = true
-strip-ansi-escapes.workspace = true
-serde_json.workspace = true
-serde.workspace = true
-uuid.workspace = true
 unicode-width.workspace = true
-unicode-segmentation.workspace = true
-arboard.workspace = true
 portable-pty.workspace = true
 vt100.workspace = true
 kommand0-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+serde_json.workspace = true
