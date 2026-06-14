@@ -1340,7 +1340,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             app.embedded_prefix = false;
             match key.code {
                 KeyCode::Char('q') => {
-                    app.session_manager.shutdown_all().await?;
                     return Ok(KeyOutcome::Quit);
                 }
                 KeyCode::Char('t') | KeyCode::Tab | KeyCode::Esc => {
@@ -1439,7 +1438,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             });
                         if let Some((ws_id, running_sid)) = ws_info {
                             if let Some(sid) = running_sid {
-                                let _ = app.session_manager.stop_session(&sid).await;
                                 let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                             }
                             app.scrollbacks.remove(&ws_id);
@@ -1463,7 +1461,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             if let Some(s) = app.state.find_session_by_workspace(ws_id)
                                 && s.status == SessionStatus::Running {
                                     let sid = s.id.clone();
-                                    let _ = app.session_manager.stop_session(&sid).await;
                                     let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                 }
                             app.scrollbacks.remove(ws_id);
@@ -1527,7 +1524,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     // Global keys (work in any focus)
     match key.code {
         KeyCode::Char('q') if app.focus != Focus::Composer => {
-            app.session_manager.shutdown_all().await?;
             let running_ids: Vec<String> = app.state.sessions.iter()
                 .filter(|s| s.status == SessionStatus::Running)
                 .map(|s| s.id.clone())
@@ -1581,7 +1577,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         .map(|s| (ws.id.clone(), s.id.clone()))
                 });
             if let Some((ws_id, session_id)) = has_running {
-                let _ = app.session_manager.stop_session(&session_id).await;
                 let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                 if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
                     buf.push_line("--- Session stopped ---".to_string());
@@ -1589,7 +1584,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 app.focus = Focus::Output;
                 app.composer.set_active(false);
             } else {
-                app.session_manager.shutdown_all().await?;
                 return Ok(KeyOutcome::Quit);
             }
         }
@@ -1888,7 +1882,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                     .filter(|s| s.status == SessionStatus::Running)
                                     .map(|s| s.id.clone());
                                 if let Some(session_id) = session_info {
-                                    let _ = app.session_manager.stop_session(&session_id).await;
                                     let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                     if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
                                         buf.push_line("--- Session stopped ---".to_string());
@@ -1968,7 +1961,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                         });
                                     if let Some((ws_id, running_sid)) = ws_info {
                                         if let Some(sid) = running_sid {
-                                            let _ = app.session_manager.stop_session(&sid).await;
                                             let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                         }
                                         app.scrollbacks.remove(&ws_id);
@@ -1988,7 +1980,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                         if let Some(s) = app.state.find_session_by_workspace(ws_id)
                                             && s.status == SessionStatus::Running {
                                                 let sid = s.id.clone();
-                                                let _ = app.session_manager.stop_session(&sid).await;
                                                 let _ = app.state.update_session_status(&sid, SessionStatus::Stopped);
                                             }
                                         app.scrollbacks.remove(ws_id);
@@ -2066,65 +2057,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         let _ = app.state.save();
     }
 
-    // Auto-resume of legacy stream sessions is disabled: workspaces now open as
-    // the embedded interactive claude (press Enter). The loop below is retained
-    // (and compiles) but iterates over an empty list.
-    let sessions_to_resume: Vec<(String, String, String, Option<String>)> = Vec::new();
-
-    let mut resumed_workspace_ids: Vec<String> = Vec::new();
-
-    for (old_sid, ws_id, ws_dir, claude_sid) in sessions_to_resume {
-        if ws_dir.is_empty() {
-            continue;
-        }
-        // Mark old session as stopped
-        let _ = app.state.update_session_status(&old_sid, SessionStatus::Stopped);
-        // Create new state session first to get the canonical ID
-        if let Ok(new_session) = app.state.create_session(&ws_id) {
-            let session_id = new_session.id.clone();
-            // Start process using the state session's ID
-            match app.session_manager.start_session(&session_id, &ws_dir, claude_sid.as_deref()) {
-                Ok(pid) => {
-                    if let Some(s) = app.state.find_session_mut(&session_id) {
-                        s.pid = Some(pid);
-                        s.claude_session_id = claude_sid;
-                    }
-                    let _ = app.state.save();
-                    app.active_session_id = Some(session_id);
-                    if let Some(buf) = app.scrollbacks.get_mut(&ws_id) {
-                        buf.reset_scroll();
-                    }
-                    resumed_workspace_ids.push(ws_id);
-                }
-                Err(_) => {
-                    let _ = app.state.update_session_status(&new_session.id, SessionStatus::Failed);
-                }
-            }
-        }
-    }
-
-    // Auto-expand repos with resumed sessions and select the first resumed workspace
-    if !resumed_workspace_ids.is_empty() {
-        for ws_id in &resumed_workspace_ids {
-            if let Some(ws) = app.workspaces.iter().find(|w| w.id == *ws_id) {
-                app.expanded.insert(ws.repo_id.clone());
-            }
-        }
-        app.rebuild_tree();
-
-        // Select the first resumed workspace in the tree
-        let first_ws_id = &resumed_workspace_ids[0];
-        for (i, node) in app.tree_items.iter().enumerate() {
-            if let TreeNode::Workspace { ws, .. } = node
-                && ws.id == *first_ws_id {
-                    app.selected_index = i;
-                    break;
-                }
-        }
-        app.update_active_session();
-        app.focus = Focus::Tree;
-    }
-
     let mut reader = EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
 
@@ -2194,7 +2126,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     .filter(|s| s.status == SessionStatus::Running)
                                     .map(|s| s.id.clone())
                                 {
-                                    let _ = app.session_manager.stop_session(&session_id).await;
                                     let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                     if let Some(buf) = app.scrollbacks.get_mut(&ws.id) {
                                         buf.push_line("--- Session stopped ---".to_string());
@@ -2215,7 +2146,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 .filter(|s| s.status == SessionStatus::Running)
                                 .map(|s| s.id.clone())
                             {
-                                let _ = app.session_manager.stop_session(&session_id).await;
                                 let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                 if let Some(buf) = app.scrollbacks.get_mut(&workspace_id) {
                                     buf.push_line("--- Session stopped ---".to_string());
@@ -2245,7 +2175,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     .filter(|s| s.status == SessionStatus::Running)
                                     .map(|s| s.id.clone())
                                 {
-                                    let _ = app.session_manager.stop_session(&session_id).await;
                                     let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                 }
                                 if app.state.delete_workspace(&ws.name).is_ok() {
@@ -2276,7 +2205,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         .filter(|s| s.status == SessionStatus::Running)
                                         .map(|s| s.id.clone())
                                     {
-                                        let _ = app.session_manager.stop_session(&session_id).await;
                                         let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                     }
                                     app.scrollbacks.remove(ws_id);
@@ -2341,154 +2269,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             app.composer.set_copy_flash(false);
                         }
                     }
-
-                // Poll session events
-                let events = app.session_manager.poll_events();
-                for event in events {
-                    match event {
-                        SessionEvent::StreamDelta { session_id, text } => {
-                            let ws_id = app.state.sessions.iter()
-                                .find(|s| s.id == session_id)
-                                .map(|s| s.workspace_id.clone());
-                            if let Some(ws_id) = ws_id {
-                                // Clear waiting/thinking on first delta
-                                app.waiting_response.remove(&ws_id);
-
-                                let stream_buf = app.streaming_text
-                                    .entry(ws_id.clone())
-                                    .or_default();
-                                stream_buf.push_str(&text);
-
-                                // Flush completed lines (up to last \n) to scrollback
-                                let buf = app.scrollbacks
-                                    .entry(ws_id.clone())
-                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                let stream = app.streaming_text.get_mut(&ws_id).unwrap();
-                                while let Some(nl) = stream.find('\n') {
-                                    let line = stream[..nl].to_string();
-                                    buf.push_line(line);
-                                    *stream = stream[nl + 1..].to_string();
-                                }
-                                // Remaining partial text stays in streaming_text
-                                // and will be shown as an in-progress line by the renderer
-                            }
-                            app.write_log(&session_id, "claude", &text);
-                        }
-                        SessionEvent::StreamEnd { session_id } => {
-                            let ws_id = app.state.sessions.iter()
-                                .find(|s| s.id == session_id)
-                                .map(|s| s.workspace_id.clone());
-                            if let Some(ws_id) = ws_id {
-                                // Flush any remaining partial line
-                                if let Some(remaining) = app.streaming_text.remove(&ws_id)
-                                    && !remaining.is_empty() {
-                                        let buf = app.scrollbacks
-                                            .entry(ws_id)
-                                            .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                        buf.push_line(remaining);
-                                    }
-                            }
-                        }
-                        SessionEvent::Output { session_id, line, source } => {
-                            // Complete message (non-streaming content or stderr).
-                            let ws_id = app.state.sessions.iter()
-                                .find(|s| s.id == session_id)
-                                .map(|s| s.workspace_id.clone());
-                            if let Some(ws_id) = ws_id {
-                                let buf = app.scrollbacks
-                                    .entry(ws_id.clone())
-                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                for segment in line.split('\n') {
-                                    buf.push_line(segment.to_string());
-                                }
-                                // Clear "Thinking..." for stdout content (actual responses).
-                                // Don't clear for stderr (CLI warnings, version info).
-                                if !line.is_empty() && source == session_manager::OutputSource::Stdout {
-                                    app.waiting_response.remove(&ws_id);
-                                }
-                            }
-                            app.write_log(&session_id, "claude", &line);
-                        }
-                        SessionEvent::Exited { session_id, exit_code } => {
-                            let status = match exit_code {
-                                Some(0) | None => SessionStatus::Exited,
-                                Some(_) => SessionStatus::Failed,
-                            };
-                            // Update claude_session_id from session_manager before removing.
-                            // If the process never produced a session_id (e.g. --resume with a
-                            // stale ID caused immediate exit), clear the stored one so the next
-                            // attempt starts fresh instead of repeating the same failure.
-                            // BUT: don't clear if session was explicitly stopped (status already
-                            // Stopped) — stop_session() removes from manager before Exited arrives,
-                            // so get_claude_session_id() returns None even though the ID is valid.
-                            if let Some(csid) = app.session_manager.get_claude_session_id(&session_id) {
-                                if let Some(s) = app.state.find_session_mut(&session_id) {
-                                    s.claude_session_id = Some(csid);
-                                }
-                            } else {
-                                let already_stopped = app.state.sessions.iter()
-                                    .find(|s| s.id == session_id)
-                                    .map(|s| s.status == SessionStatus::Stopped)
-                                    .unwrap_or(false);
-                                if !already_stopped
-                                    && let Some(s) = app.state.find_session_mut(&session_id) {
-                                        s.claude_session_id = None;
-                                    }
-                            }
-                            let _ = app.state.update_session_status(&session_id, status);
-                            // Push exit message to scrollback
-                            let ws_id = app.state.sessions.iter()
-                                .find(|s| s.id == session_id)
-                                .map(|s| s.workspace_id.clone());
-                            if let Some(ws_id) = ws_id {
-                                let buf = app.scrollbacks
-                                    .entry(ws_id)
-                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                let msg = match exit_code {
-                                    Some(code) => format!("--- Session exited (code: {code}) ---"),
-                                    None => "--- Session exited ---".to_string(),
-                                };
-                                buf.push_line(msg);
-                            }
-                            app.focus = Focus::Tree;
-                            app.composer.set_active(false);
-                        }
-                        SessionEvent::ClaudeSessionId { session_id, claude_session_id } => {
-                            if let Some(s) = app.state.find_session_mut(&session_id)
-                                && s.claude_session_id.is_none() {
-                                    s.claude_session_id = Some(claude_session_id);
-                                    let _ = app.state.save();
-                                }
-                        }
-                        SessionEvent::Error { session_id, error } => {
-                            let ws_id = app.state.sessions.iter()
-                                .find(|s| s.id == session_id)
-                                .map(|s| s.workspace_id.clone());
-                            if let Some(ws_id) = ws_id {
-                                app.waiting_response.remove(&ws_id);
-                                let buf = app.scrollbacks
-                                    .entry(ws_id)
-                                    .or_insert_with(|| ScrollbackBuffer::new(50_000));
-                                buf.push_line(format!("[ERROR] {error}"));
-                            }
-                        }
-                        SessionEvent::SlashCommands { session_id, commands } => {
-                            if let Some(ws_id) = app.state.sessions.iter()
-                                .find(|s| s.id == session_id)
-                                .map(|s| s.workspace_id.clone())
-                            {
-                                app.slash_commands.insert(ws_id.clone(), commands);
-                                // Cache so the popup is fully populated from the
-                                // first keystroke next time this workspace is used.
-                                save_slash_cache(&app.slash_commands);
-                                // If this is the focused workspace, refresh the composer now.
-                                if app.selected_workspace().map(|ws| ws.id == ws_id).unwrap_or(false) {
-                                    app.sync_composer_slash_commands();
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
