@@ -18,58 +18,87 @@ pub struct KeySection {
 }
 
 const GLOBAL_BINDINGS: &[KeyBinding] = &[
-    KeyBinding { keys: "[q]", description: "Quit" },
-    KeyBinding { keys: "[?]", description: "Help" },
-    KeyBinding { keys: "[Tab]", description: "Next pane" },
-    KeyBinding { keys: "[Shift+Tab]", description: "Previous pane" },
-    KeyBinding { keys: "[Esc]", description: "Back to tree" },
+    KeyBinding {
+        keys: "[q]",
+        description: "Quit",
+    },
+    KeyBinding {
+        keys: "[?]",
+        description: "Help",
+    },
 ];
 
 const TREE_BINDINGS: &[KeyBinding] = &[
-    KeyBinding { keys: "[j/k or Up/Down]", description: "Navigate" },
-    KeyBinding { keys: "[h/l or Left/Right]", description: "Collapse / expand" },
-    KeyBinding { keys: "[gg/G]", description: "First / last item" },
-    KeyBinding { keys: "[Enter]", description: "Expand/start session" },
-    KeyBinding { keys: "[r]", description: "Start session" },
-    KeyBinding { keys: "[R]", description: "Restart session" },
-    KeyBinding { keys: "[e]", description: "Embed claude (then Ctrl+A: t=tree q=quit)" },
-    KeyBinding { keys: "[x]", description: "Stop session" },
-    KeyBinding { keys: "[a]", description: "Add repository" },
-    KeyBinding { keys: "[w]", description: "Add workspace" },
-    KeyBinding { keys: "[d]", description: "Delete selected" },
-    KeyBinding { keys: "[D]", description: "Force delete" },
+    KeyBinding {
+        keys: "[j/k or Up/Down]",
+        description: "Navigate",
+    },
+    KeyBinding {
+        keys: "[h/l or Left/Right]",
+        description: "Collapse / expand",
+    },
+    KeyBinding {
+        keys: "[gg/G]",
+        description: "First / last item",
+    },
+    KeyBinding {
+        keys: "[Enter / e / r / R]",
+        description: "Open embedded claude",
+    },
+    KeyBinding {
+        keys: "[x]",
+        description: "Close embedded claude",
+    },
+    KeyBinding {
+        keys: "[a]",
+        description: "Add repository",
+    },
+    KeyBinding {
+        keys: "[w]",
+        description: "Add workspace",
+    },
+    KeyBinding {
+        keys: "[d]",
+        description: "Delete selected",
+    },
+    KeyBinding {
+        keys: "[D]",
+        description: "Force delete",
+    },
 ];
 
-const OUTPUT_BINDINGS: &[KeyBinding] = &[
-    KeyBinding { keys: "[h/j/k/l or arrows]", description: "Move cursor" },
-    KeyBinding { keys: "[Shift+arrows]", description: "Extend selection" },
-    KeyBinding { keys: "[Ctrl+D/U]", description: "Half page down/up" },
-    KeyBinding { keys: "[PgUp/PgDn]", description: "Scroll page" },
-    KeyBinding { keys: "[gg/Home]", description: "Top" },
-    KeyBinding { keys: "[G/End]", description: "Bottom" },
-    KeyBinding { keys: "[Ctrl+A]", description: "Select all" },
-    KeyBinding { keys: "[Ctrl+C]", description: "Copy selection" },
-    KeyBinding { keys: "[z]", description: "Zoom toggle" },
-    KeyBinding { keys: "[i]", description: "Compose" },
-];
-
-const COMPOSER_BINDINGS: &[KeyBinding] = &[
-    KeyBinding { keys: "[Enter]", description: "Send message" },
-    KeyBinding { keys: "[Shift+Enter / Alt+Enter]", description: "New line" },
-    KeyBinding { keys: "[/]", description: "Slash-command popup" },
-    KeyBinding { keys: "[Up/Down]", description: "Popup: move selection" },
-    KeyBinding { keys: "[Tab/Enter]", description: "Popup: accept command" },
-    KeyBinding { keys: "[Esc]", description: "Popup: dismiss" },
-    KeyBinding { keys: "[Ctrl+A]", description: "Select all" },
-    KeyBinding { keys: "[Ctrl+C]", description: "Copy selection" },
-    KeyBinding { keys: "[Ctrl+V]", description: "Paste" },
+const EMBEDDED_BINDINGS: &[KeyBinding] = &[
+    KeyBinding {
+        keys: "(typing)",
+        description: "Goes to the embedded claude",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [t]",
+        description: "Back to tree (also Tab/Esc)",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [q]",
+        description: "Quit kommand0",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [Ctrl+A]",
+        description: "Send a literal Ctrl+A",
+    },
 ];
 
 const SECTIONS: &[KeySection] = &[
-    KeySection { title: "Global", bindings: GLOBAL_BINDINGS },
-    KeySection { title: "Tree Pane", bindings: TREE_BINDINGS },
-    KeySection { title: "Output Pane", bindings: OUTPUT_BINDINGS },
-    KeySection { title: "Composer", bindings: COMPOSER_BINDINGS },
+    KeySection {
+        title: "Global",
+        bindings: GLOBAL_BINDINGS,
+    },
+    KeySection {
+        title: "Tree Pane",
+        bindings: TREE_BINDINGS,
+    },
+    KeySection {
+        title: "Embedded claude",
+        bindings: EMBEDDED_BINDINGS,
+    },
 ];
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -90,9 +119,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 fn focus_to_section(focus: Focus) -> &'static str {
     match focus {
         Focus::Tree => "Tree Pane",
-        Focus::Output => "Output Pane",
-        Focus::Composer => "Composer",
-        Focus::Embedded => "Tree Pane",
+        Focus::Embedded => "Embedded claude",
     }
 }
 
@@ -112,7 +139,9 @@ pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus, scroll: &mu
         Span::raw("  Current: "),
         Span::styled(
             current_section,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::raw(""));
@@ -120,7 +149,9 @@ pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus, scroll: &mu
     for section in SECTIONS {
         let is_active = section.title == current_section;
         let title_style = if is_active {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
