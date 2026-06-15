@@ -1,0 +1,45 @@
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_1dfc7d660657e5 456-458,461,463-482
+  s_fc3d7618d36de0::t_0839064210af87 36-41
+  s_fc3d7618d36de0::t_e9532ae3528686 116-118
+  s_fc3d7618d36de0::t_d3548f72dc8432 1182,1184,1187
+  s_fc3d7618d36de0::t_77c59062ede992 491-493
+  s_fc3d7618d36de0::t_784daf4c394094 396-406
+  s_fc3d7618d36de0::t_8030965197aa60 378-382,385,394-395,407-409
+  s_fc3d7618d36de0::t_2f2858c17998f8 167
+  s_fc3d7618d36de0::t_1f88a3ca2646b2 1436-1466
+  s_fc3d7618d36de0::t_8b34293b07d5f9 30-35,42-61
+  s_fc3d7618d36de0::t_6d6a82d27e1616 1006-1012
+README.md
+  s_fc3d7618d36de0::t_36753ffb533dc5 51
+apps/tui/tests/fixtures/embed-stub
+  s_fc3d7618d36de0::t_a6a2794a5a4ae4 6
+apps/tui/src/pane.rs
+  s_fc3d7618d36de0::t_bf1d9523000a86 265-267,270
+  s_fc3d7618d36de0::t_94def7cc000793 457-474
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_f8819d93199bb3 353-403
+crates/core/src/lib.rs
+  s_fc3d7618d36de0::t_c1a5656d418272 12
+  s_fc3d7618d36de0::t_31ed3816325a6b 201-205
+  s_fc3d7618d36de0::t_1dc1011009825e 27-31
+  s_fc3d7618d36de0::t_1f597165e45622 387
+  s_fc3d7618d36de0::t_60892715a1d683 585-641
+  s_fc3d7618d36de0::t_ab446168d8fd72 92-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "d3839c9400a03a8771b5e119ba3d2466e5d2d9b0",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
