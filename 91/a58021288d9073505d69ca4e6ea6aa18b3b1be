@@ -1,0 +1,40 @@
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_ff7db5221ca20c 191-193
+README.md
+  s_fc3d7618d36de0::t_0f1fa7be4b5e56 54-55
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_576df5e902f3ad 1286-1295,1313,1315,1324,1327-1328,1330-1331,1334-1337,1345-1346
+  s_fc3d7618d36de0::t_29b42656863401 129,131
+  s_fc3d7618d36de0::t_afce6ebb6d626f 1314,1316-1323,1325-1326,1329,1332-1333,1338-1344
+  s_fc3d7618d36de0::t_4280e163d52d15 425,432-440,442-451,454-457,459
+  s_fc3d7618d36de0::t_54c856b0230be0 13
+  s_fc3d7618d36de0::t_361267931840a9 1096-1098
+  s_fc3d7618d36de0::t_8c86e1b7ee0a4d 1299-1312
+  s_fc3d7618d36de0::t_9b1c4cf902967e 424,426-431,441,452-453,458,460-467
+  s_fc3d7618d36de0::t_982d0f6350a834 71-73,78-82
+  s_fc3d7618d36de0::t_e331146834c149 76-77,83
+  s_fc3d7618d36de0::t_80ad65add71dc7 130
+apps/tui/src/render.rs
+  s_fc3d7618d36de0::t_9080fb7142ab60 85-91,95
+  s_fc3d7618d36de0::t_e1bdab15464e15 40-46,50,60
+  s_fc3d7618d36de0::t_6b991052bc2945 649-655,657
+  s_fc3d7618d36de0::t_033349e4c7341a 73-84,92-94,96-115,120-121,123-131
+  s_fc3d7618d36de0::t_0c416b71a8e28b 1099-1117
+  s_fc3d7618d36de0::t_646db0fb67694e 116-119,122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "91a58021288d9073505d69ca4e6ea6aa18b3b1be",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
