@@ -188,6 +188,9 @@ fn seeded_state(dir: &str) -> String {
 fn launches_renders_panes_and_quits_on_q() {
     let mut tui = Tui::launch(None);
     tui.wait_for(" Repos ");
+    // Bottom status bar is present.
+    tui.wait_for("TREE");
+    tui.wait_for("q quit");
     tui.send("q");
     tui.wait_exit();
 }
