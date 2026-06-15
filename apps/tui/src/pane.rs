@@ -262,8 +262,12 @@ impl Pane {
 
     /// Non-blocking check for child exit; returns the exit code (if known) once
     /// the child has terminated.
+    /// `None` while running; `Some(code)` once exited. A signal-killed child
+    /// (Ctrl+C, SIGKILL, crash) yields `Some(None)` — there is no meaningful exit
+    /// code, and callers must not treat it as a clean non-zero failure.
     pub fn try_wait(&mut self) -> Option<Option<i32>> {
         match self.child.try_wait() {
+            Ok(Some(status)) if status.signal().is_some() => Some(None),
             Ok(Some(status)) => Some(Some(status.exit_code() as i32)),
             _ => None,
         }
@@ -447,6 +451,25 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("SIGHUP-ignoring child survived terminate()");
+    }
+
+    #[test]
+    fn try_wait_reports_signal_exit_as_none() {
+        // A signal-killed child has no meaningful exit code: try_wait yields
+        // Some(None), not Some(Some(1)) — callers rely on this to avoid treating
+        // a Ctrl+C/SIGKILL as a clean non-zero failure.
+        let mut pane = Pane::spawn("sh", &["-c", "sleep 60"], &tmp(), 24, 80).unwrap();
+        assert!(pane.try_wait().is_none(), "should be running");
+        pane.kill(); // SIGHUP -> (grace) -> SIGKILL
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(code) = pane.try_wait() {
+                assert_eq!(code, None, "signal exit must be None, got {code:?}");
+                return;
+            }
+            assert!(Instant::now() < deadline, "child did not exit after kill");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

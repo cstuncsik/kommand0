@@ -48,6 +48,7 @@ cargo run -p kommand0-tui
 
 - **Two-pane layout**: Tree (repos/workspaces) on the left; the embedded Claude pane or workspace details on the right
 - **Embedded Claude**: opening a workspace launches a real interactive `claude` in a pseudo-terminal, composited into the right pane — full fidelity (its own input box, slash commands, `/model`, colours), not a reimplemented chat UI
+- **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items, scroll wheel in the tree
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion
 - **Git worktrees**: each workspace gets an isolated git worktree branch
