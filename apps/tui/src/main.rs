@@ -10,7 +10,7 @@ mod pane;
 mod render;
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{EventStream, KeyEvent, KeyEventKind};
 use futures::{FutureExt, StreamExt};
@@ -68,11 +68,19 @@ pub(crate) struct App {
     pub(crate) help_scroll: u16,
     /// True when a `g` was pressed and we're waiting for a second `g` (vim `gg`).
     pub(crate) pending_g: bool,
-    /// Workspaces awaiting a response — read by the tree thinking-spinner. Now
-    /// write-dead (the stream path that set it is gone) so the spinner stays
-    /// idle; kept as the hook for a future embed busy-state.
+    /// Workspaces whose embedded pane is currently active (produced output over
+    /// the last couple of ticks) — drives the tree activity spinner. Recomputed
+    /// each tick from per-pane output deltas.
     pub(crate) waiting_response: HashSet<String>,
     pub(crate) spinner_tick: u8,
+    /// Per-pane last-observed `output_seq`, to detect new output between ticks.
+    pane_seen: HashMap<String, u64>,
+    /// Panes that produced output on the previous tick but aren't armed yet — a
+    /// one-tick debounce so a single keystroke echo or redraw doesn't flash active.
+    pane_pending: HashSet<String>,
+    /// Per-pane instant until which the pane counts as active, refreshed while
+    /// its `output_seq` keeps advancing.
+    pane_active_until: HashMap<String, Instant>,
     pub(crate) pane_areas: mouse::PaneAreas,
     pub(crate) mouse_pos: Option<(u16, u16)>,
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
@@ -118,6 +126,9 @@ impl App {
             pending_g: false,
             waiting_response: HashSet::new(),
             spinner_tick: 0,
+            pane_seen: HashMap::new(),
+            pane_pending: HashSet::new(),
+            pane_active_until: HashMap::new(),
             pane_areas: mouse::PaneAreas::default(),
             mouse_pos: None,
             hit_regions: Vec::new(),
@@ -408,6 +419,50 @@ impl App {
                 self.focus = Focus::Tree;
             }
         }
+    }
+
+    /// Refresh `waiting_response` (the tree activity-spinner set) from per-pane
+    /// output deltas. Called every tick.
+    fn update_pane_activity(&mut self, now: Instant) {
+        let seqs: Vec<(String, u64)> = self
+            .embedded
+            .iter()
+            .map(|(id, p)| (id.clone(), p.output_seq()))
+            .collect();
+        self.apply_pane_activity(now, &seqs);
+    }
+
+    /// Core of [`Self::update_pane_activity`], split out for testing: given the
+    /// observed `(workspace_id, output_seq)` for the live panes, arm a pane as
+    /// active only after two consecutive ticks of new output (debounce), let it
+    /// decay after `ACTIVE_WINDOW`, and prune panes no longer present.
+    fn apply_pane_activity(&mut self, now: Instant, seqs: &[(String, u64)]) {
+        const ACTIVE_WINDOW: Duration = Duration::from_millis(500);
+        for (id, seq) in seqs {
+            let had_new = self.pane_seen.get(id) != Some(seq);
+            self.pane_seen.insert(id.clone(), *seq);
+            if had_new {
+                if self.pane_pending.contains(id) {
+                    self.pane_active_until.insert(id.clone(), now + ACTIVE_WINDOW);
+                } else {
+                    self.pane_pending.insert(id.clone());
+                }
+            } else {
+                self.pane_pending.remove(id);
+            }
+        }
+        // Drop bookkeeping for panes no longer present this tick.
+        let live: HashSet<&str> = seqs.iter().map(|(id, _)| id.as_str()).collect();
+        self.pane_seen.retain(|id, _| live.contains(id.as_str()));
+        self.pane_pending.retain(|id| live.contains(id.as_str()));
+        self.pane_active_until
+            .retain(|id, _| live.contains(id.as_str()));
+        self.waiting_response = self
+            .pane_active_until
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .map(|(id, _)| id.clone())
+            .collect();
     }
 
     /// Get the selected workspace, if any
@@ -1038,6 +1093,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             _ = tick_interval.tick() => {
                 // Reap embedded panes whose claude exited (leaves Embedded focus).
                 app.reap_embedded();
+                // Refresh per-pane activity so the tree spinner reflects which
+                // sessions are currently producing output.
+                app.update_pane_activity(Instant::now());
                 // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
                 app.tick_counter = app.tick_counter.wrapping_add(1);
                 if app.tick_counter.is_multiple_of(5) {
@@ -1222,6 +1280,68 @@ mod key_tests {
             !on_other.contains("Failed to start claude"),
             "error must not show under an unrelated entity:\n{on_other}"
         );
+    }
+
+    #[tokio::test]
+    async fn status_line_shows_mode_context_and_hints() {
+        let mut app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("TREE"), "status line should show TREE mode:\n{text}");
+        assert!(text.contains("q quit"), "status line should show hints:\n{text}");
+        assert!(
+            text.contains("no live sessions"),
+            "status line should show the live-session count:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_line_keeps_mode_badge_on_narrow_terminal() {
+        // The hints half is sized by display width (not byte length), so the mode
+        // badge isn't starved off a narrow terminal.
+        let mut app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(50, 10)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("TREE"),
+            "mode badge must survive on a 50-col terminal:\n{text}"
+        );
+    }
+
+    #[test]
+    fn pane_activity_debounces_arms_and_decays() {
+        let mut app = test_app();
+        let t = Instant::now();
+
+        // One tick of new output: held pending by the debounce, not yet active.
+        app.apply_pane_activity(t, &[("w1".to_string(), 1)]);
+        assert!(
+            !app.waiting_response.contains("w1"),
+            "a single output tick must not arm (debounce)"
+        );
+
+        // A second consecutive tick of new output arms it.
+        app.apply_pane_activity(t, &[("w1".to_string(), 2)]);
+        assert!(
+            app.waiting_response.contains("w1"),
+            "two consecutive output ticks should mark the pane active"
+        );
+
+        // No new output past the active window: decays to idle.
+        app.apply_pane_activity(t + Duration::from_millis(600), &[("w1".to_string(), 2)]);
+        assert!(
+            !app.waiting_response.contains("w1"),
+            "a stale pane should decay to idle"
+        );
+
+        // A pane that disappears is pruned from all bookkeeping.
+        app.apply_pane_activity(t, &[]);
+        assert!(app.waiting_response.is_empty());
+        assert!(app.pane_seen.is_empty());
+        assert!(app.pane_pending.is_empty());
+        assert!(app.pane_active_until.is_empty());
     }
 
     #[tokio::test]

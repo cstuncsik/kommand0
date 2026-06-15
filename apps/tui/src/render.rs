@@ -37,10 +37,17 @@ fn truncate_path(path: &str, max_width: usize) -> String {
 pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     app.hit_regions.clear();
 
+    // Reserve a one-row status bar at the bottom.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+    let body = rows[0];
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(frame.area());
+        .split(body);
 
     app.pane_areas.tree = chunks[0];
 
@@ -49,6 +56,8 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 
     // Right pane: workspace details or the embedded claude pane
     render_right_pane(frame, app, chunks[1]);
+
+    render_status_line(frame, app, rows[1]);
 
     // Help overlay on top of any layout
     if app.show_help {
@@ -59,6 +68,65 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     if app.modal.is_active() {
         modal::render_modal(frame, &app.modal);
     }
+}
+
+/// Bottom status bar: mode, current selection, live-pane count, and key hints.
+fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let (mode, mode_color) = match app.focus {
+        Focus::Tree => (" TREE ", Color::Cyan),
+        Focus::Embedded => (" CLAUDE ", Color::Green),
+    };
+    let context = match app.tree_items.get(app.selected_index) {
+        Some(TreeNode::Workspace { ws, .. }) => ws.name.clone(),
+        Some(TreeNode::Repo { name, .. }) => name.clone(),
+        _ => "—".to_string(),
+    };
+    let live = app.embedded.len();
+    // Count only active panes that still exist (waiting_response is rebuilt each
+    // tick, but a removal earlier this frame can briefly leave a stale id).
+    let active = app
+        .waiting_response
+        .iter()
+        .filter(|id| app.embedded.contains_key(*id))
+        .count();
+    let live_label = if live == 0 {
+        "no live sessions".to_string()
+    } else if active > 0 {
+        format!("{live} live · {active} active")
+    } else {
+        format!("{live} live")
+    };
+
+    let left = Line::from(vec![
+        Span::styled(
+            mode,
+            Style::default().fg(Color::Black).bg(mode_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(context, Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled(live_label, Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let hints = match app.focus {
+        Focus::Tree => "Enter open · a repo · w ws · ? help · q quit",
+        Focus::Embedded => "Ctrl+A t tree · Ctrl+A q quit",
+    };
+
+    // Size the right (hints) half by display width, not byte length — the "·"
+    // separators are multi-byte — and use Max so the mode badge keeps priority on
+    // a narrow terminal.
+    let hint_cols = UnicodeWidthStr::width(hints) as u16;
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Max(hint_cols)])
+        .split(area);
+    frame.render_widget(Paragraph::new(left), halves[0]);
+    frame.render_widget(
+        Paragraph::new(Line::styled(hints, Style::default().fg(Color::DarkGray)))
+            .alignment(ratatui::layout::Alignment::Right),
+        halves[1],
+    );
 }
 
 fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -578,8 +646,15 @@ pub(crate) fn workspace_icon_cluster(
     if embedded {
         let prompt_text = " \u{276F}".to_string(); // " ❯"
         let stop_text = " \u{25A0}".to_string(); // " ■"
+        // While the pane is producing output, animate the prompt glyph into a
+        // spinner (same width, so the hit regions below are unaffected).
+        let prompt_glyph = if is_thinking {
+            format!(" {}", SPINNER_FRAMES[spinner_tick as usize % SPINNER_FRAMES.len()])
+        } else {
+            prompt_text.clone()
+        };
         let mut spans = vec![
-            Span::styled(prompt_text.clone(), icon_style),
+            Span::styled(prompt_glyph, icon_style),
             Span::styled(stop_text.clone(), icon_style),
             Span::styled(delete_text.clone(), icon_style),
         ];
@@ -1018,6 +1093,26 @@ mod tests {
             a,
             HitAction::StartSessionFor { .. } | HitAction::ResumeSessionFor { .. }
         )));
+    }
+
+    #[test]
+    fn icon_cluster_embedded_active_animates_prompt_into_spinner() {
+        // The live shipping path: an embedded pane that is producing output must
+        // animate its prompt glyph into a spinner (the no-session/Running branches
+        // below are unreachable now that the TUI creates no stream sessions).
+        let cluster = workspace_icon_cluster(None, "ws-1", /*is_thinking*/ true, 3, 40, false, true);
+        let prompt = &cluster.spans[0].content;
+        assert!(
+            SPINNER_FRAMES.iter().any(|f| prompt.contains(f)),
+            "active embedded pane should show a spinner, got: {prompt:?}"
+        );
+        // Idle embedded pane keeps the static prompt glyph.
+        let idle = workspace_icon_cluster(None, "ws-1", false, 3, 40, false, true);
+        assert!(
+            idle.spans[0].content.contains('\u{276F}'),
+            "idle embedded pane should show the ❯ prompt, got: {:?}",
+            idle.spans[0].content
+        );
     }
 
     #[test]

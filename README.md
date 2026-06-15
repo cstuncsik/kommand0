@@ -51,6 +51,8 @@ cargo run -p kommand0-tui
 - **Mouse support**: click tree items, scroll wheel in the tree
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion
 - **Git worktrees**: each workspace gets an isolated git worktree branch
+- **Status bar**: bottom row shows the current mode (TREE / CLAUDE), the selected repo/workspace, the live-session count (and how many are active), and context key hints
+- **Activity indicator**: a workspace's tree row animates its prompt into a spinner while its embedded Claude is actively producing output (debounced, so a stray keystroke doesn't flicker it)
 
 ### Keybindings
 
