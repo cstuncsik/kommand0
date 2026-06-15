@@ -17,7 +17,7 @@ use futures::{FutureExt, StreamExt};
 use kommand0_core::{AppState, RepoEntry, SessionStatus, Workspace};
 use ratatui::{
     DefaultTerminal,
-    crossterm::event::{Event, KeyCode, KeyModifiers},
+    crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent},
 };
 
 #[allow(dead_code)]
@@ -64,6 +64,22 @@ pub(crate) enum Focus {
     Tree,
     /// An embedded interactive `claude` pane (PTY passthrough) owns the keyboard.
     Embedded,
+}
+
+/// Translate an absolute terminal mouse position into the embedded pane's inner
+/// (border-excluded) coordinate space. Returns `None` when the position is
+/// outside the pane's content area, so border/tree clicks are ignored.
+fn translate_mouse(
+    right_pane_area: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Option<(u16, u16)> {
+    let inner = right_pane_area.inner(ratatui::layout::Margin::new(1, 1));
+    if col < inner.x || col >= inner.x + inner.width || row < inner.y || row >= inner.y + inner.height
+    {
+        return None;
+    }
+    Some((col - inner.x, row - inner.y))
 }
 
 #[derive(Clone)]
@@ -447,6 +463,27 @@ impl App {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Forward a mouse event to the focused embedded pane, translated into the
+    /// pane's inner coordinate space. The pane only acts on it if claude enabled
+    /// mouse reporting. Events outside the pane's inner area are ignored (so a
+    /// click on the border/tree can't strand the pane).
+    ///
+    /// Known limitation: a drag/release that leaves the pane is dropped rather
+    /// than clamped to the edge, so a selection started inside and released
+    /// outside isn't delivered to claude. Recoverable by clicking inside again.
+    fn forward_mouse_to_embedded(&mut self, mouse: MouseEvent) {
+        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
+            return;
+        };
+        let Some((col, row)) = translate_mouse(self.right_pane_area, mouse.column, mouse.row)
+        else {
+            return;
+        };
+        if let Some(pane) = self.embedded.get_mut(&ws_id) {
+            pane.send_mouse(mouse.kind, mouse.modifiers, col, row);
         }
     }
 
@@ -1051,10 +1088,13 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         }
                     }
                     Some(Ok(Event::Mouse(mouse_event))) => {
-                        // Embedded focus owns all input (keyboard already captured);
-                        // drop mouse too so a click can't strand the pane by flipping
-                        // focus to Output. (Forwarding mouse to the PTY is Phase 3.)
-                        if !app.show_help && app.focus != Focus::Embedded {
+                        if app.show_help {
+                            // Overlay owns the screen — ignore mouse.
+                        } else if app.focus == Focus::Embedded {
+                            // The embedded pane owns the mouse: forward it to claude
+                            // (translated to its coords) when claude wants mouse input.
+                            app.forward_mouse_to_embedded(mouse_event);
+                        } else {
                             mouse::handle_mouse(&mut app, mouse_event);
                         }
                     }
@@ -1204,6 +1244,22 @@ mod key_tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn translate_mouse_maps_inner_and_rejects_outside() {
+        // Right pane at x=30,w=70 -> inner (border-excluded) x=31,y=1,w=68,h=28.
+        let area = ratatui::layout::Rect::new(30, 0, 70, 30);
+        // Top-left inner cell maps to (0, 0).
+        assert_eq!(translate_mouse(area, 31, 1), Some((0, 0)));
+        // A cell inside maps relative to the inner origin.
+        assert_eq!(translate_mouse(area, 59, 11), Some((28, 10)));
+        // The border column/row and the tree pane are rejected.
+        assert_eq!(translate_mouse(area, 30, 5), None); // left border
+        assert_eq!(translate_mouse(area, 50, 0), None); // top border
+        assert_eq!(translate_mouse(area, 10, 5), None); // tree pane
+        assert_eq!(translate_mouse(area, 99, 5), None); // right border (x+w-1)
+        assert_eq!(translate_mouse(area, 50, 29), None); // bottom border
     }
 
     fn test_app() -> App {
