@@ -9,8 +9,6 @@ use ratatui::{
 #[allow(dead_code)]
 pub(crate) enum HitAction {
     StartSession,
-    StopSession,
-    ResumeSession,
     StartSessionFor { workspace_id: String },
     StopSessionFor { workspace_id: String },
     ResumeSessionFor { workspace_id: String },

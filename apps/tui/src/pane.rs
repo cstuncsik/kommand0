@@ -1,14 +1,11 @@
 //! An embedded terminal pane: a child process running in a pseudo-terminal,
 //! emulated with vt100 and composited into a ratatui buffer.
 //!
-//! This is the foundation of the PTY-passthrough architecture (see MIGRATION.md):
-//! a [`Pane`] owns a PTY, spawns a command in it (e.g. interactive `claude`),
-//! pumps its output through a vt100 parser on a background thread, forwards
-//! keystrokes back, and renders the emulated screen.
-//!
-//! Phase 1 deliverable: a standalone, tested module. It is not yet wired into
-//! the app event loop (that is Phase 2, which also adds a reader→repaint wakeup;
-//! for now callers can poll [`Pane::output_seq`] to detect activity).
+//! This is the PTY-passthrough core (see MIGRATION.md): a [`Pane`] owns a PTY,
+//! spawns a command in it (e.g. interactive `claude`), pumps its output through a
+//! vt100 parser on a background thread, forwards keystrokes back, and blits the
+//! emulated screen. It is the app's only session view; the reader thread signals
+//! repaints via the wake callback passed to [`Pane::spawn_with_wake`].
 
 use std::io::{Read, Write};
 use std::path::Path;
