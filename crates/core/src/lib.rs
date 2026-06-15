@@ -9,6 +9,7 @@ pub use repo::{RepoEntry, run_git_status};
 pub use session::{Session, SessionStatus};
 pub use workspace::Workspace;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +24,11 @@ pub struct AppState {
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
     pub sessions: Vec<Session>,
+    /// Per-workspace Claude session id (a caller-assigned UUID) for the embedded
+    /// interactive `claude` pane, so reopening a workspace resumes its
+    /// conversation (`claude --resume <id>`) across app restarts.
+    #[serde(default)]
+    pub embedded_sessions: HashMap<String, String>,
 }
 
 impl AppState {
@@ -81,6 +87,34 @@ impl AppState {
     /// Save state to the default state directory.
     pub fn save(&self) -> anyhow::Result<()> {
         self.save_to(Self::state_dir().as_path())
+    }
+
+    /// A fresh Claude session id (UUID v4) to assign to a new embedded session.
+    pub fn new_claude_session_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// The stored Claude session id for a workspace's embedded pane, if any.
+    pub fn embedded_session_id(&self, workspace_id: &str) -> Option<&str> {
+        self.embedded_sessions.get(workspace_id).map(String::as_str)
+    }
+
+    /// Record the Claude session id assigned to a workspace's embedded pane.
+    pub fn set_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
+        self.embedded_sessions
+            .insert(workspace_id.to_string(), session_id.to_string());
+    }
+
+    /// Forget a workspace's embedded session id (on delete, or when a resume
+    /// fails because the underlying Claude session was purged).
+    pub fn clear_embedded_session(&mut self, workspace_id: &str) {
+        self.embedded_sessions.remove(workspace_id);
+    }
+
+    /// Drop embedded-session entries for workspaces that no longer exist.
+    pub fn prune_embedded_sessions(&mut self) {
+        self.embedded_sessions
+            .retain(|ws_id, _| self.workspaces.iter().any(|w| &w.id == ws_id));
     }
 
     /// Add a repo, saving state to a custom base directory.
@@ -163,6 +197,11 @@ impl AppState {
                 true
             }
         });
+
+        // Forget any embedded Claude session ids for the removed workspaces.
+        for id in &ws_ids {
+            self.embedded_sessions.remove(id);
+        }
 
         // Remove the repo itself
         self.repos.retain(|r| r.id != repo.id);
@@ -345,6 +384,7 @@ impl AppState {
             .position(|w| w.name == name)
             .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))?;
         let removed = self.workspaces.remove(idx);
+        self.embedded_sessions.remove(&removed.id);
 
         // Clean up worktree if present
         if let Some(wt_path) = &removed.worktree_path
@@ -539,6 +579,64 @@ mod tests {
         assert_eq!(loaded.repos[0].id, "abc123");
         assert_eq!(loaded.repos[0].name, "my-repo");
         assert_eq!(loaded.repos[0].path, "/tmp/my-repo");
+    }
+
+    #[test]
+    fn embedded_sessions_set_get_clear_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        assert_eq!(state.embedded_session_id("w1"), None);
+
+        let id = AppState::new_claude_session_id();
+        state.set_embedded_session("w1", &id);
+        assert_eq!(state.embedded_session_id("w1"), Some(id.as_str()));
+        state.save_to(tmp.path()).unwrap();
+
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert_eq!(loaded.embedded_session_id("w1"), Some(id.as_str()));
+
+        state.clear_embedded_session("w1");
+        assert_eq!(state.embedded_session_id("w1"), None);
+    }
+
+    #[test]
+    fn new_claude_session_id_is_a_unique_uuid() {
+        let a = AppState::new_claude_session_id();
+        let b = AppState::new_claude_session_id();
+        assert_ne!(a, b);
+        assert!(uuid::Uuid::parse_str(&a).is_ok(), "should be a valid UUID: {a}");
+    }
+
+    #[test]
+    fn prune_embedded_sessions_drops_orphans() {
+        let mut state = AppState::default();
+        state.workspaces.push(Workspace {
+            id: "w1".to_string(),
+            name: "ws".to_string(),
+            repo_id: "r1".to_string(),
+            working_dir: "/tmp/ws".to_string(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+        });
+        state.set_embedded_session("w1", "keep");
+        state.set_embedded_session("w-gone", "drop");
+        state.prune_embedded_sessions();
+        assert_eq!(state.embedded_session_id("w1"), Some("keep"));
+        assert_eq!(state.embedded_session_id("w-gone"), None);
+    }
+
+    #[test]
+    fn load_from_tolerates_state_without_embedded_sessions() {
+        // Backward compat: a state.json written before this field must still load.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("state.json"),
+            r#"{"repos":[],"workspaces":[],"sessions":[]}"#,
+        )
+        .unwrap();
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert!(loaded.embedded_sessions.is_empty());
     }
 
     #[test]

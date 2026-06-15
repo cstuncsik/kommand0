@@ -27,6 +27,38 @@ pub(crate) enum Status {
     Error(String),
 }
 
+/// Decide the `claude` CLI args for opening a workspace's embedded pane.
+///
+/// If the workspace already has a stored session id, resume it; otherwise assign
+/// a fresh UUID. Returns `(args, new_session_id)` where `new_session_id` is
+/// `Some` only when a new session was created (and should be persisted on a
+/// successful spawn).
+///
+/// Known edge: if the very first launch is abandoned before any turn, the id is
+/// still persisted but no conversation exists on disk. Reopening then runs
+/// `--resume <id>`, which `claude` rejects ("No conversation found") and exits
+/// non-zero — caught by [`resume_failed`], which forgets the id so the next open
+/// starts fresh. So the worst case self-heals in one reopen.
+fn claude_session_args(state: &AppState, ws_id: &str) -> (Vec<String>, Option<String>) {
+    match state.embedded_session_id(ws_id) {
+        Some(uuid) => (vec!["--resume".to_string(), uuid.to_string()], None),
+        None => {
+            let uuid = AppState::new_claude_session_id();
+            (vec!["--session-id".to_string(), uuid.clone()], Some(uuid))
+        }
+    }
+}
+
+/// Whether an exited embedded pane looks like a failed `--resume` (the Claude
+/// session was purged): it was resumed, died within the window, and exited with
+/// a non-zero code (a clean `/exit` is code 0 and must not trip this).
+fn resume_failed(spawned: Instant, was_resume: bool, now: Instant, exit_code: Option<i32>) -> bool {
+    const RESUME_FAIL_WINDOW: Duration = Duration::from_millis(2000);
+    was_resume
+        && now.saturating_duration_since(spawned) < RESUME_FAIL_WINDOW
+        && !matches!(exit_code, Some(0) | None)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Focus {
     Tree,
@@ -81,6 +113,9 @@ pub(crate) struct App {
     /// Per-pane instant until which the pane counts as active, refreshed while
     /// its `output_seq` keeps advancing.
     pane_active_until: HashMap<String, Instant>,
+    /// Per-pane `(spawn_instant, was_resume)` — used to detect a resumed pane
+    /// that died immediately because its Claude session could not be found.
+    pane_spawn: HashMap<String, (Instant, bool)>,
     pub(crate) pane_areas: mouse::PaneAreas,
     pub(crate) mouse_pos: Option<(u16, u16)>,
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
@@ -129,6 +164,7 @@ impl App {
             pane_seen: HashMap::new(),
             pane_pending: HashSet::new(),
             pane_active_until: HashMap::new(),
+            pane_spawn: HashMap::new(),
             pane_areas: mouse::PaneAreas::default(),
             mouse_pos: None,
             hit_regions: Vec::new(),
@@ -339,9 +375,14 @@ impl App {
                 .inner(ratatui::layout::Margin::new(1, 1));
             let rows = if inner.height > 0 { inner.height } else { 24 };
             let cols = if inner.width > 0 { inner.width } else { 80 };
+            // Resume the workspace's prior Claude session if we have one; else
+            // assign a fresh session id to persist on success.
+            let (args, new_session) = claude_session_args(&self.state, &ws_id);
+            let was_resume = new_session.is_none();
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             match pane::Pane::spawn_with_wake(
                 &bin,
-                &[],
+                &arg_refs,
                 std::path::Path::new(&ws_dir),
                 rows,
                 cols,
@@ -350,6 +391,22 @@ impl App {
                 Ok(p) => {
                     self.embedded.insert(ws_id.clone(), p);
                     self.embed_error = None;
+                    if let Some(uuid) = new_session {
+                        self.state.set_embedded_session(&ws_id, &uuid);
+                        // This is the only durable write of a freshly-created
+                        // session id; surface a failure so the user knows it may
+                        // not resume after a restart.
+                        if self.state.save().is_err() {
+                            self.embed_error = Some((
+                                ws_id.clone(),
+                                "Couldn't persist this session — it may not resume \
+                                 after restarting kommand0."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    self.pane_spawn
+                        .insert(ws_id.clone(), (Instant::now(), was_resume));
                 }
                 Err(e) => {
                     // Surface the failure in this workspace's detail pane (the old
@@ -396,12 +453,33 @@ impl App {
     /// Drop embedded panes whose child has exited or whose workspace was deleted
     /// (the latter centrally covers every delete path). If the focused pane went
     /// away, leave Embedded focus. Pane's `Drop` terminates the child.
-    fn reap_embedded(&mut self) {
-        let mut dead: Vec<String> = self
+    fn reap_embedded(&mut self, now: Instant) {
+        // Panes whose child has exited, with the exit code.
+        let exited: Vec<(String, Option<i32>)> = self
             .embedded
             .iter_mut()
-            .filter_map(|(k, p)| p.try_wait().map(|_| k.clone()))
+            .filter_map(|(k, p)| p.try_wait().map(|code| (k.clone(), code)))
             .collect();
+
+        // Resume-failure safety net: a resumed pane that died immediately with a
+        // non-zero code likely couldn't find its Claude session (purged). Forget
+        // the id so a reopen starts fresh, and tell the user why.
+        for (ws_id, code) in &exited {
+            if let Some((spawned, was_resume)) = self.pane_spawn.get(ws_id)
+                && resume_failed(*spawned, *was_resume, now, *code)
+            {
+                self.state.clear_embedded_session(ws_id);
+                let _ = self.state.save();
+                self.embed_error = Some((
+                    ws_id.clone(),
+                    "Couldn't resume the previous Claude session (it may have been \
+                     cleared) — reopen to start fresh."
+                        .to_string(),
+                ));
+            }
+        }
+
+        let mut dead: Vec<String> = exited.into_iter().map(|(k, _)| k).collect();
         for k in self.embedded.keys() {
             if !self.workspaces.iter().any(|w| &w.id == k) && !dead.contains(k) {
                 dead.push(k.clone());
@@ -410,6 +488,9 @@ impl App {
         for k in &dead {
             self.embedded.remove(k);
         }
+        // Prune spawn bookkeeping for every pane that's no longer live — covers
+        // both the reaped panes above and panes closed elsewhere (x / Stop).
+        self.pane_spawn.retain(|k, _| self.embedded.contains_key(k));
         if self.focus == Focus::Embedded {
             let gone = self
                 .selected_workspace()
@@ -922,6 +1003,13 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         let _ = app.state.save();
     }
 
+    // Drop persisted Claude session ids for workspaces that no longer exist.
+    let before = app.state.embedded_sessions.len();
+    app.state.prune_embedded_sessions();
+    if app.state.embedded_sessions.len() != before {
+        let _ = app.state.save();
+    }
+
     let mut reader = EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
 
@@ -1091,11 +1179,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 }
             }
             _ = tick_interval.tick() => {
+                let now = Instant::now();
                 // Reap embedded panes whose claude exited (leaves Embedded focus).
-                app.reap_embedded();
+                app.reap_embedded(now);
                 // Refresh per-pane activity so the tree spinner reflects which
                 // sessions are currently producing output.
-                app.update_pane_activity(Instant::now());
+                app.update_pane_activity(now);
                 // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
                 app.tick_counter = app.tick_counter.wrapping_add(1);
                 if app.tick_counter.is_multiple_of(5) {
@@ -1342,6 +1431,37 @@ mod key_tests {
         assert!(app.pane_seen.is_empty());
         assert!(app.pane_pending.is_empty());
         assert!(app.pane_active_until.is_empty());
+    }
+
+    #[test]
+    fn claude_session_args_assigns_then_resumes() {
+        let mut state = AppState::default();
+        // No stored session id: a fresh --session-id is assigned and returned.
+        let (args, new) = claude_session_args(&state, "w1");
+        assert_eq!(args[0], "--session-id");
+        assert_eq!(new.as_deref(), Some(args[1].as_str()));
+
+        // Once persisted, reopening resumes that exact id (no new id to store).
+        state.set_embedded_session("w1", &args[1]);
+        let (args2, new2) = claude_session_args(&state, "w1");
+        assert_eq!(args2, vec!["--resume".to_string(), args[1].clone()]);
+        assert!(new2.is_none());
+    }
+
+    #[test]
+    fn resume_failed_only_for_quick_nonzero_resume() {
+        let t = Instant::now();
+        let soon = t + Duration::from_millis(500);
+        // Resumed pane that died fast with a non-zero code → resume failure.
+        assert!(resume_failed(t, true, soon, Some(1)));
+        // A clean /exit (code 0) must not be treated as a failure.
+        assert!(!resume_failed(t, true, soon, Some(0)));
+        // A freshly-created (non-resume) session is never a resume failure.
+        assert!(!resume_failed(t, false, soon, Some(1)));
+        // Exit past the window (the user used it a while) → not a failure.
+        assert!(!resume_failed(t, true, t + Duration::from_millis(3000), Some(1)));
+        // Unknown/signal exit (None) → not a failure.
+        assert!(!resume_failed(t, true, soon, None));
     }
 
     #[tokio::test]
