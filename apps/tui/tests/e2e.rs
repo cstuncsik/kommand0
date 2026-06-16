@@ -382,6 +382,36 @@ fn enter_opens_embedded_claude_by_default() {
 }
 
 #[test]
+fn ctrl_a_c_adds_a_session_tab_and_x_closes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open -> tab 1
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("1 live"); // status bar counts session tabs
+
+    // Ctrl+A then c opens a second session tab.
+    tui.send("\x01");
+    tui.send("c");
+    tui.wait_for("2 live");
+    tui.wait_for("2"); // second tab shows in the strip
+
+    // Ctrl+A then x closes the active tab, back to one.
+    tui.send("\x01");
+    tui.send("x");
+    tui.wait_for("1 live");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn first_open_assigns_a_session_id() {
     // Opening a workspace with no stored session spawns `claude --session-id <uuid>`.
     let dir = tempfile::tempdir().unwrap();
