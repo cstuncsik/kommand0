@@ -1,0 +1,41 @@
+README.md
+  s_fc3d7618d36de0::t_fe066afcf3c449 52
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_99fe17a850db05 20
+  s_fc3d7618d36de0::t_662bce23aa21f7 69-84
+  s_fc3d7618d36de0::t_9880d71fe20371 469-472,477-480,483,485-489
+  s_fc3d7618d36de0::t_d7cd6717a1db5e 473-476
+  s_fc3d7618d36de0::t_343c8f6e9117e2 481-482,484
+  s_fc3d7618d36de0::t_a267f40ccfec4b 1091-1097
+  s_fc3d7618d36de0::t_8cf20639200ec5 1249-1264
+apps/tui/tests/fixtures/embed-stub
+  s_fc3d7618d36de0::t_fbca18070ce482 6,10-12
+apps/tui/src/pane.rs
+  s_fc3d7618d36de0::t_8d017c42f3fdf6 20
+  s_fc3d7618d36de0::t_8a6fc631af1eb3 23
+  s_fc3d7618d36de0::t_24e7cabf3371c9 168-196
+  s_fc3d7618d36de0::t_7b68e52c914d84 358-429,437,439,444-446
+  s_fc3d7618d36de0::t_4270638a3a99a2 430-436,438,440-443
+  s_fc3d7618d36de0::t_ce353efa5ad0a4 513-620,623-624,626,629,639,668-669
+  s_fc3d7618d36de0::t_21e38b1cf6870b 621-622,625,627-628,630-638,640-667
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_d5f3649f9bd060 284-285
+  s_fc3d7618d36de0::t_c0a6b62a5b274f 295-308,312,314-319
+  s_fc3d7618d36de0::t_7af7fcb4e919c5 309-311,313
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7",
+  "base_commit_sha": "24a077eb4552ed83ee5317f019cb65fb17b9af4e",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
