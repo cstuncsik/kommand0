@@ -1778,6 +1778,120 @@ mod key_tests {
         assert!(!resume_failed(t, true, soon, None));
     }
 
+    fn tab(id: &str, args: &[&str]) -> SessionTab {
+        SessionTab {
+            id: id.to_string(),
+            pane: pane::Pane::spawn("sh", args, std::path::Path::new("/tmp"), 24, 80).unwrap(),
+            was_resume: false,
+            spawned: Instant::now(),
+        }
+    }
+
+    fn ids(s: &WorkspaceSessions) -> Vec<&str> {
+        s.tabs.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    fn wait_exit(pane: &mut pane::Pane) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pane.try_wait().is_none() {
+            assert!(Instant::now() < deadline, "pane did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn workspace_sessions_navigation_and_close() {
+        let mut s = WorkspaceSessions {
+            tabs: vec![
+                tab("a", &["-c", "sleep 30"]),
+                tab("b", &["-c", "sleep 30"]),
+                tab("c", &["-c", "sleep 30"]),
+            ],
+            active: 0,
+        };
+        s.next();
+        assert_eq!(s.active, 1);
+        s.next();
+        s.next();
+        assert_eq!(s.active, 0, "next wraps");
+        s.prev();
+        assert_eq!(s.active, 2, "prev wraps");
+        s.select(1);
+        assert_eq!(s.active, 1);
+        s.select(9);
+        assert_eq!(s.active, 1, "out-of-range select is ignored");
+
+        // Close a tab BELOW the active one: the active tab stays the same one.
+        // [a,b,c] active=1(b); remove 0(a) -> [b,c] active=0(b).
+        assert!(!s.remove_tab(0));
+        assert_eq!(ids(&s), vec!["b", "c"]);
+        assert_eq!(s.active, 0);
+        // Close the active (last) tab: clamp back onto the remaining one.
+        s.active = 1;
+        assert!(!s.remove_tab(1));
+        assert_eq!(ids(&s), vec!["b"]);
+        assert_eq!(s.active, 0);
+        // Close the final tab -> empty.
+        assert!(s.remove_tab(0));
+    }
+
+    #[test]
+    fn reap_drops_exited_tab_and_keeps_active_by_identity() {
+        let mut app = test_app(); // has workspace "w1"
+        let mut s = WorkspaceSessions {
+            tabs: vec![
+                tab("a", &["-c", "sleep 30"]),
+                tab("b", &["-c", "sleep 30"]),
+                tab("c", &["-c", "sleep 30"]),
+            ],
+            active: 2, // active on "c"
+        };
+        s.tabs[0].pane.kill(); // a non-active tab exits
+        wait_exit(&mut s.tabs[0].pane);
+        app.embedded.insert("w1".to_string(), s);
+
+        app.reap_embedded(Instant::now());
+        let s = &app.embedded["w1"];
+        assert_eq!(ids(s), vec!["b", "c"], "exited tab a dropped");
+        assert_eq!(s.tabs[s.active].id, "c", "active stays on c by identity");
+    }
+
+    #[test]
+    fn reap_resume_failure_forgets_only_the_failed_tab_id() {
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "a");
+        app.state.add_embedded_session("w1", "b");
+        // "a" is a resume that exits non-zero at once (its session was purged);
+        // "b" is a healthy resumed session that keeps running.
+        let mut s = WorkspaceSessions {
+            tabs: vec![
+                SessionTab {
+                    id: "a".to_string(),
+                    pane: pane::Pane::spawn(
+                        "sh",
+                        &["-c", "exit 1"],
+                        std::path::Path::new("/tmp"),
+                        24,
+                        80,
+                    )
+                    .unwrap(),
+                    was_resume: true,
+                    spawned: Instant::now(),
+                },
+                tab("b", &["-c", "sleep 30"]),
+            ],
+            active: 0,
+        };
+        s.tabs[1].was_resume = true;
+        wait_exit(&mut s.tabs[0].pane);
+        app.embedded.insert("w1".to_string(), s);
+
+        app.reap_embedded(Instant::now());
+        // Only "a" is forgotten; "b" is preserved (in order).
+        assert_eq!(app.state.embedded_session_ids("w1"), &["b".to_string()]);
+        assert_eq!(ids(&app.embedded["w1"]), vec!["b"]);
+    }
+
     #[tokio::test]
     async fn renders_help_overlay_after_question_mark() {
         let mut app = test_app();
