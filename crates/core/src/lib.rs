@@ -24,11 +24,40 @@ pub struct AppState {
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
     pub sessions: Vec<Session>,
-    /// Per-workspace Claude session id (a caller-assigned UUID) for the embedded
-    /// interactive `claude` pane, so reopening a workspace resumes its
-    /// conversation (`claude --resume <id>`) across app restarts.
-    #[serde(default)]
-    pub embedded_sessions: HashMap<String, String>,
+    /// Per-workspace Claude session ids (caller-assigned UUIDs), one per session
+    /// tab, in tab order — so reopening a workspace resumes each of its sessions
+    /// (`claude --resume <id>`) across app restarts.
+    #[serde(default, deserialize_with = "de_embedded_sessions")]
+    pub embedded_sessions: HashMap<String, Vec<String>>,
+}
+
+/// Tolerates the legacy single-string form (`{"w1":"uuid"}`) and an explicit
+/// `null`, mapping both into the current `Vec<String>` shape. Serialization
+/// always emits the array form.
+fn de_embedded_sessions<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    let opt: Option<HashMap<String, OneOrMany>> = Option::deserialize(deserializer)?;
+    Ok(opt
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(ws, v)| {
+            let ids = match v {
+                OneOrMany::One(id) => vec![id],
+                OneOrMany::Many(ids) => ids,
+            };
+            (ws, ids)
+        })
+        .collect())
 }
 
 impl AppState {
@@ -94,20 +123,37 @@ impl AppState {
         uuid::Uuid::new_v4().to_string()
     }
 
-    /// The stored Claude session id for a workspace's embedded pane, if any.
-    pub fn embedded_session_id(&self, workspace_id: &str) -> Option<&str> {
-        self.embedded_sessions.get(workspace_id).map(String::as_str)
-    }
-
-    /// Record the Claude session id assigned to a workspace's embedded pane.
-    pub fn set_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
+    /// The stored Claude session ids for a workspace's session tabs, in tab
+    /// order (empty slice when none).
+    pub fn embedded_session_ids(&self, workspace_id: &str) -> &[String] {
         self.embedded_sessions
-            .insert(workspace_id.to_string(), session_id.to_string());
+            .get(workspace_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
-    /// Forget a workspace's embedded session id (on delete, or when a resume
-    /// fails because the underlying Claude session was purged).
-    pub fn clear_embedded_session(&mut self, workspace_id: &str) {
+    /// Append a Claude session id for a workspace (idempotent — no duplicates).
+    pub fn add_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
+        let ids = self.embedded_sessions.entry(workspace_id.to_string()).or_default();
+        if !ids.iter().any(|id| id == session_id) {
+            ids.push(session_id.to_string());
+        }
+    }
+
+    /// Forget a single session id for a workspace (its tab was closed, or its
+    /// resume failed because the Claude session was purged). Removes the
+    /// workspace entry when its last id is gone. Preserves the order of the rest.
+    pub fn remove_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
+        if let Some(ids) = self.embedded_sessions.get_mut(workspace_id) {
+            ids.retain(|id| id != session_id);
+            if ids.is_empty() {
+                self.embedded_sessions.remove(workspace_id);
+            }
+        }
+    }
+
+    /// Forget all of a workspace's session ids (on workspace/repo delete).
+    pub fn clear_all_embedded_sessions(&mut self, workspace_id: &str) {
         self.embedded_sessions.remove(workspace_id);
     }
 
@@ -115,6 +161,26 @@ impl AppState {
     pub fn prune_embedded_sessions(&mut self) {
         self.embedded_sessions
             .retain(|ws_id, _| self.workspaces.iter().any(|w| &w.id == ws_id));
+    }
+
+    // --- Thin single-id compatibility shims (used by the not-yet-tabbed TUI;
+    //     removed once the caller migrates to the *_ids/add/remove API). ---
+
+    /// First stored session id for a workspace, if any.
+    pub fn embedded_session_id(&self, workspace_id: &str) -> Option<&str> {
+        self.embedded_session_ids(workspace_id)
+            .first()
+            .map(String::as_str)
+    }
+
+    /// Compatibility alias for [`Self::add_embedded_session`].
+    pub fn set_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
+        self.add_embedded_session(workspace_id, session_id);
+    }
+
+    /// Compatibility alias for [`Self::clear_all_embedded_sessions`].
+    pub fn clear_embedded_session(&mut self, workspace_id: &str) {
+        self.clear_all_embedded_sessions(workspace_id);
     }
 
     /// Add a repo, saving state to a custom base directory.
@@ -605,6 +671,71 @@ mod tests {
         let b = AppState::new_claude_session_id();
         assert_ne!(a, b);
         assert!(uuid::Uuid::parse_str(&a).is_ok(), "should be a valid UUID: {a}");
+    }
+
+    #[test]
+    fn embedded_sessions_multiple_per_workspace_in_order() {
+        let mut state = AppState::default();
+        state.add_embedded_session("w1", "a");
+        state.add_embedded_session("w1", "b");
+        state.add_embedded_session("w1", "a"); // idempotent
+        assert_eq!(state.embedded_session_ids("w1"), &["a".to_string(), "b".to_string()]);
+        assert_eq!(state.embedded_session_ids("missing"), &[] as &[String]);
+
+        // Removing a middle id preserves the order of the rest.
+        state.add_embedded_session("w1", "c");
+        state.remove_embedded_session("w1", "b");
+        assert_eq!(state.embedded_session_ids("w1"), &["a".to_string(), "c".to_string()]);
+
+        // Removing the last id drops the workspace entry entirely.
+        state.remove_embedded_session("w1", "a");
+        state.remove_embedded_session("w1", "c");
+        assert!(!state.embedded_sessions.contains_key("w1"));
+    }
+
+    #[test]
+    fn embedded_sessions_serialize_as_array_and_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        state.add_embedded_session("w1", "a");
+        state.add_embedded_session("w1", "b");
+        state.save_to(tmp.path()).unwrap();
+
+        // On disk the field is the new array shape.
+        let raw = std::fs::read_to_string(tmp.path().join("state.json")).unwrap();
+        assert!(raw.contains("\"w1\""));
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(v["embedded_sessions"]["w1"].is_array());
+
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert_eq!(loaded.embedded_session_ids("w1"), &["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn embedded_sessions_reads_legacy_single_string_form() {
+        // A state.json written before tabs stored one id per workspace as a
+        // string; it must load as a one-element Vec.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("state.json"),
+            r#"{"repos":[],"workspaces":[],"sessions":[],"embedded_sessions":{"w1":"legacy-id"}}"#,
+        )
+        .unwrap();
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert_eq!(loaded.embedded_session_ids("w1"), &["legacy-id".to_string()]);
+    }
+
+    #[test]
+    fn embedded_sessions_tolerates_explicit_null() {
+        // The field has been observed written as `null`; it must load as empty.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("state.json"),
+            r#"{"repos":[],"workspaces":[],"sessions":[],"embedded_sessions":null}"#,
+        )
+        .unwrap();
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert!(loaded.embedded_sessions.is_empty());
     }
 
     #[test]
