@@ -1,0 +1,24 @@
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_d371b31a2e55e9 385-413
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_d3a9249b61ed4d 585-616
+  s_fc3d7618d36de0::t_bc0361aed7ad63 663-697
+  s_fc3d7618d36de0::t_0595893c07c42c 838-839,848-874
+  s_fc3d7618d36de0::t_aab73fd4aacd7e 1349
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7",
+  "base_commit_sha": "925f2e81c33e1ef5e5b4467f1b0a2c1ff8587b8d",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
