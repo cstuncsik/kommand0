@@ -39,9 +39,13 @@ pub(crate) enum Status {
 /// `--resume <id>`, which `claude` rejects ("No conversation found") and exits
 /// non-zero — caught by [`resume_failed`], which forgets the id so the next open
 /// starts fresh. So the worst case self-heals in one reopen.
-fn claude_session_args(state: &AppState, ws_id: &str) -> (Vec<String>, Option<String>) {
-    match state.embedded_session_id(ws_id) {
-        Some(uuid) => (vec!["--resume".to_string(), uuid.to_string()], None),
+/// Height of the session tab strip at the top of the right pane. 0 until the tab
+/// bar is rendered (kept here so the geometry helpers stay in sync).
+const TAB_BAR_HEIGHT: u16 = 0;
+
+fn claude_args(resume_id: Option<&str>) -> (Vec<String>, Option<String>) {
+    match resume_id {
+        Some(id) => (vec!["--resume".to_string(), id.to_string()], None),
         None => {
             let uuid = AppState::new_claude_session_id();
             (vec!["--session-id".to_string(), uuid.clone()], Some(uuid))
@@ -66,15 +70,32 @@ pub(crate) enum Focus {
     Embedded,
 }
 
-/// Translate an absolute terminal mouse position into the embedded pane's inner
-/// (border-excluded) coordinate space. Returns `None` when the position is
-/// outside the pane's content area, so border/tree clicks are ignored.
+/// The rect the active session's pane occupies inside the right pane: the
+/// border-excluded area, minus the session tab strip at the top. The single
+/// source of truth for the pane geometry (spawn size, blit, mouse translation).
+fn pane_content_rect(right_pane_area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let inner = right_pane_area.inner(ratatui::layout::Margin::new(1, 1));
+    // TAB_BAR_HEIGHT is 0 until the tab bar is rendered; the clamp keeps the math
+    // correct once it becomes 1 (and a tiny pane can't reserve more than it has).
+    #[allow(clippy::unnecessary_min_or_max)]
+    let tab_h = TAB_BAR_HEIGHT.min(inner.height);
+    ratatui::layout::Rect {
+        x: inner.x,
+        y: inner.y + tab_h,
+        width: inner.width,
+        height: inner.height - tab_h,
+    }
+}
+
+/// Translate an absolute terminal mouse position into the active pane's
+/// coordinate space. Returns `None` when the position is outside the pane's
+/// content area (border, tab strip, or tree), so those clicks aren't forwarded.
 fn translate_mouse(
     right_pane_area: ratatui::layout::Rect,
     col: u16,
     row: u16,
 ) -> Option<(u16, u16)> {
-    let inner = right_pane_area.inner(ratatui::layout::Margin::new(1, 1));
+    let inner = pane_content_rect(right_pane_area);
     if col < inner.x || col >= inner.x + inner.width || row < inner.y || row >= inner.y + inner.height
     {
         return None;
@@ -99,6 +120,67 @@ pub(crate) enum TreeNode {
     },
 }
 
+/// One Claude session tab within a workspace: a live PTY pane plus the metadata
+/// to persist/resume it and to detect a failed resume.
+pub(crate) struct SessionTab {
+    /// Claude session id (UUID) — also the stable key for activity tracking.
+    pub(crate) id: String,
+    pub(crate) pane: pane::Pane,
+    was_resume: bool,
+    spawned: Instant,
+}
+
+/// A workspace's open session tabs (tab order = creation order) and the active
+/// tab. Kept in `App.embedded` only while non-empty.
+#[derive(Default)]
+pub(crate) struct WorkspaceSessions {
+    pub(crate) tabs: Vec<SessionTab>,
+    pub(crate) active: usize,
+}
+
+impl WorkspaceSessions {
+    pub(crate) fn active_pane_mut(&mut self) -> Option<&mut pane::Pane> {
+        self.tabs.get_mut(self.active).map(|t| &mut t.pane)
+    }
+    fn push(&mut self, tab: SessionTab) {
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+    }
+    // The tab-navigation API below is wired up in the create/switch/close step.
+    #[allow(dead_code)]
+    fn next(&mut self) {
+        if !self.tabs.is_empty() {
+            self.active = (self.active + 1) % self.tabs.len();
+        }
+    }
+    #[allow(dead_code)]
+    fn prev(&mut self) {
+        if !self.tabs.is_empty() {
+            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+        }
+    }
+    #[allow(dead_code)]
+    fn select(&mut self, idx: usize) {
+        if idx < self.tabs.len() {
+            self.active = idx;
+        }
+    }
+    /// Remove the tab at `idx` (order-preserving), re-clamping `active`. Returns
+    /// whether the workspace is now empty (the caller removes the entry).
+    #[allow(dead_code)]
+    fn remove_tab(&mut self, idx: usize) -> bool {
+        if idx >= self.tabs.len() {
+            return self.tabs.is_empty();
+        }
+        self.tabs.remove(idx);
+        if idx < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        self.tabs.is_empty()
+    }
+}
+
 pub(crate) struct App {
     pub(crate) repos: Vec<RepoEntry>,
     pub(crate) workspaces: Vec<Workspace>,
@@ -116,22 +198,19 @@ pub(crate) struct App {
     pub(crate) help_scroll: u16,
     /// True when a `g` was pressed and we're waiting for a second `g` (vim `gg`).
     pub(crate) pending_g: bool,
-    /// Workspaces whose embedded pane is currently active (produced output over
-    /// the last couple of ticks) — drives the tree activity spinner. Recomputed
-    /// each tick from per-pane output deltas.
+    /// Claude session ids (one per tab) whose pane produced output over the last
+    /// couple of ticks — drives the activity spinner. Keyed by session id.
+    /// Recomputed each tick from per-pane output deltas.
     pub(crate) waiting_response: HashSet<String>,
     pub(crate) spinner_tick: u8,
-    /// Per-pane last-observed `output_seq`, to detect new output between ticks.
+    /// Per-session last-observed `output_seq`, to detect new output between ticks.
     pane_seen: HashMap<String, u64>,
-    /// Panes that produced output on the previous tick but aren't armed yet — a
+    /// Sessions that produced output on the previous tick but aren't armed yet — a
     /// one-tick debounce so a single keystroke echo or redraw doesn't flash active.
     pane_pending: HashSet<String>,
-    /// Per-pane instant until which the pane counts as active, refreshed while
-    /// its `output_seq` keeps advancing.
+    /// Per-session instant until which the session counts as active, refreshed
+    /// while its `output_seq` keeps advancing.
     pane_active_until: HashMap<String, Instant>,
-    /// Per-pane `(spawn_instant, was_resume)` — used to detect a resumed pane
-    /// that died immediately because its Claude session could not be found.
-    pane_spawn: HashMap<String, (Instant, bool)>,
     pub(crate) pane_areas: mouse::PaneAreas,
     pub(crate) mouse_pos: Option<(u16, u16)>,
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
@@ -141,9 +220,9 @@ pub(crate) struct App {
     pub(crate) last_pane_width: u16,
     tick_counter: u8,
 
-    // Embedded PTY panes (migration Phase 2, experimental): per-workspace
-    // interactive `claude` sessions composited into the right pane.
-    pub(crate) embedded: HashMap<String, pane::Pane>,
+    // Embedded interactive `claude` sessions, as tabs per workspace, composited
+    // into the right pane.
+    pub(crate) embedded: HashMap<String, WorkspaceSessions>,
     /// Reader-thread → event-loop repaint signal (set in `main` before the loop).
     pub(crate) embedded_wake: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     /// Last-rendered right-pane rect, so a new embedded pane spawns at its final
@@ -180,7 +259,6 @@ impl App {
             pane_seen: HashMap::new(),
             pane_pending: HashSet::new(),
             pane_active_until: HashMap::new(),
-            pane_spawn: HashMap::new(),
             pane_areas: mouse::PaneAreas::default(),
             mouse_pos: None,
             hit_regions: Vec::new(),
@@ -369,6 +447,9 @@ impl App {
 
     /// Enter (spawning if needed) the embedded interactive `claude` pane for the
     /// selected workspace. Experimental PTY-passthrough toggle (Phase 2).
+    /// Open the selected workspace's embedded sessions: if it has none live yet,
+    /// resume every persisted session id as a tab (or start a first session when
+    /// none are stored), then focus the first tab.
     fn toggle_embedded(&mut self) {
         let Some(ws) = self.selected_workspace() else {
             return;
@@ -377,69 +458,108 @@ impl App {
         let ws_name = ws.name.clone();
         let ws_dir = ws.working_dir.clone();
         if !self.embedded.contains_key(&ws_id) {
-            let bin = std::env::var("KOMMAND0_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
-            let wake: Option<Box<dyn Fn() + Send>> = self.embedded_wake.clone().map(|tx| {
-                Box::new(move || {
-                    let _ = tx.send(());
-                }) as Box<dyn Fn() + Send>
-            });
-            // Spawn at the pane's final inner size so the first render needs no
-            // resize — claude drops its initial screen (e.g. the trust prompt) on
-            // a SIGWINCH that arrives mid-render.
-            let inner = self
-                .right_pane_area
-                .inner(ratatui::layout::Margin::new(1, 1));
-            let rows = if inner.height > 0 { inner.height } else { 24 };
-            let cols = if inner.width > 0 { inner.width } else { 80 };
-            // Resume the workspace's prior Claude session if we have one; else
-            // assign a fresh session id to persist on success.
-            let (args, new_session) = claude_session_args(&self.state, &ws_id);
-            let was_resume = new_session.is_none();
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            match pane::Pane::spawn_with_wake(
-                &bin,
-                &arg_refs,
-                std::path::Path::new(&ws_dir),
-                rows,
-                cols,
-                wake,
-            ) {
-                Ok(p) => {
-                    self.embedded.insert(ws_id.clone(), p);
-                    self.embed_error = None;
-                    if let Some(uuid) = new_session {
-                        self.state.set_embedded_session(&ws_id, &uuid);
-                        // This is the only durable write of a freshly-created
-                        // session id; surface a failure so the user knows it may
-                        // not resume after a restart.
-                        if self.state.save().is_err() {
-                            self.embed_error = Some((
-                                ws_id.clone(),
-                                "Couldn't persist this session — it may not resume \
-                                 after restarting kommand0."
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    self.pane_spawn
-                        .insert(ws_id.clone(), (Instant::now(), was_resume));
-                }
-                Err(e) => {
-                    // Surface the failure in this workspace's detail pane (the old
-                    // scrollback chat surface is gone); stay on the tree.
-                    self.embed_error =
-                        Some((ws_id.clone(), format!("Failed to start claude in {ws_name}: {e}")));
-                    return;
+            let persisted: Vec<String> = self.state.embedded_session_ids(&ws_id).to_vec();
+            if persisted.is_empty() {
+                self.spawn_session_tab(&ws_id, &ws_dir, &ws_name, None);
+            } else {
+                for id in &persisted {
+                    self.spawn_session_tab(&ws_id, &ws_dir, &ws_name, Some(id));
                 }
             }
+            // If every spawn failed, embed_error is set — stay on the tree.
+            let Some(sessions) = self.embedded.get_mut(&ws_id) else {
+                return;
+            };
+            sessions.active = 0; // focus the first tab on open
+            self.embed_error = None;
+        } else {
+            self.embed_error = None;
         }
-        self.embed_error = None;
         self.focus = Focus::Embedded;
         self.embedded_prefix = false;
     }
 
-    /// Select a workspace by id (if present in the tree) and open its embedded
-    /// claude pane.
+    /// Spawn one Claude session (a tab) for a workspace and append it. `resume_id`
+    /// resumes that session; `None` assigns + persists a fresh id. Returns whether
+    /// the pane started (on failure, `embed_error` is set).
+    fn spawn_session_tab(
+        &mut self,
+        ws_id: &str,
+        ws_dir: &str,
+        ws_name: &str,
+        resume_id: Option<&str>,
+    ) -> bool {
+        let bin = std::env::var("KOMMAND0_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        let wake: Option<Box<dyn Fn() + Send>> = self.embedded_wake.clone().map(|tx| {
+            Box::new(move || {
+                let _ = tx.send(());
+            }) as Box<dyn Fn() + Send>
+        });
+        // Spawn at the pane's final inner size so the first render needs no resize
+        // (claude drops its first screen on a SIGWINCH mid-render).
+        let inner = pane_content_rect(self.right_pane_area);
+        let rows = if inner.height > 0 { inner.height } else { 24 };
+        let cols = if inner.width > 0 { inner.width } else { 80 };
+        let (args, new_id) = claude_args(resume_id);
+        let was_resume = resume_id.is_some();
+        let session_id = resume_id
+            .map(String::from)
+            .unwrap_or_else(|| new_id.clone().unwrap());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        match pane::Pane::spawn_with_wake(
+            &bin,
+            &arg_refs,
+            std::path::Path::new(ws_dir),
+            rows,
+            cols,
+            wake,
+        ) {
+            Ok(pane) => {
+                if let Some(uuid) = new_id {
+                    self.state.add_embedded_session(ws_id, &uuid);
+                    if self.state.save().is_err() {
+                        self.embed_error = Some((
+                            ws_id.to_string(),
+                            "Couldn't persist this session — it may not resume \
+                             after restarting kommand0."
+                                .to_string(),
+                        ));
+                    }
+                }
+                self.embedded
+                    .entry(ws_id.to_string())
+                    .or_default()
+                    .push(SessionTab {
+                        id: session_id,
+                        pane,
+                        was_resume,
+                        spawned: Instant::now(),
+                    });
+                true
+            }
+            Err(e) => {
+                self.embed_error =
+                    Some((ws_id.to_string(), format!("Failed to start claude in {ws_name}: {e}")));
+                false
+            }
+        }
+    }
+
+    /// The active session's pane for the selected workspace, if any.
+    fn active_pane_mut(&mut self) -> Option<&mut pane::Pane> {
+        let ws_id = self.selected_workspace()?.id.clone();
+        self.embedded.get_mut(&ws_id)?.active_pane_mut()
+    }
+
+    /// Whether any of a workspace's session tabs is currently producing output.
+    pub(crate) fn ws_has_active_session(&self, ws_id: &str) -> bool {
+        self.embedded
+            .get(ws_id)
+            .map(|s| s.tabs.iter().any(|t| self.waiting_response.contains(&t.id)))
+            .unwrap_or(false)
+    }
+
+    /// Select a workspace by id (if present in the tree) and open its sessions.
     fn embed_workspace_by_id(&mut self, ws_id: &str) {
         if let Some(i) = self
             .tree_items
@@ -451,13 +571,10 @@ impl App {
         self.toggle_embedded();
     }
 
-    /// Forward a key to the selected workspace's embedded pane.
+    /// Forward a key to the active session of the selected workspace.
     /// Returns false when there is no pane to forward to.
     fn forward_to_embedded(&mut self, key: KeyEvent) -> bool {
-        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
-            return false;
-        };
-        match self.embedded.get_mut(&ws_id) {
+        match self.active_pane_mut() {
             Some(pane) => {
                 let _ = pane.send_key(key);
                 true
@@ -475,37 +592,35 @@ impl App {
     /// than clamped to the edge, so a selection started inside and released
     /// outside isn't delivered to claude. Recoverable by clicking inside again.
     fn forward_mouse_to_embedded(&mut self, mouse: MouseEvent) {
-        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
-            return;
-        };
         let Some((col, row)) = translate_mouse(self.right_pane_area, mouse.column, mouse.row)
         else {
             return;
         };
-        if let Some(pane) = self.embedded.get_mut(&ws_id) {
+        if let Some(pane) = self.active_pane_mut() {
             pane.send_mouse(mouse.kind, mouse.modifiers, col, row);
         }
     }
 
-    /// Drop embedded panes whose child has exited or whose workspace was deleted
-    /// (the latter centrally covers every delete path). If the focused pane went
-    /// away, leave Embedded focus. Pane's `Drop` terminates the child.
+    /// Drop session tabs whose child has exited, and whole workspaces that were
+    /// deleted. Applies the per-tab resume-failure net, keeps the active tab
+    /// stable by identity, and leaves Embedded focus if the selected workspace
+    /// emptied. Pane's `Drop` terminates the child.
     fn reap_embedded(&mut self, now: Instant) {
-        // Panes whose child has exited, with the exit code.
-        let exited: Vec<(String, Option<i32>)> = self
-            .embedded
-            .iter_mut()
-            .filter_map(|(k, p)| p.try_wait().map(|code| (k.clone(), code)))
-            .collect();
+        // One pass: collect exited tabs with the data the resume-failure net
+        // needs (keep the signal-vs-exit distinction in `code`).
+        let mut exited: Vec<(String, String, bool, Instant, Option<i32>)> = Vec::new();
+        for (ws_id, sessions) in self.embedded.iter_mut() {
+            for tab in sessions.tabs.iter_mut() {
+                if let Some(code) = tab.pane.try_wait() {
+                    exited.push((ws_id.clone(), tab.id.clone(), tab.was_resume, tab.spawned, code));
+                }
+            }
+        }
 
-        // Resume-failure safety net: a resumed pane that died immediately with a
-        // non-zero code likely couldn't find its Claude session (purged). Forget
-        // the id so a reopen starts fresh, and tell the user why.
-        for (ws_id, code) in &exited {
-            if let Some((spawned, was_resume)) = self.pane_spawn.get(ws_id)
-                && resume_failed(*spawned, *was_resume, now, *code)
-            {
-                self.state.clear_embedded_session(ws_id);
+        // Resume-failure safety net, per FAILED tab id only (never the siblings).
+        for (ws_id, tab_id, was_resume, spawned, code) in &exited {
+            if resume_failed(*spawned, *was_resume, now, *code) {
+                self.state.remove_embedded_session(ws_id, tab_id);
                 let _ = self.state.save();
                 self.embed_error = Some((
                     ws_id.clone(),
@@ -516,18 +631,34 @@ impl App {
             }
         }
 
-        let mut dead: Vec<String> = exited.into_iter().map(|(k, _)| k).collect();
-        for k in self.embedded.keys() {
-            if !self.workspaces.iter().any(|w| &w.id == k) && !dead.contains(k) {
-                dead.push(k.clone());
+        let dead: HashSet<(String, String)> = exited
+            .into_iter()
+            .map(|(ws, tab, ..)| (ws, tab))
+            .collect();
+        let live_ws: HashSet<&String> = self.workspaces.iter().map(|w| &w.id).collect();
+        let mut remove_ws: Vec<String> = Vec::new();
+        for (ws_id, sessions) in self.embedded.iter_mut() {
+            if !live_ws.contains(ws_id) {
+                remove_ws.push(ws_id.clone()); // workspace was deleted
+                continue;
+            }
+            // Drop dead tabs, then rebase `active` to the same tab by identity (a
+            // saturating clamp would silently focus a different session).
+            let active_id = sessions.tabs.get(sessions.active).map(|t| t.id.clone());
+            sessions
+                .tabs
+                .retain(|t| !dead.contains(&(ws_id.clone(), t.id.clone())));
+            if sessions.tabs.is_empty() {
+                remove_ws.push(ws_id.clone());
+            } else {
+                sessions.active = active_id
+                    .and_then(|id| sessions.tabs.iter().position(|t| t.id == id))
+                    .unwrap_or_else(|| sessions.active.min(sessions.tabs.len() - 1));
             }
         }
-        for k in &dead {
-            self.embedded.remove(k);
+        for ws_id in &remove_ws {
+            self.embedded.remove(ws_id);
         }
-        // Prune spawn bookkeeping for every pane that's no longer live — covers
-        // both the reaped panes above and panes closed elsewhere (x / Stop).
-        self.pane_spawn.retain(|k, _| self.embedded.contains_key(k));
         if self.focus == Focus::Embedded {
             let gone = self
                 .selected_workspace()
@@ -539,21 +670,21 @@ impl App {
         }
     }
 
-    /// Refresh `waiting_response` (the tree activity-spinner set) from per-pane
-    /// output deltas. Called every tick.
+    /// Refresh `waiting_response` (the activity-spinner set) from per-session
+    /// output deltas across all tabs of all workspaces. Called every tick.
     fn update_pane_activity(&mut self, now: Instant) {
         let seqs: Vec<(String, u64)> = self
             .embedded
-            .iter()
-            .map(|(id, p)| (id.clone(), p.output_seq()))
+            .values()
+            .flat_map(|s| s.tabs.iter().map(|t| (t.id.clone(), t.pane.output_seq())))
             .collect();
         self.apply_pane_activity(now, &seqs);
     }
 
     /// Core of [`Self::update_pane_activity`], split out for testing: given the
-    /// observed `(workspace_id, output_seq)` for the live panes, arm a pane as
+    /// observed `(session_id, output_seq)` for the live panes, arm a session as
     /// active only after two consecutive ticks of new output (debounce), let it
-    /// decay after `ACTIVE_WINDOW`, and prune panes no longer present.
+    /// decay after `ACTIVE_WINDOW`, and prune sessions no longer present.
     fn apply_pane_activity(&mut self, now: Instant, seqs: &[(String, u64)]) {
         const ACTIVE_WINDOW: Duration = Duration::from_millis(500);
         for (id, seq) in seqs {
@@ -1075,8 +1206,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         // bracketed paste (claude enables bracketed paste, so a
                         // multi-line paste stays one block).
                         if app.focus == Focus::Embedded {
-                            let ws_id = app.selected_workspace().map(|w| w.id.clone());
-                            let sent = ws_id.and_then(|id| app.embedded.get_mut(&id)).map(|pane| {
+                            let sent = app.active_pane_mut().map(|pane| {
                                 let mut bytes = b"\x1b[200~".to_vec();
                                 bytes.extend_from_slice(text.as_bytes());
                                 bytes.extend_from_slice(b"\x1b[201~");
@@ -1490,17 +1620,15 @@ mod key_tests {
     }
 
     #[test]
-    fn claude_session_args_assigns_then_resumes() {
-        let mut state = AppState::default();
-        // No stored session id: a fresh --session-id is assigned and returned.
-        let (args, new) = claude_session_args(&state, "w1");
+    fn claude_args_assigns_or_resumes() {
+        // No resume id: a fresh --session-id is assigned and returned to persist.
+        let (args, new) = claude_args(None);
         assert_eq!(args[0], "--session-id");
         assert_eq!(new.as_deref(), Some(args[1].as_str()));
 
-        // Once persisted, reopening resumes that exact id (no new id to store).
-        state.set_embedded_session("w1", &args[1]);
-        let (args2, new2) = claude_session_args(&state, "w1");
-        assert_eq!(args2, vec!["--resume".to_string(), args[1].clone()]);
+        // With a resume id: resume that exact id (no new id to store).
+        let (args2, new2) = claude_args(Some("sess-1"));
+        assert_eq!(args2, vec!["--resume".to_string(), "sess-1".to_string()]);
         assert!(new2.is_none());
     }
 

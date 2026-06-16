@@ -81,13 +81,20 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         Some(TreeNode::Repo { name, .. }) => name.clone(),
         _ => "—".to_string(),
     };
-    let live = app.embedded.len();
-    // Count only active panes that still exist (waiting_response is rebuilt each
-    // tick, but a removal earlier this frame can briefly leave a stale id).
+    // Count session tabs across all workspaces (not workspaces).
+    let live: usize = app.embedded.values().map(|s| s.tabs.len()).sum();
+    // Active = sessions producing output; filter to live tab ids (waiting_response
+    // is rebuilt each tick, but a removal earlier this frame can briefly leave a
+    // stale id).
+    let live_ids: std::collections::HashSet<&str> = app
+        .embedded
+        .values()
+        .flat_map(|s| s.tabs.iter().map(|t| t.id.as_str()))
+        .collect();
     let active = app
         .waiting_response
         .iter()
-        .filter(|id| app.embedded.contains_key(*id))
+        .filter(|id| live_ids.contains(id.as_str()))
         .count();
     let live_label = if live == 0 {
         "no live sessions".to_string()
@@ -223,7 +230,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
                         // Build icon cluster from session state
                         let session = app.state.find_session_by_workspace(&ws.id);
-                        let is_thinking = app.waiting_response.contains(&ws.id);
+                        let is_thinking = app.ws_has_active_session(&ws.id);
                         let is_expanded_narrow = app.expanded_icon_rows.contains(&ws.id);
                         let icons = workspace_icon_cluster(
                             session,
@@ -411,7 +418,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .border_style(Style::default().fg(border));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        if let Some(p) = app.embedded.get_mut(ws_id) {
+        if let Some(p) = app
+            .embedded
+            .get_mut(ws_id)
+            .and_then(|s| s.active_pane_mut())
+        {
             let _ = p.resize(inner.height, inner.width);
             p.blit(frame.buffer_mut(), inner);
         }
