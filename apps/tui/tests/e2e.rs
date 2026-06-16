@@ -350,3 +350,54 @@ fn enter_opens_embedded_claude_by_default() {
     tui.send("q"); // quit
     tui.wait_exit();
 }
+
+#[test]
+fn first_open_assigns_a_session_id() {
+    // Opening a workspace with no stored session spawns `claude --session-id <uuid>`.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("\r");
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("--session-id"); // a fresh id was assigned for this session
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn reopen_resumes_stored_session() {
+    // A workspace with a stored session id is reopened with `claude --resume <id>`.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": { "w1": "11111111-1111-1111-1111-111111111111" }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("\r");
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("--resume"); // resumed, not freshly created
+    tui.wait_for("11111111"); // the stored session id
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
