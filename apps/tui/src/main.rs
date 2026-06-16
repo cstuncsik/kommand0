@@ -39,9 +39,12 @@ pub(crate) enum Status {
 /// `--resume <id>`, which `claude` rejects ("No conversation found") and exits
 /// non-zero — caught by [`resume_failed`], which forgets the id so the next open
 /// starts fresh. So the worst case self-heals in one reopen.
-/// Height of the session tab strip at the top of the right pane. 0 until the tab
-/// bar is rendered (kept here so the geometry helpers stay in sync).
-const TAB_BAR_HEIGHT: u16 = 0;
+/// Height of the session tab strip at the top of the right pane.
+const TAB_BAR_HEIGHT: u16 = 1;
+
+/// Maximum session tabs per workspace (keeps single-digit `1`–`9` shortcuts and
+/// single-column tab labels).
+pub(crate) const MAX_SESSION_TABS: usize = 9;
 
 fn claude_args(resume_id: Option<&str>) -> (Vec<String>, Option<String>) {
     match resume_id {
@@ -75,9 +78,7 @@ pub(crate) enum Focus {
 /// source of truth for the pane geometry (spawn size, blit, mouse translation).
 fn pane_content_rect(right_pane_area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let inner = right_pane_area.inner(ratatui::layout::Margin::new(1, 1));
-    // TAB_BAR_HEIGHT is 0 until the tab bar is rendered; the clamp keeps the math
-    // correct once it becomes 1 (and a tiny pane can't reserve more than it has).
-    #[allow(clippy::unnecessary_min_or_max)]
+    // A tiny pane can't reserve more rows for the tab strip than it has.
     let tab_h = TAB_BAR_HEIGHT.min(inner.height);
     ratatui::layout::Rect {
         x: inner.x,
@@ -159,7 +160,6 @@ impl WorkspaceSessions {
             self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
         }
     }
-    #[allow(dead_code)]
     fn select(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.active = idx;
@@ -559,8 +559,8 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Select a workspace by id (if present in the tree) and open its sessions.
-    fn embed_workspace_by_id(&mut self, ws_id: &str) {
+    /// Move the tree selection to a workspace row (if present).
+    fn select_workspace_row(&mut self, ws_id: &str) {
         if let Some(i) = self
             .tree_items
             .iter()
@@ -568,7 +568,38 @@ impl App {
         {
             self.selected_index = i;
         }
+    }
+
+    /// Select a workspace by id (if present in the tree) and open its sessions.
+    fn embed_workspace_by_id(&mut self, ws_id: &str) {
+        self.select_workspace_row(ws_id);
         self.toggle_embedded();
+    }
+
+    /// Select session tab `index` of a workspace and focus the embedded pane.
+    fn select_session_tab(&mut self, ws_id: &str, index: usize) {
+        self.select_workspace_row(ws_id);
+        if let Some(sessions) = self.embedded.get_mut(ws_id) {
+            sessions.select(index);
+            self.focus = Focus::Embedded;
+            self.embedded_prefix = false;
+        }
+    }
+
+    /// Open an additional session tab for a workspace (up to the cap) and focus it.
+    fn new_session(&mut self, ws_id: &str) {
+        self.select_workspace_row(ws_id);
+        let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
+        if count >= MAX_SESSION_TABS {
+            return;
+        }
+        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
+            return;
+        };
+        if self.spawn_session_tab(ws_id, &ws.working_dir, &ws.name, None) {
+            self.focus = Focus::Embedded;
+            self.embedded_prefix = false;
+        }
     }
 
     /// Forward a key to the active session of the selected workspace.
@@ -1246,6 +1277,13 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         | buttons::HitAction::RetrySessionFor { workspace_id } => {
                             app.embed_workspace_by_id(&workspace_id);
                         }
+                        // Session tab strip: select a tab, or open a new one.
+                        buttons::HitAction::SelectSessionTab { workspace_id, index } => {
+                            app.select_session_tab(&workspace_id, index);
+                        }
+                        buttons::HitAction::NewSessionTab { workspace_id } => {
+                            app.new_session(&workspace_id);
+                        }
                         buttons::HitAction::StopSessionFor { workspace_id } => {
                             app.embedded.remove(&workspace_id);
                             if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
@@ -1377,18 +1415,18 @@ mod key_tests {
     }
 
     #[test]
-    fn translate_mouse_maps_inner_and_rejects_outside() {
-        // Right pane at x=30,w=70 -> inner (border-excluded) x=31,y=1,w=68,h=28.
+    fn translate_mouse_maps_content_and_rejects_strip_and_border() {
+        // Right pane x=30,w=70 -> inner x=31,y=1; the active pane content starts
+        // below the 1-row tab strip, at (31, 2).
         let area = ratatui::layout::Rect::new(30, 0, 70, 30);
-        // Top-left inner cell maps to (0, 0).
-        assert_eq!(translate_mouse(area, 31, 1), Some((0, 0)));
-        // A cell inside maps relative to the inner origin.
-        assert_eq!(translate_mouse(area, 59, 11), Some((28, 10)));
-        // The border column/row and the tree pane are rejected.
+        assert_eq!(translate_mouse(area, 31, 2), Some((0, 0))); // top-left content cell
+        assert_eq!(translate_mouse(area, 59, 11), Some((28, 9)));
+        // Rejected: borders, the tab strip row, and the tree pane.
         assert_eq!(translate_mouse(area, 30, 5), None); // left border
         assert_eq!(translate_mouse(area, 50, 0), None); // top border
+        assert_eq!(translate_mouse(area, 50, 1), None); // tab strip row
         assert_eq!(translate_mouse(area, 10, 5), None); // tree pane
-        assert_eq!(translate_mouse(area, 99, 5), None); // right border (x+w-1)
+        assert_eq!(translate_mouse(area, 99, 5), None); // right border
         assert_eq!(translate_mouse(area, 50, 29), None); // bottom border
     }
 
