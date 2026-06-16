@@ -46,16 +46,21 @@ where
         One(String),
         Many(Vec<String>),
     }
-    let opt: Option<HashMap<String, OneOrMany>> = Option::deserialize(deserializer)?;
+    let opt: Option<HashMap<String, Option<OneOrMany>>> = Option::deserialize(deserializer)?;
     Ok(opt
         .unwrap_or_default()
         .into_iter()
-        .map(|(ws, v)| {
+        .filter_map(|(ws, v)| {
             let ids = match v {
-                OneOrMany::One(id) => vec![id],
-                OneOrMany::Many(ids) => ids,
+                Some(OneOrMany::One(id)) => vec![id],
+                Some(OneOrMany::Many(ids)) => ids,
+                None => return None, // tolerate a per-entry null
             };
-            (ws, ids)
+            if ids.is_empty() {
+                None
+            } else {
+                Some((ws, ids))
+            }
         })
         .collect())
 }
@@ -736,6 +741,22 @@ mod tests {
         .unwrap();
         let loaded = AppState::load_from(tmp.path()).unwrap();
         assert!(loaded.embedded_sessions.is_empty());
+    }
+
+    #[test]
+    fn embedded_sessions_tolerates_per_entry_null_and_empty() {
+        // A null or empty value for a single workspace must not abort the whole
+        // load (it just contributes no sessions).
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("state.json"),
+            r#"{"repos":[],"workspaces":[],"sessions":[],"embedded_sessions":{"w1":null,"w2":[],"w3":["keep"]}}"#,
+        )
+        .unwrap();
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert_eq!(loaded.embedded_session_ids("w1"), &[] as &[String]);
+        assert_eq!(loaded.embedded_session_ids("w2"), &[] as &[String]);
+        assert_eq!(loaded.embedded_session_ids("w3"), &["keep".to_string()]);
     }
 
     #[test]

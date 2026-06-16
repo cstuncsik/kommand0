@@ -454,11 +454,15 @@ impl App {
         let ws_name = ws.name.clone();
         let ws_dir = ws.working_dir.clone();
         if !self.embedded.contains_key(&ws_id) {
+            // Cleared up front; spawn_session_tab re-sets it on any failure, so a
+            // partial-resume failure's message survives (a later clear would
+            // swallow it).
+            self.embed_error = None;
             let persisted: Vec<String> = self.state.embedded_session_ids(&ws_id).to_vec();
             if persisted.is_empty() {
                 self.spawn_session_tab(&ws_id, &ws_dir, &ws_name, None);
             } else {
-                for id in &persisted {
+                for id in persisted.iter().take(MAX_SESSION_TABS) {
                     self.spawn_session_tab(&ws_id, &ws_dir, &ws_name, Some(id));
                 }
             }
@@ -467,7 +471,6 @@ impl App {
                 return;
             };
             sessions.active = 0; // focus the first tab on open
-            self.embed_error = None;
         } else {
             self.embed_error = None;
         }
@@ -534,6 +537,14 @@ impl App {
                 true
             }
             Err(e) => {
+                // A resume that couldn't even spawn: forget the id so the
+                // persisted Vec stays aligned with the runtime tabs (otherwise a
+                // failed middle id leaves the tab numbering pointing at the wrong
+                // session).
+                if let Some(id) = resume_id {
+                    self.state.remove_embedded_session(ws_id, id);
+                    let _ = self.state.save();
+                }
                 self.embed_error =
                     Some((ws_id.to_string(), format!("Failed to start claude in {ws_name}: {e}")));
                 false
@@ -619,6 +630,10 @@ impl App {
         self.select_workspace_row(ws_id);
         let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
         if count >= MAX_SESSION_TABS {
+            self.embed_error = Some((
+                ws_id.to_string(),
+                format!("Maximum {MAX_SESSION_TABS} session tabs reached."),
+            ));
             return;
         }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
@@ -841,7 +856,11 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 KeyCode::Char('q') => {
                     return Ok(KeyOutcome::Quit);
                 }
-                KeyCode::Char('t') | KeyCode::Tab | KeyCode::Esc => {
+                KeyCode::Char('t') if !ctrl => {
+                    app.focus = Focus::Tree;
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Tab | KeyCode::Esc => {
                     app.focus = Focus::Tree;
                     return Ok(KeyOutcome::Continue);
                 }
@@ -1412,7 +1431,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                 }
                                 if app.state.delete_workspace(&ws.name).is_ok() {
                                     app.embedded.remove(&workspace_id);
-                                    app.waiting_response.remove(&workspace_id);
                                     app.expanded_icon_rows.remove(&workspace_id);
                                     app.repos = app.state.repos.clone();
                                     app.workspaces = app.state.workspaces.clone();
@@ -1439,7 +1457,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                         let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                     }
                                     app.embedded.remove(ws_id);
-                                    app.waiting_response.remove(ws_id);
                                     app.expanded_icon_rows.remove(ws_id);
                                 }
                                 if app.state.delete_repo(&repo_name).is_ok() {
@@ -1854,6 +1871,32 @@ mod key_tests {
         let s = &app.embedded["w1"];
         assert_eq!(ids(s), vec!["b", "c"], "exited tab a dropped");
         assert_eq!(s.tabs[s.active].id, "c", "active stays on c by identity");
+    }
+
+    #[tokio::test]
+    async fn embed_error_banner_renders_over_a_live_pane() {
+        // The detail-pane error surface is unreachable while embedded; the error
+        // must show in the embedded view (here, the bottom border banner).
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        // tree: [Repo alpha, Workspace ws-one (w1), Repo beta]; select w1.
+        app.selected_index = 1;
+        let s = WorkspaceSessions {
+            tabs: vec![tab("a", &["-c", "sleep 30"])],
+            active: 0,
+        };
+        app.embedded.insert("w1".to_string(), s);
+        app.focus = Focus::Embedded;
+        app.embed_error = Some(("w1".to_string(), "BOOM-ERR".to_string()));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("BOOM-ERR"),
+            "error banner should render over the embedded pane:\n{text}"
+        );
     }
 
     #[test]
