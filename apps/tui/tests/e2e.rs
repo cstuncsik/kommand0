@@ -251,7 +251,7 @@ fn embedded_pane_renders_real_terminal_and_forwards_keys() {
 
     // The embedded child's own terminal output is composited into the pane.
     tui.wait_for("EMBED-STUB-READY");
-    tui.wait_for("Ctrl+A then"); // the pane border title
+    tui.wait_for("Ctrl+A:"); // the pane border title
 
     // Keys go to the embedded child, which echoes them.
     tui.send("hi");
@@ -307,10 +307,11 @@ fn mouse_click_is_forwarded_to_embedded_pane() {
     tui.wait_for("EMBED-STUB-READY");
 
     // SGR left-click at absolute 60;12. With the 100x30 / 30-70 split the right
-    // pane's inner origin is (31,1), so the forwarded report is pane-relative:
-    // 0-based (59,11) -> inner (28,10) -> 1-based wire 29;11.
+    // pane's inner origin is (31,1); the active pane content starts below the
+    // 1-row tab strip at (31,2), so the forwarded report is pane-relative:
+    // 0-based (59,11) -> content (28,9) -> 1-based wire 29;10.
     tui.send("\x1b[<0;60;12M");
-    tui.wait_for("[<0;29;11"); // exact translated coords reached the stub
+    tui.wait_for("[<0;29;10"); // exact translated coords reached the stub
 
     tui.send("\x1d"); // Ctrl+] leaves
     tui.send("q");
@@ -370,7 +371,10 @@ fn enter_opens_embedded_claude_by_default() {
     tui.send("j");
     tui.send("\r"); // Enter opens the embedded claude (not the old stream view)
     tui.wait_for("EMBED-STUB-READY");
-    tui.wait_for("Ctrl+A then"); // embedded pane border
+    tui.wait_for("Ctrl+A:"); // embedded pane border
+    // The session tab strip shows the first tab and the new-tab affordance.
+    tui.wait_for("1");
+    tui.wait_for("+");
 
     tui.send("\x01"); // Ctrl+A
     tui.send("q"); // quit
