@@ -281,10 +281,36 @@ fn embedded_pane_not_stranded_by_mouse_click() {
     tui.send("\x1b[<0;60;12M");
     tui.send("\x1b[<0;60;12m");
 
-    // If focus were stranded to Output, these keys would drive the scrollback
-    // cursor and never reach the child; the stub only echoes what it receives.
+    // A click must not knock focus off the embedded pane: typed keys still reach
+    // the child (the stub only echoes what it actually receives).
     tui.send("MARKER");
     tui.wait_for("MARKER");
+
+    tui.send("\x1d"); // Ctrl+] leaves
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn mouse_click_is_forwarded_to_embedded_pane() {
+    // When claude (the stub) has enabled mouse reporting, a click inside the pane
+    // is re-encoded into the pane's coordinate space and forwarded to the child.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+
+    // SGR left-click at absolute 60;12. With the 100x30 / 30-70 split the right
+    // pane's inner origin is (31,1), so the forwarded report is pane-relative:
+    // 0-based (59,11) -> inner (28,10) -> 1-based wire 29;11.
+    tui.send("\x1b[<0;60;12M");
+    tui.wait_for("[<0;29;11"); // exact translated coords reached the stub
 
     tui.send("\x1d"); // Ctrl+] leaves
     tui.send("q");

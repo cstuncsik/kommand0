@@ -17,9 +17,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// A child process running in a pseudo-terminal, with its screen emulated.
 ///
@@ -161,6 +162,35 @@ impl Pane {
                 Ok(true)
             }
             None => Ok(false),
+        }
+    }
+
+    /// Forward a mouse event to the child, but only if it has enabled mouse
+    /// reporting (and a mode that wants this event). `col`/`row` are 0-based cells
+    /// within the child's screen. Returns whether anything was sent.
+    pub fn send_mouse(
+        &mut self,
+        kind: MouseEventKind,
+        mods: KeyModifiers,
+        col: u16,
+        row: u16,
+    ) -> bool {
+        let (mode, encoding) = {
+            let Ok(parser) = self.parser.lock() else {
+                return false;
+            };
+            let screen = parser.screen();
+            (
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            )
+        };
+        match encode_mouse(mode, encoding, kind, mods, col, row) {
+            Some(bytes) => {
+                let _ = self.send(&bytes);
+                true
+            }
+            None => false,
         }
     }
 
@@ -325,6 +355,95 @@ fn map_color(c: vt100::Color) -> Color {
     }
 }
 
+fn mouse_button_code(button: MouseButton) -> u32 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+/// Encode a crossterm mouse event into the bytes a terminal would send to a
+/// child that has enabled mouse reporting, honoring the negotiated `mode` and
+/// `encoding`. `col`/`row` are 0-based cells within the child's screen.
+///
+/// Returns `None` when the child wants no mouse input, or this specific event
+/// isn't reported by the active mode (e.g. drag under press-only mode).
+pub fn encode_mouse(
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+    kind: MouseEventKind,
+    mods: KeyModifiers,
+    col: u16,
+    row: u16,
+) -> Option<Vec<u8>> {
+    if mode == MouseProtocolMode::None {
+        return None;
+    }
+    // (base button code, is_release)
+    let (mut cb, release): (u32, bool) = match kind {
+        MouseEventKind::Down(b) => (mouse_button_code(b), false),
+        MouseEventKind::Up(b) => {
+            if mode == MouseProtocolMode::Press {
+                return None; // X10 reports presses only
+            }
+            (mouse_button_code(b), true)
+        }
+        MouseEventKind::Drag(b) => {
+            if !matches!(
+                mode,
+                MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+            ) {
+                return None;
+            }
+            (mouse_button_code(b) | 32, false) // + motion bit
+        }
+        MouseEventKind::Moved => {
+            if mode != MouseProtocolMode::AnyMotion {
+                return None;
+            }
+            (3 | 32, false) // no button held + motion bit
+        }
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+    };
+    if mods.contains(KeyModifiers::SHIFT) {
+        cb |= 4;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        cb |= 8;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        cb |= 16;
+    }
+    let x = col as u32 + 1; // mouse coords are 1-based
+    let y = row as u32 + 1;
+    match encoding {
+        MouseProtocolEncoding::Sgr => {
+            let final_byte = if release { b'm' } else { b'M' };
+            let mut out = format!("\x1b[<{cb};{x};{y}").into_bytes();
+            out.push(final_byte);
+            Some(out)
+        }
+        // X10 "normal" encoding: ESC [ M  <cb+32> <x+32> <y+32>, with a release
+        // marked by button bits 0b11. Cells past index 222 can't be represented
+        // (the +32 byte would overflow), so drop rather than report a wrong cell.
+        MouseProtocolEncoding::Default => {
+            if x > 223 || y > 223 {
+                return None;
+            }
+            let enc_cb = if release { (cb & !0b11) | 0b11 } else { cb };
+            Some(vec![0x1b, b'[', b'M', (enc_cb + 32) as u8, (x + 32) as u8, (y + 32) as u8])
+        }
+        // ?1005 UTF-8 mouse encoding would multibyte-encode coords ≥ 95; claude
+        // never negotiates it (it uses SGR), so rather than emit the corrupt
+        // single-byte form, decline — the caller treats this as "nothing sent".
+        MouseProtocolEncoding::Utf8 => None,
+    }
+}
+
 /// Encode a crossterm key event into the bytes a terminal would send to the
 /// child. Legacy encoding: the probe (see MIGRATION.md) confirmed interactive
 /// `claude` honors these even when it negotiates the Kitty keyboard protocol, so
@@ -389,6 +508,163 @@ mod tests {
 
     fn tmp() -> std::path::PathBuf {
         std::env::temp_dir()
+    }
+
+    fn sgr(kind: MouseEventKind, mods: KeyModifiers, col: u16, row: u16) -> Option<String> {
+        encode_mouse(
+            MouseProtocolMode::ButtonMotion,
+            MouseProtocolEncoding::Sgr,
+            kind,
+            mods,
+            col,
+            row,
+        )
+        .map(|b| String::from_utf8(b).unwrap())
+    }
+
+    #[test]
+    fn encode_mouse_none_when_disabled() {
+        assert_eq!(
+            encode_mouse(
+                MouseProtocolMode::None,
+                MouseProtocolEncoding::Sgr,
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                0,
+                0,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn encode_mouse_sgr_press_release_and_coords() {
+        // Left press at the top-left cell -> button 0, 1-based coords.
+        assert_eq!(
+            sgr(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE, 0, 0).as_deref(),
+            Some("\x1b[<0;1;1M")
+        );
+        // Release uses the trailing 'm'.
+        assert_eq!(
+            sgr(MouseEventKind::Up(MouseButton::Left), KeyModifiers::NONE, 0, 0).as_deref(),
+            Some("\x1b[<0;1;1m")
+        );
+        // Right button at (col 5, row 3) -> button 2, coords 6;4.
+        assert_eq!(
+            sgr(MouseEventKind::Down(MouseButton::Right), KeyModifiers::NONE, 5, 3).as_deref(),
+            Some("\x1b[<2;6;4M")
+        );
+        // Ctrl modifier adds 16 to the button code.
+        assert_eq!(
+            sgr(MouseEventKind::Down(MouseButton::Left), KeyModifiers::CONTROL, 0, 0).as_deref(),
+            Some("\x1b[<16;1;1M")
+        );
+        // Scroll up is button 64.
+        assert_eq!(
+            sgr(MouseEventKind::ScrollUp, KeyModifiers::NONE, 0, 0).as_deref(),
+            Some("\x1b[<64;1;1M")
+        );
+    }
+
+    #[test]
+    fn encode_mouse_mode_gating() {
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let moved = MouseEventKind::Moved;
+        // Press-only (X10) reports no release and no motion.
+        assert_eq!(
+            encode_mouse(
+                MouseProtocolMode::Press,
+                MouseProtocolEncoding::Sgr,
+                MouseEventKind::Up(MouseButton::Left),
+                KeyModifiers::NONE,
+                0,
+                0
+            ),
+            None
+        );
+        // Drag needs ButtonMotion; Moved needs AnyMotion.
+        let pr = MouseProtocolMode::PressRelease;
+        assert_eq!(
+            encode_mouse(pr, MouseProtocolEncoding::Sgr, drag, KeyModifiers::NONE, 0, 0),
+            None
+        );
+        assert_eq!(
+            sgr(drag, KeyModifiers::NONE, 0, 0).as_deref(),
+            Some("\x1b[<32;1;1M") // button 0 + motion bit (32)
+        );
+        assert_eq!(
+            encode_mouse(
+                MouseProtocolMode::ButtonMotion,
+                MouseProtocolEncoding::Sgr,
+                moved,
+                KeyModifiers::NONE,
+                0,
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            encode_mouse(
+                MouseProtocolMode::AnyMotion,
+                MouseProtocolEncoding::Sgr,
+                moved,
+                KeyModifiers::NONE,
+                0,
+                0
+            )
+            .map(|b| String::from_utf8(b).unwrap())
+            .as_deref(),
+            Some("\x1b[<35;1;1M") // no button (3) + motion bit (32)
+        );
+    }
+
+    fn default_enc(kind: MouseEventKind, col: u16, row: u16) -> Option<Vec<u8>> {
+        encode_mouse(
+            MouseProtocolMode::PressRelease,
+            MouseProtocolEncoding::Default,
+            kind,
+            KeyModifiers::NONE,
+            col,
+            row,
+        )
+    }
+
+    #[test]
+    fn encode_mouse_default_encoding_bytes() {
+        // X10 normal encoding: ESC [ M  <cb+32> <x+32> <y+32>.
+        assert_eq!(
+            default_enc(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+        );
+        // Release sets the low two button bits to 0b11 -> cb 3 -> 3+32 = 35.
+        assert_eq!(
+            default_enc(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            Some(vec![0x1b, b'[', b'M', 35, 33, 33])
+        );
+        // Last representable cell (1-based 223 -> byte 255).
+        assert_eq!(
+            default_enc(MouseEventKind::Down(MouseButton::Left), 222, 0),
+            Some(vec![0x1b, b'[', b'M', 32, 255, 33])
+        );
+        // Beyond that, drop rather than report a wrong cell.
+        assert_eq!(default_enc(MouseEventKind::Down(MouseButton::Left), 223, 0), None);
+    }
+
+    #[test]
+    fn encode_mouse_utf8_encoding_declines() {
+        // ?1005 UTF-8 mouse mode is not supported (claude uses SGR) — never emit
+        // the corrupt single-byte form.
+        assert_eq!(
+            encode_mouse(
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Utf8,
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                100,
+                0,
+            ),
+            None
+        );
     }
 
     fn wait_until(pane: &Pane, needle: &str) -> bool {
