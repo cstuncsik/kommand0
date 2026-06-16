@@ -482,12 +482,22 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             Color::DarkGray
         };
-        let block = Block::default()
+        let mut block = Block::default()
             .title(format!(
                 " {ws_name} — claude · Ctrl+A: c new · [ ] switch · x close · t tree · q quit "
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border));
+        // Surface a spawn/resume/cap error for this workspace in the bottom
+        // border (the detail-pane error surface is unreachable while embedded).
+        if let Some((err_ws, msg)) = &app.embed_error
+            && err_ws == ws_id
+        {
+            block = block.title_bottom(Line::styled(
+                format!(" ⚠ {msg} "),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
         let inner = block.inner(area);
         frame.render_widget(block, area);
         // Session tab strip across the top row of the inner area.
