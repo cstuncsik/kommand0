@@ -147,14 +147,11 @@ impl WorkspaceSessions {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
     }
-    // The tab-navigation API below is wired up in the create/switch/close step.
-    #[allow(dead_code)]
     fn next(&mut self) {
         if !self.tabs.is_empty() {
             self.active = (self.active + 1) % self.tabs.len();
         }
     }
-    #[allow(dead_code)]
     fn prev(&mut self) {
         if !self.tabs.is_empty() {
             self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
@@ -167,7 +164,6 @@ impl WorkspaceSessions {
     }
     /// Remove the tab at `idx` (order-preserving), re-clamping `active`. Returns
     /// whether the workspace is now empty (the caller removes the entry).
-    #[allow(dead_code)]
     fn remove_tab(&mut self, idx: usize) -> bool {
         if idx >= self.tabs.len() {
             return self.tabs.is_empty();
@@ -586,6 +582,38 @@ impl App {
         }
     }
 
+    /// The selected workspace's session set, if it has live tabs.
+    fn selected_sessions_mut(&mut self) -> Option<&mut WorkspaceSessions> {
+        let ws_id = self.selected_workspace()?.id.clone();
+        self.embedded.get_mut(&ws_id)
+    }
+
+    /// Close the active session tab of the selected workspace: drop its pane,
+    /// forget its persisted id, and re-focus the previous tab (or the tree when
+    /// the last tab is gone).
+    fn close_active_session(&mut self) {
+        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
+            return;
+        };
+        let (tab_id, now_empty) = {
+            let Some(sessions) = self.embedded.get_mut(&ws_id) else {
+                return;
+            };
+            let active = sessions.active;
+            let Some(tab_id) = sessions.tabs.get(active).map(|t| t.id.clone()) else {
+                return;
+            };
+            (tab_id, sessions.remove_tab(active))
+        };
+        // Closing a tab forgets its session (it won't resume next time).
+        self.state.remove_embedded_session(&ws_id, &tab_id);
+        let _ = self.state.save();
+        if now_empty {
+            self.embedded.remove(&ws_id);
+            self.focus = Focus::Tree;
+        }
+    }
+
     /// Open an additional session tab for a workspace (up to the cap) and focus it.
     fn new_session(&mut self, ws_id: &str) {
         self.select_workspace_row(ws_id);
@@ -629,6 +657,41 @@ impl App {
         };
         if let Some(pane) = self.active_pane_mut() {
             pane.send_mouse(mouse.kind, mouse.modifiers, col, row);
+        }
+    }
+
+    /// Handle a mouse event while an embedded pane is focused: a left-click on a
+    /// session tab / `[+]` drives kommand0; everything else is forwarded to the
+    /// active session (translated to its coords).
+    fn handle_embedded_mouse(&mut self, mouse: MouseEvent) {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                // Keep mouse_pos current so tab hover styling works in Embedded mode.
+                self.mouse_pos = Some((mouse.column, mouse.row));
+                self.forward_mouse_to_embedded(mouse);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = Some((mouse.column, mouse.row));
+                let tab_action = self.hit_regions.iter().find_map(|r| {
+                    if buttons::is_hovered(pos, r.area)
+                        && matches!(
+                            r.action,
+                            buttons::HitAction::SelectSessionTab { .. }
+                                | buttons::HitAction::NewSessionTab { .. }
+                        )
+                    {
+                        Some(r.action.clone())
+                    } else {
+                        None
+                    }
+                });
+                match tab_action {
+                    Some(action) => self.pending_button_action = Some(action),
+                    None => self.forward_mouse_to_embedded(mouse),
+                }
+            }
+            _ => self.forward_mouse_to_embedded(mouse),
         }
     }
 
@@ -772,12 +835,43 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if app.embedded_prefix {
             app.embedded_prefix = false;
+            // The `!ctrl` guards keep `Ctrl+]` (decoded as Char(']') or Char('5')
+            // with CTRL) from being read as a tab command after the prefix.
             match key.code {
                 KeyCode::Char('q') => {
                     return Ok(KeyOutcome::Quit);
                 }
                 KeyCode::Char('t') | KeyCode::Tab | KeyCode::Esc => {
                     app.focus = Focus::Tree;
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('c') if !ctrl => {
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.new_session(&ws_id);
+                    }
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('x') if !ctrl => {
+                    app.close_active_session();
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('[') if !ctrl => {
+                    if let Some(s) = app.selected_sessions_mut() {
+                        s.prev();
+                    }
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char(']') if !ctrl => {
+                    if let Some(s) = app.selected_sessions_mut() {
+                        s.next();
+                    }
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char(c @ '1'..='9') if !ctrl => {
+                    let idx = (c as u8 - b'1') as usize;
+                    if let Some(s) = app.selected_sessions_mut() {
+                        s.select(idx);
+                    }
                     return Ok(KeyOutcome::Continue);
                 }
                 KeyCode::Char('a') if ctrl => {
@@ -1252,9 +1346,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         if app.show_help {
                             // Overlay owns the screen — ignore mouse.
                         } else if app.focus == Focus::Embedded {
-                            // The embedded pane owns the mouse: forward it to claude
-                            // (translated to its coords) when claude wants mouse input.
-                            app.forward_mouse_to_embedded(mouse_event);
+                            app.handle_embedded_mouse(mouse_event);
                         } else {
                             mouse::handle_mouse(&mut app, mouse_event);
                         }
