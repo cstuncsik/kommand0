@@ -48,6 +48,7 @@ cargo run -p kommand0-tui
 
 - **Two-pane layout**: Tree (repos/workspaces) on the left; the embedded Claude pane or workspace details on the right
 - **Embedded Claude**: opening a workspace launches a real interactive `claude` in a pseudo-terminal, composited into the right pane — full fidelity (its own input box, slash commands, `/model`, colours), not a reimplemented chat UI
+- **Session tabs**: a workspace can run several Claude sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click, open a new one with `Ctrl+A c` or the `[+]` tab (up to 9). Each tab persists its own session and resumes on reopen
 - **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items and scroll the tree; inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion
@@ -68,6 +69,10 @@ cargo run -p kommand0-tui
 | `w` | Tree | Add workspace to selected repo (modal) |
 | `d` / `D` | Tree | Delete / force-delete selected |
 | _typing_ | Embedded | Goes straight to the embedded Claude |
+| `Ctrl+A` then `c` | Embedded | New session tab |
+| `Ctrl+A` then `[` / `]` | Embedded | Previous / next tab |
+| `Ctrl+A` then `1`–`9` | Embedded | Jump to tab N |
+| `Ctrl+A` then `x` | Embedded | Close the active tab |
 | `Ctrl+A` then `t` | Embedded | Back to tree (also `Tab` / `Esc`) |
 | `Ctrl+A` then `q` | Embedded | Quit kommand0 |
 | `Ctrl+A` then `Ctrl+A` | Embedded | Send a literal `Ctrl+A` to Claude |

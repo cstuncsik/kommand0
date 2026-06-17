@@ -81,13 +81,20 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         Some(TreeNode::Repo { name, .. }) => name.clone(),
         _ => "—".to_string(),
     };
-    let live = app.embedded.len();
-    // Count only active panes that still exist (waiting_response is rebuilt each
-    // tick, but a removal earlier this frame can briefly leave a stale id).
+    // Count session tabs across all workspaces (not workspaces).
+    let live: usize = app.embedded.values().map(|s| s.tabs.len()).sum();
+    // Active = sessions producing output; filter to live tab ids (waiting_response
+    // is rebuilt each tick, but a removal earlier this frame can briefly leave a
+    // stale id).
+    let live_ids: std::collections::HashSet<&str> = app
+        .embedded
+        .values()
+        .flat_map(|s| s.tabs.iter().map(|t| t.id.as_str()))
+        .collect();
     let active = app
         .waiting_response
         .iter()
-        .filter(|id| app.embedded.contains_key(*id))
+        .filter(|id| live_ids.contains(id.as_str()))
         .count();
     let live_label = if live == 0 {
         "no live sessions".to_string()
@@ -223,7 +230,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
                         // Build icon cluster from session state
                         let session = app.state.find_session_by_workspace(&ws.id);
-                        let is_thinking = app.waiting_response.contains(&ws.id);
+                        let is_thinking = app.ws_has_active_session(&ws.id);
                         let is_expanded_narrow = app.expanded_icon_rows.contains(&ws.id);
                         let icons = workspace_icon_cluster(
                             session,
@@ -384,6 +391,78 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Render the session tab strip ("1 2 3 … +") for a workspace into `strip`,
+/// highlighting the active tab and animating a tab into a spinner while its
+/// session produces output. Registers click hit regions for each tab and `[+]`.
+fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, strip: Rect) {
+    if strip.height == 0 {
+        return;
+    }
+    // Snapshot what we need so we can mutate app.hit_regions afterward.
+    let snapshot: Vec<(usize, bool, bool)> = match app.embedded.get(ws_id) {
+        Some(s) => s
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, i == s.active, app.waiting_response.contains(&t.id)))
+            .collect(),
+        None => return,
+    };
+    let tab_count = snapshot.len();
+    let spinner = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut regions: Vec<(Rect, HitAction)> = Vec::new();
+    let mut x = strip.x;
+    let right = strip.x + strip.width;
+    for (i, is_active, producing) in &snapshot {
+        let glyph = if *producing {
+            spinner.to_string()
+        } else {
+            (i + 1).to_string()
+        };
+        let label = format!(" {glyph} ");
+        let w = label.chars().count() as u16;
+        let style = if *is_active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        if x + w <= right {
+            regions.push((
+                Rect::new(x, strip.y, w, 1),
+                HitAction::SelectSessionTab {
+                    workspace_id: ws_id.to_string(),
+                    index: *i,
+                },
+            ));
+        }
+        spans.push(Span::styled(label, style));
+        x += w;
+    }
+    // The [+] new-tab affordance, while under the cap and it fits.
+    if tab_count < super::MAX_SESSION_TABS && x + 3 <= right {
+        spans.push(Span::styled(
+            " + ".to_string(),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ));
+        regions.push((
+            Rect::new(x, strip.y, 3, 1),
+            HitAction::NewSessionTab {
+                workspace_id: ws_id.to_string(),
+            },
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), strip);
+    for (area, action) in regions {
+        app.hit_regions.push(buttons::HitRegion { area, action });
+    }
+}
+
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // Remember the right-pane geometry so a newly-toggled embedded pane spawns at
     // its final size (avoids a resize-after-spawn that loses claude's first screen).
@@ -403,17 +482,41 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             Color::DarkGray
         };
-        let block = Block::default()
+        let mut block = Block::default()
             .title(format!(
-                " {ws_name} — claude · Ctrl+A then: q quit · t tree "
+                " {ws_name} — claude · Ctrl+A: c new · [ ] switch · x close · t tree · q quit "
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border));
+        // Surface a spawn/resume/cap error for this workspace in the bottom
+        // border (the detail-pane error surface is unreachable while embedded).
+        if let Some((err_ws, msg)) = &app.embed_error
+            && err_ws == ws_id
+        {
+            block = block.title_bottom(Line::styled(
+                format!(" ⚠ {msg} "),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        if let Some(p) = app.embedded.get_mut(ws_id) {
-            let _ = p.resize(inner.height, inner.width);
-            p.blit(frame.buffer_mut(), inner);
+        // Session tab strip across the top row of the inner area.
+        let strip = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: super::TAB_BAR_HEIGHT.min(inner.height),
+        };
+        render_session_tabs(frame, app, ws_id, strip);
+        // The active session's pane fills the area below the tab strip.
+        let content = super::pane_content_rect(area);
+        if let Some(p) = app
+            .embedded
+            .get_mut(ws_id)
+            .and_then(|s| s.active_pane_mut())
+        {
+            let _ = p.resize(content.height, content.width);
+            p.blit(frame.buffer_mut(), content);
         }
         return;
     }

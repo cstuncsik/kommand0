@@ -19,6 +19,10 @@ pub(crate) enum HitAction {
     DeleteRepoFor { repo_name: String },
     AddWorkspaceFor { repo_id: String },
     AddRepo,
+    /// Select session tab `index` of a workspace (click on the tab strip).
+    SelectSessionTab { workspace_id: String, index: usize },
+    /// Open a new session tab for a workspace (click on the `[+]` tab).
+    NewSessionTab { workspace_id: String },
 }
 
 /// A clickable region tracked during rendering.
