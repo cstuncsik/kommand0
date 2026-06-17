@@ -96,6 +96,39 @@ impl Tui {
         self.parser.lock().unwrap().screen().contents()
     }
 
+    /// The text of screen row `y` (0-based).
+    fn row(&self, y: u16) -> String {
+        self.screen()
+            .lines()
+            .nth(y as usize)
+            .map(str::to_string)
+            .unwrap_or_default()
+    }
+
+    /// Wait until screen row `y` contains `needle`.
+    fn wait_for_row(&self, y: u16, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.row(y).contains(needle) {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "timed out waiting for {needle:?} in row {y}; screen:\n{}",
+                    self.screen()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Read the persisted state.json (after the app has written it).
+    fn read_state(&self) -> serde_json::Value {
+        let raw = std::fs::read_to_string(self._state_dir.path().join("state.json"))
+            .unwrap_or_else(|_| "{}".to_string());
+        serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null)
+    }
+
     fn send(&mut self, bytes: &str) {
         self.writer.write_all(bytes.as_bytes()).unwrap();
         self.writer.flush().unwrap();
@@ -251,7 +284,7 @@ fn embedded_pane_renders_real_terminal_and_forwards_keys() {
 
     // The embedded child's own terminal output is composited into the pane.
     tui.wait_for("EMBED-STUB-READY");
-    tui.wait_for("Ctrl+A then"); // the pane border title
+    tui.wait_for("Ctrl+A:"); // the pane border title
 
     // Keys go to the embedded child, which echoes them.
     tui.send("hi");
@@ -307,10 +340,11 @@ fn mouse_click_is_forwarded_to_embedded_pane() {
     tui.wait_for("EMBED-STUB-READY");
 
     // SGR left-click at absolute 60;12. With the 100x30 / 30-70 split the right
-    // pane's inner origin is (31,1), so the forwarded report is pane-relative:
-    // 0-based (59,11) -> inner (28,10) -> 1-based wire 29;11.
+    // pane's inner origin is (31,1); the active pane content starts below the
+    // 1-row tab strip at (31,2), so the forwarded report is pane-relative:
+    // 0-based (59,11) -> content (28,9) -> 1-based wire 29;10.
     tui.send("\x1b[<0;60;12M");
-    tui.wait_for("[<0;29;11"); // exact translated coords reached the stub
+    tui.wait_for("[<0;29;10"); // exact translated coords reached the stub
 
     tui.send("\x1d"); // Ctrl+] leaves
     tui.send("q");
@@ -370,10 +404,151 @@ fn enter_opens_embedded_claude_by_default() {
     tui.send("j");
     tui.send("\r"); // Enter opens the embedded claude (not the old stream view)
     tui.wait_for("EMBED-STUB-READY");
-    tui.wait_for("Ctrl+A then"); // embedded pane border
+    tui.wait_for("Ctrl+A:"); // embedded pane border
+    // The session tab strip (top inner row) shows the first tab and the [+].
+    tui.wait_for_row(1, " 1 ");
+    tui.wait_for_row(1, "+");
 
     tui.send("\x01"); // Ctrl+A
     tui.send("q"); // quit
+    tui.wait_exit();
+}
+
+#[test]
+fn reopen_resumes_all_persisted_sessions_as_tabs() {
+    // A workspace with two stored session ids reopens as two tabs, each resumed
+    // in order, with the first tab active.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": [
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222"
+            ]
+        }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("2 live"); // both stored sessions resumed as tabs
+    tui.wait_for("--resume"); // resumed, not freshly created
+    tui.wait_for("11111111"); // the first tab is active and shows the first id
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn failed_resume_shows_error_and_forgets_the_id() {
+    // A stored session whose binary can't start: the error is shown and the id is
+    // forgotten so it doesn't desync / keep failing.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": { "w1": ["dead-session-id"] }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[("KOMMAND0_CLAUDE_BIN", "/nonexistent/kommand0-claude")],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open -> the only persisted session fails to spawn
+    tui.wait_for("Failed to start claude");
+
+    tui.send("q");
+    tui.wait_exit();
+    // The unspawnable id was forgotten, keeping persistence coherent.
+    let st = tui.read_state();
+    assert!(
+        st["embedded_sessions"]
+            .get("w1")
+            .map(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(true))
+            .unwrap_or(true),
+        "the failed resume id should be forgotten: {st}"
+    );
+}
+
+#[test]
+fn closing_the_last_tab_returns_to_tree_and_reopens_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open -> tab 1 (a fresh --session-id)
+    tui.wait_for("1 live");
+
+    // Ctrl+A x on the only tab returns to the tree.
+    tui.send("\x01");
+    tui.send("x");
+    tui.wait_for("no live sessions");
+    tui.wait_for("Press Enter to open Claude"); // detail view, back on the tree
+
+    // Reopening starts a fresh session (the closed id was forgotten).
+    tui.send("\r");
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("--session-id");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn ctrl_a_c_adds_a_session_tab_and_x_closes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open -> tab 1
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("1 live"); // status bar counts session tabs
+
+    // Ctrl+A then c opens a second session tab.
+    tui.send("\x01");
+    tui.send("c");
+    tui.wait_for("2 live");
+    tui.wait_for_row(1, " 2 "); // second tab shows in the strip
+
+    // Ctrl+A then x closes the active tab, back to one.
+    tui.send("\x01");
+    tui.send("x");
+    tui.wait_for("1 live");
+
+    tui.send("\x01");
+    tui.send("q");
     tui.wait_exit();
 }
 

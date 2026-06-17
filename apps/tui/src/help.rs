@@ -73,6 +73,22 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
         description: "Goes to the embedded claude",
     },
     KeyBinding {
+        keys: "[Ctrl+A] then [c]",
+        description: "New session tab",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [ / ]",
+        description: "Previous / next tab",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [1]-[9]",
+        description: "Jump to tab N",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [x]",
+        description: "Close the active tab",
+    },
+    KeyBinding {
         keys: "[Ctrl+A] then [t]",
         description: "Back to tree (also Tab/Esc)",
     },
