@@ -523,6 +523,50 @@ fn closing_the_last_tab_returns_to_tree_and_reopens_fresh() {
 }
 
 #[test]
+fn stale_resume_detected_from_output_and_id_forgotten() {
+    // The real bug: `claude --resume <gone-id>` prints "No conversation found"
+    // and STAYS ALIVE, so the exit-code net never fires and the dead id is never
+    // cleared (reopen keeps re-resuming the gone session). kommand0 must detect
+    // the miss from the pane output, drop the stuck pane, and forget the id.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": { "w1": ["gone-session-id"] }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[("KOMMAND0_CLAUDE_BIN", "embed-stub-resume-miss")],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open -> resume the gone session (stub stays alive on the error)
+    tui.wait_for("Couldn't resume"); // detected from output, pane dropped, message shown
+
+    tui.send("q");
+    tui.wait_exit();
+    // The gone id is forgotten so a future open starts fresh (no re-resume loop).
+    let st = tui.read_state();
+    assert!(
+        st["embedded_sessions"]
+            .get("w1")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "the stale resume id should be forgotten: {st}"
+    );
+}
+
+#[test]
 fn ctrl_a_c_adds_a_session_tab_and_x_closes_it() {
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());
