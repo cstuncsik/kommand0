@@ -1,0 +1,25 @@
+apps/tui/tests/fixtures/embed-stub-resume-miss
+  s_fc3d7618d36de0::t_a8ca67c1579218 1-8
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_a6eef109c67e7a 526-568
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_9dfeefe34e520c 49-62
+  s_fc3d7618d36de0::t_a2b6f027a864f3 746-752
+  s_fc3d7618d36de0::t_a827989e3b9b6c 732-736,738,743-745,757-771,777
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "52bd1085297f0330c44a9da6ca8c275544bb6b79",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
