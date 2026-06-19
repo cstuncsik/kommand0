@@ -138,13 +138,17 @@ fn open_pull_request_with(worktree_path: &str, branch: &str, gh_bin: &str) -> Re
     // takes title/body from the commits, and the base is left to gh's
     // default-branch detection.
     match run_gh(gh_bin, worktree_path, &["pr", "create", "--fill", "--head", branch]) {
-        Ok(out) if out.status.success() => Ok(last_line(&out.stdout)),
+        Ok(out) if out.status.success() && !last_line(&out.stdout).is_empty() => {
+            Ok(last_line(&out.stdout))
+        }
         Ok(out) => {
-            // A PR may already exist — recover its URL so the action is idempotent.
+            // Either create failed (a PR may already exist) or it exited 0 without
+            // a URL on stdout — recover the existing PR's URL so the action is
+            // idempotent. `gh pr view` takes the branch as a positional arg.
             if let Ok(view) = run_gh(
                 gh_bin,
                 worktree_path,
-                &["pr", "view", "--head", branch, "--json", "url", "-q", ".url"],
+                &["pr", "view", branch, "--json", "url", "-q", ".url"],
             ) && view.status.success()
             {
                 let url = last_line(&view.stdout);
@@ -152,7 +156,15 @@ fn open_pull_request_with(worktree_path: &str, branch: &str, gh_bin: &str) -> Re
                     return Ok(url);
                 }
             }
-            Err(format!("gh: {}", last_line(&out.stderr)))
+            let msg = last_line(&out.stderr);
+            Err(format!(
+                "gh: {}",
+                if msg.is_empty() {
+                    "PR created but no URL was returned".to_string()
+                } else {
+                    msg
+                }
+            ))
         }
         Err(_) => Err("gh CLI not found — install GitHub CLI to open PRs".to_string()),
     }
@@ -305,9 +317,11 @@ mod tests {
         let work = repo_with_remote(tmp.path());
         let stub = tmp.path().join("gh");
         // `create` fails ("already exists"); `view` returns the existing URL.
+        // `gh pr view` takes the branch as a positional arg — reject the bogus
+        // `--head` flag so a regression to it would fail this test.
         write_stub(
             &stub,
-            "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = create ]; then\n  echo 'a pull request already exists' >&2\n  exit 1\nfi\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then\n  echo https://github.com/x/y/pull/2\n  exit 0\nfi\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = create ]; then\n  echo 'a pull request already exists' >&2\n  exit 1\nfi\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then\n  if [ \"$3\" = --head ]; then echo 'unknown flag: --head' >&2; exit 1; fi\n  echo https://github.com/x/y/pull/2\n  exit 0\nfi\nexit 1\n",
         );
         let url = open_pull_request_with(work.to_str().unwrap(), "feature", stub.to_str().unwrap());
         assert_eq!(url, Ok("https://github.com/x/y/pull/2".to_string()));
