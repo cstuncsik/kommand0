@@ -506,6 +506,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // its final size (avoids a resize-after-spawn that loses claude's first screen).
     app.right_pane_area = area;
 
+    // Keep every live pane (all tabs, all workspaces — not just the visible one)
+    // sized to the content area, so a terminal resize reaches background panes
+    // and switching to one is instant. No-op per pane when the size is unchanged.
+    app.resize_embedded_panes(super::pane_content_rect(area));
+
     // Embedded interactive claude (Phase 2): if the selected workspace has a live
     // pane, it owns the whole right area (claude renders its own input box).
     let sel_ws = match app.tree_items.get(app.selected_index) {
@@ -546,14 +551,14 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             height: super::TAB_BAR_HEIGHT.min(inner.height),
         };
         render_session_tabs(frame, app, ws_id, strip);
-        // The active session's pane fills the area below the tab strip.
+        // The active session's pane fills the area below the tab strip. It was
+        // already sized to `content` by resize_embedded_panes above.
         let content = super::pane_content_rect(area);
         if let Some(p) = app
             .embedded
             .get_mut(ws_id)
             .and_then(|s| s.active_pane_mut())
         {
-            let _ = p.resize(content.height, content.width);
             p.blit(frame.buffer_mut(), content);
         }
         return;
