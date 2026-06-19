@@ -157,6 +157,9 @@ impl WorkspaceSessions {
     pub(crate) fn active_pane_mut(&mut self) -> Option<&mut pane::Pane> {
         self.tabs.get_mut(self.active).map(|t| &mut t.pane)
     }
+    pub(crate) fn active_tab(&self) -> Option<&SessionTab> {
+        self.tabs.get(self.active)
+    }
     fn push(&mut self, tab: SessionTab) {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -581,10 +584,20 @@ impl App {
     /// numbering are preserved). Returns `false` if the fresh spawn itself failed
     /// (the caller then drops the tab). `now` stamps the new tab.
     fn heal_resume(&mut self, ws_id: &str, gone_id: &str, ws_dir: &str, now: Instant) -> bool {
+        // Carry the user's tab title to the replacement (capture before the
+        // remove, which now also forgets the title). The tab's *purpose* is still
+        // meaningful even though its conversation is gone.
+        let prior_title = self
+            .state
+            .embedded_session_title(ws_id, gone_id)
+            .map(str::to_string);
         self.state.remove_embedded_session(ws_id, gone_id);
         match self.spawn_pane(ws_dir, None) {
             Ok((pane, new_id, was_resume)) => {
                 self.state.add_embedded_session(ws_id, &new_id);
+                if let Some(title) = &prior_title {
+                    self.state.set_embedded_session_title(ws_id, &new_id, title);
+                }
                 let _ = self.state.save();
                 if let Some(sessions) = self.embedded.get_mut(ws_id)
                     && let Some(slot) = sessions.tabs.iter().position(|t| t.id == gone_id)
@@ -680,6 +693,38 @@ impl App {
             self.embedded.remove(&ws_id);
             self.focus = Focus::Tree;
         }
+    }
+
+    /// Open the Rename Session modal for the selected workspace's active tab,
+    /// prefilled with its current title. Focus stays on the embedded pane (the
+    /// modal renders over it and intercepts keys via the `!modal.is_active()`
+    /// guards), so submitting/cancelling drops the user straight back in.
+    fn open_rename_active_session(&mut self) {
+        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
+            return;
+        };
+        let Some(session_id) = self
+            .embedded
+            .get(&ws_id)
+            .and_then(|s| s.active_tab())
+            .map(|t| t.id.clone())
+        else {
+            return;
+        };
+        let current = self
+            .state
+            .embedded_session_title(&ws_id, &session_id)
+            .unwrap_or("")
+            .to_string();
+        let cursor = current.len();
+        self.embedded_prefix = false;
+        self.modal = modal::ModalState::RenameSession {
+            ws_id,
+            session_id,
+            input: current,
+            cursor,
+            error: None,
+        };
     }
 
     /// Open an additional session tab for a workspace (up to the cap) and focus it.
@@ -933,7 +978,11 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     // (incl. Ctrl+C, Tab, q, slash commands). kommand0 commands are reached via a
     // tmux-style prefix (Ctrl+A) so there's always a reliable way out:
     //   Ctrl+A then  q = quit · t/Tab/Esc = back to tree · Ctrl+A = literal Ctrl+A
-    if app.focus == Focus::Embedded {
+    // A modal (e.g. Rename Session) opens over the embedded pane without leaving
+    // Embedded focus, so it must intercept keys before this block forwards them
+    // to claude. The modal block below (and the paste/mouse paths) is gated the
+    // same way.
+    if app.focus == Focus::Embedded && !app.modal.is_active() {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if app.embedded_prefix {
             app.embedded_prefix = false;
@@ -959,6 +1008,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 }
                 KeyCode::Char('x') if !ctrl => {
                     app.close_active_session();
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('r') if !ctrl => {
+                    app.open_rename_active_session();
                     return Ok(KeyOutcome::Continue);
                 }
                 KeyCode::Char('[') if !ctrl => {
@@ -1141,6 +1194,22 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             error: Some(e.to_string()),
                         };
                     }
+                }
+            }
+            modal::ModalResult::SubmitRename(ws_id, session_id, title) => {
+                // Only title a session that's still live — reap can heal/drop the
+                // tab (assigning a new id) while the modal is open, and a title
+                // must never outlive its session. Persist immediately (the quit
+                // path does not unconditionally save). Focus stays Embedded, so
+                // closing the modal drops the user straight back into the pane.
+                if app
+                    .state
+                    .embedded_session_ids(&ws_id)
+                    .iter()
+                    .any(|id| id == &session_id)
+                {
+                    app.state.set_embedded_session_title(&ws_id, &session_id, &title);
+                    let _ = app.state.save();
                 }
             }
         }
@@ -1435,8 +1504,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                     Some(Ok(Event::Paste(text))) => {
                         // Only the embedded pane consumes paste; forward it as a
                         // bracketed paste (claude enables bracketed paste, so a
-                        // multi-line paste stays one block).
-                        if app.focus == Focus::Embedded {
+                        // multi-line paste stays one block). A modal over the pane
+                        // (e.g. Rename Session) suppresses the passthrough.
+                        if app.focus == Focus::Embedded && !app.modal.is_active() {
                             let sent = app.active_pane_mut().map(|pane| {
                                 let mut bytes = b"\x1b[200~".to_vec();
                                 bytes.extend_from_slice(text.as_bytes());
@@ -1449,8 +1519,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         }
                     }
                     Some(Ok(Event::Mouse(mouse_event))) => {
-                        if app.show_help {
-                            // Overlay owns the screen — ignore mouse.
+                        if app.show_help || app.modal.is_active() {
+                            // An overlay owns the screen — ignore mouse (don't leak
+                            // stray clicks to the embedded claude behind a modal).
                         } else if app.focus == Focus::Embedded {
                             app.handle_embedded_mouse(mouse_event);
                         } else {
@@ -2034,6 +2105,64 @@ mod key_tests {
         assert!(tab_ids.contains(&"b"), "healthy tab kept: {tab_ids:?}");
         assert!(!tab_ids.contains(&"a"), "failed tab gone (healed or dropped): {tab_ids:?}");
         assert!(s.active < s.tabs.len(), "active stays in range");
+    }
+
+    #[tokio::test]
+    async fn ctrl_a_r_renames_active_tab_and_empty_clears() {
+        let mut app = test_app();
+        // Select the workspace row and give it one live embedded session tab.
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.state.add_embedded_session("w1", "sess-1");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("sess-1", &["-c", "sleep 30"])],
+                active: 0,
+            },
+        );
+        app.focus = Focus::Embedded;
+
+        // Ctrl+A r opens the rename modal; typing goes to it (not claude) because
+        // the embedded block yields once a modal is active.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        press(&mut app, KeyCode::Char('r')).await;
+        assert!(app.modal.is_active(), "rename modal opened");
+        for c in "auth".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        press(&mut app, KeyCode::Enter).await;
+        assert!(!app.modal.is_active(), "modal closed on submit");
+        assert_eq!(app.state.embedded_session_title("w1", "sess-1"), Some("auth"));
+        // The typed name went to the modal, not the pane behind it.
+        let pane_text = app.embedded["w1"].tabs[0].pane.screen_contents();
+        assert!(!pane_text.contains("auth"), "rename input must not leak to claude");
+
+        // The title renders in the tab strip.
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("auth"),
+            "tab strip shows the title"
+        );
+
+        // Reopening prefills the current name; clearing it resets to the number.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        press(&mut app, KeyCode::Char('r')).await;
+        match &app.modal {
+            modal::ModalState::RenameSession { input, .. } => assert_eq!(input, "auth"),
+            _ => panic!("expected the rename modal prefilled with the current title"),
+        }
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Backspace).await;
+        }
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.state.embedded_session_title("w1", "sess-1"), None);
     }
 
     #[tokio::test]
