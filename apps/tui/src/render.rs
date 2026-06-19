@@ -96,6 +96,13 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         .iter()
         .filter(|id| live_ids.contains(id.as_str()))
         .count();
+    // Sessions that produced unseen output and went quiet — same session unit as
+    // `live`/`active` (the stale-id guard applies here too).
+    let waiting = app
+        .attention
+        .iter()
+        .filter(|id| live_ids.contains(id.as_str()))
+        .count();
     let live_label = if live == 0 {
         "no live sessions".to_string()
     } else if active > 0 {
@@ -104,7 +111,7 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         format!("{live} live")
     };
 
-    let left = Line::from(vec![
+    let mut left_spans = vec![
         Span::styled(
             mode,
             Style::default().fg(Color::Black).bg(mode_color).add_modifier(Modifier::BOLD),
@@ -113,7 +120,14 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         Span::styled(context, Style::default().fg(Color::White)),
         Span::raw("  "),
         Span::styled(live_label, Style::default().fg(Color::DarkGray)),
-    ]);
+    ];
+    if waiting > 0 {
+        left_spans.push(Span::styled(
+            format!("  {waiting} waiting"),
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let left = Line::from(left_spans);
 
     let hints = match app.focus {
         Focus::Tree => "Enter open · a repo · w ws · ? help · q quit",
@@ -208,7 +222,14 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         ListItem::new(Line::from(spans))
                     }
                     TreeNode::Workspace { ws, .. } => {
-                        let (dot, dot_color) = if ws.active {
+                        // A magenta dot flags a workspace whose session produced
+                        // output you haven't viewed and went quiet ("needs you").
+                        // It can coexist with the right-side activity spinner: the
+                        // dot answers "unseen since it last went quiet", the
+                        // spinner "producing right now".
+                        let (dot, dot_color) = if app.ws_needs_attention(&ws.id) {
+                            ("\u{25CF}", Color::Magenta)
+                        } else if ws.active {
                             ("\u{25CF}", Color::Green)
                         } else {
                             ("\u{25CB}", Color::DarkGray)
