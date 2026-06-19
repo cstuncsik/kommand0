@@ -2057,6 +2057,58 @@ mod key_tests {
     }
 
     #[test]
+    fn attention_clears_per_tab_not_per_workspace() {
+        // A workspace stays flagged while a *sibling* tab has unseen output, even
+        // while you're viewing another of its tabs — it clears only when you open
+        // that specific session.
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"]), tab("b", &["-c", "sleep 30"])],
+                active: 0, // viewing tab "a"
+            },
+        );
+        app.attention.insert("b".to_string()); // sibling tab "b" came back
+        app.focus = Focus::Embedded;
+
+        app.mark_active_viewed(); // marks "a" seen, leaves "b" latched
+        assert!(app.ws_needs_attention("w1"), "sibling tab keeps the workspace flagged");
+        assert!(app.attention.contains("b"));
+
+        // Switch to "b" and view it -> now it clears.
+        app.embedded.get_mut("w1").unwrap().active = 1;
+        app.mark_active_viewed();
+        assert!(!app.ws_needs_attention("w1"), "viewing the sibling clears it");
+    }
+
+    #[test]
+    fn attention_relatches_after_view_then_new_output() {
+        let mut app = test_app(); // focus Tree
+        let t = Instant::now();
+        app.apply_pane_activity(t, &[("s1".to_string(), 1)]);
+        app.recompute_attention(t + Duration::from_millis(1500), &[("s1".to_string(), 1)]);
+        assert!(app.attention.contains("s1"), "first latch");
+
+        // Simulate viewing it (seen up to seq 1, cleared).
+        app.viewed_seq.insert("s1".to_string(), 1);
+        app.attention.remove("s1");
+
+        // New output after viewing, still fresh -> not yet.
+        let t2 = t + Duration::from_millis(2000);
+        app.apply_pane_activity(t2, &[("s1".to_string(), 2)]);
+        app.recompute_attention(t2, &[("s1".to_string(), 2)]);
+        assert!(!app.attention.contains("s1"), "fresh post-view output isn't attention yet");
+
+        // ...once it settles, it re-latches.
+        app.recompute_attention(t2 + Duration::from_millis(1500), &[("s1".to_string(), 2)]);
+        assert!(app.attention.contains("s1"), "unseen output after a view re-latches");
+    }
+
+    #[test]
     fn attention_count_shows_in_status_bar() {
         let mut app = test_app();
         app.expanded.insert("r1".to_string());
