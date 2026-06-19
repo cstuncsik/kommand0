@@ -5,7 +5,7 @@ pub mod session;
 pub mod workspace;
 pub mod worktree;
 
-pub use git::{BranchStatus, branch_status};
+pub use git::{BranchStatus, branch_status, open_pull_request};
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
 pub use session::{Session, SessionStatus};

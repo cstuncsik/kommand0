@@ -54,6 +54,7 @@ cargo run -p kommand0-tui
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion
 - **Git worktrees**: each workspace gets an isolated git worktree branch
 - **Branch/diff status**: each workspace shows its git branch and how far it is ahead/behind its upstream plus whether it has uncommitted changes — a compact `↑2↓1*` segment in the tree row and full detail (`Branch:` / `Changes:`) in the detail pane. Computed off the render loop (never blocks keystrokes), refreshed every couple of seconds and on workspace create/close
+- **Open a PR**: press `p` (or click `[Open PR]` in the detail pane) to push a workspace's branch and open a GitHub PR via the `gh` CLI. Runs off the render loop with progress (`Opening PR…`) and shows the resulting URL (or a readable error); idempotent — re-running on a branch that already has a PR returns its URL. Requires `gh` installed and authenticated
 - **Status bar**: bottom row shows the current mode (TREE / CLAUDE), the selected repo/workspace, the live-session count (and how many are active / waiting), and context key hints
 - **Activity indicator**: a workspace's tree row animates its prompt into a spinner while its embedded Claude is actively producing output (debounced, so a stray keystroke doesn't flicker it)
 - **Attention indicator**: when a session produces output you haven't viewed and then goes quiet, its workspace gets a magenta dot (and a "N waiting" count in the status bar) so you can tell at a glance which of your parallel sessions has come back to you. The flag is per-session and latches until you actually open that session (a mid-turn pause won't flicker it) — so a workspace stays flagged while any of its tabs has unseen output, and selecting a workspace in the tree doesn't count as viewing it (you have to open the session to clear it).
@@ -67,6 +68,7 @@ cargo run -p kommand0-tui
 | `gg` / `G` | Tree | Jump to first / last item |
 | `Enter` / `e` / `r` / `R` | Tree | Open the embedded Claude pane for the workspace |
 | `x` | Tree | Close the embedded Claude pane |
+| `p` | Tree | Open a GitHub PR for the selected workspace (`gh`) |
 | `a` | Tree | Add repository (modal) |
 | `w` | Tree | Add workspace to selected repo (modal) |
 | `d` / `D` | Tree | Delete / force-delete selected |
