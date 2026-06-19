@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Fake `gh` for the open-PR e2e (selected via KOMMAND0_GH_BIN): returns a PR URL
 # for `pr create`/`pr view`, so the test can drive the flow without real GitHub.
-if [ "$1" = "pr" ] && { [ "$2" = "create" ] || [ "$2" = "view" ]; }; then
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  echo "https://github.com/example/repo/pull/42"
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # `gh pr view` takes the branch positionally, not via --head.
+  if [ "$3" = "--head" ]; then echo "unknown flag: --head" >&2; exit 1; fi
   echo "https://github.com/example/repo/pull/42"
   exit 0
 fi
