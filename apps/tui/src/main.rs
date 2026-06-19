@@ -46,6 +46,20 @@ const TAB_BAR_HEIGHT: u16 = 1;
 /// single-column tab labels).
 pub(crate) const MAX_SESSION_TABS: usize = 9;
 
+/// Claude's message when a `--resume <id>` target no longer exists. Interactive
+/// `claude` prints this and STAYS ALIVE (it does not exit), so resume failure
+/// must be detected from the pane's output, not just from a fast non-zero exit.
+const RESUME_MISS_MARKER: &str = "No conversation found with session ID";
+
+/// Shown when a resume fails so the user knows reopening starts fresh.
+const RESUME_FAIL_MSG: &str =
+    "Couldn't resume the previous Claude session (it may have been cleared) — reopen to start fresh.";
+
+/// A resumed tab still showing the resume-miss marker within this window of spawn
+/// is a genuine miss (claude prints it at startup). After the window we stop
+/// scanning so a live session's own output can't false-positive.
+const RESUME_CHECK_WINDOW: Duration = Duration::from_secs(8);
+
 fn claude_args(resume_id: Option<&str>) -> (Vec<String>, Option<String>) {
     match resume_id {
         Some(id) => (vec!["--resume".to_string(), id.to_string()], None),
@@ -478,16 +492,14 @@ impl App {
         self.embedded_prefix = false;
     }
 
-    /// Spawn one Claude session (a tab) for a workspace and append it. `resume_id`
-    /// resumes that session; `None` assigns + persists a fresh id. Returns whether
-    /// the pane started (on failure, `embed_error` is set).
-    fn spawn_session_tab(
-        &mut self,
-        ws_id: &str,
+    /// Spawn a claude pane (no persistence, no tab append). `resume_id` resumes
+    /// that session; `None` assigns a fresh session id. Returns the pane plus its
+    /// `(session_id, was_resume)`, or the spawn error.
+    fn spawn_pane(
+        &self,
         ws_dir: &str,
-        ws_name: &str,
         resume_id: Option<&str>,
-    ) -> bool {
+    ) -> anyhow::Result<(pane::Pane, String, bool)> {
         let bin = std::env::var("KOMMAND0_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         let wake: Option<Box<dyn Fn() + Send>> = self.embedded_wake.clone().map(|tx| {
             Box::new(move || {
@@ -503,19 +515,33 @@ impl App {
         let was_resume = resume_id.is_some();
         let session_id = resume_id
             .map(String::from)
-            .unwrap_or_else(|| new_id.clone().unwrap());
+            .unwrap_or_else(|| new_id.unwrap());
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        match pane::Pane::spawn_with_wake(
+        let pane = pane::Pane::spawn_with_wake(
             &bin,
             &arg_refs,
             std::path::Path::new(ws_dir),
             rows,
             cols,
             wake,
-        ) {
-            Ok(pane) => {
-                if let Some(uuid) = new_id {
-                    self.state.add_embedded_session(ws_id, &uuid);
+        )?;
+        Ok((pane, session_id, was_resume))
+    }
+
+    /// Spawn one Claude session (a tab) for a workspace and append it. `resume_id`
+    /// resumes that session; `None` assigns + persists a fresh id. Returns whether
+    /// the pane started (on failure, `embed_error` is set).
+    fn spawn_session_tab(
+        &mut self,
+        ws_id: &str,
+        ws_dir: &str,
+        ws_name: &str,
+        resume_id: Option<&str>,
+    ) -> bool {
+        match self.spawn_pane(ws_dir, resume_id) {
+            Ok((pane, session_id, was_resume)) => {
+                if !was_resume {
+                    self.state.add_embedded_session(ws_id, &session_id);
                     if self.state.save().is_err() {
                         self.embed_error = Some((
                             ws_id.to_string(),
@@ -538,15 +564,46 @@ impl App {
             }
             Err(e) => {
                 // A resume that couldn't even spawn: forget the id so the
-                // persisted Vec stays aligned with the runtime tabs (otherwise a
-                // failed middle id leaves the tab numbering pointing at the wrong
-                // session).
+                // persisted Vec stays aligned with the runtime tabs.
                 if let Some(id) = resume_id {
                     self.state.remove_embedded_session(ws_id, id);
                     let _ = self.state.save();
                 }
                 self.embed_error =
                     Some((ws_id.to_string(), format!("Failed to start claude in {ws_name}: {e}")));
+                false
+            }
+        }
+    }
+
+    /// Auto-heal a resume that found no session: forget the gone id and replace
+    /// its tab in place with a fresh session (same slot, so the active tab and
+    /// numbering are preserved). Returns `false` if the fresh spawn itself failed
+    /// (the caller then drops the tab). `now` stamps the new tab.
+    fn heal_resume(&mut self, ws_id: &str, gone_id: &str, ws_dir: &str, now: Instant) -> bool {
+        self.state.remove_embedded_session(ws_id, gone_id);
+        match self.spawn_pane(ws_dir, None) {
+            Ok((pane, new_id, was_resume)) => {
+                self.state.add_embedded_session(ws_id, &new_id);
+                let _ = self.state.save();
+                if let Some(sessions) = self.embedded.get_mut(ws_id)
+                    && let Some(slot) = sessions.tabs.iter().position(|t| t.id == gone_id)
+                {
+                    sessions.tabs[slot] = SessionTab {
+                        id: new_id,
+                        pane,
+                        was_resume,
+                        spawned: now,
+                    };
+                }
+                self.embed_error = Some((
+                    ws_id.to_string(),
+                    "The previous Claude session was gone — started a fresh one.".to_string(),
+                ));
+                true
+            }
+            Err(_) => {
+                let _ = self.state.save();
                 false
             }
         }
@@ -715,34 +772,64 @@ impl App {
     /// stable by identity, and leaves Embedded focus if the selected workspace
     /// emptied. Pane's `Drop` terminates the child.
     fn reap_embedded(&mut self, now: Instant) {
-        // One pass: collect exited tabs with the data the resume-failure net
-        // needs (keep the signal-vs-exit distinction in `code`).
+        // One pass: collect exited tabs (with the signal-vs-exit distinction in
+        // `code`) and live resumed tabs that are showing claude's resume-miss
+        // error — claude prints it and STAYS ALIVE, so the exit-code net alone
+        // would never see it and the dead id would never be cleared (every reopen
+        // would re-resume the same gone session).
         let mut exited: Vec<(String, String, bool, Instant, Option<i32>)> = Vec::new();
+        let mut resume_missed: Vec<(String, String)> = Vec::new();
         for (ws_id, sessions) in self.embedded.iter_mut() {
             for tab in sessions.tabs.iter_mut() {
                 if let Some(code) = tab.pane.try_wait() {
                     exited.push((ws_id.clone(), tab.id.clone(), tab.was_resume, tab.spawned, code));
+                } else if tab.was_resume
+                    && now.saturating_duration_since(tab.spawned) < RESUME_CHECK_WINDOW
+                {
+                    // Require BOTH the marker and this tab's (random uuid) session
+                    // id, so a resumed conversation that merely mentions the phrase
+                    // can't be mistaken for a real miss.
+                    let screen = tab.pane.screen_contents();
+                    if screen.contains(RESUME_MISS_MARKER) && screen.contains(&tab.id) {
+                        resume_missed.push((ws_id.clone(), tab.id.clone()));
+                    }
                 }
             }
         }
 
-        // Resume-failure safety net, per FAILED tab id only (never the siblings).
-        for (ws_id, tab_id, was_resume, spawned, code) in &exited {
-            if resume_failed(*spawned, *was_resume, now, *code) {
-                self.state.remove_embedded_session(ws_id, tab_id);
-                let _ = self.state.save();
-                self.embed_error = Some((
-                    ws_id.clone(),
-                    "Couldn't resume the previous Claude session (it may have been \
-                     cleared) — reopen to start fresh."
-                        .to_string(),
-                ));
+        // Resume failures: a resumed tab that exited fast non-zero, OR one still
+        // alive showing the resume-miss marker. Auto-heal each by replacing the
+        // gone session with a fresh one in the SAME tab slot (the replacement
+        // gets a new id, so the retain pass below leaves it alone). If the fresh
+        // spawn also fails, fall back to dropping the tab with the reopen message.
+        let mut failed_resume: Vec<(String, String)> = exited
+            .iter()
+            .filter(|(_, _, was_resume, spawned, code)| resume_failed(*spawned, *was_resume, now, *code))
+            .map(|(ws, tab, ..)| (ws.clone(), tab.clone()))
+            .collect();
+        failed_resume.extend(resume_missed.iter().cloned());
+        for (ws_id, tab_id) in &failed_resume {
+            let ws_dir = self
+                .workspaces
+                .iter()
+                .find(|w| &w.id == ws_id)
+                .map(|w| w.working_dir.clone());
+            match ws_dir {
+                Some(dir) if self.heal_resume(ws_id, tab_id, &dir, now) => {}
+                _ => {
+                    // Couldn't start a fresh session — forget the id and drop the
+                    // stuck/dead tab; the message tells the user to reopen.
+                    self.state.remove_embedded_session(ws_id, tab_id);
+                    let _ = self.state.save();
+                    self.embed_error = Some((ws_id.clone(), RESUME_FAIL_MSG.to_string()));
+                }
             }
         }
 
         let dead: HashSet<(String, String)> = exited
             .into_iter()
             .map(|(ws, tab, ..)| (ws, tab))
+            .chain(resume_missed)
             .collect();
         let live_ws: HashSet<&String> = self.workspaces.iter().map(|w| &w.id).collect();
         let mut remove_ws: Vec<String> = Vec::new();
@@ -1900,7 +1987,14 @@ mod key_tests {
     }
 
     #[test]
-    fn reap_resume_failure_forgets_only_the_failed_tab_id() {
+    fn reap_resume_failure_affects_only_the_failed_tab() {
+        // A resume failure must only ever touch the tab that failed: the gone id
+        // is forgotten and a healthy sibling is never collateral. The in-place
+        // heal itself (spawning a fresh session into the slot) is covered
+        // end-to-end by the `stale_resume_auto_heals_to_a_fresh_session` e2e,
+        // which can guarantee a real bin in a real cwd; here the fresh spawn's
+        // success is environment-dependent, so we assert only what holds in both
+        // the healed and the drop-fallback branch.
         let mut app = test_app();
         app.state.add_embedded_session("w1", "a");
         app.state.add_embedded_session("w1", "b");
@@ -1930,9 +2024,16 @@ mod key_tests {
         app.embedded.insert("w1".to_string(), s);
 
         app.reap_embedded(Instant::now());
-        // Only "a" is forgotten; "b" is preserved (in order).
-        assert_eq!(app.state.embedded_session_ids("w1"), &["b".to_string()]);
-        assert_eq!(ids(&app.embedded["w1"]), vec!["b"]);
+        // "a" is always forgotten; "b" is always preserved (never collateral).
+        let persisted = app.state.embedded_session_ids("w1");
+        assert!(persisted.contains(&"b".to_string()), "healthy id kept: {persisted:?}");
+        assert!(!persisted.contains(&"a".to_string()), "gone id forgotten: {persisted:?}");
+
+        let s = &app.embedded["w1"];
+        let tab_ids = ids(s);
+        assert!(tab_ids.contains(&"b"), "healthy tab kept: {tab_ids:?}");
+        assert!(!tab_ids.contains(&"a"), "failed tab gone (healed or dropped): {tab_ids:?}");
+        assert!(s.active < s.tabs.len(), "active stays in range");
     }
 
     #[tokio::test]

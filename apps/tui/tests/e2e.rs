@@ -523,6 +523,57 @@ fn closing_the_last_tab_returns_to_tree_and_reopens_fresh() {
 }
 
 #[test]
+fn stale_resume_auto_heals_to_a_fresh_session() {
+    // The real bug: `claude --resume <gone-id>` prints "No conversation found"
+    // and STAYS ALIVE, so the exit-code net never fires and the dead id is never
+    // cleared (reopen keeps re-resuming the gone session). kommand0 detects the
+    // miss from the pane output, then AUTO-HEALS: it forgets the gone id and
+    // replaces the stuck tab in place with a fresh session (no manual reopen).
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": { "w1": ["gone-session-id"] }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[("KOMMAND0_CLAUDE_BIN", "embed-stub-resume-miss")],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open -> resume the gone session (stub stays alive on the error)
+    tui.wait_for("started a fresh one"); // detected, healed in place with a new session
+    tui.wait_for("1 live"); // still embedded — the slot now holds the fresh session
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    // The gone id was forgotten and replaced by exactly one fresh id, so a future
+    // open resumes the healthy session instead of re-resuming the gone one.
+    let st = tui.read_state();
+    let ids = st["embedded_sessions"]
+        .get("w1")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(ids.len(), 1, "exactly one fresh session persisted: {st}");
+    assert_ne!(
+        ids[0].as_str(),
+        Some("gone-session-id"),
+        "the stale resume id should be replaced, not re-persisted: {st}"
+    );
+}
+
+#[test]
 fn ctrl_a_c_adds_a_session_tab_and_x_closes_it() {
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());

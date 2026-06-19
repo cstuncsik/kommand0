@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Simulates interactive `claude --resume <gone-id>`: prints claude's resume-miss
+# error and STAYS ALIVE (claude does not exit on a missing session), so kommand0
+# must detect the failure from this output, not from a process exit.
+stty -echo 2>/dev/null
+printf '\033[?1049h\033[2J\033[H'
+printf 'No conversation found with session ID: %s\r\n' "$*"
+while IFS= read -r -n1 ch; do :; done
