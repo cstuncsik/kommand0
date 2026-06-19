@@ -604,6 +604,41 @@ fn ctrl_a_c_adds_a_session_tab_and_x_closes_it() {
 }
 
 #[test]
+fn ctrl_a_r_renames_a_tab_and_persists_the_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open -> tab 1
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("1 live");
+
+    // Ctrl+A r opens the rename modal; typing goes to the modal, not claude.
+    tui.send("\x01");
+    tui.send("r");
+    tui.wait_for("Rename Session");
+    tui.send("auth");
+    tui.send("\r");
+    tui.wait_for_row(1, "auth"); // title shows in the tab strip once the modal closes
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+
+    // The title persisted, keyed by the tab's session id.
+    let st = tui.read_state();
+    let titled = st["embedded_titles"]["w1"]
+        .as_object()
+        .map(|m| m.values().any(|v| v == "auth"))
+        .unwrap_or(false);
+    assert!(titled, "a session tab is persisted as titled 'auth': {st}");
+}
+
+#[test]
 fn first_open_assigns_a_session_id() {
     // Opening a workspace with no stored session spawns `claude --session-id <uuid>`.
     let dir = tempfile::tempdir().unwrap();

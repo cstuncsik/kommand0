@@ -29,6 +29,13 @@ pub struct AppState {
     /// (`claude --resume <id>`) across app restarts.
     #[serde(default, deserialize_with = "de_embedded_sessions")]
     pub embedded_sessions: HashMap<String, Vec<String>>,
+    /// Optional per-session display titles, keyed workspace-id → session-id →
+    /// title. Additive: absent for un-renamed sessions, so old state files (and
+    /// the common case) carry nothing. Kept in lockstep with `embedded_sessions`
+    /// — pruned whenever a session id or workspace is removed — so a title never
+    /// outlives its session.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub embedded_titles: HashMap<String, HashMap<String, String>>,
 }
 
 /// Tolerates the legacy single-string form (`{"w1":"uuid"}`) and an explicit
@@ -155,17 +162,51 @@ impl AppState {
                 self.embedded_sessions.remove(workspace_id);
             }
         }
+        // Keep titles in lockstep so a renamed-then-closed session leaves nothing
+        // behind (a title must never outlive its session id).
+        self.set_embedded_session_title(workspace_id, session_id, "");
     }
 
     /// Forget all of a workspace's session ids (on workspace/repo delete).
     pub fn clear_all_embedded_sessions(&mut self, workspace_id: &str) {
         self.embedded_sessions.remove(workspace_id);
+        self.embedded_titles.remove(workspace_id);
     }
 
-    /// Drop embedded-session entries for workspaces that no longer exist.
+    /// Drop embedded-session entries (ids and titles) for workspaces that no
+    /// longer exist.
     pub fn prune_embedded_sessions(&mut self) {
         self.embedded_sessions
             .retain(|ws_id, _| self.workspaces.iter().any(|w| &w.id == ws_id));
+        self.embedded_titles
+            .retain(|ws_id, _| self.workspaces.iter().any(|w| &w.id == ws_id));
+    }
+
+    /// The display title for a session tab, if the user has renamed it.
+    pub fn embedded_session_title(&self, workspace_id: &str, session_id: &str) -> Option<&str> {
+        self.embedded_titles
+            .get(workspace_id)
+            .and_then(|m| m.get(session_id))
+            .map(String::as_str)
+    }
+
+    /// Set (or, with an empty `title`, clear) a session tab's display title.
+    /// Drops the workspace's title map once its last title is cleared so the
+    /// field stays absent from serialized state in the common case.
+    pub fn set_embedded_session_title(&mut self, workspace_id: &str, session_id: &str, title: &str) {
+        if title.is_empty() {
+            if let Some(m) = self.embedded_titles.get_mut(workspace_id) {
+                m.remove(session_id);
+                if m.is_empty() {
+                    self.embedded_titles.remove(workspace_id);
+                }
+            }
+        } else {
+            self.embedded_titles
+                .entry(workspace_id.to_string())
+                .or_default()
+                .insert(session_id.to_string(), title.to_string());
+        }
     }
 
     // --- Thin single-id compatibility shims (used by the not-yet-tabbed TUI;
@@ -269,9 +310,11 @@ impl AppState {
             }
         });
 
-        // Forget any embedded Claude session ids for the removed workspaces.
+        // Forget any embedded Claude session ids (and titles) for the removed
+        // workspaces.
         for id in &ws_ids {
             self.embedded_sessions.remove(id);
+            self.embedded_titles.remove(id);
         }
 
         // Remove the repo itself
@@ -456,6 +499,7 @@ impl AppState {
             .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))?;
         let removed = self.workspaces.remove(idx);
         self.embedded_sessions.remove(&removed.id);
+        self.embedded_titles.remove(&removed.id);
 
         // Clean up worktree if present
         if let Some(wt_path) = &removed.worktree_path
@@ -789,6 +833,78 @@ mod tests {
         .unwrap();
         let loaded = AppState::load_from(tmp.path()).unwrap();
         assert!(loaded.embedded_sessions.is_empty());
+    }
+
+    #[test]
+    fn embedded_session_title_set_get_clear_and_persist() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        state.add_embedded_session("w1", "a");
+        assert_eq!(state.embedded_session_title("w1", "a"), None);
+
+        state.set_embedded_session_title("w1", "a", "auth refactor");
+        assert_eq!(state.embedded_session_title("w1", "a"), Some("auth refactor"));
+        state.save_to(tmp.path()).unwrap();
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert_eq!(loaded.embedded_session_title("w1", "a"), Some("auth refactor"));
+
+        // Clearing drops the entry and the (now-empty) field disappears on disk.
+        state.set_embedded_session_title("w1", "a", "");
+        assert_eq!(state.embedded_session_title("w1", "a"), None);
+        assert!(state.embedded_titles.is_empty());
+        state.save_to(tmp.path()).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("state.json")).unwrap();
+        assert!(!raw.contains("embedded_titles"), "empty title map is omitted: {raw}");
+    }
+
+    #[test]
+    fn embedded_titles_never_outlive_their_session() {
+        // The titles map must stay a subset of the session ids through every
+        // removal path (close, workspace delete, prune).
+        let mut state = AppState::default();
+        state.workspaces.push(Workspace {
+            id: "w1".to_string(),
+            name: "ws".to_string(),
+            repo_id: "r1".to_string(),
+            working_dir: "/tmp/ws".to_string(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+        });
+        state.add_embedded_session("w1", "a");
+        state.add_embedded_session("w1", "b");
+        state.set_embedded_session_title("w1", "a", "alpha");
+        state.set_embedded_session_title("w1", "b", "beta");
+
+        // Closing one tab forgets only its title.
+        state.remove_embedded_session("w1", "a");
+        assert_eq!(state.embedded_session_title("w1", "a"), None);
+        assert_eq!(state.embedded_session_title("w1", "b"), Some("beta"));
+
+        // Pruning an orphan workspace drops its titles too.
+        state.add_embedded_session("w-gone", "z");
+        state.set_embedded_session_title("w-gone", "z", "zed");
+        state.prune_embedded_sessions();
+        assert!(!state.embedded_titles.contains_key("w-gone"));
+
+        // Clearing a whole workspace drops its titles.
+        state.clear_all_embedded_sessions("w1");
+        assert!(!state.embedded_titles.contains_key("w1"));
+        assert!(state.embedded_titles.is_empty());
+    }
+
+    #[test]
+    fn load_tolerates_state_without_embedded_titles() {
+        // Back-compat: a state.json written before titles existed must load.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("state.json"),
+            r#"{"repos":[],"workspaces":[],"sessions":[],"embedded_sessions":{"w1":["a"]}}"#,
+        )
+        .unwrap();
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert!(loaded.embedded_titles.is_empty());
+        assert_eq!(loaded.embedded_session_title("w1", "a"), None);
     }
 
     #[test]
