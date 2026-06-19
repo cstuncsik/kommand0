@@ -46,6 +46,27 @@ const TAB_BAR_HEIGHT: u16 = 1;
 /// single-column tab labels).
 pub(crate) const MAX_SESSION_TABS: usize = 9;
 
+/// How often the periodic git-status refresh runs (off the render loop). Git
+/// status is cheap but can stall on large/cold worktrees, so it never runs on
+/// the 50ms tick; on-demand triggers (workspace create/close) keep it snappy.
+const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Carries a status-refresh result to the event loop, sending on drop so the
+/// loop always gets a message (and clears `status_inflight`) even if the worker
+/// thread panics before finishing.
+struct StatusRefreshGuard {
+    tx: tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::BranchStatus>>,
+    result: Option<HashMap<String, kommand0_core::BranchStatus>>,
+}
+
+impl Drop for StatusRefreshGuard {
+    fn drop(&mut self) {
+        if let Some(map) = self.result.take() {
+            let _ = self.tx.send(map);
+        }
+    }
+}
+
 /// Claude's message when a `--resume <id>` target no longer exists. Interactive
 /// `claude` prints this and STAYS ALIVE (it does not exit), so resume failure
 /// must be detected from the pane's output, not just from a fast non-zero exit.
@@ -258,6 +279,18 @@ pub(crate) struct App {
     /// Last embedded-pane spawn failure as `(workspace_id, message)`, surfaced
     /// in that workspace's detail pane only.
     pub(crate) embed_error: Option<(String, String)>,
+
+    /// Per-workspace git status (branch, ahead/behind, dirty), refreshed off the
+    /// render loop. Keyed by workspace id; absent until the first refresh lands.
+    pub(crate) branch_status: HashMap<String, kommand0_core::BranchStatus>,
+    /// A status-refresh worker is running; gates re-spawning (cleared when its
+    /// result arrives — and it always sends, even on a partial/empty result).
+    status_inflight: bool,
+    /// Worker → event-loop channel carrying a fresh status map (set in `run`).
+    status_tx: Option<tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::BranchStatus>>>,
+    /// When the periodic status refresh last fired (time-based, so it doesn't
+    /// depend on the wrapping tick counter).
+    last_status_refresh: Option<Instant>,
 }
 
 impl App {
@@ -298,6 +331,10 @@ impl App {
             right_pane_area: ratatui::layout::Rect::default(),
             embedded_prefix: false,
             embed_error: None,
+            branch_status: HashMap::new(),
+            status_inflight: false,
+            status_tx: None,
+            last_status_refresh: None,
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -706,6 +743,8 @@ impl App {
             self.embedded.remove(&ws_id);
             self.focus = Focus::Tree;
         }
+        // The session likely committed; refresh this workspace's branch status.
+        self.request_branch_status_refresh();
     }
 
     /// Open the Rename Session modal for the selected workspace's active tab,
@@ -998,6 +1037,43 @@ impl App {
         }
     }
 
+    /// Kick off an off-loop git-status refresh for every workspace (no-op if one
+    /// is already running or the channel isn't wired). The worker computes each
+    /// workspace's [`kommand0_core::branch_status`] and sends the whole map back;
+    /// the event loop replaces the cache wholesale, so deleted workspaces drop
+    /// out on the next refresh (no manual pruning).
+    fn request_branch_status_refresh(&mut self) {
+        if self.status_inflight {
+            return;
+        }
+        let Some(tx) = self.status_tx.clone() else {
+            return; // not wired (e.g. unit tests drive the cache directly)
+        };
+        let targets: Vec<(String, String)> = self
+            .workspaces
+            .iter()
+            .map(|w| (w.id.clone(), w.working_dir.clone()))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.status_inflight = true;
+        std::thread::spawn(move || {
+            // The guard sends `result` on drop — including on panic — so the
+            // event loop always clears `status_inflight`.
+            let mut guard = StatusRefreshGuard {
+                tx,
+                result: Some(HashMap::new()),
+            };
+            let map = guard.result.as_mut().expect("result present until drop");
+            for (id, dir) in targets {
+                if let Some(status) = kommand0_core::branch_status(&dir) {
+                    map.insert(id, status);
+                }
+            }
+        });
+    }
+
     /// Whether any of a workspace's session tabs needs the user's attention.
     pub(crate) fn ws_needs_attention(&self, ws_id: &str) -> bool {
         self.embedded
@@ -1271,6 +1347,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         // Auto-expand the repo
                         app.expanded.insert(repo_id);
                         app.rebuild_tree();
+                        // Surface the new workspace's branch status promptly.
+                        app.request_branch_status_refresh();
                     }
                     Err(e) => {
                         app.modal = modal::ModalState::AddWorkspace {
@@ -1573,6 +1651,15 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     app.embedded_wake = Some(wake_tx);
 
+    // Off-loop git-status worker → event loop. Seed one refresh up front, then
+    // refresh periodically (and on demand) so branch/diff status stays current
+    // without ever blocking the render loop on a git call.
+    let (status_tx, mut status_rx) =
+        tokio::sync::mpsc::unbounded_channel::<HashMap<String, kommand0_core::BranchStatus>>();
+    app.status_tx = Some(status_tx);
+    app.request_branch_status_refresh();
+    app.last_status_refresh = Some(Instant::now());
+
     loop {
         // Seed the viewed session before drawing so a just-opened/just-switched
         // tab is never momentarily flagged "needs you" before the next tick.
@@ -1583,6 +1670,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             _ = wake_rx.recv() => {
                 // Drain any backlog so we coalesce into a single redraw.
                 while wake_rx.try_recv().is_ok() {}
+            }
+            Some(status) = status_rx.recv() => {
+                // A status refresh finished: replace the cache wholesale (drops
+                // entries for deleted workspaces) and allow the next refresh.
+                app.branch_status = status;
+                app.status_inflight = false;
             }
             event = reader.next().fuse() => {
                 match event {
@@ -1755,6 +1848,15 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 if app.tick_counter.is_multiple_of(5) {
                     app.spinner_tick = (app.spinner_tick + 1) % 10;
                 }
+                // Periodic git-status refresh (off-loop). Time-based so it doesn't
+                // depend on the wrapping tick counter.
+                if app
+                    .last_status_refresh
+                    .is_none_or(|t| now.duration_since(t) >= STATUS_REFRESH_INTERVAL)
+                {
+                    app.last_status_refresh = Some(now);
+                    app.request_branch_status_refresh();
+                }
             }
         }
     }
@@ -1807,6 +1909,7 @@ mod key_tests {
             active: true,
             created_at: 0,
             worktree_path: None,
+            branch_name: None,
         });
         App::new(state)
     }
@@ -2198,6 +2301,56 @@ mod key_tests {
                 "a render sizes background tabs to the pane, not just the active one"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn branch_status_shows_in_detail_and_tree() {
+        let mut app = test_app();
+        // Give w1 an own worktree/branch so the status surfaces (test_app's
+        // default workspace has no worktree_path).
+        app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+        app.workspaces[0].branch_name = Some("kommand0/ws-one".into());
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.branch_status.insert(
+            "w1".to_string(),
+            kommand0_core::BranchStatus {
+                branch: Some("kommand0/ws-one".into()),
+                ahead: 2,
+                behind: 1,
+                dirty: true,
+                has_upstream: true,
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        // Detail pane.
+        assert!(text.contains("Branch:"), "detail shows a Branch line:\n{text}");
+        assert!(text.contains("kommand0/ws-one"), "detail shows the branch name");
+        assert!(text.contains("↑2 ↓1"), "detail shows ahead/behind");
+        assert!(text.contains("uncommitted changes"), "detail shows dirty state");
+        // Tree row segment (compact, no spaces): " ↑2↓1*".
+        assert!(text.contains("↑2↓1*"), "tree row shows the compact status segment:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn fallback_workspace_shows_shared_checkout() {
+        let mut app = test_app(); // w1 has worktree_path: None
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("shared checkout"),
+            "a workspace with no own worktree is labelled shared:\n{text}"
+        );
     }
 
     #[tokio::test]

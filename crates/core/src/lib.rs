@@ -1,9 +1,11 @@
+pub mod git;
 pub mod id;
 pub mod repo;
 pub mod session;
 pub mod workspace;
 pub mod worktree;
 
+pub use git::{BranchStatus, branch_status};
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
 pub use session::{Session, SessionStatus};
@@ -413,20 +415,16 @@ impl AppState {
             .as_secs();
 
         // Try to create a git worktree
-        let (working_dir, worktree_path) = if use_worktree {
+        let (working_dir, worktree_path, branch_name) = if use_worktree {
             match worktree::create_worktree(&repo.path, &ws_name, base) {
                 worktree::WorktreeResult::Created {
                     worktree_path,
-                    branch_name: _,
-                } => {
-                    (worktree_path.clone(), Some(worktree_path))
-                }
-                worktree::WorktreeResult::Fallback { reason: _ } => {
-                    (repo.path.clone(), None)
-                }
+                    branch_name,
+                } => (worktree_path.clone(), Some(worktree_path), Some(branch_name)),
+                worktree::WorktreeResult::Fallback { reason: _ } => (repo.path.clone(), None, None),
             }
         } else {
-            (repo.path.clone(), None)
+            (repo.path.clone(), None, None)
         };
 
         let ws = Workspace {
@@ -437,6 +435,7 @@ impl AppState {
             active: true,
             created_at: now,
             worktree_path,
+            branch_name,
         };
 
         self.workspaces.push(ws.clone());
@@ -814,6 +813,7 @@ mod tests {
             active: true,
             created_at: 0,
             worktree_path: None,
+            branch_name: None,
         });
         state.set_embedded_session("w1", "keep");
         state.set_embedded_session("w-gone", "drop");
@@ -870,6 +870,7 @@ mod tests {
             active: true,
             created_at: 0,
             worktree_path: None,
+            branch_name: None,
         });
         state.add_embedded_session("w1", "a");
         state.add_embedded_session("w1", "b");
