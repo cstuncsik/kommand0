@@ -1049,9 +1049,12 @@ impl App {
         let Some(tx) = self.status_tx.clone() else {
             return; // not wired (e.g. unit tests drive the cache directly)
         };
+        // Only workspaces with their own worktree/branch — a fallback workspace's
+        // working_dir is the shared repo root, whose status the UI never shows.
         let targets: Vec<(String, String)> = self
             .workspaces
             .iter()
+            .filter(|w| w.worktree_path.is_some())
             .map(|w| (w.id.clone(), w.working_dir.clone()))
             .collect();
         if targets.is_empty() {
