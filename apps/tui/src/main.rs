@@ -2200,6 +2200,33 @@ mod key_tests {
         }
     }
 
+    #[tokio::test]
+    async fn render_sizes_panes_even_when_a_repo_row_is_selected() {
+        // The resize runs before the right-pane branch, so a live pane is sized
+        // even while the selection is a repo row (detail view, no embedded pane
+        // shown) — the whole point of "reaches background panes too".
+        let mut app = test_app(); // default selection is the first repo row
+        assert!(app.selected_workspace().is_none(), "precondition: a repo row is selected");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+
+        let content = pane_content_rect(app.right_pane_area);
+        assert!(content.width > 0 && content.height > 0);
+        assert_eq!(
+            app.embedded["w1"].tabs[0].pane.size(),
+            (content.height, content.width),
+            "panes are sized regardless of what's selected"
+        );
+    }
+
     #[test]
     fn claude_args_assigns_or_resumes() {
         // No resume id: a fresh --session-id is assigned and returned to persist.
