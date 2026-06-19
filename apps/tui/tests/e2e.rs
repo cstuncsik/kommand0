@@ -639,6 +639,37 @@ fn ctrl_a_r_renames_a_tab_and_persists_the_title() {
 }
 
 #[test]
+fn unseen_background_output_raises_the_attention_flag() {
+    // Open a workspace (its session is "viewed"), navigate back to the tree, and
+    // let the session emit output while you're away. Once it goes quiet, the
+    // status bar must surface that the workspace needs you.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[("KOMMAND0_CLAUDE_BIN", "embed-stub-attention")],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open -> the tab is viewed; its initial marker is seen
+    tui.wait_for("READY-DELAYED");
+
+    // Back to the tree before the late output lands.
+    tui.send("\x01");
+    tui.send("t");
+    tui.wait_for("TREE");
+
+    // The late output arrives unseen, then the pane goes quiet -> attention.
+    tui.wait_for("waiting");
+
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn first_open_assigns_a_session_id() {
     // Opening a workspace with no stored session spawns `claude --session-id <uuid>`.
     let dir = tempfile::tempdir().unwrap();
