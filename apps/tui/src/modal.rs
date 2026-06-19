@@ -43,6 +43,13 @@ pub(crate) enum ModalState {
         cursor: usize,
         error: Option<String>,
     },
+    ConfirmCleanup {
+        ws_id: String,
+        ws_name: String,
+        branch: String,
+        dirty: bool,
+        unpushed: bool,
+    },
 }
 
 impl ModalState {
@@ -65,6 +72,8 @@ pub(crate) enum ModalResult {
     ConfirmDelete(DeleteTarget),
     /// Rename submitted with (ws_id, session_id, title); an empty title clears it.
     SubmitRename(String, String, String),
+    /// Cleanup confirmed for a workspace id.
+    ConfirmCleanup(String),
 }
 
 /// Handle a key event when a modal is active.
@@ -331,6 +340,22 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                 _ => ModalResult::Consumed,
             }
         }
+        ModalState::ConfirmCleanup { ws_id, .. } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let id = ws_id.clone();
+                *modal = ModalState::None;
+                ModalResult::ConfirmCleanup(id)
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                *modal = ModalState::None;
+                ModalResult::Cancelled
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                *modal = ModalState::None;
+                ModalResult::Cancelled
+            }
+            _ => ModalResult::Consumed,
+        },
     }
 }
 
@@ -683,6 +708,83 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
                     Span::raw(": cancel"),
                 ])),
                 inner[4],
+            );
+        }
+        ModalState::ConfirmCleanup {
+            ws_name,
+            branch,
+            dirty,
+            unpushed,
+            ..
+        } => {
+            let area = centered_rect(60, 35, frame.area());
+            frame.render_widget(Clear, area);
+
+            let inner = Layout::vertical([
+                Constraint::Length(1), // message
+                Constraint::Length(1), // branch
+                Constraint::Length(1), // requirement
+                Constraint::Length(2), // warnings
+                Constraint::Min(0),
+                Constraint::Length(1), // footer
+            ])
+            .split(Rect::new(
+                area.x + 2,
+                area.y + 1,
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(2),
+            ));
+
+            let block = Block::default()
+                .title(" Clean Up Workspace ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow));
+            frame.render_widget(block, area);
+
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!("Remove worktree and delete branch for '{ws_name}'?"),
+                    Style::default().fg(Color::White),
+                )),
+                inner[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Branch: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(branch.as_str()),
+                ])),
+                inner[1],
+            );
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "Only proceeds if the branch's PR has been merged.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                inner[2],
+            );
+            let mut warn = Vec::new();
+            if *dirty {
+                warn.push(Line::styled(
+                    "⚠ Uncommitted changes will block cleanup.",
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            if *unpushed {
+                warn.push(Line::styled(
+                    "⚠ Unpushed commits will block cleanup.",
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            frame.render_widget(Paragraph::new(warn), inner[3]);
+
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("y", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw(": clean up  "),
+                    Span::styled("n/Esc", Style::default().fg(Color::Cyan)),
+                    Span::raw(": cancel"),
+                ])),
+                inner[5],
             );
         }
     }

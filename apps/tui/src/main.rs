@@ -82,6 +82,21 @@ impl Drop for PrOpenGuard {
     }
 }
 
+/// Carries a cleanup result `(workspace_id, Ok(()) | Err(msg))` to the event
+/// loop, sending on drop so a worker panic still clears `cleanup_inflight`.
+struct CleanupGuard {
+    tx: tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>,
+    payload: Option<(String, Result<(), String>)>,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.payload.take() {
+            let _ = self.tx.send(p);
+        }
+    }
+}
+
 /// Claude's message when a `--resume <id>` target no longer exists. Interactive
 /// `claude` prints this and STAYS ALIVE (it does not exit), so resume failure
 /// must be detected from the pane's output, not just from a fast non-zero exit.
@@ -313,6 +328,13 @@ pub(crate) struct App {
     pub(crate) pr_result: HashMap<String, Result<String, String>>,
     /// PR worker → event-loop channel carrying `(workspace_id, result)`.
     pr_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<String, String>)>>,
+
+    /// Workspaces with a cleanup in flight (gates re-triggering; shows progress).
+    pub(crate) cleanup_inflight: HashSet<String>,
+    /// Last cleanup *failure* per workspace (a success deletes the workspace).
+    pub(crate) cleanup_result: HashMap<String, String>,
+    /// Cleanup worker → event-loop channel carrying `(workspace_id, result)`.
+    cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>>,
 }
 
 impl App {
@@ -360,6 +382,9 @@ impl App {
             pr_inflight: HashSet::new(),
             pr_result: HashMap::new(),
             pr_tx: None,
+            cleanup_inflight: HashSet::new(),
+            cleanup_result: HashMap::new(),
+            cleanup_tx: None,
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -1138,6 +1163,72 @@ impl App {
         });
     }
 
+    /// Open the cleanup confirmation modal for a workspace (own-branch only),
+    /// pre-filling the branch and any cached uncommitted/unpushed warnings.
+    fn cleanup_workspace_prompt(&mut self, ws_id: &str) {
+        if self.cleanup_inflight.contains(ws_id) {
+            return;
+        }
+        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
+            return;
+        };
+        let (Some(_), Some(branch)) = (ws.worktree_path.as_ref(), ws.branch_name.clone()) else {
+            return; // fallback workspace: nothing to clean up
+        };
+        let ws_name = ws.name.clone();
+        let st = self.branch_status.get(ws_id);
+        let dirty = st.map(|s| s.dirty).unwrap_or(false);
+        let unpushed = st.map(|s| s.ahead > 0).unwrap_or(false);
+        self.modal = modal::ModalState::ConfirmCleanup {
+            ws_id: ws_id.to_string(),
+            ws_name,
+            branch,
+            dirty,
+            unpushed,
+        };
+    }
+
+    /// Run the merged-workspace cleanup off the render loop (worktree removal +
+    /// branch deletion happen in core, which enforces the safety guards). Tears
+    /// down any live embedded pane first so its cwd isn't yanked out from under it.
+    fn start_cleanup(&mut self, ws_id: &str) {
+        if self.cleanup_inflight.contains(ws_id) {
+            return;
+        }
+        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
+            return;
+        };
+        let (Some(worktree), Some(branch)) = (ws.worktree_path.clone(), ws.branch_name.clone())
+        else {
+            return;
+        };
+        let Some(repo) = self
+            .repos
+            .iter()
+            .find(|r| r.id == ws.repo_id)
+            .map(|r| r.path.clone())
+        else {
+            return;
+        };
+        let Some(tx) = self.cleanup_tx.clone() else {
+            return; // not wired (unit tests)
+        };
+        // Tear down the embedded pane synchronously (Drop terminates the child),
+        // so the worktree dir isn't removed while a claude is running inside it.
+        self.embedded.remove(ws_id);
+        self.cleanup_inflight.insert(ws_id.to_string());
+        self.cleanup_result.remove(ws_id);
+        let id = ws_id.to_string();
+        std::thread::spawn(move || {
+            let mut guard = CleanupGuard {
+                tx,
+                payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
+            };
+            let result = kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch);
+            guard.payload = Some((id, result));
+        });
+    }
+
     /// Whether any of a workspace's session tabs needs the user's attention.
     pub(crate) fn ws_needs_attention(&self, ws_id: &str) -> bool {
         self.embedded
@@ -1441,6 +1532,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     let _ = app.state.save();
                 }
             }
+            modal::ModalResult::ConfirmCleanup(ws_id) => {
+                app.start_cleanup(&ws_id);
+            }
         }
         return Ok(KeyOutcome::Continue);
     }
@@ -1524,6 +1618,13 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             // Open a GitHub PR for the selected workspace's branch.
                             if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
                                 app.open_pr(&ws_id);
+                            }
+                        }
+                        KeyCode::Char('c') => {
+                            // Clean up the selected (merged) workspace, via a
+                            // confirmation modal.
+                            if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                                app.cleanup_workspace_prompt(&ws_id);
                             }
                         }
                         KeyCode::Char('a') => {
@@ -1735,6 +1836,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         tokio::sync::mpsc::unbounded_channel::<(String, Result<String, String>)>();
     app.pr_tx = Some(pr_tx);
 
+    // Cleanup worker → event loop, carrying `(workspace_id, Ok(()) | Err(msg))`.
+    let (cleanup_tx, mut cleanup_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
+    app.cleanup_tx = Some(cleanup_tx);
+
     loop {
         // Seed the viewed session before drawing so a just-opened/just-switched
         // tab is never momentarily flagged "needs you" before the next tick.
@@ -1757,6 +1863,31 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 // refresh branch status (the push changed ahead/behind).
                 app.pr_inflight.remove(&ws_id);
                 app.pr_result.insert(ws_id, result);
+                app.request_branch_status_refresh();
+            }
+            Some((ws_id, result)) = cleanup_rx.recv() => {
+                app.cleanup_inflight.remove(&ws_id);
+                match result {
+                    Ok(()) => {
+                        // The worktree + branch are gone — drop the workspace too.
+                        if let Some(name) = app.state.workspaces.iter()
+                            .find(|w| w.id == ws_id).map(|w| w.name.clone())
+                        {
+                            let _ = app.state.delete_workspace(&name);
+                            app.workspaces = app.state.workspaces.clone();
+                            app.expanded_icon_rows.remove(&ws_id);
+                            app.pr_result.remove(&ws_id);
+                            app.cleanup_result.remove(&ws_id);
+                            app.rebuild_tree();
+                            if app.selected_index >= app.tree_items.len() && !app.tree_items.is_empty() {
+                                app.selected_index = app.tree_items.len() - 1;
+                            }
+                        }
+                    }
+                    Err(msg) => {
+                        app.cleanup_result.insert(ws_id, msg);
+                    }
+                }
                 app.request_branch_status_refresh();
             }
             event = reader.next().fuse() => {
@@ -1820,6 +1951,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         }
                         buttons::HitAction::OpenPrFor { workspace_id } => {
                             app.open_pr(&workspace_id);
+                        }
+                        buttons::HitAction::CleanupWorkspaceFor { workspace_id } => {
+                            app.cleanup_workspace_prompt(&workspace_id);
                         }
                         buttons::HitAction::StopSessionFor { workspace_id } => {
                             app.embedded.remove(&workspace_id);
@@ -2470,6 +2604,62 @@ mod key_tests {
             .insert("w1".to_string(), Err("boom".to_string()));
         let text = draw(&mut app);
         assert!(text.contains("PR failed:") && text.contains("boom"), "shows the error:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn c_opens_cleanup_modal_for_own_branch_and_noops_for_fallback() {
+        // Own-branch workspace: `c` opens the confirmation modal.
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+        app.workspaces[0].branch_name = Some("kommand0/ws-one".into());
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        press(&mut app, KeyCode::Char('c')).await;
+        assert!(
+            matches!(app.modal, modal::ModalState::ConfirmCleanup { .. }),
+            "c opens the cleanup modal"
+        );
+
+        // Fallback workspace (no own branch): `c` is a no-op.
+        let mut app = test_app(); // w1 has worktree_path: None
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        press(&mut app, KeyCode::Char('c')).await;
+        assert!(!app.modal.is_active(), "no cleanup modal for a branchless workspace");
+    }
+
+    #[tokio::test]
+    async fn cleanup_affordance_and_states_render() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+        app.workspaces[0].branch_name = Some("kommand0/ws-one".into());
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+
+        let draw = |app: &mut App| {
+            let mut t = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            t.draw(|frame| render::ui(frame, app)).unwrap();
+            buffer_text(&t)
+        };
+
+        assert!(draw(&mut app).contains("[Clean up]"), "idle offers the button");
+
+        app.cleanup_inflight.insert("w1".to_string());
+        let text = draw(&mut app);
+        assert!(text.contains("Cleaning up"), "in-flight shows progress");
+        assert!(!text.contains("[Clean up]"), "button hidden while in flight");
+        app.cleanup_inflight.remove("w1");
+
+        app.cleanup_result
+            .insert("w1".to_string(), "uncommitted changes".to_string());
+        let text = draw(&mut app);
+        assert!(
+            text.contains("Cleanup blocked:") && text.contains("uncommitted"),
+            "shows the refusal reason:\n{text}"
+        );
     }
 
     #[tokio::test]
