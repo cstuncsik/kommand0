@@ -985,6 +985,19 @@ impl App {
         self.attention.retain(|id| live.contains(id.as_str()));
     }
 
+    /// Keep every live embedded pane sized to the visible content area — not just
+    /// the one on screen — so switching tabs or workspaces is instant and a
+    /// terminal resize reaches the background panes too. `Pane::resize` is a
+    /// no-op (no PTY resize, no SIGWINCH) when the size is unchanged, so calling
+    /// this every frame only does work on an actual resize.
+    pub(crate) fn resize_embedded_panes(&mut self, content: ratatui::layout::Rect) {
+        for sessions in self.embedded.values_mut() {
+            for tab in sessions.tabs.iter_mut() {
+                let _ = tab.pane.resize(content.height, content.width);
+            }
+        }
+    }
+
     /// Whether any of a workspace's session tabs needs the user's attention.
     pub(crate) fn ws_needs_attention(&self, ws_id: &str) -> bool {
         self.embedded
@@ -2130,6 +2143,61 @@ mod key_tests {
             "status bar shows the waiting count:\n{text}"
         );
         assert!(app.ws_needs_attention("w1"), "workspace flagged for attention");
+    }
+
+    #[test]
+    fn resize_embedded_panes_covers_all_workspaces_and_tabs() {
+        let mut app = test_app();
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"]), tab("b", &["-c", "sleep 30"])],
+                active: 0,
+            },
+        );
+        app.embedded.insert(
+            "w2".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("c", &["-c", "sleep 30"])],
+                active: 0,
+            },
+        );
+        // Every pane starts at the tab() helper's 24x80.
+        app.resize_embedded_panes(ratatui::layout::Rect::new(31, 2, 50, 20));
+        for sessions in app.embedded.values() {
+            for t in &sessions.tabs {
+                assert_eq!(t.pane.size(), (20, 50), "every tab of every workspace is resized");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn render_sizes_background_tabs_too() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"]), tab("b", &["-c", "sleep 30"])],
+                active: 0, // "a" is visible; "b" is a background tab
+            },
+        );
+        app.focus = Focus::Embedded;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+
+        let content = pane_content_rect(app.right_pane_area);
+        assert!(content.width > 0 && content.height > 0);
+        for t in &app.embedded["w1"].tabs {
+            assert_eq!(
+                t.pane.size(),
+                (content.height, content.width),
+                "a render sizes background tabs to the pane, not just the active one"
+            );
+        }
     }
 
     #[test]
