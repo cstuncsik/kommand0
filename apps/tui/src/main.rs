@@ -1987,7 +1987,14 @@ mod key_tests {
     }
 
     #[test]
-    fn reap_resume_failure_auto_heals_only_the_failed_tab() {
+    fn reap_resume_failure_affects_only_the_failed_tab() {
+        // A resume failure must only ever touch the tab that failed: the gone id
+        // is forgotten and a healthy sibling is never collateral. The in-place
+        // heal itself (spawning a fresh session into the slot) is covered
+        // end-to-end by the `stale_resume_auto_heals_to_a_fresh_session` e2e,
+        // which can guarantee a real bin in a real cwd; here the fresh spawn's
+        // success is environment-dependent, so we assert only what holds in both
+        // the healed and the drop-fallback branch.
         let mut app = test_app();
         app.state.add_embedded_session("w1", "a");
         app.state.add_embedded_session("w1", "b");
@@ -2017,19 +2024,16 @@ mod key_tests {
         app.embedded.insert("w1".to_string(), s);
 
         app.reap_embedded(Instant::now());
-        // "a" is forgotten and replaced in place by a fresh session; "b" is
-        // untouched. The slot count and active index are preserved.
+        // "a" is always forgotten; "b" is always preserved (never collateral).
         let persisted = app.state.embedded_session_ids("w1");
-        assert_eq!(persisted.len(), 2, "fresh id replaces the gone one: {persisted:?}");
-        assert!(persisted.contains(&"b".to_string()));
-        assert!(!persisted.contains(&"a".to_string()), "gone id dropped: {persisted:?}");
+        assert!(persisted.contains(&"b".to_string()), "healthy id kept: {persisted:?}");
+        assert!(!persisted.contains(&"a".to_string()), "gone id forgotten: {persisted:?}");
 
-        let tab_ids = ids(&app.embedded["w1"]);
-        assert_eq!(tab_ids.len(), 2);
-        assert_eq!(tab_ids[1], "b", "the healthy tab keeps its slot");
-        assert_ne!(tab_ids[0], "a", "slot 0 healed to a fresh session");
-        assert_ne!(tab_ids[0], "b");
-        assert_eq!(app.embedded["w1"].active, 0, "active tab is preserved");
+        let s = &app.embedded["w1"];
+        let tab_ids = ids(s);
+        assert!(tab_ids.contains(&"b"), "healthy tab kept: {tab_ids:?}");
+        assert!(!tab_ids.contains(&"a"), "failed tab gone (healed or dropped): {tab_ids:?}");
+        assert!(s.active < s.tabs.len(), "active stays in range");
     }
 
     #[tokio::test]
