@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Fake interactive claude for the attention-surfacing e2e: prints an initial
+# marker (seen while the user is viewing the pane on open), then after a short
+# delay prints a late line and idles. If the user navigated away before the
+# late output, that output is "unseen" and — once the pane goes quiet — must
+# raise the workspace's attention flag.
+stty -echo 2>/dev/null
+printf '\033[?1049h\033[2J\033[H'
+printf 'READY-DELAYED\r\n'
+# Generous delay so the test reliably navigates away (leaves Embedded focus)
+# before this lands, even on a loaded CI box — otherwise it'd be marked seen.
+sleep 2
+printf 'LATE-OUTPUT\r\n'
+while IFS= read -r -n1 ch; do :; done

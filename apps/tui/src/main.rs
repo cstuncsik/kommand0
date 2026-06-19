@@ -224,6 +224,16 @@ pub(crate) struct App {
     /// Per-session instant until which the session counts as active, refreshed
     /// while its `output_seq` keeps advancing.
     pane_active_until: HashMap<String, Instant>,
+    /// Per-session `output_seq` at the moment the user last *viewed* it (it was
+    /// the focused workspace's active tab). Output past this point is "unseen".
+    viewed_seq: HashMap<String, u64>,
+    /// Per-session instant of the most recent new output (any delta, no
+    /// debounce) — used to decide a session has gone quiet ("settled").
+    last_output_at: HashMap<String, Instant>,
+    /// Sessions that produced unseen output and then went quiet — they "need
+    /// you". A latched set: a session stays here until the user views it (or its
+    /// pane is gone), so a mid-turn pause that resumes can't strobe it on/off.
+    pub(crate) attention: HashSet<String>,
     pub(crate) pane_areas: mouse::PaneAreas,
     pub(crate) mouse_pos: Option<(u16, u16)>,
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
@@ -272,6 +282,9 @@ impl App {
             pane_seen: HashMap::new(),
             pane_pending: HashSet::new(),
             pane_active_until: HashMap::new(),
+            viewed_seq: HashMap::new(),
+            last_output_at: HashMap::new(),
+            attention: HashSet::new(),
             pane_areas: mouse::PaneAreas::default(),
             mouse_pos: None,
             hit_regions: Vec::new(),
@@ -920,6 +933,64 @@ impl App {
             .flat_map(|s| s.tabs.iter().map(|t| (t.id.clone(), t.pane.output_seq())))
             .collect();
         self.apply_pane_activity(now, &seqs);
+        // Keep the on-screen session marked seen, then latch any others that went
+        // quiet with unseen output. Order matters: clear before latching so the
+        // session you're watching is never flagged.
+        self.mark_active_viewed();
+        self.recompute_attention(now, &seqs);
+    }
+
+    /// Mark the currently-viewed session (the focused workspace's active tab) as
+    /// seen up to its latest output, and clear any pending attention on it. Runs
+    /// every frame (before draw) and every tick, so a session you're looking at
+    /// never raises the "needs you" flag.
+    pub(crate) fn mark_active_viewed(&mut self) {
+        if self.focus != Focus::Embedded {
+            return;
+        }
+        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
+            return;
+        };
+        let Some((id, seq)) = self
+            .embedded
+            .get(&ws_id)
+            .and_then(|s| s.active_tab())
+            .map(|t| (t.id.clone(), t.pane.output_seq()))
+        else {
+            return;
+        };
+        self.viewed_seq.insert(id.clone(), seq);
+        self.attention.remove(&id);
+    }
+
+    /// Latch sessions that produced unseen output and have since gone quiet. A
+    /// latched session stays flagged until viewed (or its pane disappears), so a
+    /// mid-turn tool pause that later resumes can't strobe the indicator.
+    fn recompute_attention(&mut self, now: Instant, seqs: &[(String, u64)]) {
+        const ATTENTION_SETTLE: Duration = Duration::from_millis(1500);
+        for (id, seq) in seqs {
+            let seen = self.viewed_seq.get(id).copied().unwrap_or(0);
+            let unseen = *seq > seen;
+            let settled = self
+                .last_output_at
+                .get(id)
+                .is_some_and(|t| now.duration_since(*t) >= ATTENTION_SETTLE);
+            if unseen && settled {
+                self.attention.insert(id.clone());
+            }
+        }
+        // Forget sessions whose pane is gone (closed/healed-to-a-new-id).
+        let live: HashSet<&str> = seqs.iter().map(|(id, _)| id.as_str()).collect();
+        self.viewed_seq.retain(|id, _| live.contains(id.as_str()));
+        self.attention.retain(|id| live.contains(id.as_str()));
+    }
+
+    /// Whether any of a workspace's session tabs needs the user's attention.
+    pub(crate) fn ws_needs_attention(&self, ws_id: &str) -> bool {
+        self.embedded
+            .get(ws_id)
+            .map(|s| s.tabs.iter().any(|t| self.attention.contains(&t.id)))
+            .unwrap_or(false)
     }
 
     /// Core of [`Self::update_pane_activity`], split out for testing: given the
@@ -932,6 +1003,8 @@ impl App {
             let had_new = self.pane_seen.get(id) != Some(seq);
             self.pane_seen.insert(id.clone(), *seq);
             if had_new {
+                // Stamp the last-output time (no debounce) for the settle check.
+                self.last_output_at.insert(id.clone(), now);
                 if self.pane_pending.contains(id) {
                     self.pane_active_until.insert(id.clone(), now + ACTIVE_WINDOW);
                 } else {
@@ -947,6 +1020,7 @@ impl App {
         self.pane_pending.retain(|id| live.contains(id.as_str()));
         self.pane_active_until
             .retain(|id, _| live.contains(id.as_str()));
+        self.last_output_at.retain(|id, _| live.contains(id.as_str()));
         self.waiting_response = self
             .pane_active_until
             .iter()
@@ -1487,6 +1561,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     app.embedded_wake = Some(wake_tx);
 
     loop {
+        // Seed the viewed session before drawing so a just-opened/just-switched
+        // tab is never momentarily flagged "needs you" before the next tick.
+        app.mark_active_viewed();
         terminal.draw(|frame| render::ui(frame, &mut app))?;
 
         tokio::select! {
@@ -1922,6 +1999,137 @@ mod key_tests {
         assert!(app.pane_seen.is_empty());
         assert!(app.pane_pending.is_empty());
         assert!(app.pane_active_until.is_empty());
+        assert!(app.last_output_at.is_empty());
+    }
+
+    #[test]
+    fn attention_latches_on_unseen_quiet_and_sticks() {
+        let mut app = test_app(); // focus Tree -> nothing is "viewed"
+        let t = Instant::now();
+
+        // Fresh output isn't attention until it has gone quiet (settled).
+        app.apply_pane_activity(t, &[("s1".to_string(), 1)]);
+        app.recompute_attention(t, &[("s1".to_string(), 1)]);
+        assert!(!app.attention.contains("s1"), "fresh output isn't attention yet");
+
+        // Unseen + quiet past the settle window -> latched.
+        let later = t + Duration::from_millis(1500);
+        app.recompute_attention(later, &[("s1".to_string(), 1)]);
+        assert!(app.attention.contains("s1"), "unseen + settled => needs you");
+
+        // Resumed output must NOT clear it (no mid-turn strobe) — only viewing does.
+        app.apply_pane_activity(later, &[("s1".to_string(), 2)]);
+        app.recompute_attention(later, &[("s1".to_string(), 2)]);
+        assert!(
+            app.attention.contains("s1"),
+            "latched attention survives resumed output"
+        );
+
+        // A gone pane is forgotten.
+        app.recompute_attention(later, &[]);
+        assert!(app.attention.is_empty());
+        assert!(app.viewed_seq.is_empty());
+    }
+
+    #[test]
+    fn viewing_the_active_tab_clears_its_attention() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("s1", &["-c", "sleep 30"])],
+                active: 0,
+            },
+        );
+        app.attention.insert("s1".to_string());
+        app.focus = Focus::Embedded;
+
+        app.mark_active_viewed();
+        assert!(
+            !app.attention.contains("s1"),
+            "viewing the active tab clears its attention"
+        );
+        assert!(app.viewed_seq.contains_key("s1"), "viewed_seq is seeded on view");
+        assert!(!app.ws_needs_attention("w1"));
+    }
+
+    #[test]
+    fn attention_clears_per_tab_not_per_workspace() {
+        // A workspace stays flagged while a *sibling* tab has unseen output, even
+        // while you're viewing another of its tabs — it clears only when you open
+        // that specific session.
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"]), tab("b", &["-c", "sleep 30"])],
+                active: 0, // viewing tab "a"
+            },
+        );
+        app.attention.insert("b".to_string()); // sibling tab "b" came back
+        app.focus = Focus::Embedded;
+
+        app.mark_active_viewed(); // marks "a" seen, leaves "b" latched
+        assert!(app.ws_needs_attention("w1"), "sibling tab keeps the workspace flagged");
+        assert!(app.attention.contains("b"));
+
+        // Switch to "b" and view it -> now it clears.
+        app.embedded.get_mut("w1").unwrap().active = 1;
+        app.mark_active_viewed();
+        assert!(!app.ws_needs_attention("w1"), "viewing the sibling clears it");
+    }
+
+    #[test]
+    fn attention_relatches_after_view_then_new_output() {
+        let mut app = test_app(); // focus Tree
+        let t = Instant::now();
+        app.apply_pane_activity(t, &[("s1".to_string(), 1)]);
+        app.recompute_attention(t + Duration::from_millis(1500), &[("s1".to_string(), 1)]);
+        assert!(app.attention.contains("s1"), "first latch");
+
+        // Simulate viewing it (seen up to seq 1, cleared).
+        app.viewed_seq.insert("s1".to_string(), 1);
+        app.attention.remove("s1");
+
+        // New output after viewing, still fresh -> not yet.
+        let t2 = t + Duration::from_millis(2000);
+        app.apply_pane_activity(t2, &[("s1".to_string(), 2)]);
+        app.recompute_attention(t2, &[("s1".to_string(), 2)]);
+        assert!(!app.attention.contains("s1"), "fresh post-view output isn't attention yet");
+
+        // ...once it settles, it re-latches.
+        app.recompute_attention(t2 + Duration::from_millis(1500), &[("s1".to_string(), 2)]);
+        assert!(app.attention.contains("s1"), "unseen output after a view re-latches");
+    }
+
+    #[test]
+    fn attention_count_shows_in_status_bar() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("s1", &["-c", "sleep 30"])],
+                active: 0,
+            },
+        );
+        app.attention.insert("s1".to_string());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("1 waiting"),
+            "status bar shows the waiting count:\n{text}"
+        );
+        assert!(app.ws_needs_attention("w1"), "workspace flagged for attention");
     }
 
     #[test]
