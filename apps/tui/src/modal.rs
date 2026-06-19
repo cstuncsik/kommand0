@@ -36,6 +36,13 @@ pub(crate) enum ModalState {
     ConfirmDelete {
         target: DeleteTarget,
     },
+    RenameSession {
+        ws_id: String,
+        session_id: String,
+        input: String,
+        cursor: usize,
+        error: Option<String>,
+    },
 }
 
 impl ModalState {
@@ -56,6 +63,8 @@ pub(crate) enum ModalResult {
     SubmitWorkspace(String, String),
     /// Delete confirmed.
     ConfirmDelete(DeleteTarget),
+    /// Rename submitted with (ws_id, session_id, title); an empty title clears it.
+    SubmitRename(String, String, String),
 }
 
 /// Handle a key event when a modal is active.
@@ -253,6 +262,71 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     *modal = ModalState::None;
                     ModalResult::Cancelled
+                }
+                _ => ModalResult::Consumed,
+            }
+        }
+        ModalState::RenameSession {
+            ws_id,
+            session_id,
+            input,
+            cursor,
+            error,
+        } => {
+            *error = None;
+
+            match key.code {
+                KeyCode::Esc => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
+                }
+                KeyCode::Enter => {
+                    // An empty title is allowed — it clears any existing one.
+                    let title = input.trim().to_string();
+                    let result = ModalResult::SubmitRename(ws_id.clone(), session_id.clone(), title);
+                    *modal = ModalState::None;
+                    result
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
+                }
+                KeyCode::Char(c) => {
+                    input.insert(*cursor, c);
+                    *cursor += c.len_utf8();
+                    ModalResult::Consumed
+                }
+                KeyCode::Backspace => {
+                    if *cursor > 0 {
+                        let prev = input[..*cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        input.replace_range(prev..*cursor, "");
+                        *cursor = prev;
+                    }
+                    ModalResult::Consumed
+                }
+                KeyCode::Left => {
+                    if *cursor > 0 {
+                        *cursor = input[..*cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                    ModalResult::Consumed
+                }
+                KeyCode::Right => {
+                    if *cursor < input.len() {
+                        *cursor = input[*cursor..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(i, _)| *cursor + i)
+                            .unwrap_or(input.len());
+                    }
+                    ModalResult::Consumed
                 }
                 _ => ModalResult::Consumed,
             }
@@ -551,6 +625,64 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
                     Span::raw(": cancel"),
                 ])),
                 inner[2],
+            );
+        }
+        ModalState::RenameSession {
+            input, cursor, error, ..
+        } => {
+            let area = centered_rect(50, 25, frame.area());
+            frame.render_widget(Clear, area);
+
+            let inner = Layout::vertical([
+                Constraint::Length(2), // label
+                Constraint::Length(1), // input
+                Constraint::Length(1), // error
+                Constraint::Min(0),   // spacer
+                Constraint::Length(1), // footer
+            ])
+            .split(Rect::new(
+                area.x + 2,
+                area.y + 1,
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(2),
+            ));
+
+            let block = Block::default()
+                .title(" Rename Session ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+            frame.render_widget(block, area);
+
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "Session name (empty clears):",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                inner[0],
+            );
+
+            let display_input = render_input_with_cursor(input, *cursor, inner[1].width as usize);
+            frame.render_widget(
+                Paragraph::new(display_input)
+                    .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+                inner[1],
+            );
+
+            if let Some(err) = error {
+                frame.render_widget(
+                    Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)),
+                    inner[2],
+                );
+            }
+
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                    Span::raw(": submit  "),
+                    Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                    Span::raw(": cancel"),
+                ])),
+                inner[4],
             );
         }
     }

@@ -398,31 +398,43 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     if strip.height == 0 {
         return;
     }
-    // Snapshot what we need so we can mutate app.hit_regions afterward.
-    let snapshot: Vec<(usize, bool, bool)> = match app.embedded.get(ws_id) {
+    // Snapshot what we need (incl. the session id, to look up its title) so we
+    // can mutate app.hit_regions afterward.
+    let snapshot: Vec<(usize, bool, bool, String)> = match app.embedded.get(ws_id) {
         Some(s) => s
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| (i, i == s.active, app.waiting_response.contains(&t.id)))
+            .map(|(i, t)| (i, i == s.active, app.waiting_response.contains(&t.id), t.id.clone()))
             .collect(),
         None => return,
     };
     let tab_count = snapshot.len();
     let spinner = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+    // Cap a title so one long name can't push later tabs (and the [+]) off-screen.
+    const MAX_TITLE_COLS: usize = 16;
 
     let mut spans: Vec<Span> = Vec::new();
     let mut regions: Vec<(Rect, HitAction)> = Vec::new();
     let mut x = strip.x;
     let right = strip.x + strip.width;
-    for (i, is_active, producing) in &snapshot {
+    for (i, is_active, producing, id) in &snapshot {
+        // Producing replaces the number with the spinner (unchanged); a user
+        // title, when set, is appended so the tab is identifiable by name too.
         let glyph = if *producing {
             spinner.to_string()
         } else {
             (i + 1).to_string()
         };
-        let label = format!(" {glyph} ");
-        let w = label.chars().count() as u16;
+        let label = match app.state.embedded_session_title(ws_id, id) {
+            Some(title) if !title.is_empty() => {
+                let shown = truncate_to_width(title, MAX_TITLE_COLS);
+                let ellipsis = if UnicodeWidthStr::width(title) > MAX_TITLE_COLS { "…" } else { "" };
+                format!(" {glyph} {shown}{ellipsis} ")
+            }
+            _ => format!(" {glyph} "),
+        };
+        let w = UnicodeWidthStr::width(label.as_str()) as u16;
         let style = if *is_active {
             Style::default()
                 .fg(Color::Black)
@@ -484,7 +496,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         };
         let mut block = Block::default()
             .title(format!(
-                " {ws_name} — claude · Ctrl+A: c new · [ ] switch · x close · t tree · q quit "
+                " {ws_name} — claude · Ctrl+A: c new · [ ] switch · r rename · x close · t tree · q quit "
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border));
