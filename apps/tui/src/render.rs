@@ -263,17 +263,55 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             app.embedded.contains_key(&ws.id),
                         );
 
-                        // Fill-span layout: prefix + dot + space + name + fill + icons
+                        // Fill-span layout: prefix + dot + space + name + fill + git + icons
                         let prefix_width = UnicodeWidthStr::width(prefix);
                         let dot_width: usize = 1;
                         let space_after_dot: usize = 1;
                         let fixed_width = prefix_width + dot_width + space_after_dot;
+
+                        // Compact git-status segment for own-branch workspaces,
+                        // e.g. " ↑2↓1*". Right-anchored before the icons; its width
+                        // is reserved from the name/fill so the icon hit-regions
+                        // (measured from the right edge) stay aligned. Suppressed
+                        // when the row is too narrow to also fit a name + icons.
+                        let git_seg = if ws.worktree_path.is_some() {
+                            app.branch_status
+                                .get(&ws.id)
+                                .map(|s| {
+                                    let mut seg = String::new();
+                                    if s.ahead > 0 {
+                                        seg.push_str(&format!("↑{}", s.ahead));
+                                    }
+                                    if s.behind > 0 {
+                                        seg.push_str(&format!("↓{}", s.behind));
+                                    }
+                                    if s.dirty {
+                                        seg.push('*');
+                                    }
+                                    seg
+                                })
+                                .filter(|s| !s.is_empty())
+                                .map(|s| format!(" {s}"))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let git_w_raw = UnicodeWidthStr::width(git_seg.as_str());
+                        let git_w = if fixed_width + icons.total_width as usize + git_w_raw
+                            < pane_inner_width
+                        {
+                            git_w_raw
+                        } else {
+                            0 // too narrow — drop the segment, keep name + icons
+                        };
+                        let git_seg = if git_w == 0 { String::new() } else { git_seg };
+
                         let name_max_width = pane_inner_width
-                            .saturating_sub(fixed_width + icons.total_width as usize);
+                            .saturating_sub(fixed_width + git_w + icons.total_width as usize);
                         let display_name = truncate_to_width(&ws.name, name_max_width);
                         let name_display_width = UnicodeWidthStr::width(display_name.as_str());
                         let fill_width = pane_inner_width.saturating_sub(
-                            fixed_width + name_display_width + icons.total_width as usize,
+                            fixed_width + name_display_width + git_w + icons.total_width as usize,
                         );
 
                         let mut spans = vec![
@@ -282,6 +320,9 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             Span::styled(format!(" {display_name}"), style),
                             Span::raw(" ".repeat(fill_width)),
                         ];
+                        if git_w > 0 {
+                            spans.push(Span::styled(git_seg, Style::default().fg(Color::Yellow)));
+                        }
                         spans.extend(icons.spans.clone());
 
                         // Collect icon data for hit region registration after render
@@ -669,6 +710,55 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::raw(format_timestamp(ws.created_at)),
                 ]),
             ];
+
+            // Git branch / changes, from the off-loop status cache.
+            let label_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            if ws.worktree_path.is_none() {
+                lines.push(Line::from(vec![
+                    Span::styled("Branch: ", label_style),
+                    Span::styled(
+                        "(shared checkout — no workspace branch)",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            } else {
+                let st = app.branch_status.get(&ws.id);
+                let branch = st
+                    .and_then(|s| s.branch.clone())
+                    .or_else(|| ws.branch_name.clone())
+                    .unwrap_or_else(|| "(detached)".to_string());
+                let mut branch_spans =
+                    vec![Span::styled("Branch: ", label_style), Span::raw(branch)];
+                if let Some(s) = st {
+                    if !s.has_upstream {
+                        branch_spans.push(Span::styled(
+                            " (no upstream)",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    } else if s.ahead > 0 || s.behind > 0 {
+                        branch_spans.push(Span::styled(
+                            format!(" ↑{} ↓{}", s.ahead, s.behind),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    } else {
+                        branch_spans.push(Span::styled(
+                            " (up to date)",
+                            Style::default().fg(Color::Green),
+                        ));
+                    }
+                }
+                lines.push(Line::from(branch_spans));
+
+                let changes = match st {
+                    Some(s) if s.dirty => {
+                        Span::styled("uncommitted changes", Style::default().fg(Color::Yellow))
+                    }
+                    Some(_) => Span::styled("clean", Style::default().fg(Color::Green)),
+                    None => Span::styled("…", Style::default().fg(Color::DarkGray)),
+                };
+                lines.push(Line::from(vec![Span::styled("Changes: ", label_style), changes]));
+            }
+
             // Hint + button to open the embedded interactive claude.
             lines.push(Line::raw(""));
             lines.push(Line::styled(

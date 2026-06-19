@@ -10,6 +10,10 @@ pub struct Workspace {
     pub created_at: u64,
     #[serde(default)]
     pub worktree_path: Option<String>,
+    /// The git branch the worktree was created on (`kommand0/<name>`), captured
+    /// at creation. `None` for fallback workspaces with no own worktree/branch.
+    #[serde(default)]
+    pub branch_name: Option<String>,
 }
 
 /// Format a unix timestamp (seconds) as "YYYY-MM-DD HH:MM" in local timezone.

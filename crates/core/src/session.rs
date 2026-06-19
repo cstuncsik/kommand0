@@ -42,6 +42,7 @@ mod tests {
             active: true,
             created_at: 1000,
             worktree_path: None,
+            branch_name: None,
         });
         state.save_to(tmp.path()).unwrap();
         (state, "ws1".to_string())
