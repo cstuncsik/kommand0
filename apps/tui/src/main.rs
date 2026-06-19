@@ -1131,8 +1131,8 @@ impl App {
     /// branch and run `gh pr create`. No-op if one is already in flight; sets a
     /// `pr_result` error immediately when the workspace has no own branch.
     fn open_pr(&mut self, ws_id: &str) {
-        if self.pr_inflight.contains(ws_id) {
-            return;
+        if self.pr_inflight.contains(ws_id) || self.cleanup_inflight.contains(ws_id) {
+            return; // don't race a cleanup of the same worktree
         }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
             return;
@@ -1192,8 +1192,8 @@ impl App {
     /// branch deletion happen in core, which enforces the safety guards). Tears
     /// down any live embedded pane first so its cwd isn't yanked out from under it.
     fn start_cleanup(&mut self, ws_id: &str) {
-        if self.cleanup_inflight.contains(ws_id) {
-            return;
+        if self.cleanup_inflight.contains(ws_id) || self.pr_inflight.contains(ws_id) {
+            return; // don't remove the worktree while a PR push runs in it
         }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
             return;
