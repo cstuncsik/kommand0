@@ -53,8 +53,9 @@ cargo run -p kommand0-tui
 - **Mouse support**: click tree items and scroll the tree; inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion
 - **Git worktrees**: each workspace gets an isolated git worktree branch
-- **Status bar**: bottom row shows the current mode (TREE / CLAUDE), the selected repo/workspace, the live-session count (and how many are active), and context key hints
+- **Status bar**: bottom row shows the current mode (TREE / CLAUDE), the selected repo/workspace, the live-session count (and how many are active / waiting), and context key hints
 - **Activity indicator**: a workspace's tree row animates its prompt into a spinner while its embedded Claude is actively producing output (debounced, so a stray keystroke doesn't flicker it)
+- **Attention indicator**: when a session produces output you haven't viewed and then goes quiet, its workspace gets a magenta dot (and a "N waiting" count in the status bar) so you can tell at a glance which of your parallel sessions has come back to you. It clears as soon as you view that session, and a mid-turn pause won't flicker it — the flag latches until you look.
 
 ### Keybindings
 
