@@ -1,0 +1,22 @@
+crates/core/src/git.rs
+  s_fc3d7618d36de0::t_09cc2d19726c45 141-143,145-147,151,159-167
+  s_fc3d7618d36de0::t_24a99304a249b3 320-321,324
+apps/tui/tests/fixtures/gh-stub
+  s_fc3d7618d36de0::t_ae26eb6d32fa9e 4-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "0c70a18edadf3e48616b4271756528a31e0fa4d3",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
