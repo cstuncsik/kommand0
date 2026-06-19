@@ -50,6 +50,10 @@ const TREE_BINDINGS: &[KeyBinding] = &[
         description: "Close embedded claude",
     },
     KeyBinding {
+        keys: "[p]",
+        description: "Open a GitHub PR for the workspace",
+    },
+    KeyBinding {
         keys: "[a]",
         description: "Add repository",
     },
