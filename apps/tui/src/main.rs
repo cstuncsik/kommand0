@@ -1197,11 +1197,20 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 }
             }
             modal::ModalResult::SubmitRename(ws_id, session_id, title) => {
-                // Single source of truth: persist immediately (the quit path does
-                // not unconditionally save). Focus stays Embedded, so the modal
-                // closing drops the user straight back into the pane.
-                app.state.set_embedded_session_title(&ws_id, &session_id, &title);
-                let _ = app.state.save();
+                // Only title a session that's still live — reap can heal/drop the
+                // tab (assigning a new id) while the modal is open, and a title
+                // must never outlive its session. Persist immediately (the quit
+                // path does not unconditionally save). Focus stays Embedded, so
+                // closing the modal drops the user straight back into the pane.
+                if app
+                    .state
+                    .embedded_session_ids(&ws_id)
+                    .iter()
+                    .any(|id| id == &session_id)
+                {
+                    app.state.set_embedded_session_title(&ws_id, &session_id, &title);
+                    let _ = app.state.save();
+                }
             }
         }
         return Ok(KeyOutcome::Continue);
@@ -2128,6 +2137,9 @@ mod key_tests {
         press(&mut app, KeyCode::Enter).await;
         assert!(!app.modal.is_active(), "modal closed on submit");
         assert_eq!(app.state.embedded_session_title("w1", "sess-1"), Some("auth"));
+        // The typed name went to the modal, not the pane behind it.
+        let pane_text = app.embedded["w1"].tabs[0].pane.screen_contents();
+        assert!(!pane_text.contains("auth"), "rename input must not leak to claude");
 
         // The title renders in the tab strip.
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
