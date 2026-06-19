@@ -1,0 +1,47 @@
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_ef964d1f71a060 360-362
+  s_fc3d7618d36de0::t_60e6f7785d7475 1523-1528
+  s_fc3d7618d36de0::t_211acbcc250560 1821-1823
+  s_fc3d7618d36de0::t_a24048ccffe77c 70-84
+  s_fc3d7618d36de0::t_eb59e6d23d5568 2425-2472
+  s_fc3d7618d36de0::t_ec370ac8cf2f77 309-315
+  s_fc3d7618d36de0::t_a4101c1e12859b 1105-1121,1125-1140
+  s_fc3d7618d36de0::t_99b1acd3393970 1733-1737
+  s_fc3d7618d36de0::t_28e11f81b1ae75 1755-1761
+  s_fc3d7618d36de0::t_72dfb880bd7a0d 1122-1124
+README.md
+  s_fc3d7618d36de0::t_a1f9cbc6405a93 57
+  s_fc3d7618d36de0::t_9b266077181953 71
+crates/core/src/lib.rs
+  s_fc3d7618d36de0::t_d8d73f645f303d 8
+apps/tui/src/buttons.rs
+  s_fc3d7618d36de0::t_125cd724b266ae 26-27
+apps/tui/src/render.rs
+  s_fc3d7618d36de0::t_ff8ffec4c0cd83 793-842
+apps/tui/src/help.rs
+  s_fc3d7618d36de0::t_205c29585ba665 53-55
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_7e3bf36c43895d 641-695
+crates/core/src/git.rs
+  s_fc3d7618d36de0::t_476c975b4622e4 1,8-11,13
+  s_fc3d7618d36de0::t_498ab41abc62a1 73-160
+  s_fc3d7618d36de0::t_d2642e2ebaccac 256-336
+apps/tui/tests/fixtures/gh-stub
+  s_fc3d7618d36de0::t_a9db8f8e3fda67 1-8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "743ebe3fc26f3f08bf450457c29c71e47f06e8d8",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
