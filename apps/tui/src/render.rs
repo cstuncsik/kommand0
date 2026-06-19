@@ -428,9 +428,14 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
         };
         let label = match app.state.embedded_session_title(ws_id, id) {
             Some(title) if !title.is_empty() => {
-                let shown = truncate_to_width(title, MAX_TITLE_COLS);
-                let ellipsis = if UnicodeWidthStr::width(title) > MAX_TITLE_COLS { "…" } else { "" };
-                format!(" {glyph} {shown}{ellipsis} ")
+                if UnicodeWidthStr::width(title) > MAX_TITLE_COLS {
+                    // Reserve one column for the ellipsis so the title block stays
+                    // within MAX_TITLE_COLS.
+                    let shown = truncate_to_width(title, MAX_TITLE_COLS - 1);
+                    format!(" {glyph} {shown}… ")
+                } else {
+                    format!(" {glyph} {title} ")
+                }
             }
             _ => format!(" {glyph} "),
         };
