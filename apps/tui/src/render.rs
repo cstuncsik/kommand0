@@ -840,6 +840,49 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 }
             }
 
+            // Clean-up affordance + last failure (own-branch workspaces).
+            let cleanup_inflight = app.cleanup_inflight.contains(&ws.id);
+            if has_branch || cleanup_inflight || app.cleanup_result.contains_key(&ws.id) {
+                lines.push(Line::raw(""));
+                if cleanup_inflight {
+                    let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+                    lines.push(Line::styled(
+                        format!("{spin} Cleaning up…"),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                } else if has_branch {
+                    let btn_y = area.y + 1 + lines.len() as u16;
+                    let btn_x = area.x + 2;
+                    let btn_label = "Clean up";
+                    let btn_rect = Rect::new(btn_x, btn_y, (btn_label.len() + 2) as u16, 1);
+                    let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
+                    let style = if hovered {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    };
+                    lines.push(Line::styled(format!("[{btn_label}]"), style));
+                    app.hit_regions.push(buttons::HitRegion {
+                        area: btn_rect,
+                        action: buttons::HitAction::CleanupWorkspaceFor {
+                            workspace_id: ws.id.clone(),
+                        },
+                    });
+                }
+                if let Some(msg) = app.cleanup_result.get(&ws.id) {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "Cleanup blocked: ",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(msg.clone(), Style::default().fg(Color::Red)),
+                    ]));
+                }
+            }
+
             (title, lines)
         }
         Some(TreeNode::Hint { .. }) | None => {
