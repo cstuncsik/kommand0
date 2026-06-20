@@ -1,0 +1,42 @@
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_334274c2d55819 844-863
+  s_fc3d7618d36de0::t_0f25b5ea053e91 262
+README.md
+  s_fc3d7618d36de0::t_b03b4ef33b9404 132-133,140
+crates/core/src/config.rs
+  s_fc3d7618d36de0::t_2776befffd2ab0 26-30
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_03c2046eefda55 3320-3321
+  s_fc3d7618d36de0::t_66891f9b3267da 355-356,358-359
+  s_fc3d7618d36de0::t_d61987097443ee 3
+  s_fc3d7618d36de0::t_df828afc9c0207 1670,1673-1683,1685-1746,1748-1775,1777-1835,1837,1840-1846,1848,1850-1870,1872,1874-1879,1881-1882
+  s_fc3d7618d36de0::t_c2a1cba8800447 1944-1945,1948-1959
+  s_fc3d7618d36de0::t_0fda54645ad24c 3052-3070
+  s_fc3d7618d36de0::t_5aad114c3f75ae 413
+apps/tui/src/keymap.rs
+  s_fc3d7618d36de0::t_966886f375605d 361-363,366
+  s_fc3d7618d36de0::t_91e2f724cf7a07 151-152,155-157
+  s_fc3d7618d36de0::t_b0c645c8c2d5fa 1-150,153-154,158-322,324-360,364-365,367-437
+  s_fc3d7618d36de0::t_47bd8e7a913450 323
+apps/tui/src/render.rs
+  s_fc3d7618d36de0::t_2c024507e346b0 62-63,65-66
+apps/tui/src/help.rs
+  s_fc3d7618d36de0::t_daf26c1aad5429 76-83,106-115,124-131,133,135
+  s_fc3d7618d36de0::t_12125aba52036f 10-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "c7c998cd7bd612838c1d7c063b325d7dec7b45b4",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
