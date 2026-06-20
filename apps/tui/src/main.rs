@@ -1631,6 +1631,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 app.apply_filter();
             }
             KeyCode::Enter => app.filter_input = false, // keep the query applied
+            // Arrows walk the live matches without leaving the filter box.
+            KeyCode::Up => app.move_up(),
+            KeyCode::Down => app.move_down(),
             KeyCode::Backspace => {
                 app.filter_query.pop();
                 app.apply_filter();
@@ -2241,6 +2244,17 @@ mod key_tests {
     }
 
     fn test_app() -> App {
+        // Redirect persistence to a hermetic per-process temp dir so tests that
+        // save (archive, rename, close-session) never touch the dev's
+        // `.kommand0-dev`. Set once, early, to a single value.
+        use std::sync::Once;
+        static STATE_DIR: Once = Once::new();
+        STATE_DIR.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("kommand0-tests-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            unsafe { std::env::set_var("KOMMAND0_STATE_DIR", &dir) };
+        });
+
         let mut state = AppState::default();
         state.repos.push(RepoEntry {
             id: "r1".into(),
@@ -2357,6 +2371,36 @@ mod key_tests {
         press(&mut app, KeyCode::Esc).await;
         assert!(!app.filter_input && app.filter_query.is_empty(), "Esc clears the filter");
         assert_eq!(ws_names(&app).len(), 2, "tree restored");
+    }
+
+    #[tokio::test]
+    async fn filter_to_zero_matches_is_safe_and_enter_keeps_the_filter() {
+        let mut app = test_app();
+        app.workspaces = vec![mk_ws("w1", "auth", "r1", None)];
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+
+        press(&mut app, KeyCode::Char('/')).await;
+        for c in "zzz".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        // No match: the tree is empty, selection stays in-range, nothing panics.
+        assert!(app.tree_items.is_empty());
+        assert!(app.selected_workspace().is_none());
+
+        // Narrow back to a match, then Enter keeps the filter applied for nav.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Backspace).await;
+        }
+        for c in "au".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        press(&mut app, KeyCode::Enter).await;
+        assert!(!app.filter_input, "Enter exits input mode");
+        assert_eq!(app.filter_query, "au", "Enter keeps the query applied");
+        assert_eq!(ws_names(&app), vec!["auth"]);
+        // Navigation works on the filtered tree (j/k reach the handlers now).
+        assert!(app.selected_workspace().is_some());
     }
 
     #[tokio::test]
