@@ -794,7 +794,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
 }
 
 /// Render an input string with a visible cursor.
-fn render_input_with_cursor(input: &str, cursor: usize, width: usize, th: Theme) -> Line<'static> {
+pub(crate) fn render_input_with_cursor(input: &str, cursor: usize, width: usize, th: Theme) -> Line<'static> {
     if input.is_empty() {
         return Line::from(vec![
             Span::styled("█", Style::default().fg(th.accent)),
