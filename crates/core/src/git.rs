@@ -170,6 +170,128 @@ fn open_pull_request_with(worktree_path: &str, branch: &str, gh_bin: &str) -> Re
     }
 }
 
+/// Remove a merged workspace's worktree and delete its branch — but only when it
+/// is provably safe. Returns a message (deleting nothing) unless ALL hold:
+/// - the branch is workspace-owned (`kommand0/…`) — never the default branch;
+/// - its PR is `MERGED` (per `gh`);
+/// - the worktree is clean (no uncommitted/untracked changes; an unreadable
+///   status aborts rather than assuming clean); and
+/// - the branch tip equals the last commit the PR merged (so there are no
+///   commits beyond the PR — squash-safe, and catches pushed or unpushed extras).
+///
+/// The worktree is removed WITHOUT `--force` (a last-moment dirty state still
+/// fails safe), and only then is the branch deleted.
+pub fn cleanup_merged_workspace(
+    repo_path: &str,
+    worktree_path: &str,
+    branch: &str,
+) -> Result<(), String> {
+    cleanup_merged_workspace_with(repo_path, worktree_path, branch, &gh_bin())
+}
+
+fn cleanup_merged_workspace_with(
+    repo_path: &str,
+    worktree_path: &str,
+    branch: &str,
+    gh_bin: &str,
+) -> Result<(), String> {
+    // Never delete a branch kommand0 didn't create — the `kommand0/` prefix
+    // blocks `main`/`master`/any default branch; the `..` reject is explicit
+    // defense against a traversal-y ref name (git would reject it anyway).
+    if branch.is_empty() || !branch.starts_with("kommand0/") || branch.contains("..") {
+        return Err("refusing to delete a branch kommand0 didn't create".to_string());
+    }
+
+    // The PR must be merged; capture the oid of the last commit it merged. Run gh
+    // from the repo (not the worktree) so a partial-cleanup retry — worktree
+    // already gone — still works instead of failing with a bogus "gh not found".
+    let out = match run_gh(
+        gh_bin,
+        repo_path,
+        &[
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "state,commits",
+            "-q",
+            ".state, (.commits[-1].oid // \"\")",
+        ],
+    ) {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => return Err(format!("no merged PR found for this branch ({})", last_line(&o.stderr))),
+        Err(_) => return Err("gh CLI not found — install GitHub CLI to clean up".to_string()),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let state = lines.next().unwrap_or("").trim();
+    let pr_tip = lines.next().unwrap_or("").trim().to_string();
+    if state != "MERGED" {
+        return Err(format!(
+            "the PR for this branch isn't merged (state: {state}) — not cleaning up"
+        ));
+    }
+
+    // The worktree must be clean — but only check if it still exists (a retry
+    // after a partial cleanup has no worktree left to be dirty). An unreadable
+    // status on an existing worktree aborts (never assume safe).
+    let worktree_exists = std::path::Path::new(worktree_path).exists();
+    if worktree_exists {
+        let st = branch_status(worktree_path)
+            .ok_or_else(|| "couldn't read the worktree's git status — not cleaning up".to_string())?;
+        if st.dirty {
+            return Err(
+                "the worktree has uncommitted changes — commit or discard them first".to_string(),
+            );
+        }
+    }
+
+    // The branch tip must be exactly what the PR merged: no commits beyond it
+    // (pushed OR unpushed). This is the guard that makes the force-delete safe.
+    let local_tip = match Command::new("git")
+        .args(["-C", repo_path, "rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+    {
+        Ok(o) if o.status.success() => last_line(&o.stdout),
+        _ => return Err("couldn't resolve the branch tip — not cleaning up".to_string()),
+    };
+    if pr_tip.is_empty() || local_tip != pr_tip {
+        return Err("the branch has commits beyond its merged PR — not cleaning up".to_string());
+    }
+
+    // Remove the worktree (no --force, so a last-moment dirty state still fails
+    // safe); if it's still there after the attempt, the remove failed — abort.
+    if worktree_exists {
+        let _ = Command::new("git")
+            .args(["-C", repo_path, "worktree", "remove", worktree_path])
+            .output();
+        if std::path::Path::new(worktree_path).exists() {
+            return Err(
+                "couldn't remove the worktree (it may have changes) — not cleaning up".to_string(),
+            );
+        }
+    }
+    // Clean up any stale worktree admin entry (whether we removed it or it was
+    // already gone) so the branch is deletable.
+    let _ = Command::new("git")
+        .args(["-C", repo_path, "worktree", "prune"])
+        .output();
+
+    // Delete the local branch (force: a squash-merge leaves it "unmerged" locally,
+    // but the PR-tip check above proved there's nothing beyond the merge).
+    match Command::new("git")
+        .args(["-C", repo_path, "branch", "-D", branch])
+        .output()
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "worktree removed, but couldn't delete branch {branch}: {}",
+            last_line(&o.stderr)
+        )),
+        Err(e) => Err(format!("worktree removed, but couldn't delete branch {branch}: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +469,154 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("gh CLI not found"), "friendly gh-missing error: {err}");
+    }
+
+    // --- cleanup_merged_workspace ---
+
+    /// A repo with a linked worktree on `kommand0/feat`. Returns
+    /// `(repo_path, worktree_path, branch, branch_tip_sha)`.
+    fn repo_with_worktree(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "1").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "init"]);
+        let wt = root.join("wt");
+        git(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "-b", "kommand0/feat"],
+        );
+        let tip = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "rev-parse", "refs/heads/kommand0/feat"])
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&tip.stdout).trim().to_string();
+        (repo, wt, "kommand0/feat".to_string(), sha)
+    }
+
+    /// A `gh` stub whose `pr view` prints `<state>\n<oid>`.
+    fn gh_view_stub(path: &Path, state: &str, oid: &str) {
+        write_stub(
+            path,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then\n  printf '{state}\\n{oid}\\n'\n  exit 0\nfi\nexit 1\n"
+            ),
+        );
+    }
+
+    fn cleanup(repo: &Path, wt: &Path, branch: &str, gh: &Path) -> Result<(), String> {
+        cleanup_merged_workspace_with(
+            repo.to_str().unwrap(),
+            wt.to_str().unwrap(),
+            branch,
+            gh.to_str().unwrap(),
+        )
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "rev-parse", "--verify", branch])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    #[test]
+    fn cleanup_merged_clean_removes_worktree_and_branch() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        let gh = tmp.path().join("gh");
+        gh_view_stub(&gh, "MERGED", &sha);
+        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
+        assert!(!wt.exists(), "worktree dir removed");
+        assert!(!branch_exists(&repo, &branch), "branch deleted");
+    }
+
+    #[test]
+    fn cleanup_refuses_when_pr_open_and_destroys_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        let gh = tmp.path().join("gh");
+        gh_view_stub(&gh, "OPEN", &sha);
+        assert!(cleanup(&repo, &wt, &branch, &gh).unwrap_err().contains("isn't merged"));
+        assert!(wt.exists(), "worktree untouched");
+        assert!(branch_exists(&repo, &branch), "branch untouched");
+    }
+
+    #[test]
+    fn cleanup_refuses_when_no_pr() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, _) = repo_with_worktree(tmp.path());
+        let gh = tmp.path().join("gh");
+        write_stub(&gh, "#!/bin/sh\nexit 1\n"); // gh finds no PR
+        assert!(cleanup(&repo, &wt, &branch, &gh).is_err());
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
+
+    #[test]
+    fn cleanup_refuses_dirty_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        std::fs::write(wt.join("scratch.txt"), "wip").unwrap(); // untracked => dirty
+        let gh = tmp.path().join("gh");
+        gh_view_stub(&gh, "MERGED", &sha);
+        assert!(cleanup(&repo, &wt, &branch, &gh).unwrap_err().contains("uncommitted"));
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
+
+    #[test]
+    fn cleanup_refuses_commits_beyond_the_merged_pr() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        // The PR's last merged commit is the original tip; the local branch has
+        // since advanced (a commit beyond the PR).
+        std::fs::write(wt.join("more.txt"), "x").unwrap();
+        git(&wt, &["config", "user.email", "t@t"]);
+        git(&wt, &["config", "user.name", "t"]);
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-m", "beyond"]);
+        let gh = tmp.path().join("gh");
+        gh_view_stub(&gh, "MERGED", &sha); // stale (pre-extra-commit) oid
+        assert!(cleanup(&repo, &wt, &branch, &gh).unwrap_err().contains("beyond its merged PR"));
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
+
+    #[test]
+    fn cleanup_refuses_a_non_workspace_branch() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, _, _) = repo_with_worktree(tmp.path());
+        // Even with a "MERGED" gh, a non-kommand0 branch (e.g. main) is refused
+        // before any gh/git deletion.
+        let err = cleanup(&repo, &wt, "main", &tmp.path().join("gh")).unwrap_err();
+        assert!(err.contains("kommand0 didn't create"));
+        assert!(branch_exists(&repo, "main"), "main untouched");
+    }
+
+    #[test]
+    fn cleanup_refuses_when_pr_has_no_commits() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, _) = repo_with_worktree(tmp.path());
+        let gh = tmp.path().join("gh");
+        gh_view_stub(&gh, "MERGED", ""); // empty oid (no commits)
+        assert!(cleanup(&repo, &wt, &branch, &gh).unwrap_err().contains("beyond its merged PR"));
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
+
+    #[test]
+    fn cleanup_completes_when_worktree_dir_already_gone() {
+        // A retry after a partial cleanup (worktree removed, branch left) must
+        // still delete the orphaned branch — gh runs from the repo, the missing
+        // worktree skips the dirty check, and `worktree prune` clears the entry.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        std::fs::remove_dir_all(&wt).unwrap(); // worktree dir vanished
+        let gh = tmp.path().join("gh");
+        gh_view_stub(&gh, "MERGED", &sha);
+        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
+        assert!(!branch_exists(&repo, &branch), "orphaned branch deleted");
     }
 }
