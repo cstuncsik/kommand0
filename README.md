@@ -130,13 +130,13 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
   "claude_args": ["--model", "sonnet"],
   "claude_bin": "/usr/local/bin/claude",
   "status_refresh_secs": 2,
-  "keybindings": { "quit": ["ctrl+q"], "open": ["o", "Enter"] }
+  "keybindings": { "quit": ["ctrl+q"], "open": ["o"] }
 }
 ```
 
 - `claude_args` — extra args appended to every embedded `claude` spawn (e.g. `--model`, `--permission-mode`). Don't put `--session-id`/`--resume` here — kommand0 manages those.
 - `claude_bin` — override the `claude` binary (the `KOMMAND0_CLAUDE_BIN` env var still takes precedence).
 - `status_refresh_secs` — how often the background git-status refresh runs (default 2; floored at 1).
-- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `activate`, `open`, `close`, `open-pr`, `cleanup`, `filter`, `archive`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `quit`. The `gg` motion and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing the reserved `g` are warned (tree border + log), not fatal.
+- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `activate`, `open`, `close`, `open-pr`, `cleanup`, `filter`, `archive`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
 
 The config is read once at startup, so edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border.
