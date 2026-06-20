@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{EventStream, KeyEvent, KeyEventKind};
 use futures::{FutureExt, StreamExt};
-use kommand0_core::{AppState, RepoEntry, SessionStatus, Workspace};
+use kommand0_core::{AppState, Config, RepoEntry, SessionStatus, Workspace};
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent},
@@ -119,6 +119,15 @@ fn claude_args(resume_id: Option<&str>) -> (Vec<String>, Option<String>) {
             (vec!["--session-id".to_string(), uuid.clone()], Some(uuid))
         }
     }
+}
+
+/// Resolve the `claude` binary: `KOMMAND0_CLAUDE_BIN` env (used by tests and
+/// ad-hoc overrides) wins, then the config's `claude_bin`, then `claude`.
+fn pick_claude_bin(env_bin: Option<String>, config_bin: Option<&str>) -> String {
+    env_bin
+        .filter(|s| !s.is_empty())
+        .or_else(|| config_bin.map(str::to_string))
+        .unwrap_or_else(|| "claude".to_string())
 }
 
 /// Whether an exited embedded pane looks like a failed `--resume` (the Claude
@@ -350,6 +359,9 @@ pub(crate) struct App {
     pub(crate) cleanup_result: HashMap<String, String>,
     /// Cleanup worker → event-loop channel carrying `(workspace_id, result)`.
     cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>>,
+
+    /// User config (claude passthrough + tunables), loaded once at startup.
+    pub(crate) config: Config,
 }
 
 impl App {
@@ -402,6 +414,7 @@ impl App {
             cleanup_inflight: HashSet::new(),
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
+            config: Config::load(),
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -680,7 +693,10 @@ impl App {
         ws_dir: &str,
         resume_id: Option<&str>,
     ) -> anyhow::Result<(pane::Pane, String, bool)> {
-        let bin = std::env::var("KOMMAND0_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        let bin = pick_claude_bin(
+            std::env::var("KOMMAND0_CLAUDE_BIN").ok(),
+            self.config.claude_bin.as_deref(),
+        );
         let wake: Option<Box<dyn Fn() + Send>> = self.embedded_wake.clone().map(|tx| {
             Box::new(move || {
                 let _ = tx.send(());
@@ -691,7 +707,9 @@ impl App {
         let inner = pane_content_rect(self.right_pane_area);
         let rows = if inner.height > 0 { inner.height } else { 24 };
         let cols = if inner.width > 0 { inner.width } else { 80 };
-        let (args, new_id) = claude_args(resume_id);
+        let (mut args, new_id) = claude_args(resume_id);
+        // Append the user's configured passthrough args (e.g. `--model sonnet`).
+        args.extend(self.config.claude_args.iter().cloned());
         let was_resume = resume_id.is_some();
         let session_id = resume_id
             .map(String::from)
@@ -2203,10 +2221,15 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                     app.spinner_tick = (app.spinner_tick + 1) % 10;
                 }
                 // Periodic git-status refresh (off-loop). Time-based so it doesn't
-                // depend on the wrapping tick counter.
+                // depend on the wrapping tick counter; interval is configurable.
+                let status_interval = app
+                    .config
+                    .status_refresh_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(STATUS_REFRESH_INTERVAL);
                 if app
                     .last_status_refresh
-                    .is_none_or(|t| now.duration_since(t) >= STATUS_REFRESH_INTERVAL)
+                    .is_none_or(|t| now.duration_since(t) >= status_interval)
                 {
                     app.last_status_refresh = Some(now);
                     app.request_branch_status_refresh();
@@ -3003,6 +3026,16 @@ mod key_tests {
         let (args2, new2) = claude_args(Some("sess-1"));
         assert_eq!(args2, vec!["--resume".to_string(), "sess-1".to_string()]);
         assert!(new2.is_none());
+    }
+
+    #[test]
+    fn pick_claude_bin_precedence() {
+        // Env wins (tests/e2e rely on this); empty env is ignored.
+        assert_eq!(pick_claude_bin(Some("envbin".into()), Some("cfgbin")), "envbin");
+        assert_eq!(pick_claude_bin(Some(String::new()), Some("cfgbin")), "cfgbin");
+        // No env -> config; nothing -> default.
+        assert_eq!(pick_claude_bin(None, Some("cfgbin")), "cfgbin");
+        assert_eq!(pick_claude_bin(None, None), "claude");
     }
 
     #[test]

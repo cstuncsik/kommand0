@@ -816,6 +816,35 @@ fn unseen_background_output_raises_the_attention_flag() {
 }
 
 #[test]
+fn config_claude_args_pass_through_to_the_pane() {
+    // A config file's `claude_args` are appended to every embedded spawn — here
+    // the embed-stub echoes its args, so we can see `--model sonnet` arrive.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let cfg = dir.path().join("config.json");
+    std::fs::write(&cfg, r#"{ "claude_args": ["--model", "sonnet"] }"#).unwrap();
+    let state = seeded_state(d);
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[
+            ("KOMMAND0_CLAUDE_BIN", "embed-stub"),
+            ("KOMMAND0_CONFIG", cfg.to_str().unwrap()),
+        ],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open the embedded pane
+    tui.wait_for("--model"); // the stub echoed its spawn args (incl. the config arg)
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn first_open_assigns_a_session_id() {
     // Opening a workspace with no stored session spawns `claude --session-id <uuid>`.
     let dir = tempfile::tempdir().unwrap();
