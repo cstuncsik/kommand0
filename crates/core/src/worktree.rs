@@ -153,18 +153,18 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<()> {
         Ok(result) if result.status.success() => Ok(()),
         Ok(result) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            // Log but don't fail — worktree removal shouldn't block workspace deletion
-            eprintln!(
-                "warning: git worktree remove failed for {}: {}",
-                worktree_path,
+            // Log but don't fail — worktree removal shouldn't block workspace
+            // deletion. `tracing` (not stderr, which would corrupt the TUI's
+            // alt-screen) so it reaches the app's log file.
+            tracing::warn!(
+                worktree = worktree_path,
+                "git worktree remove failed: {}",
                 stderr.trim()
             );
             Ok(())
         }
         Err(e) => {
-            eprintln!(
-                "warning: failed to run git worktree remove for {worktree_path}: {e}"
-            );
+            tracing::warn!(worktree = worktree_path, "failed to run git worktree remove: {e}");
             Ok(())
         }
     }

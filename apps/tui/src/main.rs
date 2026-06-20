@@ -628,6 +628,14 @@ impl App {
         }
     }
 
+    /// Persist state, logging (not silently dropping) any failure — a save error
+    /// is otherwise invisible while the TUI owns the terminal.
+    pub(crate) fn save_state(&self) {
+        if let Err(e) = self.state.save() {
+            tracing::warn!("failed to persist state: {e}");
+        }
+    }
+
     /// Keep keyboard focus on the tree when the selection is not a workspace row.
     pub(crate) fn update_active_session(&mut self) {
         if !matches!(
@@ -755,7 +763,7 @@ impl App {
                 // persisted Vec stays aligned with the runtime tabs.
                 if let Some(id) = resume_id {
                     self.state.remove_embedded_session(ws_id, id);
-                    let _ = self.state.save();
+                    self.save_state();
                 }
                 self.embed_error =
                     Some((ws_id.to_string(), format!("Failed to start claude in {ws_name}: {e}")));
@@ -783,7 +791,7 @@ impl App {
                 if let Some(title) = &prior_title {
                     self.state.set_embedded_session_title(ws_id, &new_id, title);
                 }
-                let _ = self.state.save();
+                self.save_state();
                 if let Some(sessions) = self.embedded.get_mut(ws_id)
                     && let Some(slot) = sessions.tabs.iter().position(|t| t.id == gone_id)
                 {
@@ -801,7 +809,7 @@ impl App {
                 true
             }
             Err(_) => {
-                let _ = self.state.save();
+                self.save_state();
                 false
             }
         }
@@ -873,7 +881,7 @@ impl App {
         };
         // Closing a tab forgets its session (it won't resume next time).
         self.state.remove_embedded_session(&ws_id, &tab_id);
-        let _ = self.state.save();
+        self.save_state();
         if now_empty {
             self.embedded.remove(&ws_id);
             self.focus = Focus::Tree;
@@ -1052,7 +1060,7 @@ impl App {
                     // Couldn't start a fresh session — forget the id and drop the
                     // stuck/dead tab; the message tells the user to reopen.
                     self.state.remove_embedded_session(ws_id, tab_id);
-                    let _ = self.state.save();
+                    self.save_state();
                     self.embed_error = Some((ws_id.clone(), RESUME_FAIL_MSG.to_string()));
                 }
             }
@@ -1614,7 +1622,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     .any(|id| id == &session_id)
                 {
                     app.state.set_embedded_session_title(&ws_id, &session_id, &title);
-                    let _ = app.state.save();
+                    app.save_state();
                 }
             }
             modal::ModalResult::ConfirmCleanup(ws_id) => {
@@ -1895,8 +1903,29 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     Ok(KeyOutcome::Continue)
 }
 
+/// Route warnings/errors to `<state_dir>/kommand0.log` — they can't go to stderr
+/// while the TUI owns the terminal (alt-screen). Best-effort: if the file can't
+/// be opened, the app still starts (tracing calls just become no-ops).
+fn init_logging() {
+    let dir = AppState::state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("kommand0.log"))
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .with_target(false)
+            .try_init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_logging();
+    tracing::info!("kommand0 started");
     let mut terminal = ratatui::init();
     // DISAMBIGUATE_ESCAPE_CODES lets terminals report Shift+Enter distinctly from Enter
     let supports_enhanced_keys =
@@ -1952,14 +1981,14 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 .state
                 .update_session_status(&sid, SessionStatus::Stopped);
         }
-        let _ = app.state.save();
+        app.save_state();
     }
 
     // Drop persisted Claude session ids for workspaces that no longer exist.
     let before = app.state.embedded_sessions.len();
     app.state.prune_embedded_sessions();
     if app.state.embedded_sessions.len() != before {
-        let _ = app.state.save();
+        app.save_state();
     }
 
     let mut reader = EventStream::new();
