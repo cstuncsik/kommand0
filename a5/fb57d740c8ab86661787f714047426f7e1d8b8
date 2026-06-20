@@ -1,0 +1,25 @@
+Cargo.toml
+  s_fc3d7618d36de0::t_48287b5abceb71 18
+apps/cli/Cargo.toml
+  s_fc3d7618d36de0::t_9b002eff4bd4e1 16
+apps/cli/src/main.rs
+  s_fc3d7618d36de0::t_82960e878c48cc 175-182
+README.md
+  s_fc3d7618d36de0::t_67d4e696b88e07 122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "a5fb57d740c8ab86661787f714047426f7e1d8b8",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
