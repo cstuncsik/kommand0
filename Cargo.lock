@@ -614,6 +614,7 @@ dependencies = [
  "kommand0-core",
  "nix 0.30.1",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
