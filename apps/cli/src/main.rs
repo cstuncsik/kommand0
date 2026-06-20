@@ -172,6 +172,14 @@ fn print_status_row(ws: &Workspace) {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Surface core's diagnostics (e.g. a failed worktree removal on delete/
+    // cleanup) on stderr — fine for a CLI (no alt-screen to corrupt).
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time()
+        .try_init();
+
     let cli = Cli::parse();
 
     match cli.command {

@@ -134,6 +134,11 @@ impl Tui {
         serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null)
     }
 
+    /// Contents of the app's log file (empty if not written).
+    fn log_contents(&self) -> String {
+        std::fs::read_to_string(self._state_dir.path().join("kommand0.log")).unwrap_or_default()
+    }
+
     fn send(&mut self, bytes: &str) {
         self.writer.write_all(bytes.as_bytes()).unwrap();
         self.writer.flush().unwrap();
@@ -231,6 +236,21 @@ fn launches_renders_panes_and_quits_on_q() {
     tui.wait_for("q quit");
     tui.send("q");
     tui.wait_exit();
+}
+
+#[test]
+fn writes_a_log_file_on_startup() {
+    // Background warnings/errors can't go to stderr (alt-screen); they're logged
+    // to <state_dir>/kommand0.log. The startup line proves the sink is wired.
+    let mut tui = Tui::launch(None);
+    tui.wait_for(" Repos ");
+    tui.send("q");
+    tui.wait_exit();
+    assert!(
+        tui.log_contents().contains("kommand0 started"),
+        "log: {:?}",
+        tui.log_contents()
+    );
 }
 
 #[test]
