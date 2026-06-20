@@ -133,6 +133,8 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 }
 ```
 
-- `claude_args` — extra args appended to every embedded `claude` spawn (e.g. `--model`, `--permission-mode`).
+- `claude_args` — extra args appended to every embedded `claude` spawn (e.g. `--model`, `--permission-mode`). Don't put `--session-id`/`--resume` here — kommand0 manages those.
 - `claude_bin` — override the `claude` binary (the `KOMMAND0_CLAUDE_BIN` env var still takes precedence).
-- `status_refresh_secs` — how often the background git-status refresh runs (default 2).
+- `status_refresh_secs` — how often the background git-status refresh runs (default 2; floored at 1).
+
+The config is read once at startup, so edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border.

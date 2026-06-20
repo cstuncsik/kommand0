@@ -28,26 +28,39 @@ pub struct Config {
 impl Config {
     const FILE: &str = "config.json";
 
-    /// Read a config file directly, defaulting on a missing/unreadable/invalid
-    /// file (config must never block startup).
-    fn read(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+    /// Read a config file, returning a warning if a present file fails to parse
+    /// (a missing/unreadable file is a silent default). Any parse error discards
+    /// the WHOLE file — config must never block startup.
+    fn read(path: &Path) -> (Self, Option<String>) {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return (Self::default(), None); // missing/unreadable -> silent default
+        };
+        match serde_json::from_str(&contents) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => (
+                Self::default(),
+                Some(format!("ignoring invalid config {}: {e}", path.display())),
+            ),
+        }
     }
 
-    /// Load `config.json` from a base directory.
+    /// Load `config.json` from a base directory (defaults on any problem).
     pub fn load_from(base: &Path) -> Self {
-        Self::read(&base.join(Self::FILE))
+        Self::read(&base.join(Self::FILE)).0
     }
 
     /// Load config: `KOMMAND0_CONFIG` (a file path) if set, else the state dir.
     pub fn load() -> Self {
+        Self::load_checked().0
+    }
+
+    /// Like [`Self::load`] but also returns a human-readable warning when a
+    /// present config file couldn't be parsed (so the caller can surface it).
+    pub fn load_checked() -> (Self, Option<String>) {
         if let Some(path) = std::env::var_os("KOMMAND0_CONFIG").filter(|p| !p.is_empty()) {
             return Self::read(Path::new(&path));
         }
-        Self::load_from(AppState::state_dir().as_path())
+        Self::read(&AppState::state_dir().join(Self::FILE))
     }
 }
 
@@ -79,10 +92,18 @@ mod tests {
     }
 
     #[test]
-    fn malformed_config_degrades_to_default() {
+    fn malformed_config_degrades_to_default_with_a_warning() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("config.json"), "{ not valid json").unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
         let cfg = Config::load_from(tmp.path());
         assert!(cfg.claude_args.is_empty(), "invalid config falls back to default");
+        // The warning path (so a typo isn't invisible).
+        let (cfg, warn) = Config::read(&path);
+        assert!(cfg.claude_args.is_empty());
+        assert!(warn.is_some_and(|w| w.contains("invalid config")), "warns on a present-but-bad file");
+        // A missing file is a silent default (no warning).
+        let (_, warn) = Config::read(&tmp.path().join("absent.json"));
+        assert!(warn.is_none());
     }
 }

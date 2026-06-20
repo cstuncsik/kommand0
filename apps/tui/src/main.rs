@@ -126,7 +126,7 @@ fn claude_args(resume_id: Option<&str>) -> (Vec<String>, Option<String>) {
 fn pick_claude_bin(env_bin: Option<String>, config_bin: Option<&str>) -> String {
     env_bin
         .filter(|s| !s.is_empty())
-        .or_else(|| config_bin.map(str::to_string))
+        .or_else(|| config_bin.filter(|s| !s.is_empty()).map(str::to_string))
         .unwrap_or_else(|| "claude".to_string())
 }
 
@@ -362,6 +362,9 @@ pub(crate) struct App {
 
     /// User config (claude passthrough + tunables), loaded once at startup.
     pub(crate) config: Config,
+    /// Set when a present `config.json` failed to parse — surfaced in the tree
+    /// border so a typo isn't silently ignored.
+    pub(crate) config_warning: Option<String>,
 }
 
 impl App {
@@ -414,7 +417,8 @@ impl App {
             cleanup_inflight: HashSet::new(),
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
-            config: Config::load(),
+            config: Config::default(),
+            config_warning: None,
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -1938,6 +1942,11 @@ async fn main() -> anyhow::Result<()> {
 async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let state = AppState::load()?;
     let mut app = App::new(state);
+    // Load user config now (App::new keeps a hermetic default for tests). A
+    // present-but-invalid file surfaces a warning in the tree border.
+    let (config, config_warning) = Config::load_checked();
+    app.config = config;
+    app.config_warning = config_warning;
 
     // Reconcile persisted status with the (empty) session_manager. No stream
     // session is ever resurrected now, so a persisted `Running` is stale — left
@@ -2225,7 +2234,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 let status_interval = app
                     .config
                     .status_refresh_secs
-                    .map(Duration::from_secs)
+                    // Floor at 1s so a mis-set 0 can't thrash a git subprocess
+                    // every tick.
+                    .map(|s| Duration::from_secs(s.max(1)))
                     .unwrap_or(STATUS_REFRESH_INTERVAL);
                 if app
                     .last_status_refresh
@@ -3036,6 +3047,8 @@ mod key_tests {
         // No env -> config; nothing -> default.
         assert_eq!(pick_claude_bin(None, Some("cfgbin")), "cfgbin");
         assert_eq!(pick_claude_bin(None, None), "claude");
+        // An empty config bin is ignored too (else the spawn would fail on "").
+        assert_eq!(pick_claude_bin(None, Some("")), "claude");
     }
 
     #[test]
