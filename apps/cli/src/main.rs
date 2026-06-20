@@ -1,8 +1,10 @@
 use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
-use kommand0_core::{AppState, SessionStatus};
 use kommand0_core::workspace::format_timestamp;
+use kommand0_core::{
+    AppState, SessionStatus, Workspace, branch_status, cleanup_merged_workspace, open_pull_request,
+};
 
 #[derive(Parser)]
 #[command(name = "kmd", version, about = "Keyboard-first local orchestrator for parallel coding sessions")]
@@ -94,6 +96,24 @@ enum WorkspaceAction {
         /// Workspace name
         name: String,
     },
+    /// Show git branch/diff status (one workspace, or all)
+    Status {
+        /// Workspace name (omit for all)
+        name: Option<String>,
+    },
+    /// Push the workspace's branch and open a GitHub PR (via `gh`)
+    OpenPr {
+        /// Workspace name
+        name: String,
+    },
+    /// Remove a merged workspace's worktree and delete its branch
+    Cleanup {
+        /// Workspace name
+        name: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -108,13 +128,47 @@ enum SessionAction {
         /// Workspace name
         workspace: String,
     },
-    /// List all sessions
-    List,
+    /// List sessions (optionally for one workspace)
+    List {
+        /// Only sessions for this workspace
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Clear session metadata and log file
     Clear {
         /// Workspace name
         workspace: String,
     },
+}
+
+/// Print one `workspace status` table row (looks up live git status).
+fn print_status_row(ws: &Workspace) {
+    let (branch, ahead, behind, dirty) = match &ws.worktree_path {
+        Some(_) => match branch_status(&ws.working_dir) {
+            Some(s) => (
+                s.branch
+                    .clone()
+                    .or_else(|| ws.branch_name.clone())
+                    .unwrap_or_else(|| "(detached)".into()),
+                s.ahead.to_string(),
+                s.behind.to_string(),
+                if s.dirty { "yes" } else { "no" }.to_string(),
+            ),
+            None => (
+                ws.branch_name.clone().unwrap_or_else(|| "?".into()),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+            ),
+        },
+        None => (
+            "(shared checkout)".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+        ),
+    };
+    println!("{:<20} {:<26} {ahead:>6} {behind:>6}  {dirty}", ws.name, branch);
 }
 
 fn main() -> anyhow::Result<()> {
@@ -267,6 +321,74 @@ fn main() -> anyhow::Result<()> {
                 state.activate_workspace(&name)?;
                 println!("Activated workspace: {name}");
             }
+            WorkspaceAction::Status { name } => {
+                let state = AppState::load()?;
+                let targets: Vec<&Workspace> = match &name {
+                    Some(n) => vec![state.show_workspace(n)?],
+                    None => state.workspaces.iter().collect(),
+                };
+                if targets.is_empty() {
+                    println!("No workspaces found.");
+                } else {
+                    println!("{:<20} {:<26} {:>6} {:>6}  DIRTY", "NAME", "BRANCH", "AHEAD", "BEHIND");
+                    for ws in targets {
+                        print_status_row(ws);
+                    }
+                }
+            }
+            WorkspaceAction::OpenPr { name } => {
+                let state = AppState::load()?;
+                let ws = state.show_workspace(&name)?;
+                let (Some(worktree), Some(branch)) =
+                    (ws.worktree_path.clone(), ws.branch_name.clone())
+                else {
+                    anyhow::bail!("workspace '{name}' has no branch to open a PR from");
+                };
+                match open_pull_request(&worktree, &branch) {
+                    Ok(url) => println!("{url}"),
+                    Err(e) => anyhow::bail!("{e}"),
+                }
+            }
+            WorkspaceAction::Cleanup { name, force } => {
+                let mut state = AppState::load()?;
+                let ws = state.show_workspace(&name)?.clone();
+                let (Some(worktree), Some(branch)) =
+                    (ws.worktree_path.clone(), ws.branch_name.clone())
+                else {
+                    anyhow::bail!("workspace '{name}' has no worktree/branch to clean up");
+                };
+                let repo = state
+                    .repos
+                    .iter()
+                    .find(|r| r.id == ws.repo_id)
+                    .map(|r| r.path.clone())
+                    .ok_or_else(|| anyhow::anyhow!("repo not found for workspace '{name}'"))?;
+
+                if !force {
+                    let stdin = std::io::stdin();
+                    if !stdin.is_terminal() {
+                        eprintln!("error: refusing to clean up without --force in non-interactive mode");
+                        std::process::exit(1);
+                    }
+                    print!("Clean up '{name}' (remove worktree, delete branch {branch})? [y/N] ");
+                    std::io::stdout().flush()?;
+                    let mut input = String::new();
+                    stdin.read_line(&mut input)?;
+                    if !matches!(input.trim(), "y" | "Y") {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+
+                match cleanup_merged_workspace(&repo, &worktree, &branch) {
+                    Ok(()) => {
+                        // The worktree + branch are gone — drop the workspace entry.
+                        state.delete_workspace(&name)?;
+                        println!("Cleaned up workspace: {name}");
+                    }
+                    Err(e) => anyhow::bail!("{e}"),
+                }
+            }
         },
         Commands::Session { action } => match action {
             SessionAction::Start { workspace } => {
@@ -347,9 +469,17 @@ fn main() -> anyhow::Result<()> {
                 state.update_session_status(&session_id, SessionStatus::Stopped)?;
                 println!("Stopped session for workspace: {workspace}");
             }
-            SessionAction::List => {
+            SessionAction::List { workspace } => {
                 let state = AppState::load()?;
-                let sessions = state.list_sessions();
+                let ws_filter = match &workspace {
+                    Some(n) => Some(state.show_workspace(n)?.id.clone()),
+                    None => None,
+                };
+                let sessions: Vec<&_> = state
+                    .list_sessions()
+                    .iter()
+                    .filter(|s| ws_filter.as_ref().is_none_or(|id| &s.workspace_id == id))
+                    .collect();
                 if sessions.is_empty() {
                     println!("No sessions.");
                 } else {
