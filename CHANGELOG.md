@@ -64,3 +64,10 @@ a real interactive `claude` in an embedded PTY pane.
   passthrough (e.g. `--model`), `claude_bin` override, `status_refresh_secs`. A
   present-but-invalid config degrades to defaults and is flagged in the tree
   border.
+- **Keybindings** — `keybindings` rebinds tree-pane actions; the configured keys
+  replace an action's defaults. Unknown actions / bad specs / reserved keys warn
+  (not fatal); an action left with no keys shows `(unbound)` in `?`.
+- **Theming** — `theme` selects a built-in chrome palette (`default` /
+  `high-contrast`) and `theme_colors` overrides individual roles (`accent`,
+  `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
+  pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.

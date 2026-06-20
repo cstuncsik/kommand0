@@ -1,11 +1,13 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use super::theme::Theme;
 
 /// What kind of delete is being confirmed.
 #[derive(Clone)]
@@ -432,7 +434,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 /// Render the modal dialog overlay.
-pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
+pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme: Theme) {
+    let th = theme;
     match modal {
         ModalState::None => {}
         ModalState::AddRepo {
@@ -463,30 +466,30 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             let block = Block::default()
                 .title(" Add Repository ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_style(Style::default().fg(th.accent));
             frame.render_widget(block, area);
 
             // Label
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     "Repository path:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 )),
                 inner[0],
             );
 
             // Input field with cursor
-            let display_input = render_input_with_cursor(input, *cursor, inner[1].width as usize);
+            let display_input = render_input_with_cursor(input, *cursor, inner[1].width as usize, th);
             frame.render_widget(
                 Paragraph::new(display_input)
-                    .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+                    .style(Style::default().fg(th.text).bg(th.muted)),
                 inner[1],
             );
 
             // Error
             if let Some(err) = error {
                 frame.render_widget(
-                    Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)),
+                    Paragraph::new(err.as_str()).style(Style::default().fg(th.error)),
                     inner[2],
                 );
             }
@@ -500,9 +503,9 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
                     .map(|(i, path)| {
                         let selected = *completion_index == Some(i);
                         let style = if selected {
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(Color::DarkGray)
+                            Style::default().fg(th.muted)
                         };
                         Line::styled(format!("  {path}"), style)
                     })
@@ -513,11 +516,11 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             // Footer
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                    Span::styled("Enter", Style::default().fg(th.accent)),
                     Span::raw(": submit  "),
-                    Span::styled("Tab", Style::default().fg(Color::Cyan)),
+                    Span::styled("Tab", Style::default().fg(th.accent)),
                     Span::raw(": complete  "),
-                    Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                    Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(": cancel"),
                 ])),
                 inner[4],
@@ -551,30 +554,30 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             let block = Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_style(Style::default().fg(th.accent));
             frame.render_widget(block, area);
 
             // Label
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     "Workspace name:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 )),
                 inner[0],
             );
 
             // Input
-            let display_input = render_input_with_cursor(input, *cursor, inner[1].width as usize);
+            let display_input = render_input_with_cursor(input, *cursor, inner[1].width as usize, th);
             frame.render_widget(
                 Paragraph::new(display_input)
-                    .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+                    .style(Style::default().fg(th.text).bg(th.muted)),
                 inner[1],
             );
 
             // Error
             if let Some(err) = error {
                 frame.render_widget(
-                    Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)),
+                    Paragraph::new(err.as_str()).style(Style::default().fg(th.error)),
                     inner[2],
                 );
             }
@@ -582,9 +585,9 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             // Footer
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                    Span::styled("Enter", Style::default().fg(th.accent)),
                     Span::raw(": submit  "),
-                    Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                    Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(": cancel"),
                 ])),
                 inner[4],
@@ -631,22 +634,22 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             let block = Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red));
+                .border_style(Style::default().fg(th.error));
             frame.render_widget(block, area);
 
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     message,
-                    Style::default().fg(Color::White),
+                    Style::default().fg(th.text),
                 )),
                 inner[0],
             );
 
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("y", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled("y", Style::default().fg(th.error).add_modifier(Modifier::BOLD)),
                     Span::raw(": delete  "),
-                    Span::styled("n/Esc", Style::default().fg(Color::Cyan)),
+                    Span::styled("n/Esc", Style::default().fg(th.accent)),
                     Span::raw(": cancel"),
                 ])),
                 inner[2],
@@ -675,36 +678,36 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             let block = Block::default()
                 .title(" Rename Session ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_style(Style::default().fg(th.accent));
             frame.render_widget(block, area);
 
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     "Session name (empty clears):",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 )),
                 inner[0],
             );
 
-            let display_input = render_input_with_cursor(input, *cursor, inner[1].width as usize);
+            let display_input = render_input_with_cursor(input, *cursor, inner[1].width as usize, th);
             frame.render_widget(
                 Paragraph::new(display_input)
-                    .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+                    .style(Style::default().fg(th.text).bg(th.muted)),
                 inner[1],
             );
 
             if let Some(err) = error {
                 frame.render_widget(
-                    Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)),
+                    Paragraph::new(err.as_str()).style(Style::default().fg(th.error)),
                     inner[2],
                 );
             }
 
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                    Span::styled("Enter", Style::default().fg(th.accent)),
                     Span::raw(": submit  "),
-                    Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                    Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(": cancel"),
                 ])),
                 inner[4],
@@ -738,19 +741,19 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             let block = Block::default()
                 .title(" Clean Up Workspace ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow));
+                .border_style(Style::default().fg(th.dirty));
             frame.render_widget(block, area);
 
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     format!("Remove worktree and delete branch for '{ws_name}'?"),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(th.text),
                 )),
                 inner[0],
             );
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("Branch: ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Branch: ", Style::default().fg(th.accent)),
                     Span::raw(branch.as_str()),
                 ])),
                 inner[1],
@@ -758,7 +761,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     "Only proceeds if the branch's PR has been merged.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(th.muted),
                 )),
                 inner[2],
             );
@@ -766,22 +769,22 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
             if *dirty {
                 warn.push(Line::styled(
                     "⚠ Uncommitted changes will block cleanup.",
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(th.error),
                 ));
             }
             if *unpushed {
                 warn.push(Line::styled(
                     "⚠ Unpushed commits will block cleanup.",
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(th.error),
                 ));
             }
             frame.render_widget(Paragraph::new(warn), inner[3]);
 
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("y", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled("y", Style::default().fg(th.dirty).add_modifier(Modifier::BOLD)),
                     Span::raw(": clean up  "),
-                    Span::styled("n/Esc", Style::default().fg(Color::Cyan)),
+                    Span::styled("n/Esc", Style::default().fg(th.accent)),
                     Span::raw(": cancel"),
                 ])),
                 inner[5],
@@ -791,10 +794,10 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState) {
 }
 
 /// Render an input string with a visible cursor.
-fn render_input_with_cursor(input: &str, cursor: usize, width: usize) -> Line<'static> {
+fn render_input_with_cursor(input: &str, cursor: usize, width: usize, th: Theme) -> Line<'static> {
     if input.is_empty() {
         return Line::from(vec![
-            Span::styled("█", Style::default().fg(Color::Cyan)),
+            Span::styled("█", Style::default().fg(th.accent)),
             Span::raw(" ".repeat(width.saturating_sub(1))),
         ]);
     }
@@ -808,10 +811,10 @@ fn render_input_with_cursor(input: &str, cursor: usize, width: usize) -> Line<'s
     if let Some(c) = cursor_char {
         spans.push(Span::styled(
             c.to_string(),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(th.inverse).bg(th.accent),
         ));
     } else {
-        spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled("█", Style::default().fg(th.accent)));
     }
     spans.push(Span::raw(after.to_string()));
 

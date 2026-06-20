@@ -1,13 +1,14 @@
 use kommand0_core::{SessionStatus, workspace::format_timestamp};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::buttons::HitAction;
+use super::theme::Theme;
 use super::{App, Focus, TreeNode, buttons, help, modal};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -63,20 +64,21 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // keymap so the overlay reflects the user's config.
     if app.show_help {
         let tree_rows = app.keymap.help_rows();
-        help::render_help_overlay(frame, app.focus, &mut app.help_scroll, &tree_rows);
+        help::render_help_overlay(frame, app.focus, &mut app.help_scroll, &tree_rows, app.theme);
     }
 
     // Modal overlay on top of everything
     if app.modal.is_active() {
-        modal::render_modal(frame, &app.modal);
+        modal::render_modal(frame, &app.modal, app.theme);
     }
 }
 
 /// Bottom status bar: mode, current selection, live-pane count, and key hints.
 fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let th = app.theme;
     let (mode, mode_color) = match app.focus {
-        Focus::Tree => (" TREE ", Color::Cyan),
-        Focus::Embedded => (" CLAUDE ", Color::Green),
+        Focus::Tree => (" TREE ", th.accent),
+        Focus::Embedded => (" CLAUDE ", th.active),
     };
     let context = match app.tree_items.get(app.selected_index) {
         Some(TreeNode::Workspace { ws, .. }) => ws.name.clone(),
@@ -116,17 +118,17 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let mut left_spans = vec![
         Span::styled(
             mode,
-            Style::default().fg(Color::Black).bg(mode_color).add_modifier(Modifier::BOLD),
+            Style::default().fg(th.inverse).bg(mode_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(context, Style::default().fg(Color::White)),
+        Span::styled(context, Style::default().fg(th.text)),
         Span::raw("  "),
-        Span::styled(live_label, Style::default().fg(Color::DarkGray)),
+        Span::styled(live_label, Style::default().fg(th.muted)),
     ];
     if waiting > 0 {
         left_spans.push(Span::styled(
             format!("  {waiting} waiting"),
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default().fg(th.attention).add_modifier(Modifier::BOLD),
         ));
     }
     let left = Line::from(left_spans);
@@ -146,13 +148,14 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         .split(area);
     frame.render_widget(Paragraph::new(left), halves[0]);
     frame.render_widget(
-        Paragraph::new(Line::styled(hints, Style::default().fg(Color::DarkGray)))
+        Paragraph::new(Line::styled(hints, Style::default().fg(th.muted)))
             .alignment(ratatui::layout::Alignment::Right),
         halves[1],
     );
 }
 
 fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
     // Tree title doubles as the `/` filter box when filtering.
     let title = if app.filter_input || !app.filter_query.is_empty() {
         let cursor = if app.filter_input { "\u{2588}" } else { "" };
@@ -170,7 +173,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         if let Some(w) = &warn {
             b = b.title_bottom(Line::styled(
                 format!(" ⚠ {w} "),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(th.error).add_modifier(Modifier::BOLD),
             ));
         }
         b
@@ -178,9 +181,9 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     if app.tree_items.is_empty() {
         let border_style = if app.focus == Focus::Tree {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(th.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(th.muted)
         };
         let hint_text = if !app.filter_query.is_empty() {
             format!("No workspaces match /{}", app.filter_query)
@@ -188,7 +191,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             "No repos tracked. Run: kmd repo add <path>".to_string()
         };
         let hint = Paragraph::new(hint_text)
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(th.muted))
             .block(tree_block(title.clone(), border_style));
         frame.render_widget(hint, area);
     }
@@ -218,18 +221,18 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         let indicator = if expanded { "\u{25BE} " } else { "\u{203A} " }; // ▾ / ›
                         let style = if is_selected && app.focus == Focus::Tree {
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(th.selected)
                                 .add_modifier(Modifier::BOLD)
                         } else if is_selected {
                             Style::default()
-                                .fg(Color::DarkGray)
+                                .fg(th.muted)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
                         };
 
                         // Build repo line icons: ✕ (delete) + (add workspace)
-                        let icons = repo_line_icons(id, name, pane_inner_width);
+                        let icons = repo_line_icons(th, id, name, pane_inner_width);
 
                         let prefix = format!("{indicator}{name}");
                         let prefix_width = UnicodeWidthStr::width(prefix.as_str());
@@ -253,23 +256,23 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         // dot answers "unseen since it last went quiet", the
                         // spinner "producing right now".
                         let (dot, dot_color) = if app.ws_needs_attention(&ws.id) {
-                            ("\u{25CF}", Color::Magenta)
+                            ("\u{25CF}", th.attention)
                         } else if ws.active {
-                            ("\u{25CF}", Color::Green)
+                            ("\u{25CF}", th.active)
                         } else {
-                            ("\u{25CB}", Color::DarkGray)
+                            ("\u{25CB}", th.muted)
                         };
                         let prefix = "  \u{251C}\u{2500} ";
                         let style = if is_selected && app.focus == Focus::Tree {
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(th.selected)
                                 .add_modifier(Modifier::BOLD)
                         } else if is_selected {
                             Style::default()
-                                .fg(Color::DarkGray)
+                                .fg(th.muted)
                                 .add_modifier(Modifier::BOLD)
                         } else if !ws.active {
-                            Style::default().fg(Color::DarkGray)
+                            Style::default().fg(th.muted)
                         } else {
                             Style::default()
                         };
@@ -279,6 +282,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         let is_thinking = app.ws_has_active_session(&ws.id);
                         let is_expanded_narrow = app.expanded_icon_rows.contains(&ws.id);
                         let icons = workspace_icon_cluster(
+                            th,
                             session,
                             &ws.id,
                             is_thinking,
@@ -346,7 +350,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             Span::raw(" ".repeat(fill_width)),
                         ];
                         if git_w > 0 {
-                            spans.push(Span::styled(git_seg, Style::default().fg(Color::Yellow)));
+                            spans.push(Span::styled(git_seg, Style::default().fg(th.dirty)));
                         }
                         spans.extend(icons.spans.clone());
 
@@ -358,7 +362,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     TreeNode::Hint { text } => {
                         let display = format!("     {text}");
                         let style = Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(th.muted)
                             .add_modifier(Modifier::ITALIC);
                         ListItem::new(Line::styled(display, style))
                     }
@@ -370,9 +374,9 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         list_state.select(Some(app.selected_index));
 
         let tree_border_style = if app.focus == Focus::Tree {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(th.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(th.muted)
         };
 
         let list = List::new(items)
@@ -421,7 +425,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             .or_else(|| icons.texts.get(idx))
                             .unwrap_or(&empty);
                         let overlay =
-                            Paragraph::new(text.clone()).style(Style::default().fg(Color::White));
+                            Paragraph::new(text.clone()).style(Style::default().fg(th.text));
                         frame.render_widget(overlay, icon_rect);
                     }
                     icon_x += icon_width;
@@ -441,7 +445,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
                     if buttons::is_hovered(mouse_pos, icon_rect) {
                         let text = icons.texts.get(idx).cloned().unwrap_or_default();
-                        let overlay = Paragraph::new(text).style(Style::default().fg(Color::White));
+                        let overlay = Paragraph::new(text).style(Style::default().fg(th.text));
                         frame.render_widget(overlay, icon_rect);
                     }
                     icon_x += icon_width;
@@ -453,15 +457,15 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // Render "+" button on title bar (top-right corner) — after all widgets so it's not overwritten
     {
         let border_style = if app.focus == Focus::Tree {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(th.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(th.muted)
         };
         let plus_x = area.x + area.width.saturating_sub(4);
         let plus_rect = Rect::new(plus_x, area.y, 3, 1);
         let plus_hovered = buttons::is_hovered(app.mouse_pos, plus_rect);
         let plus_style = if plus_hovered {
-            Style::default().fg(Color::White)
+            Style::default().fg(th.text)
         } else {
             border_style
         };
@@ -477,6 +481,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 /// highlighting the active tab and animating a tab into a spinner while its
 /// session produces output. Registers click hit regions for each tab and `[+]`.
 fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, strip: Rect) {
+    let th = app.theme;
     if strip.height == 0 {
         return;
     }
@@ -524,11 +529,11 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
         let w = UnicodeWidthStr::width(label.as_str()) as u16;
         let style = if *is_active {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(th.inverse)
+                .bg(th.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(th.muted)
         };
         if x + w <= right {
             regions.push((
@@ -546,7 +551,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     if tab_count < super::MAX_SESSION_TABS && x + 3 <= right {
         spans.push(Span::styled(
             " + ".to_string(),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default().fg(th.active).add_modifier(Modifier::BOLD),
         ));
         regions.push((
             Rect::new(x, strip.y, 3, 1),
@@ -563,6 +568,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
 }
 
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
     // Remember the right-pane geometry so a newly-toggled embedded pane spawns at
     // its final size (avoids a resize-after-spawn that loses claude's first screen).
     app.right_pane_area = area;
@@ -582,9 +588,9 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         && app.embedded.contains_key(ws_id)
     {
         let border = if app.focus == Focus::Embedded {
-            Color::Cyan
+            th.accent
         } else {
-            Color::DarkGray
+            th.muted
         };
         let mut block = Block::default()
             .title(format!(
@@ -599,7 +605,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         {
             block = block.title_bottom(Line::styled(
                 format!(" ⚠ {msg} "),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(th.error).add_modifier(Modifier::BOLD),
             ));
         }
         let inner = block.inner(area);
@@ -650,7 +656,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         "Name: ",
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(th.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(name.as_str()),
@@ -659,7 +665,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         "Path: ",
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(th.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(truncate_path(repo_path, right_width)),
@@ -668,7 +674,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         "Workspaces: ",
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(th.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!("{active} active, {total} total")),
@@ -679,16 +685,16 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Some(TreeNode::Workspace { ws, repo_name }) => {
             let title = format!(" Workspace: {} ", ws.name);
             let status_span = if ws.active {
-                Span::styled("active", Style::default().fg(Color::Green))
+                Span::styled("active", Style::default().fg(th.active))
             } else {
-                Span::styled("archived", Style::default().fg(Color::DarkGray))
+                Span::styled("archived", Style::default().fg(th.muted))
             };
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled(
                         "Name: ",
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(th.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(ws.name.as_str()),
@@ -697,7 +703,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         "Repo: ",
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(th.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(repo_name.as_str()),
@@ -706,7 +712,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         "Dir: ",
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(th.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(truncate_path(&ws.working_dir, right_width)),
@@ -715,7 +721,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         "Status: ",
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(th.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     status_span,
@@ -724,7 +730,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         "Created: ",
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(th.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format_timestamp(ws.created_at)),
@@ -732,13 +738,13 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             ];
 
             // Git branch / changes, from the off-loop status cache.
-            let label_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let label_style = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
             if ws.worktree_path.is_none() {
                 lines.push(Line::from(vec![
                     Span::styled("Branch: ", label_style),
                     Span::styled(
                         "(shared checkout — no workspace branch)",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(th.muted),
                     ),
                 ]));
             } else {
@@ -753,17 +759,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     if !s.has_upstream {
                         branch_spans.push(Span::styled(
                             " (no upstream)",
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(th.muted),
                         ));
                     } else if s.ahead > 0 || s.behind > 0 {
                         branch_spans.push(Span::styled(
                             format!(" ↑{} ↓{}", s.ahead, s.behind),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(th.dirty),
                         ));
                     } else {
                         branch_spans.push(Span::styled(
                             " (up to date)",
-                            Style::default().fg(Color::Green),
+                            Style::default().fg(th.active),
                         ));
                     }
                 }
@@ -771,10 +777,10 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
                 let changes = match st {
                     Some(s) if s.dirty => {
-                        Span::styled("uncommitted changes", Style::default().fg(Color::Yellow))
+                        Span::styled("uncommitted changes", Style::default().fg(th.dirty))
                     }
-                    Some(_) => Span::styled("clean", Style::default().fg(Color::Green)),
-                    None => Span::styled("…", Style::default().fg(Color::DarkGray)),
+                    Some(_) => Span::styled("clean", Style::default().fg(th.active)),
+                    None => Span::styled("…", Style::default().fg(th.muted)),
                 };
                 lines.push(Line::from(vec![Span::styled("Changes: ", label_style), changes]));
             }
@@ -783,7 +789,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 "Press Enter to open Claude here",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(th.muted),
             ));
             {
                 // Derive the button row from the line count so the hit
@@ -796,12 +802,12 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
                 let style = if hovered {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .fg(th.inverse)
+                        .bg(th.accent)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(th.accent)
                         .add_modifier(Modifier::BOLD)
                 };
                 lines.push(Line::styled(format!("[{btn_label}]"), style));
@@ -820,7 +826,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
                     lines.push(Line::styled(
                         format!("{spin} Opening PR…"),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(th.accent),
                     ));
                 } else if has_branch {
                     let btn_y = area.y + 1 + lines.len() as u16;
@@ -830,11 +836,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
                     let style = if hovered {
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Green)
+                            .fg(th.inverse)
+                            .bg(th.active)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        Style::default().fg(th.active).add_modifier(Modifier::BOLD)
                     };
                     lines.push(Line::styled(format!("[{btn_label}]"), style));
                     app.hit_regions.push(buttons::HitRegion {
@@ -847,14 +853,14 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 match app.pr_result.get(&ws.id) {
                     Some(Ok(url)) => lines.push(Line::from(vec![
                         Span::styled("PR: ", label_style),
-                        Span::styled(url.clone(), Style::default().fg(Color::Green)),
+                        Span::styled(url.clone(), Style::default().fg(th.active)),
                     ])),
                     Some(Err(msg)) => lines.push(Line::from(vec![
                         Span::styled(
                             "PR failed: ",
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            Style::default().fg(th.error).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(msg.clone(), Style::default().fg(Color::Red)),
+                        Span::styled(msg.clone(), Style::default().fg(th.error)),
                     ])),
                     None => {}
                 }
@@ -868,7 +874,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
                     lines.push(Line::styled(
                         format!("{spin} Cleaning up…"),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(th.dirty),
                     ));
                 } else if has_branch {
                     let btn_y = area.y + 1 + lines.len() as u16;
@@ -878,11 +884,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
                     let style = if hovered {
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
+                            .fg(th.inverse)
+                            .bg(th.dirty)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        Style::default().fg(th.dirty).add_modifier(Modifier::BOLD)
                     };
                     lines.push(Line::styled(format!("[{btn_label}]"), style));
                     app.hit_regions.push(buttons::HitRegion {
@@ -896,9 +902,9 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     lines.push(Line::from(vec![
                         Span::styled(
                             "Cleanup blocked: ",
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            Style::default().fg(th.error).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(msg.clone(), Style::default().fg(Color::Red)),
+                        Span::styled(msg.clone(), Style::default().fg(th.error)),
                     ]));
                 }
             }
@@ -909,7 +915,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             let title = " Details ".to_string();
             let lines = vec![Line::styled(
                 "Select a workspace to see details",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(th.muted),
             )];
             (title, lines)
         }
@@ -927,7 +933,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         right_content.push(Line::raw(""));
         right_content.push(Line::styled(
             msg.clone(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(th.error).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -937,7 +943,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Block::default()
                 .title(right_title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(th.muted)),
         );
     frame.render_widget(paragraph, area);
 }
@@ -956,7 +962,9 @@ pub(crate) struct IconCluster {
 ///
 /// Icons: ❯ (write prompt), ■ (stop), ▶ (start/resume), ↺ (retry), ✕ (delete)
 /// Spinner (braille) shown when thinking, morphs to ■ on hover.
+#[allow(clippy::too_many_arguments)] // positional render inputs; a struct adds more noise than it removes
 pub(crate) fn workspace_icon_cluster(
+    th: Theme,
     session: Option<&kommand0_core::Session>,
     workspace_id: &str,
     is_thinking: bool,
@@ -966,7 +974,7 @@ pub(crate) fn workspace_icon_cluster(
     embedded: bool,
 ) -> IconCluster {
     let ws_id = workspace_id.to_string();
-    let icon_style = Style::default().fg(Color::Cyan);
+    let icon_style = Style::default().fg(th.accent);
     let delete_text = " \u{2715}".to_string(); // " ✕"
 
     // Narrow-width degradation: below 12 cols, show ellipsis unless force-expanded
@@ -975,7 +983,7 @@ pub(crate) fn workspace_icon_cluster(
         return IconCluster {
             spans: vec![Span::styled(
                 text.clone(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(th.muted),
             )],
             hit_regions: vec![(
                 HitAction::ToggleIconsFor {
@@ -1053,7 +1061,7 @@ pub(crate) fn workspace_icon_cluster(
             // No session: start + delete
             let start_text = " \u{25B6}".to_string(); // " ▶"
             let mut spans = vec![
-                Span::styled(start_text.clone(), Style::default().fg(Color::Green)),
+                Span::styled(start_text.clone(), Style::default().fg(th.active)),
                 Span::styled(delete_text.clone(), icon_style),
             ];
             let mut regions = vec![
@@ -1185,7 +1193,7 @@ pub(crate) fn workspace_icon_cluster(
         Some(SessionStatus::Stopped) | Some(SessionStatus::Exited) => {
             let resume_text = " \u{25B6}".to_string(); // " ▶"
             let mut spans = vec![
-                Span::styled(resume_text.clone(), Style::default().fg(Color::Green)),
+                Span::styled(resume_text.clone(), Style::default().fg(th.active)),
                 Span::styled(delete_text.clone(), icon_style),
             ];
             let mut regions = vec![
@@ -1224,7 +1232,7 @@ pub(crate) fn workspace_icon_cluster(
         Some(SessionStatus::Failed) => {
             let retry_text = " \u{21BA}".to_string(); // " ↺"
             let mut spans = vec![
-                Span::styled(retry_text.clone(), Style::default().fg(Color::Red)),
+                Span::styled(retry_text.clone(), Style::default().fg(th.error)),
                 Span::styled(delete_text.clone(), icon_style),
             ];
             let mut regions = vec![
@@ -1264,8 +1272,8 @@ pub(crate) fn workspace_icon_cluster(
 }
 
 /// Build icons for a repo line: ✕ (delete repo) + (add workspace)
-fn repo_line_icons(repo_id: &str, repo_name: &str, pane_inner_width: usize) -> IconCluster {
-    let icon_style = Style::default().fg(Color::Cyan);
+fn repo_line_icons(th: Theme, repo_id: &str, repo_name: &str, pane_inner_width: usize) -> IconCluster {
+    let icon_style = Style::default().fg(th.accent);
 
     if pane_inner_width < 20 {
         // Too narrow for repo icons
@@ -1402,7 +1410,7 @@ mod tests {
 
     #[test]
     fn icon_cluster_no_session() {
-        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", false, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // start + delete
         assert_eq!(cluster.hit_regions.len(), 2);
         assert_eq!(
@@ -1423,7 +1431,7 @@ mod tests {
     fn icon_cluster_embedded_overrides_no_session() {
         // A live embedded pane (no stream session) must show the running
         // prompt/stop/delete cluster, never the green "start" affordance.
-        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 40, false, true);
+        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", false, 0, 40, false, true);
         assert_eq!(cluster.total_width, 6); // prompt + stop + delete
         assert_eq!(cluster.hit_regions.len(), 3);
         assert_eq!(
@@ -1449,14 +1457,14 @@ mod tests {
         // The live shipping path: an embedded pane that is producing output must
         // animate its prompt glyph into a spinner (the no-session/Running branches
         // below are unreachable now that the TUI creates no stream sessions).
-        let cluster = workspace_icon_cluster(None, "ws-1", /*is_thinking*/ true, 3, 40, false, true);
+        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", /*is_thinking*/ true, 3, 40, false, true);
         let prompt = &cluster.spans[0].content;
         assert!(
             SPINNER_FRAMES.iter().any(|f| prompt.contains(f)),
             "active embedded pane should show a spinner, got: {prompt:?}"
         );
         // Idle embedded pane keeps the static prompt glyph.
-        let idle = workspace_icon_cluster(None, "ws-1", false, 3, 40, false, true);
+        let idle = workspace_icon_cluster(Theme::default(), None, "ws-1", false, 3, 40, false, true);
         assert!(
             idle.spans[0].content.contains('\u{276F}'),
             "idle embedded pane should show the ❯ prompt, got: {:?}",
@@ -1467,7 +1475,7 @@ mod tests {
     #[test]
     fn icon_cluster_running_thinking_returns_spinner() {
         let session = make_session(SessionStatus::Running);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", true, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", true, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // spinner + delete
         // Should contain a braille spinner character
         let text = &cluster.spans[0].content;
@@ -1486,7 +1494,7 @@ mod tests {
     #[test]
     fn icon_cluster_running_idle_returns_prompt_stop_delete() {
         let session = make_session(SessionStatus::Running);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 40, false, false);
         assert_eq!(cluster.total_width, 6); // prompt + stop + delete
         assert_eq!(cluster.spans.len(), 3);
         assert_eq!(cluster.hit_regions.len(), 3);
@@ -1516,7 +1524,7 @@ mod tests {
     fn icon_cluster_running_narrow_drops_to_stop_only() {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 20 but >= 12: keep stop only
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 15, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 15, false, false);
         assert_eq!(cluster.total_width, 2);
         assert_eq!(cluster.hit_regions.len(), 1);
         assert_eq!(
@@ -1531,7 +1539,7 @@ mod tests {
     fn icon_cluster_very_narrow_shows_ellipsis() {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 12, not expanded: ellipsis
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 10, false, false);
         assert_eq!(cluster.total_width, 2);
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1546,7 +1554,7 @@ mod tests {
     fn icon_cluster_very_narrow_expanded_shows_normal() {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 12, but is_expanded_narrow=true: normal icons
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 10, true, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 10, true, false);
         // Should NOT be ellipsis -- should be stop icon (narrow < 20 drops others)
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1559,7 +1567,7 @@ mod tests {
     #[test]
     fn icon_cluster_stopped() {
         let session = make_session(SessionStatus::Stopped);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // resume + delete
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1578,7 +1586,7 @@ mod tests {
     #[test]
     fn icon_cluster_exited() {
         let session = make_session(SessionStatus::Exited);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 40, false, false);
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::ResumeSessionFor {
@@ -1590,7 +1598,7 @@ mod tests {
     #[test]
     fn icon_cluster_failed() {
         let session = make_session(SessionStatus::Failed);
-        let cluster = workspace_icon_cluster(Some(&session), "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // retry + delete
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1604,14 +1612,14 @@ mod tests {
 
     #[test]
     fn icon_cluster_no_session_narrow_drops_delete() {
-        let cluster = workspace_icon_cluster(None, "ws-1", false, 0, 15, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", false, 0, 15, false, false);
         assert_eq!(cluster.total_width, 2); // start only
         assert_eq!(cluster.hit_regions.len(), 1);
     }
 
     #[test]
     fn repo_line_icons_normal_width() {
-        let icons = repo_line_icons("r-1", "myrepo", 40);
+        let icons = repo_line_icons(Theme::default(), "r-1", "myrepo", 40);
         assert_eq!(icons.total_width, 4); // delete + add
         assert_eq!(icons.hit_regions.len(), 2);
         assert_eq!(
@@ -1630,9 +1638,22 @@ mod tests {
 
     #[test]
     fn repo_line_icons_narrow_hidden() {
-        let icons = repo_line_icons("r-1", "myrepo", 15);
+        let icons = repo_line_icons(Theme::default(), "r-1", "myrepo", 15);
         assert_eq!(icons.total_width, 0);
         assert!(icons.hit_regions.is_empty());
+    }
+
+    #[test]
+    fn icons_are_colored_by_theme_accent() {
+        // A non-default accent must thread through to the rendered spans, proving
+        // chrome color comes from the theme rather than a hardcoded `Color`.
+        let custom = ratatui::style::Color::Rgb(1, 2, 3);
+        let theme = Theme { accent: custom, ..Theme::default() };
+        let icons = repo_line_icons(theme, "r-1", "myrepo", 40);
+        assert!(
+            icons.spans.iter().all(|s| s.style.fg == Some(custom)),
+            "repo icon spans should use the theme accent color"
+        );
     }
 
     #[test]

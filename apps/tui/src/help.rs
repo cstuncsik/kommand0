@@ -1,11 +1,12 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use super::Focus;
+use super::theme::Theme;
 
 struct KeyBinding {
     keys: &'static str,
@@ -80,7 +81,9 @@ pub fn render_help_overlay(
     focus: Focus,
     scroll: &mut u16,
     tree_rows: &[(String, &'static str)],
+    theme: Theme,
 ) {
+    let th = theme;
     let area = centered_rect(60, 70, frame.area());
 
     // Clear the area behind the overlay
@@ -97,7 +100,7 @@ pub fn render_help_overlay(
         Span::styled(
             current_section,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(th.accent)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -115,7 +118,7 @@ pub fn render_help_overlay(
         let is_active = title == current_section;
         let title_style = if is_active {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(th.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -124,9 +127,9 @@ pub fn render_help_overlay(
         lines.push(Line::styled(format!("  {title}"), title_style));
 
         let style = if is_active {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(th.accent)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(th.text)
         };
         for (keys, description) in bindings {
             lines.push(Line::from(vec![
@@ -141,7 +144,7 @@ pub fn render_help_overlay(
     // Dismiss hint at bottom
     lines.push(Line::styled(
         "  Press ? or Esc to close, j/k to scroll",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(th.muted),
     ));
 
     // Clamp scroll so the last line stays at the bottom edge
@@ -152,7 +155,7 @@ pub fn render_help_overlay(
     let block = Block::default()
         .title(" Help ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(th.accent));
 
     let paragraph = Paragraph::new(lines)
         .block(block)
