@@ -1,0 +1,49 @@
+apps/tui/src/keymap.rs
+  s_fc3d7618d36de0::t_6456a296ba23e8 75
+  s_fc3d7618d36de0::t_187ee926ac9cc2 100
+  s_fc3d7618d36de0::t_efdd2087b2402e 274
+  s_fc3d7618d36de0::t_0d62741af7b319 372
+  s_fc3d7618d36de0::t_05c97604b63a5c 27
+  s_fc3d7618d36de0::t_8d21a561f7b6e5 50
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_6347346a60a926 399
+  s_fc3d7618d36de0::t_66ec85c6a64461 2631,2633-2667
+  s_fc3d7618d36de0::t_eed2f6f17d41c8 309-310
+  s_fc3d7618d36de0::t_3a539349b0e742 861-899
+  s_fc3d7618d36de0::t_cc77efaae72c0e 2183,2185-2187
+  s_fc3d7618d36de0::t_828348f606d477 1847-1852
+  s_fc3d7618d36de0::t_cd5cde7cb11811 1689-1721
+  s_fc3d7618d36de0::t_6eb911aef2a17a 6
+  s_fc3d7618d36de0::t_0854fcf3defe4d 2594-2630
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_b56715e8009f5d 335-355
+apps/tui/src/render.rs
+  s_fc3d7618d36de0::t_8122fc26046031 74-78
+  s_fc3d7618d36de0::t_03882acb230106 12
+CHANGELOG.md
+  s_fc3d7618d36de0::t_1e515f74b16c71 53
+  s_fc3d7618d36de0::t_eccb9f8bfb5519 54-55
+apps/tui/src/palette.rs
+  s_fc3d7618d36de0::t_fd88ab2076b037 1-332
+README.md
+  s_fc3d7618d36de0::t_42884f0185311f 77
+  s_fc3d7618d36de0::t_55ee6c416de2f8 143
+apps/tui/src/modal.rs
+  s_fc3d7618d36de0::t_c453b4fe287b2c 797
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "e2b51d092c095dc0d28a0cee2a4222b3b0f4c8d4",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
