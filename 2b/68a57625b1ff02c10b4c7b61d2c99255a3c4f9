@@ -1,0 +1,31 @@
+apps/cli/Cargo.toml
+  s_fc3d7618d36de0::t_268a0595523936 17-19
+apps/cli/src/main.rs
+  s_fc3d7618d36de0::t_a4e97f1d0ef3f4 144-173
+  s_fc3d7618d36de0::t_6aa2390db53fed 324-332,334-391
+  s_fc3d7618d36de0::t_ca725a6328e1a8 333
+  s_fc3d7618d36de0::t_a92217366c3a7c 472,474-482
+  s_fc3d7618d36de0::t_1c97a6968a9b12 131-136
+  s_fc3d7618d36de0::t_abe1973872e36c 99-116
+  s_fc3d7618d36de0::t_c3521a13f132e7 5-7
+README.md
+  s_fc3d7618d36de0::t_dc6a2513f8f0ad 28,30-32,34,39
+apps/cli/tests/cli.rs
+  s_fc3d7618d36de0::t_5ad06b06ca722d 1-176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "2b68a57625b1ff02c10b4c7b61d2c99255a3c4f9",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
