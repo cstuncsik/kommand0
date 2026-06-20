@@ -739,6 +739,52 @@ fn c_cleans_up_a_merged_workspace() {
 }
 
 #[test]
+fn slash_filters_the_tree_and_capital_a_archives() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [
+            { "id": "w1", "name": "auth-ws", "repo_id": "r1", "working_dir": d, "active": true, "created_at": 0 },
+            { "id": "w2", "name": "docs-ws", "repo_id": "r1", "working_dir": d, "active": true, "created_at": 0 }
+        ],
+        "sessions": []
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l"); // expand the repo
+    tui.wait_for("auth-ws");
+    tui.wait_for("docs-ws");
+
+    // Filter to "auth" — only the matching workspace remains.
+    tui.send("/");
+    tui.send("auth");
+    tui.wait_for("auth-ws");
+    tui.wait_gone("docs-ws");
+
+    // Esc clears the filter — both are back.
+    tui.send_esc();
+    tui.wait_for("docs-ws");
+
+    // Select the first workspace and archive it with `A`.
+    tui.send("j");
+    tui.send("A");
+
+    tui.send("q");
+    tui.wait_exit();
+    // The archive persisted.
+    let st = tui.read_state();
+    let archived = st["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["active"] == false);
+    assert!(archived, "a workspace was archived: {st}");
+}
+
+#[test]
 fn unseen_background_output_raises_the_attention_flag() {
     // Open a workspace (its session is "viewed"), navigate back to the tree, and
     // let the session emit output while you're away. Once it goes quiet, the

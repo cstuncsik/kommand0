@@ -151,17 +151,30 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    // Tree title doubles as the `/` filter box when filtering.
+    let title = if app.filter_input || !app.filter_query.is_empty() {
+        let cursor = if app.filter_input { "\u{2588}" } else { "" };
+        format!(" Repos · /{}{} ", app.filter_query, cursor)
+    } else {
+        " Repos ".to_string()
+    };
+
     if app.tree_items.is_empty() {
         let border_style = if app.focus == Focus::Tree {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let hint = Paragraph::new("No repos tracked. Run: kmd repo add <path>")
+        let hint_text = if !app.filter_query.is_empty() {
+            format!("No workspaces match /{}", app.filter_query)
+        } else {
+            "No repos tracked. Run: kmd repo add <path>".to_string()
+        };
+        let hint = Paragraph::new(hint_text)
             .style(Style::default().fg(Color::DarkGray))
             .block(
                 Block::default()
-                    .title(" Repos ")
+                    .title(title.clone())
                     .borders(Borders::ALL)
                     .border_style(border_style),
             );
@@ -353,7 +366,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(" Repos ")
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(tree_border_style),
             )

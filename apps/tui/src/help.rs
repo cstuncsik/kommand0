@@ -42,6 +42,14 @@ const TREE_BINDINGS: &[KeyBinding] = &[
         description: "First / last item",
     },
     KeyBinding {
+        keys: "[/]",
+        description: "Filter workspaces (Esc clears)",
+    },
+    KeyBinding {
+        keys: "[A]",
+        description: "Archive / activate workspace",
+    },
+    KeyBinding {
         keys: "[Enter / e / r / R]",
         description: "Open embedded claude",
     },
