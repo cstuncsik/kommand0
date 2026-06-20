@@ -58,6 +58,11 @@ impl Tui {
             .unwrap();
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_kommand0-tui"));
+        // Don't let a developer's exported env leak into tests; each test sets
+        // exactly what it needs via extra_env below.
+        cmd.env_remove("KOMMAND0_CONFIG");
+        cmd.env_remove("KOMMAND0_CLAUDE_BIN");
+        cmd.env_remove("KOMMAND0_GH_BIN");
         cmd.env("KOMMAND0_STATE_DIR", state_dir.path());
         cmd.env("PATH", path_env);
         cmd.env("TERM", "xterm-256color");
@@ -811,6 +816,35 @@ fn unseen_background_output_raises_the_attention_flag() {
     // The late output arrives unseen, then the pane goes quiet -> attention.
     tui.wait_for("waiting");
 
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn config_claude_args_pass_through_to_the_pane() {
+    // A config file's `claude_args` are appended to every embedded spawn — here
+    // the embed-stub echoes its args, so we can see `--model sonnet` arrive.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let cfg = dir.path().join("config.json");
+    // Drive BOTH the binary and the extra args from config (no KOMMAND0_CLAUDE_BIN
+    // env), so this exercises config.claude_bin too.
+    std::fs::write(
+        &cfg,
+        r#"{ "claude_bin": "embed-stub", "claude_args": ["--model", "sonnet"] }"#,
+    )
+    .unwrap();
+    let state = seeded_state(d);
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CONFIG", cfg.to_str().unwrap())]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open the embedded pane
+    tui.wait_for("--model"); // the stub echoed its spawn args (incl. the config arg)
+
+    tui.send("\x01");
     tui.send("q");
     tui.wait_exit();
 }

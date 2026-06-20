@@ -158,6 +158,21 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else {
         " Repos ".to_string()
     };
+    // A present-but-invalid config surfaces in the bottom border.
+    let warn = app.config_warning.clone();
+    let tree_block = |title: String, border_style: Style| {
+        let mut b = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(border_style);
+        if let Some(w) = &warn {
+            b = b.title_bottom(Line::styled(
+                format!(" ⚠ {w} "),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+        b
+    };
 
     if app.tree_items.is_empty() {
         let border_style = if app.focus == Focus::Tree {
@@ -172,12 +187,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         };
         let hint = Paragraph::new(hint_text)
             .style(Style::default().fg(Color::DarkGray))
-            .block(
-                Block::default()
-                    .title(title.clone())
-                    .borders(Borders::ALL)
-                    .border_style(border_style),
-            );
+            .block(tree_block(title.clone(), border_style));
         frame.render_widget(hint, area);
     }
 
@@ -364,12 +374,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         };
 
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(tree_border_style),
-            )
+            .block(tree_block(title, tree_border_style))
             .highlight_style(Style::default());
 
         frame.render_stateful_widget(list, area, &mut list_state);

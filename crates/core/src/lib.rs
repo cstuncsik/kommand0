@@ -1,3 +1,4 @@
+pub mod config;
 pub mod git;
 pub mod id;
 pub mod repo;
@@ -5,6 +6,7 @@ pub mod session;
 pub mod workspace;
 pub mod worktree;
 
+pub use config::Config;
 pub use git::{BranchStatus, branch_status, cleanup_merged_workspace, open_pull_request};
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
