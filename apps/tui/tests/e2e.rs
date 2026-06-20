@@ -58,6 +58,11 @@ impl Tui {
             .unwrap();
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_kommand0-tui"));
+        // Don't let a developer's exported env leak into tests; each test sets
+        // exactly what it needs via extra_env below.
+        cmd.env_remove("KOMMAND0_CONFIG");
+        cmd.env_remove("KOMMAND0_CLAUDE_BIN");
+        cmd.env_remove("KOMMAND0_GH_BIN");
         cmd.env("KOMMAND0_STATE_DIR", state_dir.path());
         cmd.env("PATH", path_env);
         cmd.env("TERM", "xterm-256color");
@@ -822,15 +827,15 @@ fn config_claude_args_pass_through_to_the_pane() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().to_str().unwrap();
     let cfg = dir.path().join("config.json");
-    std::fs::write(&cfg, r#"{ "claude_args": ["--model", "sonnet"] }"#).unwrap();
+    // Drive BOTH the binary and the extra args from config (no KOMMAND0_CLAUDE_BIN
+    // env), so this exercises config.claude_bin too.
+    std::fs::write(
+        &cfg,
+        r#"{ "claude_bin": "embed-stub", "claude_args": ["--model", "sonnet"] }"#,
+    )
+    .unwrap();
     let state = seeded_state(d);
-    let mut tui = Tui::launch_with(
-        Some(state),
-        &[
-            ("KOMMAND0_CLAUDE_BIN", "embed-stub"),
-            ("KOMMAND0_CONFIG", cfg.to_str().unwrap()),
-        ],
-    );
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CONFIG", cfg.to_str().unwrap())]);
 
     tui.wait_for("demo");
     tui.send("l");
