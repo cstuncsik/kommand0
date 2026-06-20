@@ -9,6 +9,7 @@ mod mouse;
 #[allow(dead_code)]
 mod pane;
 mod render;
+mod theme;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -357,6 +358,8 @@ pub(crate) struct App {
     pub(crate) config_warning: Option<String>,
     /// Rebindable tree-pane key map (defaults until `run` applies config).
     pub(crate) keymap: keymap::KeyMap,
+    /// Color theme for the chrome (defaults until `run` applies config).
+    pub(crate) theme: theme::Theme,
 }
 
 impl App {
@@ -411,6 +414,7 @@ impl App {
             config: Config::default(),
             config_warning: None,
             keymap: keymap::KeyMap::default(),
+            theme: theme::Theme::default(),
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -1947,8 +1951,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     app.config = config;
     let (keymap, key_warnings) = keymap::KeyMap::build(&app.config.keybindings);
     app.keymap = keymap;
+    let (theme, theme_warnings) =
+        theme::Theme::build(app.config.theme.as_deref(), &app.config.theme_colors);
+    app.theme = theme;
     let mut warnings: Vec<String> = config_warning.into_iter().collect();
     warnings.extend(key_warnings);
+    warnings.extend(theme_warnings);
     for w in &warnings {
         tracing::warn!("config: {w}");
     }
