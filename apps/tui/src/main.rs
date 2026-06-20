@@ -1,5 +1,6 @@
 mod buttons;
 mod help;
+mod keymap;
 mod modal;
 mod mouse;
 // PTY-passthrough embedded `claude` pane — the app's only session view. The
@@ -351,9 +352,11 @@ pub(crate) struct App {
 
     /// User config (claude passthrough + tunables), loaded once at startup.
     pub(crate) config: Config,
-    /// Set when a present `config.json` failed to parse — surfaced in the tree
-    /// border so a typo isn't silently ignored.
+    /// Set when a present `config.json` failed to parse, or a keybinding was
+    /// unknown/invalid — surfaced in the tree border so it isn't silently ignored.
     pub(crate) config_warning: Option<String>,
+    /// Rebindable tree-pane key map (defaults until `run` applies config).
+    pub(crate) keymap: keymap::KeyMap,
 }
 
 impl App {
@@ -407,6 +410,7 @@ impl App {
             cleanup_tx: None,
             config: Config::default(),
             config_warning: None,
+            keymap: keymap::KeyMap::default(),
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -1663,240 +1667,219 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         return Ok(KeyOutcome::Continue);
     }
 
-    // Vim `gg`: consume the pending flag; only a bare `g` below re-arms it
+    // Vim `gg`: consume the pending flag; only a bare `g` below re-arms it.
     let g_was_pending = std::mem::take(&mut app.pending_g);
 
-    // Global keys (work in any focus)
-    match key.code {
-        KeyCode::Char('q') => {
-            let running_ids: Vec<String> = app
-                .state
-                .sessions
-                .iter()
-                .filter(|s| s.status == SessionStatus::Running)
-                .map(|s| s.id.clone())
-                .collect();
-            for sid in running_ids {
-                let _ = app
-                    .state
-                    .update_session_status(&sid, SessionStatus::Stopped);
+    // Tree-pane keys. (Embedded focus is intercepted at the top of handle_key.)
+    if app.focus == Focus::Tree {
+        // Fixed (non-rebindable) keys: the `gg` motion and Esc-clears-filter.
+        match key.code {
+            KeyCode::Char('g') if key.modifiers.is_empty() => {
+                if g_was_pending {
+                    app.tree_select_first();
+                } else {
+                    app.pending_g = true;
+                }
+                return Ok(KeyOutcome::Continue);
             }
-            return Ok(KeyOutcome::Quit);
+            KeyCode::Esc => {
+                if !app.filter_query.is_empty() {
+                    app.filter_query.clear();
+                    app.apply_filter();
+                }
+                return Ok(KeyOutcome::Continue);
+            }
+            _ => {}
         }
-        KeyCode::Char('?') => {
-            app.show_help = !app.show_help;
-            app.help_scroll = 0;
-        }
-        _ => {
-            // Focus-specific keys
-            match app.focus {
-                // Embedded keys are intercepted at the top of handle_key.
-                Focus::Embedded => {}
-                Focus::Tree => {
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                        KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                        KeyCode::Left | KeyCode::Char('h') => app.tree_collapse_or_parent(),
-                        KeyCode::Right | KeyCode::Char('l') => app.tree_expand_or_enter(),
-                        KeyCode::Char('g') => {
-                            if g_was_pending {
-                                app.tree_select_first();
-                            } else {
-                                app.pending_g = true;
-                            }
-                        }
-                        KeyCode::Char('G') => app.tree_select_last(),
-                        KeyCode::Char('e') => app.toggle_embedded(),
-                        KeyCode::Enter => {
-                            match app.tree_items.get(app.selected_index) {
-                                // Enter on a repo expands it; on a workspace it
-                                // opens the embedded interactive claude (the
-                                // default session experience).
-                                Some(TreeNode::Repo { .. }) => app.toggle_expand(),
-                                Some(TreeNode::Workspace { .. }) => app.toggle_embedded(),
-                                Some(TreeNode::Hint { .. }) | None => {}
-                            }
-                        }
-                        // 'r' is an alias for Enter/'e': open the embedded claude.
-                        KeyCode::Char('r') => app.toggle_embedded(),
-                        KeyCode::Char('x') | KeyCode::Delete => {
-                            if let Some(ws) = app.selected_workspace().cloned() {
-                                // Close an embedded claude pane (Pane's Drop kills it).
-                                app.embedded.remove(&ws.id);
-                                // Also stop any legacy stream session.
-                                let session_info = app
-                                    .state
-                                    .find_session_by_workspace(&ws.id)
-                                    .filter(|s| s.status == SessionStatus::Running)
-                                    .map(|s| s.id.clone());
-                                if let Some(session_id) = session_info {
-                                    let _ = app
-                                        .state
-                                        .update_session_status(&session_id, SessionStatus::Stopped);
-                                }
-                            }
-                        }
-                        // 'R' is an alias for Enter/'e': open the embedded claude.
-                        KeyCode::Char('R') => app.toggle_embedded(),
-                        KeyCode::Char('p') => {
-                            // Open a GitHub PR for the selected workspace's branch.
-                            if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                                app.open_pr(&ws_id);
-                            }
-                        }
-                        KeyCode::Char('c') => {
-                            // Clean up the selected (merged) workspace, via a
-                            // confirmation modal.
-                            if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                                app.cleanup_workspace_prompt(&ws_id);
-                            }
-                        }
-                        KeyCode::Char('/') => {
-                            // Enter the tree filter; keep any existing query to edit.
-                            app.filter_input = true;
-                        }
-                        KeyCode::Esc => {
-                            // Clear an applied filter (no-op otherwise).
-                            if !app.filter_query.is_empty() {
-                                app.filter_query.clear();
-                                app.apply_filter();
-                            }
-                        }
-                        KeyCode::Char('A') => {
-                            // Toggle the selected workspace's archived/active state.
-                            if let Some(ws) = app.selected_workspace().cloned() {
-                                let res = if ws.active {
-                                    app.state.archive_workspace(&ws.name)
-                                } else {
-                                    app.state.activate_workspace(&ws.name)
-                                };
-                                if res.is_ok() {
-                                    app.workspaces = app.state.workspaces.clone();
-                                    app.rebuild_tree();
-                                    app.select_workspace_row(&ws.id);
-                                    app.clamp_selection();
-                                }
-                            }
-                        }
-                        KeyCode::Char('a') => {
-                            // Open Add Repo modal
-                            app.modal = modal::ModalState::AddRepo {
-                                input: String::new(),
-                                cursor: 0,
-                                error: None,
-                                completions: Vec::new(),
-                                completion_index: None,
-                            };
-                        }
-                        KeyCode::Char('w') => {
-                            // Open Add Workspace modal for selected repo
-                            let repo_info = match app.tree_items.get(app.selected_index) {
-                                Some(TreeNode::Repo { id, name, .. }) => {
-                                    Some((id.clone(), name.clone()))
-                                }
-                                Some(TreeNode::Workspace { ws, repo_name }) => {
-                                    Some((ws.repo_id.clone(), repo_name.clone()))
-                                }
-                                _ => None,
-                            };
-                            if let Some((repo_id, repo_name)) = repo_info {
-                                app.modal = modal::ModalState::AddWorkspace {
-                                    repo_id,
-                                    repo_name,
-                                    input: String::new(),
-                                    cursor: 0,
-                                    error: None,
-                                };
-                            }
-                        }
-                        KeyCode::Char('d') => {
-                            // Delete selected item with confirmation
-                            match app.tree_items.get(app.selected_index).cloned() {
-                                Some(TreeNode::Workspace { ws, .. }) => {
-                                    app.modal = modal::ModalState::ConfirmDelete {
-                                        target: modal::DeleteTarget::Workspace {
-                                            name: ws.name.clone(),
-                                        },
-                                    };
-                                }
-                                Some(TreeNode::Repo { id, name, .. }) => {
-                                    let ws_count =
-                                        app.workspaces.iter().filter(|w| w.repo_id == id).count();
-                                    app.modal = modal::ModalState::ConfirmDelete {
-                                        target: modal::DeleteTarget::Repo {
-                                            id,
-                                            name,
-                                            workspace_count: ws_count,
-                                        },
-                                    };
-                                }
-                                _ => {}
-                            }
-                        }
-                        KeyCode::Char('D') => {
-                            // Force delete without confirmation
-                            match app.tree_items.get(app.selected_index).cloned() {
-                                Some(TreeNode::Workspace { ws, .. }) => {
-                                    let ws_info = app
-                                        .state
-                                        .workspaces
-                                        .iter()
-                                        .find(|w| w.name == ws.name)
-                                        .map(|w| {
-                                            let sid = app
-                                                .state
-                                                .find_session_by_workspace(&w.id)
-                                                .filter(|s| s.status == SessionStatus::Running)
-                                                .map(|s| s.id.clone());
-                                            (w.id.clone(), sid)
-                                        });
-                                    if let Some((ws_id, running_sid)) = ws_info {
-                                        if let Some(sid) = running_sid {
-                                            let _ = app.state.update_session_status(
-                                                &sid,
-                                                SessionStatus::Stopped,
-                                            );
-                                        }
-                                        app.embedded.remove(&ws_id);
-                                    }
-                                    let _ = app.state.delete_workspace(&ws.name);
-                                    app.workspaces = app.state.workspaces.clone();
-                                    app.rebuild_tree();
-                                    app.update_active_session();
-                                }
-                                Some(TreeNode::Repo { id, .. }) => {
-                                    let ws_ids: Vec<String> = app
-                                        .state
-                                        .workspaces
-                                        .iter()
-                                        .filter(|w| w.repo_id == id)
-                                        .map(|w| w.id.clone())
-                                        .collect();
-                                    for ws_id in &ws_ids {
-                                        if let Some(s) = app.state.find_session_by_workspace(ws_id)
-                                            && s.status == SessionStatus::Running
-                                        {
-                                            let sid = s.id.clone();
-                                            let _ = app.state.update_session_status(
-                                                &sid,
-                                                SessionStatus::Stopped,
-                                            );
-                                        }
-                                        app.embedded.remove(ws_id);
-                                    }
-                                    let _ = app.state.delete_repo(&id);
-                                    app.repos = app.state.repos.clone();
-                                    app.workspaces = app.state.workspaces.clone();
-                                    app.expanded.remove(&id);
-                                    app.rebuild_tree();
-                                    app.update_active_session();
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {}
+
+        // Everything else dispatches through the (rebindable) keymap.
+        if let Some(action) = app.keymap.resolve(&key) {
+            use keymap::Action;
+            match action {
+                Action::Quit => {
+                    let running_ids: Vec<String> = app
+                        .state
+                        .sessions
+                        .iter()
+                        .filter(|s| s.status == SessionStatus::Running)
+                        .map(|s| s.id.clone())
+                        .collect();
+                    for sid in running_ids {
+                        let _ = app
+                            .state
+                            .update_session_status(&sid, SessionStatus::Stopped);
+                    }
+                    return Ok(KeyOutcome::Quit);
+                }
+                Action::Help => {
+                    app.show_help = !app.show_help;
+                    app.help_scroll = 0;
+                }
+                Action::MoveUp => app.move_up(),
+                Action::MoveDown => app.move_down(),
+                Action::CollapseOrParent => app.tree_collapse_or_parent(),
+                Action::StepInto => app.tree_expand_or_enter(),
+                Action::SelectLast => app.tree_select_last(),
+                Action::OpenSession => app.toggle_embedded(),
+                Action::ActivateSelection => {
+                    // Enter on a repo expands it; on a workspace it opens the
+                    // embedded interactive claude (the default session experience).
+                    match app.tree_items.get(app.selected_index) {
+                        Some(TreeNode::Repo { .. }) => app.toggle_expand(),
+                        Some(TreeNode::Workspace { .. }) => app.toggle_embedded(),
+                        Some(TreeNode::Hint { .. }) | None => {}
                     }
                 }
+                Action::CloseSession => {
+                    if let Some(ws) = app.selected_workspace().cloned() {
+                        // Close an embedded claude pane (Pane's Drop kills it).
+                        app.embedded.remove(&ws.id);
+                        // Also stop any legacy stream session.
+                        let session_info = app
+                            .state
+                            .find_session_by_workspace(&ws.id)
+                            .filter(|s| s.status == SessionStatus::Running)
+                            .map(|s| s.id.clone());
+                        if let Some(session_id) = session_info {
+                            let _ = app
+                                .state
+                                .update_session_status(&session_id, SessionStatus::Stopped);
+                        }
+                    }
+                }
+                Action::OpenPr => {
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.open_pr(&ws_id);
+                    }
+                }
+                Action::Cleanup => {
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.cleanup_workspace_prompt(&ws_id);
+                    }
+                }
+                Action::Filter => {
+                    // Enter the tree filter; keep any existing query to edit.
+                    app.filter_input = true;
+                }
+                Action::ArchiveToggle => {
+                    if let Some(ws) = app.selected_workspace().cloned() {
+                        let res = if ws.active {
+                            app.state.archive_workspace(&ws.name)
+                        } else {
+                            app.state.activate_workspace(&ws.name)
+                        };
+                        if res.is_ok() {
+                            app.workspaces = app.state.workspaces.clone();
+                            app.rebuild_tree();
+                            app.select_workspace_row(&ws.id);
+                            app.clamp_selection();
+                        }
+                    }
+                }
+                Action::AddRepo => {
+                    app.modal = modal::ModalState::AddRepo {
+                        input: String::new(),
+                        cursor: 0,
+                        error: None,
+                        completions: Vec::new(),
+                        completion_index: None,
+                    };
+                }
+                Action::AddWorkspace => {
+                    let repo_info = match app.tree_items.get(app.selected_index) {
+                        Some(TreeNode::Repo { id, name, .. }) => Some((id.clone(), name.clone())),
+                        Some(TreeNode::Workspace { ws, repo_name }) => {
+                            Some((ws.repo_id.clone(), repo_name.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((repo_id, repo_name)) = repo_info {
+                        app.modal = modal::ModalState::AddWorkspace {
+                            repo_id,
+                            repo_name,
+                            input: String::new(),
+                            cursor: 0,
+                            error: None,
+                        };
+                    }
+                }
+                Action::Delete => match app.tree_items.get(app.selected_index).cloned() {
+                    Some(TreeNode::Workspace { ws, .. }) => {
+                        app.modal = modal::ModalState::ConfirmDelete {
+                            target: modal::DeleteTarget::Workspace {
+                                name: ws.name.clone(),
+                            },
+                        };
+                    }
+                    Some(TreeNode::Repo { id, name, .. }) => {
+                        let ws_count =
+                            app.workspaces.iter().filter(|w| w.repo_id == id).count();
+                        app.modal = modal::ModalState::ConfirmDelete {
+                            target: modal::DeleteTarget::Repo {
+                                id,
+                                name,
+                                workspace_count: ws_count,
+                            },
+                        };
+                    }
+                    _ => {}
+                },
+                Action::ForceDelete => match app.tree_items.get(app.selected_index).cloned() {
+                    Some(TreeNode::Workspace { ws, .. }) => {
+                        let ws_info = app
+                            .state
+                            .workspaces
+                            .iter()
+                            .find(|w| w.name == ws.name)
+                            .map(|w| {
+                                let sid = app
+                                    .state
+                                    .find_session_by_workspace(&w.id)
+                                    .filter(|s| s.status == SessionStatus::Running)
+                                    .map(|s| s.id.clone());
+                                (w.id.clone(), sid)
+                            });
+                        if let Some((ws_id, running_sid)) = ws_info {
+                            if let Some(sid) = running_sid {
+                                let _ = app
+                                    .state
+                                    .update_session_status(&sid, SessionStatus::Stopped);
+                            }
+                            app.embedded.remove(&ws_id);
+                        }
+                        let _ = app.state.delete_workspace(&ws.name);
+                        app.workspaces = app.state.workspaces.clone();
+                        app.rebuild_tree();
+                        app.update_active_session();
+                    }
+                    Some(TreeNode::Repo { id, .. }) => {
+                        let ws_ids: Vec<String> = app
+                            .state
+                            .workspaces
+                            .iter()
+                            .filter(|w| w.repo_id == id)
+                            .map(|w| w.id.clone())
+                            .collect();
+                        for ws_id in &ws_ids {
+                            if let Some(s) = app.state.find_session_by_workspace(ws_id)
+                                && s.status == SessionStatus::Running
+                            {
+                                let sid = s.id.clone();
+                                let _ = app
+                                    .state
+                                    .update_session_status(&sid, SessionStatus::Stopped);
+                            }
+                            app.embedded.remove(ws_id);
+                        }
+                        let _ = app.state.delete_repo(&id);
+                        app.repos = app.state.repos.clone();
+                        app.workspaces = app.state.workspaces.clone();
+                        app.expanded.remove(&id);
+                        app.rebuild_tree();
+                        app.update_active_session();
+                    }
+                    _ => {}
+                },
             }
         }
     }
@@ -1958,10 +1941,22 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let state = AppState::load()?;
     let mut app = App::new(state);
     // Load user config now (App::new keeps a hermetic default for tests). A
-    // present-but-invalid file surfaces a warning in the tree border.
+    // present-but-invalid file (or a bad keybinding) surfaces a warning in the
+    // tree border, with full detail in the log.
     let (config, config_warning) = Config::load_checked();
     app.config = config;
-    app.config_warning = config_warning;
+    let (keymap, key_warnings) = keymap::KeyMap::build(&app.config.keybindings);
+    app.keymap = keymap;
+    let mut warnings: Vec<String> = config_warning.into_iter().collect();
+    warnings.extend(key_warnings);
+    for w in &warnings {
+        tracing::warn!("config: {w}");
+    }
+    app.config_warning = match warnings.len() {
+        0 => None,
+        1 => Some(warnings.remove(0)),
+        n => Some(format!("{n} config issues — see kommand0.log")),
+    };
 
     // Reconcile persisted status with the (empty) session_manager. No stream
     // session is ever resurrected now, so a persisted `Running` is stale — left
@@ -3054,6 +3049,25 @@ mod key_tests {
         assert!(new2.is_none());
     }
 
+    #[tokio::test]
+    async fn rebound_quit_works_and_the_default_key_is_dead() {
+        let mut app = test_app();
+        let mut cfg = std::collections::HashMap::new();
+        cfg.insert("quit".to_string(), vec!["ctrl+q".to_string()]);
+        let (km, warns) = keymap::KeyMap::build(&cfg);
+        assert!(warns.is_empty(), "{warns:?}");
+        app.keymap = km;
+
+        // The default `q` no longer quits.
+        let out = handle_key(&mut app, key(KeyCode::Char('q'))).await.unwrap();
+        assert_eq!(out, KeyOutcome::Continue);
+        // The rebound chord does.
+        let out = handle_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(out, KeyOutcome::Quit);
+    }
+
     #[test]
     fn pick_claude_bin_precedence() {
         // Env wins (tests/e2e rely on this); empty env is ignored.
@@ -3303,8 +3317,8 @@ mod key_tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("Help"), "help overlay should render:\n{text}");
         assert!(
-            text.contains("Navigate"),
-            "help should list bindings:\n{text}"
+            text.contains("Move down"),
+            "help should list bindings from the keymap:\n{text}"
         );
     }
 }
