@@ -50,6 +50,9 @@ a real interactive `claude` in an embedded PTY pane.
 
 - **Filter** — `/` live-filters the tree by name/branch (matched repos
   auto-expand; Up/Down walk matches; `Esc` clears).
+- **Go-to-workspace palette** — `:` opens a fuzzy jump list over every workspace
+  (across collapsed repos); Enter jumps to the match and opens it (clearing any
+  active `/` filter so the target is reachable). Rebindable (`palette`).
 - **Archive/activate** — `A` toggles a workspace's active state.
 - Vim-style navigation (`j`/`k`, `h`/`l`, `gg`/`G`), help overlay (`?`).
 - **First-run onboarding** — an empty tree shows a centered welcome pointing at
