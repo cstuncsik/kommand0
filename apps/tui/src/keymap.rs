@@ -135,9 +135,16 @@ fn normalize(code: KeyCode, mods: KeyModifiers) -> KeyChord {
     KeyChord { code, mods }
 }
 
-/// The bare `g` chord, reserved for the fixed `gg` motion.
-fn is_reserved(chord: &KeyChord) -> bool {
-    chord.code == KeyCode::Char('g') && chord.mods.is_empty()
+/// Chords handled by fixed (non-rebindable) pre-checks in `handle_key`, with a
+/// reason for the warning. Binding an action to one of these would never fire.
+fn reserved_reason(chord: &KeyChord) -> Option<&'static str> {
+    if chord.code == KeyCode::Char('g') && chord.mods.is_empty() {
+        Some("the gg motion")
+    } else if chord.code == KeyCode::Esc {
+        Some("clearing the filter")
+    } else {
+        None
+    }
 }
 
 /// Parse a key spec like `"j"`, `"Up"`, `"Enter"`, `"/"`, `"ctrl+a"`, `"G"` into
@@ -298,8 +305,8 @@ impl KeyMap {
                     warnings.push(format!("invalid key '{spec}' for '{name}'"));
                     continue;
                 };
-                if is_reserved(&chord) {
-                    warnings.push(format!("key 'g' is reserved (gg motion); ignored for '{name}'"));
+                if let Some(reason) = reserved_reason(&chord) {
+                    warnings.push(format!("key '{spec}' is reserved for {reason}; ignored for '{name}'"));
                     continue;
                 }
                 if let Some(prev) = keymap.map.get(&chord)
@@ -406,6 +413,8 @@ mod tests {
         let cq = parse_chord("ctrl+q").unwrap();
         assert_eq!(km.resolve(&ev(cq.code, cq.mods)), Some(Action::Quit));
         assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), None);
+        // An unmodified action is unaffected by the rebind.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('j'), KeyModifiers::NONE)), Some(Action::MoveDown));
     }
 
     #[test]
@@ -413,7 +422,7 @@ mod tests {
         let mut cfg = HashMap::new();
         cfg.insert("nope".to_string(), vec!["x".to_string()]);
         cfg.insert("quit".to_string(), vec!["Nope".to_string()]);
-        cfg.insert("open".to_string(), vec!["g".to_string()]);
+        cfg.insert("open".to_string(), vec!["g".to_string(), "Esc".to_string()]);
         // Reassign: bind delete to `q` (q is quit's default, not rebound here).
         cfg.insert("delete".to_string(), vec!["q".to_string()]);
         let (km, warns) = KeyMap::build(&cfg);
