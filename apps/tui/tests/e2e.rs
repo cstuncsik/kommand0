@@ -239,6 +239,17 @@ fn launches_renders_panes_and_quits_on_q() {
 }
 
 #[test]
+fn first_run_shows_welcome_and_add_repo_hint() {
+    // Empty state (no repos): the tree leads with an in-TUI call to action
+    // (press a), not a CLI command.
+    let mut tui = Tui::launch(None);
+    tui.wait_for("Welcome to kommand0");
+    tui.wait_for("add a repo");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn writes_a_log_file_on_startup() {
     // Background warnings/errors can't go to stderr (alt-screen); they're logged
     // to <state_dir>/kommand0.log. The startup line proves the sink is wired.

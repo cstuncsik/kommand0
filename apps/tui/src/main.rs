@@ -462,7 +462,7 @@ impl App {
                 }
             } else if repo_workspaces.is_empty() {
                 self.tree_items.push(TreeNode::Hint {
-                    text: "(no workspaces)".into(),
+                    text: "(no workspaces — press w to add)".into(),
                 });
             } else {
                 let all_archived = repo_workspaces.iter().all(|w| !w.active);
@@ -1514,7 +1514,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         match modal::handle_modal_key(&mut app.modal, key) {
             modal::ModalResult::Consumed | modal::ModalResult::Cancelled => {}
             modal::ModalResult::SubmitRepo(path) => match app.state.add_repo(&path) {
-                Ok(_) => {
+                Ok(repo) => {
+                    // Expand the just-added repo so its "(no workspaces — press w)"
+                    // hint shows immediately, pointing the user at the next step.
+                    app.expanded.insert(repo.id.clone());
                     app.repos = app.state.repos.clone();
                     app.rebuild_tree();
                 }
@@ -2453,6 +2456,55 @@ mod key_tests {
         assert_eq!(ws_names(&app), vec!["auth"]);
         // Navigation works on the filtered tree (j/k reach the handlers now).
         assert!(app.selected_workspace().is_some());
+    }
+
+    #[test]
+    fn expanded_empty_repo_shows_press_w_hint() {
+        let mut app = test_app();
+        // r2 (from test_app) has no workspaces; expanding it surfaces the hint
+        // that points at the in-TUI `w` key.
+        app.expanded.insert("r2".to_string());
+        app.rebuild_tree();
+        assert!(
+            app.tree_items.iter().any(|n| matches!(
+                n,
+                TreeNode::Hint { text } if text.as_str() == "(no workspaces — press w to add)"
+            )),
+            "an expanded empty repo guides the user to press w"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_repo_auto_expands_it() {
+        let mut app = test_app();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        // Submit the Add-Repo modal pre-filled with a real directory.
+        app.modal = modal::ModalState::AddRepo {
+            input: path.clone(),
+            cursor: path.len(),
+            error: None,
+            completions: Vec::new(),
+            completion_index: None,
+        };
+        press(&mut app, KeyCode::Enter).await;
+
+        // The freshly added repo is tracked, auto-expanded, and immediately shows
+        // its "press w" hint (no extra expand keypress needed).
+        let new = app
+            .state
+            .repos
+            .iter()
+            .find(|r| r.id != "r1" && r.id != "r2")
+            .expect("repo was added");
+        assert!(app.expanded.contains(&new.id), "freshly added repo is auto-expanded");
+        assert!(
+            app.tree_items.iter().any(|n| matches!(
+                n,
+                TreeNode::Hint { text } if text.as_str() == "(no workspaces — press w to add)"
+            )),
+            "the new empty repo guides the user to press w"
+        );
     }
 
     #[tokio::test]

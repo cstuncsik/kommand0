@@ -185,15 +185,39 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             Style::default().fg(th.muted)
         };
-        let hint_text = if !app.filter_query.is_empty() {
-            format!("No workspaces match /{}", app.filter_query)
+        let block = tree_block(title.clone(), border_style);
+        if !app.filter_query.is_empty() {
+            // Filter matched nothing — a single muted line.
+            let hint = Paragraph::new(format!("No workspaces match /{}", app.filter_query))
+                .style(Style::default().fg(th.muted))
+                .block(block);
+            frame.render_widget(hint, area);
         } else {
-            "No repos tracked. Run: kmd repo add <path>".to_string()
-        };
-        let hint = Paragraph::new(hint_text)
-            .style(Style::default().fg(th.muted))
-            .block(tree_block(title.clone(), border_style));
-        frame.render_widget(hint, area);
+            // First-run welcome: lead with the in-TUI action (not the CLI), and
+            // vertically center it within the bordered pane.
+            let mut lines = vec![
+                Line::styled(
+                    "Welcome to kommand0",
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled("a", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+                    Span::raw(" to add a repo"),
+                ]),
+                Line::styled("? help · q quit", Style::default().fg(th.muted)),
+            ];
+            let inner_h = area.height.saturating_sub(2) as usize;
+            for _ in 0..inner_h.saturating_sub(lines.len()) / 2 {
+                lines.insert(0, Line::raw(""));
+            }
+            let hint = Paragraph::new(lines)
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(Style::default().fg(th.text))
+                .block(block);
+            frame.render_widget(hint, area);
+        }
     }
 
     if !app.tree_items.is_empty() {
