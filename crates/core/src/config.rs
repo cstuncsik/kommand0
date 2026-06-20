@@ -28,6 +28,12 @@ pub struct Config {
     /// replace its defaults. Unknown actions / bad specs are warned, not fatal.
     #[serde(default)]
     pub keybindings: std::collections::HashMap<String, Vec<String>>,
+    /// Built-in color theme name (e.g. `"high-contrast"`); `None` = default.
+    pub theme: Option<String>,
+    /// Per-role color overrides: role (e.g. `"accent"`) → color spec (e.g.
+    /// `"blue"`, `"#ff8800"`). Parsed by the TUI; bad roles/colors are warned.
+    #[serde(default)]
+    pub theme_colors: std::collections::HashMap<String, String>,
 }
 
 impl Config {
