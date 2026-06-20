@@ -1,0 +1,25 @@
+crates/core/src/lib.rs
+  s_fc3d7618d36de0::t_655a527c194d52 800-801,803-804
+  s_fc3d7618d36de0::t_39a91db6529f02 688,692
+  s_fc3d7618d36de0::t_0c4d2ad7f8aedc 681,684,687,694-695
+CHANGELOG.md
+  s_fc3d7618d36de0::t_c18a406f259716 1-66
+apps/tui/src/buttons.rs
+  s_fc3d7618d36de0::t_3d90e469694428 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "4df4a2806088eeeed38132606f27f22f5c3e5597",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
