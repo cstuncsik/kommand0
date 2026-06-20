@@ -259,7 +259,7 @@ fn help_overlay_opens_scrolls_and_closes() {
     tui.wait_for(" Repos ");
 
     tui.send("?");
-    tui.wait_for("Global");
+    tui.wait_for("Tree Pane");
     tui.wait_for("Current:");
 
     // G jumps to the bottom of the help content
@@ -837,6 +837,27 @@ fn unseen_background_output_raises_the_attention_flag() {
     tui.wait_for("waiting");
 
     tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn config_rebinds_quit() {
+    // Rebind quit to `Q`; the default `q` becomes a no-op, `Q` quits.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.json");
+    std::fs::write(&cfg, r#"{ "keybindings": { "quit": ["Q"] } }"#).unwrap();
+    let mut tui = Tui::launch_with(None, &[("KOMMAND0_CONFIG", cfg.to_str().unwrap())]);
+
+    tui.wait_for(" Repos ");
+    // The old `q` no longer quits — prove the app is still alive by opening the
+    // filter afterwards (a dead process couldn't render it).
+    tui.send("q");
+    tui.send("/");
+    tui.wait_for("Repos · /");
+    tui.send_esc();
+
+    // The rebound key quits.
+    tui.send("Q");
     tui.wait_exit();
 }
 

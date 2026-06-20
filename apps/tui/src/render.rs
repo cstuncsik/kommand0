@@ -59,9 +59,11 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 
     render_status_line(frame, app, rows[1]);
 
-    // Help overlay on top of any layout
+    // Help overlay on top of any layout. Tree bindings come from the (rebindable)
+    // keymap so the overlay reflects the user's config.
     if app.show_help {
-        help::render_help_overlay(frame, app.focus, &mut app.help_scroll);
+        let tree_rows = app.keymap.help_rows();
+        help::render_help_overlay(frame, app.focus, &mut app.help_scroll, &tree_rows);
     }
 
     // Modal overlay on top of everything
