@@ -1,0 +1,32 @@
+crates/core/src/worktree.rs
+  s_fc3d7618d36de0::t_3d881eb20aff4e 156-161,167
+README.md
+  s_fc3d7618d36de0::t_0b6a45740b628d 122
+apps/tui/Cargo.toml
+  s_fc3d7618d36de0::t_10b6ba15d5a964 16-17
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_45ecd5ae1b6d1c 766,794,812,884,1063,1625,1984,1991
+  s_fc3d7618d36de0::t_4eaf542a28848c 1906-1924,1927-1928
+  s_fc3d7618d36de0::t_174deb3d9bbb7a 631-638
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_eb59a3a14903ad 242-255
+  s_fc3d7618d36de0::t_c2f0fd938d1df7 137-141
+Cargo.toml
+  s_fc3d7618d36de0::t_e3791f6d14d0b1 18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "bed478c02d859bb20cb8aada3c0d849d121ba496",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
