@@ -119,7 +119,7 @@ The state directory is resolved in this order:
 2. Debug builds: `.kommand0-dev/` relative to the current directory
 3. Release builds: the platform data directory (`~/Library/Application Support/kommand0` on macOS)
 
-`state.json` (repos, workspaces, sessions) lives at the root of that directory; session logs are written as JSON lines files in its `sessions/` subdirectory. The app's own diagnostics (warnings/errors that can't go to the terminal while the TUI is running) are appended to `kommand0.log` there.
+`state.json` (repos, workspaces, sessions) lives at the root of that directory; session logs are written as JSON lines files in its `sessions/` subdirectory. The app's own diagnostics (warnings/errors that can't go to the terminal while the TUI is running) are appended to `kommand0.log` there. It's append-only and not rotated — safe to delete anytime.
 
 ## Config
 
