@@ -20,13 +20,6 @@ use ratatui::{
     crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent},
 };
 
-#[allow(dead_code)]
-pub(crate) enum Status {
-    Idle,
-    Done,
-    Error(String),
-}
-
 /// Decide the `claude` CLI args for opening a workspace's embedded pane.
 ///
 /// If the workspace already has a stored session id, resume it; otherwise assign
@@ -193,8 +186,6 @@ pub(crate) enum TreeNode {
     Repo {
         id: String,
         name: String,
-        #[allow(dead_code)]
-        workspace_count: usize,
     },
     Workspace {
         ws: Workspace,
@@ -271,8 +262,6 @@ pub(crate) struct App {
     pub(crate) expanded: HashSet<String>,
     pub(crate) tree_items: Vec<TreeNode>,
     pub(crate) selected_index: usize,
-    #[allow(dead_code)]
-    pub(crate) status: Status,
 
     pub(crate) focus: Focus,
 
@@ -379,7 +368,6 @@ impl App {
             expanded: HashSet::new(),
             tree_items: Vec::new(),
             selected_index: 0,
-            status: Status::Idle,
             focus: Focus::Tree,
             show_help: false,
             help_scroll: 0,
@@ -432,7 +420,6 @@ impl App {
         let q = self.filter_query.to_lowercase();
         let filtering = !q.is_empty();
         for repo in &self.repos {
-            let total = self.workspaces.iter().filter(|w| w.repo_id == repo.id).count();
             // When a repo's name matches, show all its workspaces; otherwise only
             // those whose name/branch matches. No filter => all of them.
             let repo_matches = filtering && repo.name.to_lowercase().contains(&q);
@@ -452,7 +439,6 @@ impl App {
             self.tree_items.push(TreeNode::Repo {
                 id: repo.id.clone(),
                 name: repo.name.clone(),
-                workspace_count: total,
             });
 
             // Matched repos are force-expanded so the matches are visible.
