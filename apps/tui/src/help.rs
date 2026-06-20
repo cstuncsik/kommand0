@@ -7,81 +7,10 @@ use ratatui::{
 
 use super::Focus;
 
-pub struct KeyBinding {
-    pub keys: &'static str,
-    pub description: &'static str,
+struct KeyBinding {
+    keys: &'static str,
+    description: &'static str,
 }
-
-pub struct KeySection {
-    pub title: &'static str,
-    pub bindings: &'static [KeyBinding],
-}
-
-const GLOBAL_BINDINGS: &[KeyBinding] = &[
-    KeyBinding {
-        keys: "[q]",
-        description: "Quit",
-    },
-    KeyBinding {
-        keys: "[?]",
-        description: "Help",
-    },
-];
-
-const TREE_BINDINGS: &[KeyBinding] = &[
-    KeyBinding {
-        keys: "[j/k or Up/Down]",
-        description: "Navigate",
-    },
-    KeyBinding {
-        keys: "[h/l or Left/Right]",
-        description: "Collapse / expand",
-    },
-    KeyBinding {
-        keys: "[gg/G]",
-        description: "First / last item",
-    },
-    KeyBinding {
-        keys: "[/]",
-        description: "Filter workspaces (Esc clears)",
-    },
-    KeyBinding {
-        keys: "[A]",
-        description: "Archive / activate workspace",
-    },
-    KeyBinding {
-        keys: "[Enter / e / r / R]",
-        description: "Open embedded claude",
-    },
-    KeyBinding {
-        keys: "[x]",
-        description: "Close embedded claude",
-    },
-    KeyBinding {
-        keys: "[p]",
-        description: "Open a GitHub PR for the workspace",
-    },
-    KeyBinding {
-        keys: "[c]",
-        description: "Clean up a merged workspace",
-    },
-    KeyBinding {
-        keys: "[a]",
-        description: "Add repository",
-    },
-    KeyBinding {
-        keys: "[w]",
-        description: "Add workspace",
-    },
-    KeyBinding {
-        keys: "[d]",
-        description: "Delete selected",
-    },
-    KeyBinding {
-        keys: "[D]",
-        description: "Force delete",
-    },
-];
 
 const EMBEDDED_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
@@ -122,21 +51,6 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
     },
 ];
 
-const SECTIONS: &[KeySection] = &[
-    KeySection {
-        title: "Global",
-        bindings: GLOBAL_BINDINGS,
-    },
-    KeySection {
-        title: "Tree Pane",
-        bindings: TREE_BINDINGS,
-    },
-    KeySection {
-        title: "Embedded claude",
-        bindings: EMBEDDED_BINDINGS,
-    },
-];
-
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::vertical([
         Constraint::Percentage((100 - percent_y) / 2),
@@ -159,7 +73,14 @@ fn focus_to_section(focus: Focus) -> &'static str {
     }
 }
 
-pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus, scroll: &mut u16) {
+/// Render the help overlay. `tree_rows` are the live tree-pane bindings
+/// (`(keys, description)`) from the keymap, so the overlay reflects any rebinds.
+pub fn render_help_overlay(
+    frame: &mut ratatui::Frame,
+    focus: Focus,
+    scroll: &mut u16,
+    tree_rows: &[(String, &'static str)],
+) {
     let area = centered_rect(60, 70, frame.area());
 
     // Clear the area behind the overlay
@@ -182,8 +103,16 @@ pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus, scroll: &mu
     ]));
     lines.push(Line::raw(""));
 
-    for section in SECTIONS {
-        let is_active = section.title == current_section;
+    // Sections: tree pane bindings come from the keymap (dynamic); the embedded
+    // prefix is fixed (static).
+    let tree: Vec<(&str, &str)> = tree_rows.iter().map(|(k, d)| (k.as_str(), *d)).collect();
+    let embedded: Vec<(&str, &str)> =
+        EMBEDDED_BINDINGS.iter().map(|b| (b.keys, b.description)).collect();
+    let sections: [(&str, &[(&str, &str)]); 2] =
+        [("Tree Pane", &tree), ("Embedded claude", &embedded)];
+
+    for (title, bindings) in sections {
+        let is_active = title == current_section;
         let title_style = if is_active {
             Style::default()
                 .fg(Color::Cyan)
@@ -192,24 +121,18 @@ pub fn render_help_overlay(frame: &mut ratatui::Frame, focus: Focus, scroll: &mu
             Style::default().add_modifier(Modifier::BOLD)
         };
 
-        lines.push(Line::styled(format!("  {}", section.title), title_style));
+        lines.push(Line::styled(format!("  {title}"), title_style));
 
-        for binding in section.bindings {
-            let key_style = if is_active {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let desc_style = if is_active {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::White)
-            };
+        let style = if is_active {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        for (keys, description) in bindings {
             lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(binding.keys, key_style),
+                Span::styled(format!("    {keys:<16}"), style),
                 Span::raw(" "),
-                Span::styled(binding.description, desc_style),
+                Span::styled(*description, style),
             ]));
         }
         lines.push(Line::raw(""));

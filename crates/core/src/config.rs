@@ -23,6 +23,11 @@ pub struct Config {
     pub claude_bin: Option<String>,
     /// Seconds between background git-status refreshes (default 2).
     pub status_refresh_secs: Option<u64>,
+    /// Tree-pane key rebindings: action name (e.g. `"quit"`) → key specs (e.g.
+    /// `["ctrl+q"]`). Parsed/validated by the TUI; an action's configured keys
+    /// replace its defaults. Unknown actions / bad specs are warned, not fatal.
+    #[serde(default)]
+    pub keybindings: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Config {
