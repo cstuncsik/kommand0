@@ -52,6 +52,7 @@ cargo run -p kommand0-tui
 - **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items and scroll the tree; inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion
+- **Filter & archive**: press `/` to live-filter the workspace tree by name or branch (matched repos auto-expand, `Esc` clears); press `A` to archive/activate a workspace — so the tree stays navigable as you accumulate repos and workspaces
 - **Git worktrees**: each workspace gets an isolated git worktree branch
 - **Branch/diff status**: each workspace shows its git branch and how far it is ahead/behind its upstream plus whether it has uncommitted changes — a compact `↑2↓1*` segment in the tree row and full detail (`Branch:` / `Changes:`) in the detail pane. Computed off the render loop (never blocks keystrokes), refreshed every couple of seconds and on workspace create/close
 - **Open a PR**: press `p` (or click `[Open PR]` in the detail pane) to push a workspace's branch and open a GitHub PR via the `gh` CLI. Runs off the render loop with progress (`Opening PR…`) and shows the resulting URL (or a readable error); idempotent — re-running on a branch that already has a PR returns its URL. Requires `gh` installed and authenticated
@@ -67,6 +68,8 @@ cargo run -p kommand0-tui
 | `j` / `k` / `Up` / `Down` | Tree | Navigate workspaces |
 | `h` / `l` / `Left` / `Right` | Tree | Collapse repo (or jump to parent) / expand repo |
 | `gg` / `G` | Tree | Jump to first / last item |
+| `/` | Tree | Filter workspaces by name/branch (`Esc` clears) |
+| `A` | Tree | Archive / activate the selected workspace |
 | `Enter` / `e` / `r` / `R` | Tree | Open the embedded Claude pane for the workspace |
 | `x` | Tree | Close the embedded Claude pane |
 | `p` | Tree | Open a GitHub PR for the selected workspace (`gh`) |

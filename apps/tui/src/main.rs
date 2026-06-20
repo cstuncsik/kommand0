@@ -153,6 +153,16 @@ fn pane_content_rect(right_pane_area: ratatui::layout::Rect) -> ratatui::layout:
     }
 }
 
+/// Whether a workspace matches a (lowercased) tree-filter query by its name or
+/// its branch.
+fn ws_matches_query(w: &Workspace, q: &str) -> bool {
+    w.name.to_lowercase().contains(q)
+        || w
+            .branch_name
+            .as_deref()
+            .is_some_and(|b| b.to_lowercase().contains(q))
+}
+
 /// Translate an absolute terminal mouse position into the active pane's
 /// coordinate space. Returns `None` when the position is outside the pane's
 /// content area (border, tab strip, or tree), so those clicks aren't forwarded.
@@ -262,6 +272,11 @@ pub(crate) struct App {
     pub(crate) help_scroll: u16,
     /// True when a `g` was pressed and we're waiting for a second `g` (vim `gg`).
     pub(crate) pending_g: bool,
+    /// Tree filter query (case-insensitive; empty = no filter). Matches a
+    /// workspace by name or branch, or a repo by name (showing all its rows).
+    pub(crate) filter_query: String,
+    /// True while the `/` filter box is capturing keystrokes.
+    pub(crate) filter_input: bool,
     /// Claude session ids (one per tab) whose pane produced output over the last
     /// couple of ticks — drives the activity spinner. Keyed by session id.
     /// Recomputed each tick from per-pane output deltas.
@@ -354,6 +369,8 @@ impl App {
             show_help: false,
             help_scroll: 0,
             pending_g: false,
+            filter_query: String::new(),
+            filter_input: false,
             waiting_response: HashSet::new(),
             spinner_tick: 0,
             pane_seen: HashMap::new(),
@@ -395,41 +412,95 @@ impl App {
 
     fn rebuild_tree(&mut self) {
         self.tree_items.clear();
+        let q = self.filter_query.to_lowercase();
+        let filtering = !q.is_empty();
         for repo in &self.repos {
+            let total = self.workspaces.iter().filter(|w| w.repo_id == repo.id).count();
+            // When a repo's name matches, show all its workspaces; otherwise only
+            // those whose name/branch matches. No filter => all of them.
+            let repo_matches = filtering && repo.name.to_lowercase().contains(&q);
             let repo_workspaces: Vec<&Workspace> = self
                 .workspaces
                 .iter()
                 .filter(|w| w.repo_id == repo.id)
+                .filter(|w| !filtering || repo_matches || ws_matches_query(w, &q))
                 .collect();
-            let workspace_count = repo_workspaces.len();
+
+            // A filtered-out repo (no matching workspaces, name doesn't match) is
+            // omitted entirely so search narrows across collapsed repos too.
+            if filtering && repo_workspaces.is_empty() {
+                continue;
+            }
 
             self.tree_items.push(TreeNode::Repo {
                 id: repo.id.clone(),
                 name: repo.name.clone(),
-                workspace_count,
+                workspace_count: total,
             });
 
-            if self.expanded.contains(&repo.id) {
-                if repo_workspaces.is_empty() {
-                    self.tree_items.push(TreeNode::Hint {
-                        text: "(no workspaces)".into(),
+            // Matched repos are force-expanded so the matches are visible.
+            if !filtering && !self.expanded.contains(&repo.id) {
+                continue;
+            }
+            if filtering {
+                for ws in &repo_workspaces {
+                    self.tree_items.push(TreeNode::Workspace {
+                        ws: (*ws).clone(),
+                        repo_name: repo.name.clone(),
                     });
-                } else {
-                    let all_archived = repo_workspaces.iter().all(|w| !w.active);
-                    for ws in &repo_workspaces {
-                        self.tree_items.push(TreeNode::Workspace {
-                            ws: (*ws).clone(),
-                            repo_name: repo.name.clone(),
-                        });
-                    }
-                    if all_archived {
-                        self.tree_items.push(TreeNode::Hint {
-                            text: "(all archived)".into(),
-                        });
-                    }
+                }
+            } else if repo_workspaces.is_empty() {
+                self.tree_items.push(TreeNode::Hint {
+                    text: "(no workspaces)".into(),
+                });
+            } else {
+                let all_archived = repo_workspaces.iter().all(|w| !w.active);
+                for ws in &repo_workspaces {
+                    self.tree_items.push(TreeNode::Workspace {
+                        ws: (*ws).clone(),
+                        repo_name: repo.name.clone(),
+                    });
+                }
+                if all_archived {
+                    self.tree_items.push(TreeNode::Hint {
+                        text: "(all archived)".into(),
+                    });
                 }
             }
         }
+    }
+
+    /// Apply the current filter: rebuild and land selection on the first match
+    /// (the tree shrinks as the query narrows, so selection must be re-seated).
+    fn apply_filter(&mut self) {
+        self.rebuild_tree();
+        self.selected_index = self
+            .tree_items
+            .iter()
+            .position(|n| matches!(n, TreeNode::Workspace { .. }))
+            .or_else(|| {
+                self.tree_items
+                    .iter()
+                    .position(|n| !matches!(n, TreeNode::Hint { .. }))
+            })
+            .unwrap_or(0);
+        self.update_active_session();
+    }
+
+    /// Re-seat `selected_index` after a rebuild that may have shrunk the tree:
+    /// clamp into range and off any hint row.
+    fn clamp_selection(&mut self) {
+        if self.tree_items.is_empty() {
+            self.selected_index = 0;
+            return;
+        }
+        if self.selected_index >= self.tree_items.len() {
+            self.selected_index = self.tree_items.len() - 1;
+        }
+        if self.is_hint(self.selected_index) {
+            self.move_up();
+        }
+        self.update_active_session();
     }
 
     pub(crate) fn is_hint(&self, index: usize) -> bool {
@@ -475,6 +546,11 @@ impl App {
     }
 
     pub(crate) fn toggle_expand(&mut self) {
+        // While filtering, repos are force-expanded; don't mutate the user's
+        // saved expand state (it's restored when the filter clears).
+        if !self.filter_query.is_empty() {
+            return;
+        }
         if let Some(TreeNode::Repo { id, .. }) = self.tree_items.get(self.selected_index) {
             let id = id.clone();
             if self.expanded.contains(&id) {
@@ -524,7 +600,8 @@ impl App {
     /// Vim `l`: expand the selected repo, or step into its first child when already expanded.
     pub(crate) fn tree_expand_or_enter(&mut self) {
         if let Some(TreeNode::Repo { id, .. }) = self.tree_items.get(self.selected_index) {
-            if self.expanded.contains(id) {
+            // A filter force-expands repos, so step into the children directly.
+            if !self.filter_query.is_empty() || self.expanded.contains(id) {
                 self.move_down();
             } else {
                 self.toggle_expand();
@@ -1283,7 +1360,7 @@ impl App {
 }
 
 /// Outcome of handling a single key event.
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum KeyOutcome {
     Continue,
     Quit,
@@ -1539,6 +1616,37 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         return Ok(KeyOutcome::Continue);
     }
 
+    // Tree filter input: while typing a `/` filter, swallow every key so it
+    // edits the query rather than running a tree/global command (incl. q/?).
+    if app.filter_input {
+        match key.code {
+            KeyCode::Esc => {
+                app.filter_query.clear();
+                app.filter_input = false;
+                app.apply_filter();
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.filter_query.clear();
+                app.filter_input = false;
+                app.apply_filter();
+            }
+            KeyCode::Enter => app.filter_input = false, // keep the query applied
+            // Arrows walk the live matches without leaving the filter box.
+            KeyCode::Up => app.move_up(),
+            KeyCode::Down => app.move_down(),
+            KeyCode::Backspace => {
+                app.filter_query.pop();
+                app.apply_filter();
+            }
+            KeyCode::Char(ch) => {
+                app.filter_query.push(ch);
+                app.apply_filter();
+            }
+            _ => {}
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
     // Vim `gg`: consume the pending flag; only a bare `g` below re-arms it
     let g_was_pending = std::mem::take(&mut app.pending_g);
 
@@ -1625,6 +1733,33 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             // confirmation modal.
                             if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
                                 app.cleanup_workspace_prompt(&ws_id);
+                            }
+                        }
+                        KeyCode::Char('/') => {
+                            // Enter the tree filter; keep any existing query to edit.
+                            app.filter_input = true;
+                        }
+                        KeyCode::Esc => {
+                            // Clear an applied filter (no-op otherwise).
+                            if !app.filter_query.is_empty() {
+                                app.filter_query.clear();
+                                app.apply_filter();
+                            }
+                        }
+                        KeyCode::Char('A') => {
+                            // Toggle the selected workspace's archived/active state.
+                            if let Some(ws) = app.selected_workspace().cloned() {
+                                let res = if ws.active {
+                                    app.state.archive_workspace(&ws.name)
+                                } else {
+                                    app.state.activate_workspace(&ws.name)
+                                };
+                                if res.is_ok() {
+                                    app.workspaces = app.state.workspaces.clone();
+                                    app.rebuild_tree();
+                                    app.select_workspace_row(&ws.id);
+                                    app.clamp_selection();
+                                }
                             }
                         }
                         KeyCode::Char('a') => {
@@ -2109,6 +2244,17 @@ mod key_tests {
     }
 
     fn test_app() -> App {
+        // Redirect persistence to a hermetic per-process temp dir so tests that
+        // save (archive, rename, close-session) never touch the dev's
+        // `.kommand0-dev`. Set once, early, to a single value.
+        use std::sync::Once;
+        static STATE_DIR: Once = Once::new();
+        STATE_DIR.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("kommand0-tests-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            unsafe { std::env::set_var("KOMMAND0_STATE_DIR", &dir) };
+        });
+
         let mut state = AppState::default();
         state.repos.push(RepoEntry {
             id: "r1".into(),
@@ -2135,6 +2281,147 @@ mod key_tests {
 
     async fn press(app: &mut App, code: KeyCode) -> KeyOutcome {
         handle_key(app, key(code)).await.unwrap()
+    }
+
+    fn mk_ws(id: &str, name: &str, repo: &str, branch: Option<&str>) -> Workspace {
+        Workspace {
+            id: id.into(),
+            name: name.into(),
+            repo_id: repo.into(),
+            working_dir: "/tmp".into(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+            branch_name: branch.map(Into::into),
+        }
+    }
+
+    fn ws_names(app: &App) -> Vec<String> {
+        app.tree_items
+            .iter()
+            .filter_map(|n| match n {
+                TreeNode::Workspace { ws, .. } => Some(ws.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rebuild_tree_filters_by_name_and_branch() {
+        let mut app = test_app();
+        app.workspaces = vec![
+            mk_ws("w1", "auth-refactor", "r1", None),
+            mk_ws("w2", "docs", "r1", None),
+            mk_ws("w3", "misc", "r1", Some("kommand0/billing")),
+            mk_ws("w4", "ui", "r2", None),
+        ];
+        app.expanded.insert("r1".to_string());
+        app.expanded.insert("r2".to_string());
+
+        // Name match.
+        app.filter_query = "auth".into();
+        app.rebuild_tree();
+        assert_eq!(ws_names(&app), vec!["auth-refactor"]);
+        assert!(
+            !app.tree_items.iter().any(|n| matches!(n, TreeNode::Hint { .. })),
+            "no hint rows while filtering"
+        );
+
+        // Branch match (workspace name doesn't contain the query).
+        app.filter_query = "billing".into();
+        app.rebuild_tree();
+        assert_eq!(ws_names(&app), vec!["misc"]);
+
+        // A match in repo r2 force-expands r2 even though r1 is also expanded.
+        app.filter_query = "ui".into();
+        app.rebuild_tree();
+        assert_eq!(ws_names(&app), vec!["ui"]);
+
+        // Empty query => no filter (all four shown).
+        app.filter_query.clear();
+        app.rebuild_tree();
+        assert_eq!(ws_names(&app).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn slash_filters_and_q_does_not_quit_while_typing() {
+        let mut app = test_app();
+        app.workspaces = vec![
+            mk_ws("w1", "auth", "r1", None),
+            mk_ws("w2", "docs", "r1", None),
+        ];
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+
+        press(&mut app, KeyCode::Char('/')).await;
+        assert!(app.filter_input, "slash enters filter input");
+
+        // A literal 'q' must edit the query, not quit the app.
+        let outcome = press(&mut app, KeyCode::Char('q')).await;
+        assert_eq!(outcome, KeyOutcome::Continue, "q while typing must not quit");
+        assert_eq!(app.filter_query, "q");
+
+        press(&mut app, KeyCode::Backspace).await;
+        for c in "au".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        assert_eq!(app.filter_query, "au");
+        assert_eq!(ws_names(&app), vec!["auth"], "tree narrows live");
+
+        press(&mut app, KeyCode::Esc).await;
+        assert!(!app.filter_input && app.filter_query.is_empty(), "Esc clears the filter");
+        assert_eq!(ws_names(&app).len(), 2, "tree restored");
+    }
+
+    #[tokio::test]
+    async fn filter_to_zero_matches_is_safe_and_enter_keeps_the_filter() {
+        let mut app = test_app();
+        app.workspaces = vec![mk_ws("w1", "auth", "r1", None)];
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+
+        press(&mut app, KeyCode::Char('/')).await;
+        for c in "zzz".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        // No match: the tree is empty, selection stays in-range, nothing panics.
+        assert!(app.tree_items.is_empty());
+        assert!(app.selected_workspace().is_none());
+
+        // Narrow back to a match, then Enter keeps the filter applied for nav.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Backspace).await;
+        }
+        for c in "au".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        press(&mut app, KeyCode::Enter).await;
+        assert!(!app.filter_input, "Enter exits input mode");
+        assert_eq!(app.filter_query, "au", "Enter keeps the query applied");
+        assert_eq!(ws_names(&app), vec!["auth"]);
+        // Navigation works on the filtered tree (j/k reach the handlers now).
+        assert!(app.selected_workspace().is_some());
+    }
+
+    #[tokio::test]
+    async fn capital_a_toggles_archive() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        assert!(app.selected_workspace().unwrap().active);
+
+        press(&mut app, KeyCode::Char('A')).await;
+        assert!(
+            !app.workspaces.iter().find(|w| w.id == "w1").unwrap().active,
+            "A archives an active workspace"
+        );
+
+        press(&mut app, KeyCode::Char('A')).await;
+        assert!(
+            app.workspaces.iter().find(|w| w.id == "w1").unwrap().active,
+            "A re-activates an archived workspace"
+        );
     }
 
     #[tokio::test]
