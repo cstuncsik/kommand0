@@ -52,6 +52,9 @@ a real interactive `claude` in an embedded PTY pane.
   auto-expand; Up/Down walk matches; `Esc` clears).
 - **Archive/activate** — `A` toggles a workspace's active state.
 - Vim-style navigation (`j`/`k`, `h`/`l`, `gg`/`G`), help overlay (`?`).
+- **First-run onboarding** — an empty tree shows a centered welcome pointing at
+  the in-TUI `a` (add repo) key instead of a CLI command; a freshly added repo
+  auto-expands and a workspace-less repo reads `(no workspaces — press w to add)`.
 
 ### CLI (`kmd`)
 
