@@ -213,26 +213,6 @@ impl AppState {
         }
     }
 
-    // --- Thin single-id compatibility shims (used by the not-yet-tabbed TUI;
-    //     removed once the caller migrates to the *_ids/add/remove API). ---
-
-    /// First stored session id for a workspace, if any.
-    pub fn embedded_session_id(&self, workspace_id: &str) -> Option<&str> {
-        self.embedded_session_ids(workspace_id)
-            .first()
-            .map(String::as_str)
-    }
-
-    /// Compatibility alias for [`Self::add_embedded_session`].
-    pub fn set_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
-        self.add_embedded_session(workspace_id, session_id);
-    }
-
-    /// Compatibility alias for [`Self::clear_all_embedded_sessions`].
-    pub fn clear_embedded_session(&mut self, workspace_id: &str) {
-        self.clear_all_embedded_sessions(workspace_id);
-    }
-
     /// Add a repo, saving state to a custom base directory.
     pub fn add_repo_with_base(&mut self, path: &str, base: &Path) -> anyhow::Result<RepoEntry> {
         let dir = Path::new(path);
@@ -698,21 +678,21 @@ mod tests {
     }
 
     #[test]
-    fn embedded_sessions_set_get_clear_roundtrip() {
+    fn embedded_sessions_add_get_clear_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let mut state = AppState::default();
-        assert_eq!(state.embedded_session_id("w1"), None);
+        assert!(state.embedded_session_ids("w1").is_empty());
 
         let id = AppState::new_claude_session_id();
-        state.set_embedded_session("w1", &id);
-        assert_eq!(state.embedded_session_id("w1"), Some(id.as_str()));
+        state.add_embedded_session("w1", &id);
+        assert_eq!(state.embedded_session_ids("w1"), std::slice::from_ref(&id));
         state.save_to(tmp.path()).unwrap();
 
         let loaded = AppState::load_from(tmp.path()).unwrap();
-        assert_eq!(loaded.embedded_session_id("w1"), Some(id.as_str()));
+        assert_eq!(loaded.embedded_session_ids("w1"), std::slice::from_ref(&id));
 
-        state.clear_embedded_session("w1");
-        assert_eq!(state.embedded_session_id("w1"), None);
+        state.clear_all_embedded_sessions("w1");
+        assert!(state.embedded_session_ids("w1").is_empty());
     }
 
     #[test]
@@ -817,11 +797,11 @@ mod tests {
             worktree_path: None,
             branch_name: None,
         });
-        state.set_embedded_session("w1", "keep");
-        state.set_embedded_session("w-gone", "drop");
+        state.add_embedded_session("w1", "keep");
+        state.add_embedded_session("w-gone", "drop");
         state.prune_embedded_sessions();
-        assert_eq!(state.embedded_session_id("w1"), Some("keep"));
-        assert_eq!(state.embedded_session_id("w-gone"), None);
+        assert_eq!(state.embedded_session_ids("w1"), &["keep".to_string()]);
+        assert!(state.embedded_session_ids("w-gone").is_empty());
     }
 
     #[test]
