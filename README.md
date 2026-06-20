@@ -32,6 +32,7 @@ kmd workspace open-pr <name>           # push branch + open a GitHub PR (gh)
 kmd workspace cleanup <name> [--force] # remove a merged worktree + branch
 kmd workspace archive <name>
 kmd workspace activate <name>
+kmd workspace delete <name> [--force]
 
 # Sessions
 kmd session start <workspace>
