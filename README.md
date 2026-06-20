@@ -25,14 +25,19 @@ kmd repo delete <name-or-path> [--force]
 
 # Workspaces
 kmd workspace create --repo <name-or-path>
-kmd workspace list
+kmd workspace list [--all] [--repo <name>]
 kmd workspace show <name>
+kmd workspace status [<name>]          # git branch / ahead-behind / dirty
+kmd workspace open-pr <name>           # push branch + open a GitHub PR (gh)
+kmd workspace cleanup <name> [--force] # remove a merged worktree + branch
 kmd workspace archive <name>
+kmd workspace activate <name>
+kmd workspace delete <name> [--force]
 
 # Sessions
 kmd session start <workspace>
 kmd session stop <workspace>
-kmd session list
+kmd session list [--workspace <name>]
 kmd session clear <workspace>
 ```
 
