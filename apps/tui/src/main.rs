@@ -1994,8 +1994,34 @@ fn init_logging() {
     }
 }
 
+/// Handle the few non-launching args (`--version`, `--help`) before the TUI
+/// takes over the terminal. Returns the text to print, or `None` to launch.
+/// (The TUI takes no other arguments — anything else just launches it.)
+fn cli_short_circuit(args: &[String]) -> Option<String> {
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        return Some(format!("kommand0 {}", env!("CARGO_PKG_VERSION")));
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Some(format!(
+            "kommand0 {} — keyboard-first orchestrator for parallel Claude Code sessions\n\n\
+             Usage: kommand0              launch the TUI\n\
+             \x20      kommand0 --version  print version\n\n\
+             Manage repos/workspaces from the CLI with `kmd` (see the README).",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Answer `--version`/`--help` before entering the alt-screen, where stdout
+    // would be swallowed.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(msg) = cli_short_circuit(&args) {
+        println!("{msg}");
+        return Ok(());
+    }
     init_logging();
     tracing::info!("kommand0 started");
     let mut terminal = ratatui::init();
@@ -2628,6 +2654,21 @@ mod key_tests {
         assert!(app.palette.is_none(), "Enter closes the palette");
         assert!(app.expanded.contains("r1"), "jump expanded the target's repo");
         assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w1"));
+    }
+
+    #[test]
+    fn cli_short_circuit_handles_version_and_help() {
+        assert!(
+            cli_short_circuit(&["--version".to_string()]).unwrap().starts_with("kommand0 "),
+            "--version prints the name + version"
+        );
+        assert!(cli_short_circuit(&["-V".to_string()]).is_some());
+        assert!(cli_short_circuit(&["--help".to_string()]).unwrap().contains("Usage"));
+        assert!(cli_short_circuit(&[]).is_none(), "no args launches the TUI");
+        assert!(
+            cli_short_circuit(&["anything-else".to_string()]).is_none(),
+            "unknown args just launch the TUI"
+        );
     }
 
     #[tokio::test]
