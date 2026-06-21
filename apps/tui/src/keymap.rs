@@ -24,6 +24,7 @@ pub(crate) enum Action {
     OpenPr,
     Cleanup,
     Filter,
+    Palette,
     ArchiveToggle,
     AddRepo,
     AddWorkspace,
@@ -46,6 +47,7 @@ pub(crate) const ALL_ACTIONS: &[Action] = &[
     Action::OpenPr,
     Action::Cleanup,
     Action::Filter,
+    Action::Palette,
     Action::ArchiveToggle,
     Action::AddRepo,
     Action::AddWorkspace,
@@ -70,6 +72,7 @@ impl Action {
             Action::OpenPr => "open-pr",
             Action::Cleanup => "cleanup",
             Action::Filter => "filter",
+            Action::Palette => "palette",
             Action::ArchiveToggle => "archive",
             Action::AddRepo => "add-repo",
             Action::AddWorkspace => "add-workspace",
@@ -94,6 +97,7 @@ impl Action {
             Action::OpenPr => "Open a GitHub PR",
             Action::Cleanup => "Clean up a merged workspace",
             Action::Filter => "Filter workspaces (Esc clears)",
+            Action::Palette => "Go to workspace",
             Action::ArchiveToggle => "Archive / activate workspace",
             Action::AddRepo => "Add repository",
             Action::AddWorkspace => "Add workspace",
@@ -267,6 +271,7 @@ const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("p", Action::OpenPr),
     ("c", Action::Cleanup),
     ("/", Action::Filter),
+    (":", Action::Palette),
     ("A", Action::ArchiveToggle),
     ("a", Action::AddRepo),
     ("w", Action::AddWorkspace),
@@ -364,6 +369,7 @@ mod tests {
         assert_eq!(km.resolve(&ev(KeyCode::Down, KeyModifiers::NONE)), Some(Action::MoveDown));
         assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
         assert_eq!(km.resolve(&ev(KeyCode::Char('/'), KeyModifiers::NONE)), Some(Action::Filter));
+        assert_eq!(km.resolve(&ev(KeyCode::Char(':'), KeyModifiers::NONE)), Some(Action::Palette));
         assert_eq!(km.resolve(&ev(KeyCode::Enter, KeyModifiers::NONE)), Some(Action::ActivateSelection));
         // Enter, step-in, and open-session are three distinct actions
         // (Enter activates; l/Right steps into a repo; e/r/R open a session).

@@ -9,7 +9,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::buttons::HitAction;
 use super::theme::Theme;
-use super::{App, Focus, TreeNode, buttons, help, modal};
+use super::{App, Focus, TreeNode, buttons, help, modal, palette};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -70,6 +70,11 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // Modal overlay on top of everything
     if app.modal.is_active() {
         modal::render_modal(frame, &app.modal, app.theme);
+    }
+
+    // Command palette overlay (mutually exclusive with a modal in practice).
+    if let Some(p) = &app.palette {
+        palette::render_palette(frame, p, app.theme);
     }
 }
 

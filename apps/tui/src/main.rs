@@ -3,6 +3,7 @@ mod help;
 mod keymap;
 mod modal;
 mod mouse;
+mod palette;
 // PTY-passthrough embedded `claude` pane — the app's only session view. The
 // module exposes a small terminal API (resize/blit/send/…); a few accessors are
 // kept for tests and future wiring, hence the module-level allow.
@@ -305,6 +306,8 @@ pub(crate) struct App {
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
     pub(crate) pending_button_action: Option<buttons::HitAction>,
     pub(crate) modal: modal::ModalState,
+    /// Active "go to workspace" command palette overlay, if open (`:`).
+    pub(crate) palette: Option<palette::Palette>,
     pub(crate) expanded_icon_rows: HashSet<String>,
     pub(crate) last_pane_width: u16,
     tick_counter: u8,
@@ -393,6 +396,7 @@ impl App {
             hit_regions: Vec::new(),
             pending_button_action: None,
             modal: modal::ModalState::default(),
+            palette: None,
             expanded_icon_rows: HashSet::new(),
             last_pane_width: 0,
             tick_counter: 0,
@@ -850,6 +854,45 @@ impl App {
 
     /// Select a workspace by id (if present in the tree) and open its sessions.
     fn embed_workspace_by_id(&mut self, ws_id: &str) {
+        self.select_workspace_row(ws_id);
+        self.toggle_embedded();
+    }
+
+    /// Build the palette's jump targets from every workspace (across all repos).
+    /// The match text folds in name + branch + repo so any of them narrows.
+    fn palette_candidates(&self) -> Vec<palette::Candidate> {
+        self.workspaces
+            .iter()
+            .map(|w| {
+                let repo = self
+                    .repos
+                    .iter()
+                    .find(|r| r.id == w.repo_id)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                let match_text = match &w.branch_name {
+                    Some(b) => format!("{} {} {}", w.name, b, repo),
+                    None => format!("{} {}", w.name, repo),
+                };
+                palette::Candidate { ws_id: w.id.clone(), name: w.name.clone(), repo, match_text }
+            })
+            .collect()
+    }
+
+    /// Jump to a workspace from the palette: make it visible (expanding its repo
+    /// and clearing any active filter so its row is in the rebuilt tree), then
+    /// open its embedded session. Works for any workspace, even one currently
+    /// hidden under a collapsed repo.
+    fn jump_to_workspace(&mut self, ws_id: &str) {
+        let Some(repo_id) =
+            self.workspaces.iter().find(|w| w.id == ws_id).map(|w| w.repo_id.clone())
+        else {
+            return; // unknown workspace — nothing to jump to
+        };
+        self.expanded.insert(repo_id);
+        self.filter_query.clear();
+        self.filter_input = false;
+        self.rebuild_tree();
         self.select_workspace_row(ws_id);
         self.toggle_embedded();
     }
@@ -1643,6 +1686,39 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         return Ok(KeyOutcome::Continue);
     }
 
+    // Command palette ("go to workspace"): a flat fuzzy jump overlay. While open
+    // it captures every key — Enter jumps to the selection, Esc cancels. The
+    // borrow of `app.palette` is scoped so we can mutate `app` after it closes.
+    if app.palette.is_some() {
+        let mut close = false;
+        let mut jump: Option<String> = None;
+        {
+            let p = app.palette.as_mut().unwrap();
+            match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => close = true,
+                KeyCode::Enter => {
+                    jump = p.selected_ws_id().map(|s| s.to_string());
+                    close = true;
+                }
+                KeyCode::Up => p.move_up(),
+                KeyCode::Down => p.move_down(),
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => p.move_up(),
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => p.move_down(),
+                KeyCode::Backspace => p.pop_char(),
+                KeyCode::Char(c) => p.push_char(c),
+                _ => {}
+            }
+        }
+        if close {
+            app.palette = None;
+        }
+        if let Some(ws_id) = jump {
+            app.jump_to_workspace(&ws_id);
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
     // Tree filter input: while typing a `/` filter, swallow every key so it
     // edits the query rather than running a tree/global command (incl. q/?).
     if app.filter_input {
@@ -1767,6 +1843,12 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Action::Filter => {
                     // Enter the tree filter; keep any existing query to edit.
                     app.filter_input = true;
+                }
+                Action::Palette => {
+                    // Open the "go to workspace" jump palette over a snapshot of
+                    // every workspace.
+                    let candidates = app.palette_candidates();
+                    app.palette = Some(palette::Palette::new(candidates));
                 }
                 Action::ArchiveToggle => {
                     if let Some(ws) = app.selected_workspace().cloned() {
@@ -2098,9 +2180,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         }
                     }
                     Some(Ok(Event::Mouse(mouse_event))) => {
-                        if app.show_help || app.modal.is_active() {
+                        if app.show_help || app.modal.is_active() || app.palette.is_some() {
                             // An overlay owns the screen — ignore mouse (don't leak
-                            // stray clicks to the embedded claude behind a modal).
+                            // stray clicks to the tree/embedded claude behind it; a
+                            // leaked click could even open a modal and orphan the
+                            // palette, which captures keys after the modal block).
                         } else if app.focus == Focus::Embedded {
                             app.handle_embedded_mouse(mouse_event);
                         } else {
@@ -2504,6 +2588,80 @@ mod key_tests {
                 TreeNode::Hint { text } if text.as_str() == "(no workspaces — press w to add)"
             )),
             "the new empty repo guides the user to press w"
+        );
+    }
+
+    #[tokio::test]
+    async fn palette_opens_types_and_esc_closes() {
+        let mut app = test_app();
+        app.rebuild_tree();
+        press(&mut app, KeyCode::Char(':')).await;
+        assert!(app.palette.is_some(), "`:` opens the palette");
+        press(&mut app, KeyCode::Char('w')).await;
+        press(&mut app, KeyCode::Char('s')).await;
+        assert_eq!(app.palette.as_ref().unwrap().query, "ws", "keys edit the query");
+        press(&mut app, KeyCode::Esc).await;
+        assert!(app.palette.is_none(), "Esc closes the palette");
+    }
+
+    #[tokio::test]
+    async fn palette_jumps_to_a_workspace_under_a_collapsed_repo() {
+        let mut app = test_app();
+        app.rebuild_tree();
+        // r1 is collapsed by default, so its workspace w1 ("ws-one") has no row.
+        assert!(app.expanded.is_empty());
+        assert!(
+            !app.tree_items.iter().any(|n| matches!(n, TreeNode::Workspace { ws, .. } if ws.id == "w1")),
+            "precondition: the target row is hidden under a collapsed repo"
+        );
+
+        press(&mut app, KeyCode::Char(':')).await;
+        for c in "ws-one".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        assert_eq!(app.palette.as_ref().unwrap().selected_ws_id(), Some("w1"));
+        press(&mut app, KeyCode::Enter).await;
+
+        // The palette closed and the jump expanded r1 + selected w1 — even though
+        // its row didn't exist when the palette opened. (Opening the embedded pane
+        // itself needs a claude stub; that's covered e2e.)
+        assert!(app.palette.is_none(), "Enter closes the palette");
+        assert!(app.expanded.contains("r1"), "jump expanded the target's repo");
+        assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w1"));
+    }
+
+    #[tokio::test]
+    async fn colon_while_filtering_types_a_colon_not_palette() {
+        let mut app = test_app();
+        app.rebuild_tree();
+        press(&mut app, KeyCode::Char('/')).await; // enter the filter box
+        assert!(app.filter_input);
+        press(&mut app, KeyCode::Char(':')).await;
+        assert!(app.palette.is_none(), "`:` while filtering must not open the palette");
+        assert_eq!(app.filter_query, ":", "`:` edits the filter query instead");
+    }
+
+    #[tokio::test]
+    async fn palette_jumps_to_an_archived_workspace() {
+        let mut app = test_app();
+        // An archived (inactive) workspace is still listed; r1 stays collapsed.
+        app.workspaces = vec![mk_ws("w1", "ws-one", "r1", None)];
+        app.workspaces[0].active = false;
+        app.rebuild_tree();
+
+        press(&mut app, KeyCode::Char(':')).await;
+        for c in "ws-one".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        press(&mut app, KeyCode::Enter).await;
+
+        // The jump lands on the archived row (rebuild_tree lists archived
+        // workspaces), not a stale previously-selected one.
+        assert!(app.expanded.contains("r1"));
+        assert_eq!(
+            app.selected_workspace().map(|w| w.id.as_str()),
+            Some("w1"),
+            "jump reaches an archived workspace"
         );
     }
 

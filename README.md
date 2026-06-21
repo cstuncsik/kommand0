@@ -74,6 +74,7 @@ cargo run -p kommand0-tui
 | `h` / `l` / `Left` / `Right` | Tree | Collapse repo (or jump to parent) / expand repo |
 | `gg` / `G` | Tree | Jump to first / last item |
 | `/` | Tree | Filter workspaces by name/branch (`Esc` clears) |
+| `:` | Tree | Go-to-workspace palette: fuzzy-jump to any workspace (across collapsed repos) and open it |
 | `A` | Tree | Archive / activate the selected workspace |
 | `Enter` / `e` / `r` / `R` | Tree | Open the embedded Claude pane for the workspace |
 | `x` | Tree | Close the embedded Claude pane |
@@ -139,7 +140,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `claude_args` — extra args appended to every embedded `claude` spawn (e.g. `--model`, `--permission-mode`). Don't put `--session-id`/`--resume` here — kommand0 manages those.
 - `claude_bin` — override the `claude` binary (the `KOMMAND0_CLAUDE_BIN` env var still takes precedence).
 - `status_refresh_secs` — how often the background git-status refresh runs (default 2; floored at 1).
-- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `activate`, `open`, `close`, `open-pr`, `cleanup`, `filter`, `archive`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
+- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `activate`, `open`, `close`, `open-pr`, `cleanup`, `filter`, `palette`, `archive`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
 - `theme` — a built-in palette for the app chrome: `"default"` or `"high-contrast"` (the embedded `claude` pane keeps its own colours either way). Unknown names warn and fall back to default.
 - `theme_colors` — per-role overrides applied on top of `theme`: `"<role>": "<color>"`. Roles: `accent`, `selected`, `active`, `attention`, `dirty`, `error`, `muted`, `text`, `inverse`. Colors: a named color (`cyan`, `light-red`, `darkgray`), an `#rrggbb` hex, a 0–255 palette index, or `reset`/`default` (the terminal's own default color — not the role's built-in). Unknown roles / unparseable colors are warned (tree border + log), not fatal.
 
