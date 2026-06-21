@@ -177,16 +177,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn init_git_repo(dir: &Path) {
-        Command::new("git")
-            .args(["init"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "init"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
+        // Set a local identity so the commit succeeds on a runner with no global
+        // git config (e.g. Linux CI); `-b main` pins the initial branch. Without
+        // the commit, HEAD is unborn and branch-collision detection misbehaves.
+        let git = |args: &[&str]| Command::new("git").args(args).current_dir(dir).output().unwrap();
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "--allow-empty", "-m", "init"]);
     }
 
     #[test]
