@@ -1,0 +1,25 @@
+README.md
+  s_fc3d7618d36de0::t_3f90739ae0fe4e 169-177
+scripts/cut-release.sh
+  s_fc3d7618d36de0::t_2624e9660c70c5 1-32,38-57
+  s_fc3d7618d36de0::t_ce58a363145afb 33-37
+.github/workflows/release.yml
+  s_fc3d7618d36de0::t_7274260be8bc4f 56
+  s_fc3d7618d36de0::t_9808b8e1598d25 3-8,10-20,25,29,33-34,38,43-55,57-74,88-89,91-93,96-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "f71e42f905f81303813fc4da4a2ce3e5c26f1de2",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
