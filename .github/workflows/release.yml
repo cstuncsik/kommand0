@@ -1,18 +1,37 @@
 name: Release
 
+# One-button release: trigger from the Actions tab (workflow_dispatch), pick a
+# bump level (or type an explicit version), and this bumps the workspace version
+# + rolls the CHANGELOG, commits + tags on main, then builds and publishes a
+# universal macOS binary. A manually-pushed `v*` tag also builds + publishes
+# (skipping the bump), preserving the manual escape hatch.
+
 on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: "Version bump (ignored if 'version' is set)"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: "Explicit version without leading v (overrides bump)"
+        type: string
+        required: false
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write # create the GitHub Release and upload assets
+  contents: write # push the bump commit + tag, create the release
 
 jobs:
   release:
-    name: Build & publish macOS binaries
+    name: Build & publish
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the bump commit pushes cleanly
 
       - name: Install Rust (both macOS targets)
         run: |
@@ -20,6 +39,39 @@ jobs:
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
+
+      # On the button path, gate the release on a green tree before tagging
+      # (main isn't branch-protected, so don't assume every commit passed CI).
+      - name: Test gate
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo test --workspace
+
+      # Bump + commit + tag LOCALLY only. The push (irreversible) is deferred
+      # until after the build succeeds, so a build failure leaves main and the
+      # remote tags untouched — just re-dispatch.
+      - name: Cut version (bump + CHANGELOG + commit + tag, local)
+        id: cut
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          BUMP: ${{ inputs.version || inputs.level }}
+        run: |
+          new=$(scripts/cut-release.sh "$BUMP")
+          cargo metadata --format-version 1 >/dev/null # sync member versions in Cargo.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "chore(release): v$new"
+          git tag -a "v$new" -m "kommand0 v$new"
+          echo "tag=v$new" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ steps.cut.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build universal binaries
         run: |
@@ -34,16 +86,32 @@ jobs:
           done
 
       - name: Package
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          archive="kommand0-${GITHUB_REF_NAME}-macos-universal.tar.gz"
-          tar -C dist -czf "dist/$archive" kommand0 kmd
-          shasum -a 256 "dist/$archive" > "dist/$archive.sha256"
+          archive="kommand0-${TAG}-macos-universal.tar.gz"
+          tar -C dist -czf "$archive" kommand0 kmd
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      # Build succeeded — now push the bump commit + tag (deferred from "Cut").
+      - name: Push release commit + tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "$TAG"
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/*.sha256
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          archive="kommand0-${TAG}-macos-universal.tar.gz"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$archive" "$archive.sha256" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$archive" "$archive.sha256" \
+              --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+          fi
