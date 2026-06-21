@@ -7,7 +7,7 @@ Keyboard-first local orchestrator for parallel Claude Code sessions.
 - Rust toolchain (edition 2024)
 - [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed and authenticated
 - Git on PATH
-- macOS
+- macOS or Linux
 
 ## Build
 
@@ -139,7 +139,7 @@ The state directory is resolved in this order:
 
 1. `KOMMAND0_STATE_DIR` environment variable, if set
 2. Debug builds: `.kommand0-dev/` relative to the current directory
-3. Release builds: the platform data directory (`~/Library/Application Support/kommand0` on macOS)
+3. Release builds: the platform data directory (`~/Library/Application Support/kommand0` on macOS, `~/.local/share/kommand0` on Linux)
 
 `state.json` (repos, workspaces, sessions) lives at the root of that directory; session logs are written as JSON lines files in its `sessions/` subdirectory. The app's own diagnostics (warnings/errors that can't go to the terminal while the TUI is running) are appended to `kommand0.log` there. It's append-only and not rotated — safe to delete anytime.
 
