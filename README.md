@@ -166,3 +166,12 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `theme_colors` — per-role overrides applied on top of `theme`: `"<role>": "<color>"`. Roles: `accent`, `selected`, `active`, `attention`, `dirty`, `error`, `muted`, `text`, `inverse`. Colors: a named color (`cyan`, `light-red`, `darkgray`), an `#rrggbb` hex, a 0–255 palette index, or `reset`/`default` (the terminal's own default color — not the role's built-in). Unknown roles / unparseable colors are warned (tree border + log), not fatal.
 
 The config is read once at startup, so edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border.
+
+## Releasing
+
+One button, from the **Actions → Release → Run workflow** menu: pick a bump
+(`patch`/`minor`/`major`) or type an explicit version. The workflow runs the
+test gate, bumps the workspace version, rolls `[Unreleased]` into a dated
+section in `CHANGELOG.md` (via `scripts/cut-release.sh`), commits + tags on
+`main`, then builds and publishes the universal macOS binary. Pushing a `v*`
+tag by hand also builds + publishes (skipping the bump).
