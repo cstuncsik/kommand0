@@ -1,0 +1,21 @@
+release-plz.toml
+  s_fc3d7618d36de0::t_e94bbcdb97e672 9
+Cargo.toml
+  s_fc3d7618d36de0::t_23955089e532e7 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "aad533cdb809e398e56b2cf109f7fd230d8ae4df",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
