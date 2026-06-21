@@ -542,7 +542,8 @@ mod tests {
         let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
         let gh = tmp.path().join("gh");
         gh_view_stub(&gh, "OPEN", &sha);
-        assert!(cleanup(&repo, &wt, &branch, &gh).unwrap_err().contains("isn't merged"));
+        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        assert!(err.contains("isn't merged"), "expected 'isn't merged', got: {err}");
         assert!(wt.exists(), "worktree untouched");
         assert!(branch_exists(&repo, &branch), "branch untouched");
     }
@@ -564,7 +565,8 @@ mod tests {
         std::fs::write(wt.join("scratch.txt"), "wip").unwrap(); // untracked => dirty
         let gh = tmp.path().join("gh");
         gh_view_stub(&gh, "MERGED", &sha);
-        assert!(cleanup(&repo, &wt, &branch, &gh).unwrap_err().contains("uncommitted"));
+        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        assert!(err.contains("uncommitted"), "expected 'uncommitted', got: {err}");
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
     }
 
@@ -581,7 +583,8 @@ mod tests {
         git(&wt, &["commit", "-m", "beyond"]);
         let gh = tmp.path().join("gh");
         gh_view_stub(&gh, "MERGED", &sha); // stale (pre-extra-commit) oid
-        assert!(cleanup(&repo, &wt, &branch, &gh).unwrap_err().contains("beyond its merged PR"));
+        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        assert!(err.contains("beyond its merged PR"), "expected 'beyond its merged PR', got: {err}");
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
     }
 
