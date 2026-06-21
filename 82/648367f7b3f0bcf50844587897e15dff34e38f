@@ -1,0 +1,36 @@
+.github/workflows/release.yml
+  s_fc3d7618d36de0::t_39820d796b3a17 1-49
+apps/tui/Cargo.toml
+  s_fc3d7618d36de0::t_f2176c0bf0e070 5-10
+README.md
+  s_fc3d7618d36de0::t_d40cff11701db3 69-70
+  s_fc3d7618d36de0::t_76f8da12ea17d7 18-37
+crates/core/Cargo.toml
+  s_fc3d7618d36de0::t_95738129399fe2 5
+apps/cli/Cargo.toml
+  s_fc3d7618d36de0::t_2051508ccb4a7b 5
+CHANGELOG.md
+  s_fc3d7618d36de0::t_066fa68c0e8fa4 83-85
+  s_fc3d7618d36de0::t_f5169f9f3cd86b 8-13
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_0f4dce47ad34e9 3
+  s_fc3d7618d36de0::t_eda708f7ea6f50 60
+Cargo.toml
+  s_fc3d7618d36de0::t_308579564d66af 8-9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "82648367f7b3f0bcf50844587897e15dff34e38f",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
