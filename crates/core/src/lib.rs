@@ -83,8 +83,9 @@ impl AppState {
     /// Resolve the state directory.
     ///
     /// Priority: `KOMMAND0_STATE_DIR` env var, then `.kommand0-dev/` relative
-    /// to the current directory in debug builds, then the platform data dir
-    /// (`~/Library/Application Support/kommand0` on macOS) in release builds.
+    /// to the current directory in debug builds, then the platform data dir in
+    /// release builds (`~/Library/Application Support/kommand0` on macOS,
+    /// `~/.local/share/kommand0` on Linux).
     pub fn state_dir() -> PathBuf {
         if let Some(dir) = std::env::var_os("KOMMAND0_STATE_DIR")
             && !dir.is_empty()
