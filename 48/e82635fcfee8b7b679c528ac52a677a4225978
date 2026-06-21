@@ -1,0 +1,23 @@
+crates/core/src/git.rs
+  s_fc3d7618d36de0::t_7ea230368c087d 568-569
+  s_fc3d7618d36de0::t_062325605e58b8 545-546
+  s_fc3d7618d36de0::t_cafd5065aec704 586-587
+crates/core/src/worktree.rs
+  s_fc3d7618d36de0::t_35257d7de2af4c 180-187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "48e82635fcfee8b7b679c528ac52a677a4225978",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "x <x@x>"
+    }
+  }
+}
