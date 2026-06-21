@@ -1,6 +1,6 @@
 //! PTY-based end-to-end tests.
 //!
-//! Spawns the real `kommand0-tui` binary in a pseudo-terminal, sends
+//! Spawns the real `kommand0` binary in a pseudo-terminal, sends
 //! keystrokes as raw bytes, and asserts against the rendered screen
 //! (parsed with vt100). The embedded `claude` pane is driven by the
 //! `embed-stub` fixture in `tests/fixtures/`, selected via the
@@ -57,7 +57,7 @@ impl Tui {
             })
             .unwrap();
 
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_kommand0-tui"));
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_kommand0"));
         // Don't let a developer's exported env leak into tests; each test sets
         // exactly what it needs via extra_env below.
         cmd.env_remove("KOMMAND0_CONFIG");
