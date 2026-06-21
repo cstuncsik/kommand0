@@ -1,0 +1,29 @@
+scripts/cut-release.sh
+  s_fc3d7618d36de0::t_ce58a363145afb 33-36
+  s_fc3d7618d36de0::t_2624e9660c70c5 1-8,12-27,29-30,40-43,51-52,54-55,57-59,61,63-64
+  s_fc3d7618d36de0::t_7d6e766224ce96 9-11,28,31-32,37-39,44-50,53,56,60,62
+README.md
+  s_fc3d7618d36de0::t_3f90739ae0fe4e 169-177
+.github/workflows/release.yml
+  s_fc3d7618d36de0::t_7274260be8bc4f 59
+  s_fc3d7618d36de0::t_b640b5a04d876c 96-100,102-103
+  s_fc3d7618d36de0::t_9808b8e1598d25 3-8,10-20,25,29,33-34,43-48,53-58,60-75,89-90,92-94,106-117
+  s_fc3d7618d36de0::t_39820d796b3a17 91
+  s_fc3d7618d36de0::t_9c661387dc596e 49-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "1d65c4e8c50e5e04987bf5494d67a144cafce23d",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
