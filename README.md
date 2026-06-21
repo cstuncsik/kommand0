@@ -15,6 +15,26 @@ Keyboard-first local orchestrator for parallel Claude Code sessions.
 cargo build --workspace
 ```
 
+## Install
+
+Two binaries: `kommand0` (the TUI) and `kmd` (the CLI).
+
+**From a release** (macOS, universal — Apple Silicon + Intel): download the
+`kommand0-<version>-macos-universal.tar.gz` from the
+[Releases](https://github.com/cstuncsik/kommand0/releases) page, then:
+
+```sh
+tar -xzf kommand0-*-macos-universal.tar.gz
+sudo mv kommand0 kmd /usr/local/bin/   # or anywhere on your PATH
+```
+
+**From source** (installs into `~/.cargo/bin`):
+
+```sh
+cargo install --path apps/tui   # kommand0 (the TUI)
+cargo install --path apps/cli   # kmd (the CLI)
+```
+
 ## CLI Usage
 
 ```sh
@@ -46,7 +66,8 @@ kmd session clear <workspace>
 ## TUI
 
 ```sh
-cargo run -p kommand0-tui
+kommand0              # if installed
+cargo run -p kommand0-tui   # from a checkout
 ```
 
 ### Features
