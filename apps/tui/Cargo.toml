@@ -2,6 +2,12 @@
 name = "kommand0-tui"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+
+# The installed command is `kommand0` (the package keeps its `-tui` suffix).
+[[bin]]
+name = "kommand0"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
