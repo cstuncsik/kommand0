@@ -1,0 +1,26 @@
+.github/workflows/release.yml
+  s_fc3d7618d36de0::t_d7795a3d36cfb2 6-8
+  s_fc3d7618d36de0::t_fd39561c9cb4bc 30,32-33
+  s_fc3d7618d36de0::t_ed33c991c48ac2 121-129,134-162
+  s_fc3d7618d36de0::t_b1557eee5a650a 130-133
+README.md
+  s_fc3d7618d36de0::t_65643f74eebaca 22-25,28-29
+CHANGELOG.md
+  s_fc3d7618d36de0::t_caae6fdb79b827 8-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "07f814d625c895ac1f006167032b4654bc7af001",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
