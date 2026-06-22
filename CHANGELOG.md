@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-22
+
 ### Platforms
 
 - **Linux support** — CI builds, lints, and runs the full test suite (including
@@ -90,6 +92,7 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/cstuncsik/kommand0/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cstuncsik/kommand0/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cstuncsik/kommand0/releases/tag/v0.1.0
