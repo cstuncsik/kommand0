@@ -19,13 +19,14 @@ cargo build --workspace
 
 Two binaries: `kommand0` (the TUI) and `kmd` (the CLI).
 
-**From a release** (macOS, universal — Apple Silicon + Intel): download the
-`kommand0-<version>-macos-universal.tar.gz` from the
-[Releases](https://github.com/cstuncsik/kommand0/releases) page, then:
+**From a release**: download the archive for your platform from the
+[Releases](https://github.com/cstuncsik/kommand0/releases) page —
+`kommand0-<version>-macos-universal.tar.gz` (macOS, Apple Silicon + Intel) or
+`kommand0-<version>-linux-x86_64.tar.gz` (Linux x86_64) — then:
 
 ```sh
-tar -xzf kommand0-*-macos-universal.tar.gz
-sudo mv kommand0 kmd /usr/local/bin/   # or anywhere on your PATH
+tar -xzf kommand0-*.tar.gz              # the archive you downloaded
+sudo mv kommand0 kmd /usr/local/bin/    # or anywhere on your PATH
 ```
 
 **From source** (installs into `~/.cargo/bin`):

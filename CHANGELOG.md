@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Platforms
+
+- **Linux support** — CI builds, lints, and runs the full test suite (including
+  the PTY end-to-end tests) on Linux alongside macOS, and releases now publish a
+  native `linux-x86_64` binary in addition to the macOS universal one. No
+  functional source changes were needed; the code was already cross-platform.
+
 ## [0.1.1] - 2026-06-21
 
 ## [0.1.0] - 2026-06-21
