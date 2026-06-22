@@ -3,8 +3,9 @@ name: Release
 # One-button release: trigger from the Actions tab (workflow_dispatch), pick a
 # bump level (or type an explicit version), and this bumps the workspace version
 # + rolls the CHANGELOG, commits + tags on main, then builds and publishes a
-# universal macOS binary. A manually-pushed `v*` tag also builds + publishes
-# (skipping the bump), preserving the manual escape hatch.
+# universal macOS binary and a native Linux x86_64 binary. A manually-pushed
+# `v*` tag also builds + publishes (skipping the bump), preserving the manual
+# escape hatch.
 
 on:
   workflow_dispatch:
@@ -26,8 +27,10 @@ permissions:
 
 jobs:
   release:
-    name: Build & publish
+    name: Build & publish (macOS universal)
     runs-on: macos-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }} # consumed by the Linux job
     steps:
       - uses: actions/checkout@v4
         with:
@@ -115,3 +118,45 @@ jobs:
             gh release create "$TAG" "$archive" "$archive.sha256" \
               --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
           fi
+
+  # Native Linux build, uploaded to the release the macOS job already created.
+  # `needs: release` means it only runs once the macOS job has cut + pushed the
+  # tag and created the release — so a failed macOS build never gets here, and a
+  # failed Linux build just leaves the release missing its Linux asset (re-run
+  # this job to add it).
+  release-linux:
+    name: Build & publish (Linux x86_64)
+    needs: release
+    # Pin to an older image (x86_64) so the shipped binary links against an
+    # older glibc and runs on more distros — unlike CI, this artifact is
+    # distributed, so build for max compatibility, not the newest runner.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }} # the tag the macOS job cut + pushed
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bin kommand0 --bin kmd
+
+      - name: Package
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          archive="kommand0-${TAG}-linux-x86_64.tar.gz"
+          tar -C target/release -czf "$archive" kommand0 kmd
+          sha256sum "$archive" > "$archive.sha256"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          archive="kommand0-${TAG}-linux-x86_64.tar.gz"
+          gh release upload "$TAG" "$archive" "$archive.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
