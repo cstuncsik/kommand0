@@ -423,7 +423,8 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 let y = area.y + 1 + row_in_viewport as u16; // +1 for top border
                 if y < area.y + area.height - 1 {
                     // within viewport (before bottom border)
-                    let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+                    let mut icon_x =
+                        (area.x + 1 + pane_inner_width as u16).saturating_sub(icons.total_width);
                     for (action, icon_width) in &icons.hit_regions {
                         app.hit_regions.push(buttons::HitRegion {
                             area: Rect::new(icon_x, y, *icon_width, 1),
@@ -443,7 +444,8 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 if y >= area.y + area.height - 1 {
                     continue;
                 }
-                let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+                let mut icon_x =
+                    (area.x + 1 + pane_inner_width as u16).saturating_sub(icons.total_width);
                 for (idx, (_action, icon_width)) in icons.hit_regions.iter().enumerate() {
                     let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
                     if buttons::is_hovered(mouse_pos, icon_rect) {
@@ -469,7 +471,8 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 if y >= area.y + area.height - 1 {
                     continue;
                 }
-                let mut icon_x = area.x + 1 + pane_inner_width as u16 - icons.total_width;
+                let mut icon_x =
+                    (area.x + 1 + pane_inner_width as u16).saturating_sub(icons.total_width);
                 for (idx, (_action, icon_width)) in icons.hit_regions.iter().enumerate() {
                     let icon_rect = Rect::new(icon_x, y, *icon_width, 1);
                     if buttons::is_hovered(mouse_pos, icon_rect) {

@@ -101,7 +101,11 @@ impl AppState {
         }
     }
 
-    /// Load state from the given base directory. Returns default if no state file exists.
+    /// Load state from the given base directory. Returns default if no state file
+    /// exists, and ERRORS on a corrupt file — so a CLI command aborts (leaving the
+    /// bad file untouched and recoverable) rather than silently resetting. The TUI,
+    /// which can't usefully abort to a corrupted alt-screen, uses
+    /// [`Self::load_checked_from`] to degrade gracefully instead.
     pub fn load_from(base: &Path) -> anyhow::Result<Self> {
         let path = base.join(Self::STATE_FILE);
         if !path.exists() {
@@ -109,25 +113,68 @@ impl AppState {
         }
         let data = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let state: Self = serde_json::from_str(&data)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        Ok(state)
+        serde_json::from_str(&data).with_context(|| format!("failed to parse {}", path.display()))
     }
 
-    /// Save state to the given base directory, creating it if needed.
+    /// Like [`Self::load_from`] but never aborts on a corrupt file: it backs the
+    /// bad file up and resets to default, returning a warning to surface (mirroring
+    /// how a bad `config.json` degrades). For the TUI's startup load.
+    pub fn load_checked_from(base: &Path) -> anyhow::Result<(Self, Option<String>)> {
+        let path = base.join(Self::STATE_FILE);
+        if !path.exists() {
+            return Ok((Self::default(), None));
+        }
+        let data = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        match serde_json::from_str(&data) {
+            Ok(state) => Ok((state, None)),
+            Err(e) => {
+                // Back up the bad file without clobbering an earlier backup — the
+                // first/original is the most valuable one to keep.
+                let mut backup = path.with_file_name(format!("{}.corrupt", Self::STATE_FILE));
+                if backup.exists() {
+                    backup = path
+                        .with_file_name(format!("{}.corrupt.{}", Self::STATE_FILE, generate_id()));
+                }
+                let _ = fs::rename(&path, &backup);
+                Ok((
+                    Self::default(),
+                    Some(format!(
+                        "ignoring corrupt state ({e}); backed up to {} and reset",
+                        backup.display()
+                    )),
+                ))
+            }
+        }
+    }
+
+    /// Save state to the given base directory, creating it if needed. The write
+    /// is atomic — a uniquely-named temp file in the same dir is renamed over
+    /// `state.json` — so a process crash mid-write can't leave a partially-written
+    /// state file. (Power-loss corruption is caught by the corrupt-load backstop.)
     pub fn save_to(&self, base: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(base)
             .with_context(|| format!("failed to create {}", base.display()))?;
         let path = base.join(Self::STATE_FILE);
         let data = serde_json::to_string_pretty(self)?;
-        fs::write(&path, data)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        // Unique temp name so concurrent saves (or parallel tests sharing a dir)
+        // never collide on the same temp file mid-rename.
+        let tmp = path.with_file_name(format!("{}.tmp.{}", Self::STATE_FILE, generate_id()));
+        fs::write(&tmp, &data)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
 
     /// Load state from the default state directory.
     pub fn load() -> anyhow::Result<Self> {
         Self::load_from(Self::state_dir().as_path())
+    }
+
+    /// Like [`Self::load`] but also returns a warning for a corrupt state file.
+    pub fn load_checked() -> anyhow::Result<(Self, Option<String>)> {
+        Self::load_checked_from(Self::state_dir().as_path())
     }
 
     /// Save state to the default state directory.
@@ -889,6 +936,74 @@ mod tests {
         let loaded = AppState::load_from(tmp.path()).unwrap();
         assert!(loaded.embedded_titles.is_empty());
         assert_eq!(loaded.embedded_session_title("w1", "a"), None);
+    }
+
+    #[test]
+    fn corrupt_state_degrades_to_default_and_backs_up() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
+
+        let (state, warn) = AppState::load_checked_from(tmp.path()).unwrap();
+        // load_checked_from degrades to default instead of aborting startup.
+        assert!(state.repos.is_empty() && state.workspaces.is_empty());
+        // Warns, and the bad file is preserved (not silently lost).
+        assert!(warn.is_some_and(|w| w.contains("corrupt state")), "warns on a corrupt file");
+        assert!(tmp.path().join("state.json.corrupt").exists(), "bad file backed up");
+        assert!(!path.exists(), "corrupt state.json moved aside");
+
+        // A SECOND corruption must not clobber the first/original backup.
+        std::fs::write(&path, "garbage again").unwrap();
+        let (_, warn3) = AppState::load_checked_from(tmp.path()).unwrap();
+        assert!(warn3.is_some());
+        assert!(tmp.path().join("state.json.corrupt").exists(), "original backup kept");
+        let extra_backups = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("state.json.corrupt") && n != "state.json.corrupt"
+            })
+            .count();
+        assert_eq!(extra_backups, 1, "second corruption backed up under a distinct name");
+
+        // A missing file is a silent default (no warning).
+        let tmp2 = TempDir::new().unwrap();
+        let (_, warn2) = AppState::load_checked_from(tmp2.path()).unwrap();
+        assert!(warn2.is_none());
+    }
+
+    #[test]
+    fn load_from_errors_on_corrupt_rather_than_resetting() {
+        // The CLI path must abort (leaving the file recoverable), not silently
+        // reset — only the TUI's load_checked_from degrades.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("state.json"), "{ not valid json").unwrap();
+        assert!(AppState::load_from(tmp.path()).is_err());
+        assert!(tmp.path().join("state.json").exists(), "corrupt file left untouched");
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        state.repos.push(RepoEntry {
+            id: "r1".into(),
+            name: "x".into(),
+            path: "/tmp/x".into(),
+        });
+        state.save_to(tmp.path()).unwrap();
+        state.save_to(tmp.path()).unwrap(); // a second save must not leave temp debris
+        assert!(tmp.path().join("state.json").exists());
+        let temp_leftovers = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("state.json.tmp"))
+            .count();
+        assert_eq!(temp_leftovers, 0, "no temp file left after rename");
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert_eq!(loaded.repos.len(), 1);
     }
 
     #[test]

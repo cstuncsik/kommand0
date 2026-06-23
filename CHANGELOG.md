@@ -5,6 +5,18 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Robustness
+
+- **Panic safety net** — a panic in the render/key/tick path now restores the
+  terminal (raw mode + alt-screen) before printing, instead of stranding you on
+  a scrambled screen.
+- **Crash-proof state** — `state.json` is written atomically (a unique temp file
+  is renamed over it), so a process crash mid-write can't leave it partially
+  written; and a corrupt `state.json` no longer bricks the TUI — it's backed up
+  (without clobbering an earlier backup) and reset to default with a warning,
+  while the `kmd` CLI still aborts so the bad file stays recoverable.
+- Workspace/session id generation no longer panics on a backwards system clock.
+
 ## [0.1.2] - 2026-06-22
 
 ### Platforms
