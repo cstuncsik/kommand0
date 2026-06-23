@@ -29,6 +29,25 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// True if `pid` is a live process we can signal (`kill -0`).
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// The process group id of `pid` (via `ps`), or None if it's gone.
+fn pgid_of(pid: u32) -> Option<u32> {
+    let out = Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
 fn write_stub(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
     #[cfg(unix)]
@@ -173,4 +192,48 @@ fn session_list_filters_by_workspace() {
     // No filter shows both.
     let all = stdout(&kmd(&state_dir, &[], &["session", "list"]));
     assert!(all.contains("s-alpha") && all.contains("s-beta"), "all: {all}");
+}
+
+#[test]
+fn session_start_owns_its_group_and_stop_kills_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    // Stub `claude`: a sleep that outlives the start→stop window (kept short so a
+    // mid-test failure leaves at most a ~5s orphan, not 30s).
+    let stub = tmp.path().join("claude-stub");
+    write_stub(&stub, "#!/bin/sh\nexec sleep 5\n");
+
+    let start = kmd(
+        &state,
+        &[("KOMMAND0_CLAUDE_BIN", stub.to_str().unwrap())],
+        &["session", "start", "feat"],
+    );
+    assert!(start.status.success(), "start: {}", String::from_utf8_lossy(&start.stderr));
+    let pid: u32 = stdout(&start)
+        .lines()
+        .find_map(|l| l.strip_prefix("PID: "))
+        .expect("start prints the PID")
+        .trim()
+        .parse()
+        .expect("a numeric pid");
+
+    // The child leads its OWN process group (process_group(0)) — without the fix
+    // it would inherit kmd's group and `kill(-pgid)` would miss it.
+    assert!(process_alive(pid), "child is running after start");
+    assert_eq!(pgid_of(pid), Some(pid), "child is its own group leader");
+
+    // Stop must actually kill it now that kill(-pgid) reaches the right group.
+    let stop = kmd(&state, &[], &["session", "stop", "feat"]);
+    assert!(stop.status.success(), "stop: {}", String::from_utf8_lossy(&stop.stderr));
+
+    // Give the kernel a moment to reap the signalled child, then confirm it's gone.
+    let mut gone = false;
+    for _ in 0..30 {
+        if !process_alive(pid) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(gone, "stop killed the child (pid {pid} still alive)");
 }

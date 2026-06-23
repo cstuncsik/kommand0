@@ -16,6 +16,10 @@ All notable changes to kommand0 are documented here. The format is based on
   (without clobbering an earlier backup) and reset to default with a warning,
   while the `kmd` CLI still aborts so the bad file stays recoverable.
 - Workspace/session id generation no longer panics on a backwards system clock.
+- **`kmd session stop` now actually stops the session** — `kmd session start`
+  puts the spawned `claude` in its own process group, so `stop`'s group-kill
+  reaches it (and its children) instead of missing a group that never existed.
+  `session start` also honors `KOMMAND0_CLAUDE_BIN` now, matching the TUI.
 
 ## [0.1.2] - 2026-06-22
 

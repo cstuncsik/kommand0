@@ -1,4 +1,5 @@
 use std::io::{IsTerminal, Write};
+use std::os::unix::process::CommandExt; // for Command::process_group
 
 use clap::{Parser, Subcommand};
 use kommand0_core::workspace::format_timestamp;
@@ -413,8 +414,13 @@ fn main() -> anyhow::Result<()> {
                 let session = state.create_session(&ws.id)?;
                 let session_id = session.id.clone();
 
-                // Spawn claude process (non-async, fire-and-forget for CLI)
-                let child = std::process::Command::new("claude")
+                // Spawn claude process (non-async, fire-and-forget for CLI).
+                // Honor KOMMAND0_CLAUDE_BIN (tests / ad-hoc override), else `claude`.
+                let claude_bin = std::env::var("KOMMAND0_CLAUDE_BIN")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "claude".to_string());
+                let child = std::process::Command::new(&claude_bin)
                     .args([
                         "-p",
                         "--verbose",
@@ -426,6 +432,11 @@ fn main() -> anyhow::Result<()> {
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .env_remove("CLAUDECODE")
+                    // Put the child in its OWN process group so `session stop`'s
+                    // `kill(-pgid)` reaches it (and its descendants) instead of
+                    // kmd's own group. Without this the child is never reliably
+                    // killed — the group `child_pid` simply doesn't exist.
+                    .process_group(0)
                     .spawn();
 
                 match child {
