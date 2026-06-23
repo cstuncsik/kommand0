@@ -2867,9 +2867,20 @@ mod key_tests {
             for x in 0..area.width {
                 out.push_str(buffer[(x, y)].symbol());
             }
+            // Trim trailing blanks so snapshots aren't sensitive to right-pad.
+            while out.ends_with(' ') {
+                out.pop();
+            }
             out.push('\n');
         }
         out
+    }
+
+    /// Render the app at a fixed size to the full-buffer string (for snapshots).
+    fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| render::ui(frame, app)).unwrap();
+        buffer_text(&terminal)
     }
 
     #[tokio::test]
@@ -2883,6 +2894,54 @@ mod key_tests {
             "tree should list repo alpha:\n{text}"
         );
         assert!(text.contains("beta"), "tree should list repo beta:\n{text}");
+    }
+
+    // Golden full-screen snapshots of key layouts (geometry/position/borders that
+    // the substring `contains` checks above can't catch). A repo is kept selected
+    // so the detail pane never renders a workspace's local-timezone timestamp,
+    // which would make the snapshot machine-dependent.
+    #[tokio::test]
+    async fn snapshot_tree_collapsed() {
+        let mut app = test_app();
+        insta::assert_snapshot!(render_to_string(&mut app, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn snapshot_tree_expanded() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.selected_index = 0; // repo selected (no timestamp in the detail pane)
+        insta::assert_snapshot!(render_to_string(&mut app, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn snapshot_palette_overlay() {
+        let mut app = test_app();
+        app.workspaces = vec![mk_ws("w1", "ws-one", "r1", None)];
+        app.rebuild_tree();
+        let candidates = app.palette_candidates();
+        app.palette = Some(palette::Palette::new(candidates));
+        insta::assert_snapshot!(render_to_string(&mut app, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn snapshot_add_repo_modal() {
+        let mut app = test_app();
+        app.modal = modal::ModalState::AddRepo {
+            input: "/some/path".to_string(),
+            cursor: "/some/path".len(),
+            error: None,
+            completions: Vec::new(),
+            completion_index: None,
+        };
+        insta::assert_snapshot!(render_to_string(&mut app, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn snapshot_narrow_terminal() {
+        let mut app = test_app();
+        insta::assert_snapshot!(render_to_string(&mut app, 50, 12));
     }
 
     #[tokio::test]

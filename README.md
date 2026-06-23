@@ -125,7 +125,7 @@ cargo test --workspace
 This runs three layers:
 
 - Unit tests in `crates/core` and the TUI modules
-- In-process TUI tests (`key_tests` in `apps/tui/src/main.rs`): drive `handle_key` directly and assert rendering via ratatui's `TestBackend`
+- In-process TUI tests (`key_tests` in `apps/tui/src/main.rs`): drive `handle_key` directly and assert rendering via ratatui's `TestBackend`, including full-screen [`insta`](https://insta.rs) golden snapshots of key layouts (stored in `apps/tui/src/snapshots/`). After an intentional UI change, refresh them with `INSTA_UPDATE=always cargo test` (or `cargo insta review`) and commit the updated `.snap` files.
 - PTY end-to-end tests (`apps/tui/tests/e2e.rs`): spawn the real binary in a pseudo-terminal, send keystrokes, and assert the vt100-parsed screen. The embedded Claude pane is driven by the `embed-stub` fixture in `apps/tui/tests/fixtures/` (selected via `KOMMAND0_CLAUDE_BIN`), and each test gets an isolated state dir via `KOMMAND0_STATE_DIR`
 
 ## Project Structure

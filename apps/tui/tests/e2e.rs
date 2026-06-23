@@ -20,6 +20,7 @@ struct Tui {
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    master: Box<dyn portable_pty::MasterPty + Send>, // kept for resize()
     // Kept alive for the duration of the test: state dir + fake-claude cwd
     _state_dir: tempfile::TempDir,
 }
@@ -75,6 +76,8 @@ impl Tui {
         let killer = child.clone_killer();
         let mut reader = pair.master.try_clone_reader().unwrap();
         let writer = pair.master.take_writer().unwrap();
+        let master = pair.master; // keep the master alive so we can resize()
+        drop(pair.slave); // the child owns its end; release ours
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
         let parser_clone = parser.clone();
@@ -93,8 +96,18 @@ impl Tui {
             writer,
             child,
             killer,
+            master,
             _state_dir: state_dir,
         }
+    }
+
+    /// Resize the PTY (and the vt100 parser tracking its screen). The child gets
+    /// a SIGWINCH and re-renders at the new geometry.
+    fn resize(&self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        self.parser.lock().unwrap().set_size(rows, cols);
     }
 
     fn screen(&self) -> String {
@@ -245,6 +258,25 @@ fn first_run_shows_welcome_and_add_repo_hint() {
     let mut tui = Tui::launch(None);
     tui.wait_for("Welcome to kommand0");
     tui.wait_for("add a repo");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn survives_resizes_including_a_degenerate_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch(Some(state));
+    tui.wait_for("demo");
+    // Walk through sizes incl. a degenerate one, letting the app process each
+    // SIGWINCH (as a real terminal's spaced-out resizes would).
+    for (rows, cols) in [(10, 40), (3, 12), (40, 120)] {
+        tui.resize(rows, cols);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    // Re-rendered at the final size — a panic on any resize would have killed the
+    // process and timed this out instead.
+    tui.wait_for("demo");
     tui.send("q");
     tui.wait_exit();
 }

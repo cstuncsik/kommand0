@@ -1,0 +1,16 @@
+---
+source: apps/tui/src/main.rs
+expression: "render_to_string(&mut app, 50, 12)"
+---
+┌ Repos ─── + ┐┌ Repo: alpha ────────────────────┐
+│› alpha      ││Name: alpha                      │
+│› beta       ││Path: /tmp/alpha                 │
+│             ││Workspaces: 1 active, 1 total    │
+│             ││                                 │
+│             ││                                 │
+│             ││                                 │
+│             ││                                 │
+│             ││                                 │
+│             ││                                 │
+└─────────────┘└─────────────────────────────────┘
+ TREE Enter open · a repo · w ws · ? help · q quit
