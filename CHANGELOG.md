@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-23
+
 ### Robustness
 
 - **Panic safety net** — a panic in the render/key/tick path now restores the
@@ -108,7 +110,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/cstuncsik/kommand0/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/cstuncsik/kommand0/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cstuncsik/kommand0/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cstuncsik/kommand0/releases/tag/v0.1.0
