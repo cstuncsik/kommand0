@@ -648,6 +648,26 @@ impl App {
         }
     }
 
+    /// Flip any persisted `Running` session to `Stopped`. A `Running` left in
+    /// `state.json` is stale — a crash/SIGKILL skipped the clean-quit
+    /// normalization — and no stream session is ever resurrected, so it would
+    /// otherwise show a phantom "running" tree icon. Called once at startup;
+    /// returns the number normalized (the caller saves if > 0).
+    pub(crate) fn normalize_stale_running(&mut self) -> usize {
+        let stale: Vec<String> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|s| s.status == SessionStatus::Running)
+            .map(|s| s.id.clone())
+            .collect();
+        let n = stale.len();
+        for sid in stale {
+            let _ = self.state.update_session_status(&sid, SessionStatus::Stopped);
+        }
+        n
+    }
+
     /// Keep keyboard focus on the tree when the selection is not a workspace row.
     pub(crate) fn update_active_session(&mut self) {
         if !matches!(
@@ -2028,6 +2048,26 @@ async fn main() -> anyhow::Result<()> {
     // DISAMBIGUATE_ESCAPE_CODES lets terminals report Shift+Enter distinctly from Enter
     let supports_enhanced_keys =
         crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    // Panic safety net: we've entered raw mode + the alt-screen. `ratatui::init`
+    // already installed a hook that restores the terminal on panic, but it does
+    // NOT pop the keyboard-enhancement flags or disable mouse/bracketed-paste.
+    // Wrap it: do our extra cleanup first, then chain ratatui's hook
+    // (`prev_hook`), which leaves raw mode + the alt-screen and prints the
+    // backtrace into the restored terminal. Without this, a panic in
+    // draw/handle_key/tick would unwind past the teardown below and strand the
+    // user on a scrambled screen.
+    {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let mut out = std::io::stdout();
+            if supports_enhanced_keys {
+                let _ = crossterm::execute!(out, crossterm::event::PopKeyboardEnhancementFlags);
+            }
+            let _ = crossterm::execute!(out, crossterm::event::DisableBracketedPaste);
+            let _ = crossterm::execute!(out, crossterm::event::DisableMouseCapture);
+            prev_hook(info);
+        }));
+    }
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
     if supports_enhanced_keys {
@@ -2053,7 +2093,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
-    let state = AppState::load()?;
+    // A corrupt state.json degrades to default (backed up) + a warning, rather
+    // than aborting startup.
+    let (state, state_warning) = AppState::load_checked()?;
     let mut app = App::new(state);
     // Load user config now (App::new keeps a hermetic default for tests). A
     // present-but-invalid file (or a bad keybinding) surfaces a warning in the
@@ -2065,7 +2107,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let (theme, theme_warnings) =
         theme::Theme::build(app.config.theme.as_deref(), &app.config.theme_colors);
     app.theme = theme;
-    let mut warnings: Vec<String> = config_warning.into_iter().collect();
+    let mut warnings: Vec<String> = state_warning.into_iter().chain(config_warning).collect();
     warnings.extend(key_warnings);
     warnings.extend(theme_warnings);
     for w in &warnings {
@@ -2077,24 +2119,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         n => Some(format!("{n} config issues — see kommand0.log")),
     };
 
-    // Reconcile persisted status with the (empty) session_manager. No stream
-    // session is ever resurrected now, so a persisted `Running` is stale — left
-    // behind by a crash/SIGKILL that skipped the clean-quit normalization.
-    // Flipping it to Stopped prevents a phantom (silently-failing) legacy
-    // composer and a stale "running" tree icon on the first launch after upgrade.
-    let stale_running: Vec<String> = app
-        .state
-        .sessions
-        .iter()
-        .filter(|s| s.status == SessionStatus::Running)
-        .map(|s| s.id.clone())
-        .collect();
-    if !stale_running.is_empty() {
-        for sid in stale_running {
-            let _ = app
-                .state
-                .update_session_status(&sid, SessionStatus::Stopped);
-        }
+    // A persisted `Running` is stale (no stream session is resurrected) — heal it.
+    if app.normalize_stale_running() > 0 {
         app.save_state();
     }
 
@@ -2704,6 +2730,32 @@ mod key_tests {
             Some("w1"),
             "jump reaches an archived workspace"
         );
+    }
+
+    #[test]
+    fn normalize_stale_running_heals_running_sessions() {
+        let mut app = test_app();
+        let mk = |id: &str, status| kommand0_core::Session {
+            id: id.into(),
+            workspace_id: "w1".into(),
+            claude_session_id: None,
+            pid: None,
+            status,
+            created_at: 0,
+            ended_at: None,
+            log_file: format!("{id}.log"),
+        };
+        app.state.sessions.push(mk("s1", SessionStatus::Running));
+        app.state.sessions.push(mk("s2", SessionStatus::Stopped));
+
+        // A persisted Running (crash/SIGKILL leftover) is flipped to Stopped.
+        assert_eq!(app.normalize_stale_running(), 1, "one stale Running normalized");
+        assert!(
+            app.state.sessions.iter().all(|s| s.status != SessionStatus::Running),
+            "no Running remains"
+        );
+        // Idempotent — a second pass finds nothing.
+        assert_eq!(app.normalize_stale_running(), 0);
     }
 
     #[tokio::test]
