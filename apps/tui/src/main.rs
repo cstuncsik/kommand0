@@ -15,8 +15,7 @@ mod theme;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{EventStream, KeyEvent, KeyEventKind};
-use futures::{FutureExt, StreamExt};
+use crossterm::event::{KeyEvent, KeyEventKind};
 use kommand0_core::{AppState, Config, RepoEntry, SessionStatus, Workspace};
 use ratatui::{
     DefaultTerminal,
@@ -2131,7 +2130,23 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         app.save_state();
     }
 
-    let mut reader = EventStream::new();
+    // Terminal input is read on a dedicated blocking thread rather than via
+    // crossterm's async `EventStream`: that stream wedges after a rapid SIGWINCH
+    // burst (its internal wake task stops delivering events, so keystrokes are
+    // never seen again — see the `survives_a_resize_drag_without_wedging_input`
+    // e2e test). A plain blocking `event::read()` loop has no such machinery. The thread
+    // forwards every event over a channel into the select! loop below, and exits
+    // when the receiver is dropped (app shutdown).
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    std::thread::spawn(move || {
+        // `read()` erroring ends the `while let` (thread exits); a send error
+        // means the receiver was dropped (app shutting down) so we stop too.
+        while let Ok(ev) = crossterm::event::read() {
+            if input_tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
     let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
 
     // Embedded panes' reader threads ping this to force a coalesced repaint, so
@@ -2207,14 +2222,22 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 }
                 app.request_branch_status_refresh();
             }
-            event = reader.next().fuse() => {
+            maybe_event = input_rx.recv() => {
+                let Some(event) = maybe_event else { break; }; // reader thread ended
                 match event {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if handle_key(&mut app, key).await? == KeyOutcome::Quit {
                             break;
                         }
                     }
-                    Some(Ok(Event::Paste(text))) => {
+                    Event::Resize(_, _) => {
+                        // No-op: the redraw at the top of the loop re-queries the
+                        // terminal size (ratatui autoresize) and repaints, so a
+                        // resize needs no explicit handling. (Input is read on a
+                        // blocking thread above because crossterm's async
+                        // EventStream wedges on a rapid resize burst.)
+                    }
+                    Event::Paste(text) => {
                         // Only the embedded pane consumes paste; forward it as a
                         // bracketed paste (claude enables bracketed paste, so a
                         // multi-line paste stays one block). A modal over the pane
@@ -2231,7 +2254,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Some(Ok(Event::Mouse(mouse_event))) => {
+                    Event::Mouse(mouse_event) => {
                         if app.show_help || app.modal.is_active() || app.palette.is_some() {
                             // An overlay owns the screen — ignore mouse (don't leak
                             // stray clicks to the tree/embedded claude behind it; a
@@ -2243,8 +2266,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             mouse::handle_mouse(&mut app, mouse_event);
                         }
                     }
-                    Some(Err(_)) => break,
-                    None => break,
                     _ => {}
                 }
 
