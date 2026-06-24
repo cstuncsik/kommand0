@@ -34,6 +34,10 @@ pub struct Config {
     /// `"blue"`, `"#ff8800"`). Parsed by the TUI; bad roles/colors are warned.
     #[serde(default)]
     pub theme_colors: std::collections::HashMap<String, String>,
+    /// Notify when a backgrounded session goes quiet with unseen output:
+    /// `"off"` (default), `"bell"` (terminal bell), `"desktop"` (OS
+    /// notification), or `"both"`. Parsed by the TUI; an unknown value warns.
+    pub notify: Option<String>,
 }
 
 impl Config {

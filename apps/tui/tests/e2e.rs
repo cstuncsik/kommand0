@@ -197,6 +197,28 @@ impl Tui {
         }
     }
 
+    /// Number of audible bells (BEL) the app has emitted, per vt100's counter.
+    fn bell_count(&self) -> usize {
+        self.parser.lock().unwrap().screen().audible_bell_count()
+    }
+
+    /// Wait until the app has rung the terminal bell at least once.
+    fn wait_for_bell(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.bell_count() > 0 {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "timed out waiting for the terminal bell; screen:\n{}",
+                    self.screen()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Wait for the process to exit, panicking after 10s.
     fn wait_exit(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -923,6 +945,45 @@ fn unseen_background_output_raises_the_attention_flag() {
 
     // The late output arrives unseen, then the pane goes quiet -> attention.
     tui.wait_for("waiting");
+    // No `notify` config => default Off: the same edge must NOT ring the bell.
+    assert_eq!(tui.bell_count(), 0, "notify defaults to off — no bell");
+
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn notify_bell_rings_when_a_background_session_needs_you() {
+    // With notify="bell", the rising edge of the attention flag must ring the
+    // terminal bell. The app writes BEL to its stdout; the harness's vt100
+    // parser counts it. (Same navigation as the attention test above.)
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let cfg = dir.path().join("config.json");
+    std::fs::write(&cfg, r#"{ "notify": "bell" }"#).unwrap();
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[
+            ("KOMMAND0_CLAUDE_BIN", "embed-stub-attention"),
+            ("KOMMAND0_CONFIG", cfg.to_str().unwrap()),
+        ],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open -> the tab is viewed; its initial marker is seen
+    tui.wait_for("READY-DELAYED");
+
+    // Back to the tree before the late output lands (so it arrives unseen).
+    tui.send("\x01");
+    tui.send("t");
+    tui.wait_for("TREE");
+
+    // Unseen background output -> quiet -> attention rising edge -> bell.
+    tui.wait_for("waiting");
+    tui.wait_for_bell();
 
     tui.send("q");
     tui.wait_exit();

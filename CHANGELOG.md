@@ -5,6 +5,15 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Attention notifications** — optionally ring the terminal bell or raise a
+  desktop notification when a backgrounded session goes quiet with unseen output
+  (the same "needs you" edge as the magenta tree dot). Off by default; opt in
+  with `"notify": "bell" | "desktop" | "both"` in `config.json`. Fires once per
+  edge (the attention latch means no repeats until you view the session and it
+  comes back). Desktop uses `osascript` on macOS / `notify-send` on Linux.
+
 ## [0.1.4] - 2026-06-24
 
 ### Robustness

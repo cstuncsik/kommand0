@@ -3,6 +3,7 @@ mod help;
 mod keymap;
 mod modal;
 mod mouse;
+mod notify;
 mod palette;
 // PTY-passthrough embedded `claude` pane — the app's only session view. The
 // module exposes a small terminal API (resize/blit/send/…); a few accessors are
@@ -362,6 +363,9 @@ pub(crate) struct App {
     pub(crate) keymap: keymap::KeyMap,
     /// Color theme for the chrome (defaults until `run` applies config).
     pub(crate) theme: theme::Theme,
+    /// How to alert when a backgrounded session needs you (defaults to `Off`
+    /// until `run` applies config).
+    pub(crate) notify_mode: notify::NotifyMode,
 }
 
 impl App {
@@ -418,6 +422,7 @@ impl App {
             config_warning: None,
             keymap: keymap::KeyMap::default(),
             theme: theme::Theme::default(),
+            notify_mode: notify::NotifyMode::default(),
         };
         app.rebuild_tree();
         if !app.tree_items.is_empty() {
@@ -1189,7 +1194,55 @@ impl App {
         // quiet with unseen output. Order matters: clear before latching so the
         // session you're watching is never flagged.
         self.mark_active_viewed();
-        self.recompute_attention(now, &seqs);
+        let newly_waiting = self.recompute_attention(now, &seqs);
+        if !newly_waiting.is_empty() {
+            self.notify_newly_waiting(&newly_waiting);
+        }
+    }
+
+    /// Fire bell/desktop notifications for sessions that just entered "needs
+    /// you" (the rising edge from [`Self::recompute_attention`]), per the
+    /// configured `notify_mode`. A no-op when notifications are off, so tests and
+    /// the default install stay silent.
+    fn notify_newly_waiting(&self, session_ids: &[String]) {
+        // The bell needs no name — ring it as soon as any session newly needs
+        // you (robust even if the workspace-name lookup below comes up empty).
+        if self.notify_mode.wants_bell() {
+            notify::ring_bell(&mut std::io::stdout());
+        }
+        if !self.notify_mode.wants_desktop() {
+            return;
+        }
+        // Desktop notifications name the workspace(s) that went quiet, deduped
+        // (a workspace with two tabs going quiet at once still alerts once).
+        let mut names: Vec<String> = Vec::new();
+        for (ws_id, sessions) in &self.embedded {
+            if !sessions.tabs.iter().any(|t| session_ids.contains(&t.id)) {
+                continue;
+            }
+            let Some(ws) = self.workspaces.iter().find(|w| &w.id == ws_id) else {
+                continue;
+            };
+            if !names.contains(&ws.name) {
+                names.push(ws.name.clone());
+            }
+        }
+        for name in &names {
+            let body = format!("{name} is waiting");
+            if let Some((prog, args)) = notify::desktop_command("kommand0", &body) {
+                // Fire-and-forget on a detached thread that waits on (reaps) the
+                // short-lived notifier so it can't block the loop or zombie; a
+                // missing notifier (e.g. no `notify-send`) is silently ignored.
+                std::thread::spawn(move || {
+                    let _ = std::process::Command::new(prog)
+                        .args(args)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                });
+            }
+        }
     }
 
     /// Mark the currently-viewed session (the focused workspace's active tab) as
@@ -1218,8 +1271,11 @@ impl App {
     /// Latch sessions that produced unseen output and have since gone quiet. A
     /// latched session stays flagged until viewed (or its pane disappears), so a
     /// mid-turn tool pause that later resumes can't strobe the indicator.
-    fn recompute_attention(&mut self, now: Instant, seqs: &[(String, u64)]) {
+    /// Returns the session ids that *newly* entered the "needs you" set on this
+    /// pass (the rising edge) — used to fire one-shot attention notifications.
+    fn recompute_attention(&mut self, now: Instant, seqs: &[(String, u64)]) -> Vec<String> {
         const ATTENTION_SETTLE: Duration = Duration::from_millis(1500);
+        let mut newly = Vec::new();
         for (id, seq) in seqs {
             let seen = self.viewed_seq.get(id).copied().unwrap_or(0);
             let unseen = *seq > seen;
@@ -1227,14 +1283,17 @@ impl App {
                 .last_output_at
                 .get(id)
                 .is_some_and(|t| now.duration_since(*t) >= ATTENTION_SETTLE);
-            if unseen && settled {
-                self.attention.insert(id.clone());
+            // `insert` returns true only on the rising edge; the latch keeps a
+            // session flagged after that, so a notification fires at most once.
+            if unseen && settled && self.attention.insert(id.clone()) {
+                newly.push(id.clone());
             }
         }
         // Forget sessions whose pane is gone (closed/healed-to-a-new-id).
         let live: HashSet<&str> = seqs.iter().map(|(id, _)| id.as_str()).collect();
         self.viewed_seq.retain(|id, _| live.contains(id.as_str()));
         self.attention.retain(|id| live.contains(id.as_str()));
+        newly
     }
 
     /// Keep every live embedded pane sized to the visible content area — not just
@@ -2106,9 +2165,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let (theme, theme_warnings) =
         theme::Theme::build(app.config.theme.as_deref(), &app.config.theme_colors);
     app.theme = theme;
+    let (notify_mode, notify_warning) = notify::NotifyMode::parse(app.config.notify.as_deref());
+    app.notify_mode = notify_mode;
     let mut warnings: Vec<String> = state_warning.into_iter().chain(config_warning).collect();
     warnings.extend(key_warnings);
     warnings.extend(theme_warnings);
+    warnings.extend(notify_warning);
     for w in &warnings {
         tracing::warn!("config: {w}");
     }
@@ -3066,21 +3128,25 @@ mod key_tests {
 
         // Fresh output isn't attention until it has gone quiet (settled).
         app.apply_pane_activity(t, &[("s1".to_string(), 1)]);
-        app.recompute_attention(t, &[("s1".to_string(), 1)]);
+        let newly = app.recompute_attention(t, &[("s1".to_string(), 1)]);
         assert!(!app.attention.contains("s1"), "fresh output isn't attention yet");
+        assert!(newly.is_empty(), "no rising edge before settle");
 
-        // Unseen + quiet past the settle window -> latched.
+        // Unseen + quiet past the settle window -> latched (rising edge reported).
         let later = t + Duration::from_millis(1500);
-        app.recompute_attention(later, &[("s1".to_string(), 1)]);
+        let newly = app.recompute_attention(later, &[("s1".to_string(), 1)]);
         assert!(app.attention.contains("s1"), "unseen + settled => needs you");
+        assert_eq!(newly, vec!["s1".to_string()], "rising edge reported once");
 
-        // Resumed output must NOT clear it (no mid-turn strobe) — only viewing does.
+        // Resumed output must NOT clear it (no mid-turn strobe) — only viewing does,
+        // and a still-latched session is NOT a rising edge (no repeat notification).
         app.apply_pane_activity(later, &[("s1".to_string(), 2)]);
-        app.recompute_attention(later, &[("s1".to_string(), 2)]);
+        let newly = app.recompute_attention(later, &[("s1".to_string(), 2)]);
         assert!(
             app.attention.contains("s1"),
             "latched attention survives resumed output"
         );
+        assert!(newly.is_empty(), "no repeat rising edge while latched");
 
         // A gone pane is forgotten.
         app.recompute_attention(later, &[]);
