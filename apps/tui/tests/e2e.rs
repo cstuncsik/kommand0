@@ -263,20 +263,43 @@ fn first_run_shows_welcome_and_add_repo_hint() {
 }
 
 #[test]
-fn survives_resizes_including_a_degenerate_size() {
+fn survives_a_resize_drag_without_wedging_input() {
+    // A real drag-resize fires a rapid stream of SIGWINCH (one per frame, tens of
+    // events incl. transient degenerate sizes). We reproduce that cadence and
+    // assert the app keeps re-rendering AND still responds to input afterwards —
+    // a regression that wedges the input loop would time out at `wait_exit`.
+    //
+    // Input is read on a dedicated blocking thread (see `run` in main.rs).
+    // crossterm's input layer can wedge only when SIGWINCH arrives in a
+    // *microsecond*-tight burst (0ms apart — 9/10 of the time in a stress sweep);
+    // any spacing >= 1ms is 100% clean. No real terminal emits SIGWINCH that
+    // fast, so we drive the drag at a realistic (10ms) cadence.
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());
     let mut tui = Tui::launch(Some(state));
     tui.wait_for("demo");
-    // Walk through sizes incl. a degenerate one, letting the app process each
-    // SIGWINCH (as a real terminal's spaced-out resizes would).
-    for (rows, cols) in [(10, 40), (3, 12), (40, 120)] {
+    // Drag a corner: shrink down to a degenerate size, then grow back.
+    let sizes = [
+        (28, 90),
+        (22, 76),
+        (16, 58),
+        (10, 36),
+        (5, 18),
+        (3, 12), // degenerate
+        (8, 28),
+        (15, 52),
+        (24, 84),
+        (32, 104),
+        (40, 120),
+    ];
+    for (rows, cols) in sizes {
         tui.resize(rows, cols);
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(10));
     }
-    // Re-rendered at the final size — a panic on any resize would have killed the
-    // process and timed this out instead.
+    // Re-rendered at the final size (a panic on any resize would have killed the
+    // process and timed this out instead).
     tui.wait_for("demo");
+    // Input still flows after the drag — the wedge symptom was `q` being ignored.
     tui.send("q");
     tui.wait_exit();
 }

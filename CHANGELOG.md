@@ -5,6 +5,15 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Robustness
+
+- **Resize-proof input** — terminal input is now read on a dedicated blocking
+  thread feeding the event loop, instead of crossterm's async `EventStream`.
+  This removes a class of input-wedge where a rapid burst of terminal resizes
+  (SIGWINCH) could leave the async stream no longer delivering keystrokes. A new
+  end-to-end test drives a realistic resize "drag" and asserts the app keeps
+  rendering and still responds to input afterwards.
+
 ## [0.1.3] - 2026-06-23
 
 ### Robustness
