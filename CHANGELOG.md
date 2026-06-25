@@ -5,6 +5,16 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Easier install** — three new ways to get the prebuilt binaries without a
+  manual tarball dance: an install script
+  (`curl -fsSL https://github.com/cstuncsik/kommand0/releases/latest/download/install.sh | sh`)
+  that downloads the right archive, verifies its checksum, and installs
+  `kommand0` + `kmd`; a Homebrew tap (`brew install cstuncsik/tap/kommand0`),
+  auto-updated on each release; and `cargo-binstall` metadata
+  (`cargo binstall --git https://github.com/cstuncsik/kommand0 kommand0-tui kommand0-cli`).
+
 ## [0.1.5] - 2026-06-24
 
 ### Added
