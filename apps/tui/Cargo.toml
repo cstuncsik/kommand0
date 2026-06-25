@@ -3,6 +3,7 @@ name = "kommand0-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # The installed command is `kommand0` (the package keeps its `-tui` suffix).
 [[bin]]
@@ -27,3 +28,20 @@ kommand0-core.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 insta = "1"
+
+# `cargo binstall kommand0-tui` (use `--git <repo>` until/unless published to
+# crates.io). Our release archives don't follow binstall's default target naming,
+# so each supported target maps to its archive explicitly; the `kommand0` binary
+# sits at the archive root.
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/kommand0-v{ version }-macos-universal.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/kommand0-v{ version }-macos-universal.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/kommand0-v{ version }-linux-x86_64.tar.gz"

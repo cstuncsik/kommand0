@@ -3,6 +3,7 @@ name = "kommand0-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "kmd"
@@ -19,3 +20,19 @@ kommand0-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# `cargo binstall kommand0-cli` (use `--git <repo>` until/unless published to
+# crates.io). Same release archives as the TUI; the `kmd` binary sits at the
+# archive root.
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/kommand0-v{ version }-macos-universal.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/kommand0-v{ version }-macos-universal.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/kommand0-v{ version }-linux-x86_64.tar.gz"

@@ -17,12 +17,38 @@ cargo build --workspace
 
 ## Install
 
-Two binaries: `kommand0` (the TUI) and `kmd` (the CLI).
+Two binaries: `kommand0` (the TUI) and `kmd` (the CLI). macOS (Apple Silicon +
+Intel) and Linux x86_64 have prebuilt binaries.
 
-**From a release**: download the archive for your platform from the
+**Install script** (easiest — downloads the right binaries, verifies the
+checksum, installs both):
+
+```sh
+curl -fsSL https://github.com/cstuncsik/kommand0/releases/latest/download/install.sh | sh
+```
+
+Installs to `/usr/local/bin` (uses `sudo` if needed). Override with
+`KOMMAND0_INSTALL_DIR=~/.local/bin` or pin a version with `KOMMAND0_VERSION=v0.1.5`.
+
+**Homebrew**:
+
+```sh
+brew install cstuncsik/tap/kommand0
+```
+
+**cargo-binstall** (prebuilt binary, no compile):
+
+```sh
+cargo binstall --git https://github.com/cstuncsik/kommand0 kommand0-tui kommand0-cli
+```
+
+(The bare `cargo binstall kommand0` form needs a crates.io publish, which the
+project doesn't do yet — hence `--git`.)
+
+**From a release, by hand**: download the archive for your platform from the
 [Releases](https://github.com/cstuncsik/kommand0/releases) page —
-`kommand0-<version>-macos-universal.tar.gz` (macOS, Apple Silicon + Intel) or
-`kommand0-<version>-linux-x86_64.tar.gz` (Linux x86_64) — then:
+`kommand0-<version>-macos-universal.tar.gz` or
+`kommand0-<version>-linux-x86_64.tar.gz` — then:
 
 ```sh
 tar -xzf kommand0-*.tar.gz              # the archive you downloaded
