@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-06-25
+
 ### Added
 
 - **Easier install** — three new ways to get the prebuilt binaries without a
@@ -142,7 +144,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/cstuncsik/kommand0/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/cstuncsik/kommand0/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/cstuncsik/kommand0/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/cstuncsik/kommand0/compare/v0.1.2...v0.1.3
