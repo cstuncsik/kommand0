@@ -1,0 +1,38 @@
+apps/tui/Cargo.toml
+  s_fc3d7618d36de0::t_949fcc5736f2bf 31-47
+  s_fc3d7618d36de0::t_603473dc617956 6
+packaging/homebrew/README.md
+  s_fc3d7618d36de0::t_f3c8d2ed1c645b 1-63
+.github/workflows/release.yml
+  s_fc3d7618d36de0::t_f9d37a9fdd7bfd 165-209
+  s_fc3d7618d36de0::t_4a8c05d04b6a30 114-115,117,120
+CHANGELOG.md
+  s_fc3d7618d36de0::t_615d8e0fcbb62b 8-17
+scripts/install.sh
+  s_fc3d7618d36de0::t_8e0cec90e5d1e1 1-104
+README.md
+  s_fc3d7618d36de0::t_9a10487e23980e 20-21,23-48,50-51
+scripts/render-homebrew-formula.sh
+  s_fc3d7618d36de0::t_10ed7e6a8fcf89 1-18,22,26-34,43-61
+  s_fc3d7618d36de0::t_913d8f497251a8 19-21,35-42
+  s_fc3d7618d36de0::t_6f24b5f47b962b 23-25
+apps/cli/Cargo.toml
+  s_fc3d7618d36de0::t_0bcc68b1431397 23-38
+  s_fc3d7618d36de0::t_ebcd78e0a138ef 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.1",
+  "base_commit_sha": "f2a5ba1af239a52e9e2facc78c760f8a8acb0653",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
