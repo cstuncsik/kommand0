@@ -1,6 +1,7 @@
-//! "Go to workspace" command palette: a flat, fuzzy jump list over every
-//! workspace (across all repos, regardless of tree expand state). Opened with
-//! `:`; Enter jumps to and opens the chosen workspace.
+//! Command palette: a flat, fuzzy list over every workspace (across all repos,
+//! regardless of tree expand state) *and* the actions you can run on them —
+//! jump-and-open, open a PR, clean up, archive/activate, new session, and jump
+//! to a specific session tab. Opened with `:`; Enter runs the selection.
 //!
 //! This is presentation logic, so it lives in the TUI (not core). The fuzzy
 //! ranker is a small hand-rolled subsequence scorer — no dependency, and pure
@@ -16,13 +17,29 @@ use ratatui::{
 use super::modal::render_input_with_cursor;
 use super::theme::Theme;
 
-/// One jump target: a workspace id, its display fields, and the text the query
-/// is scored against (name + branch + repo, so any of them narrows).
+/// What running a palette entry does. Dispatched by the app once the palette
+/// closes; every variant carries the workspace it targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaletteAction {
+    /// Reveal + open the workspace's embedded session (the original jump).
+    OpenWorkspace { ws_id: String },
+    OpenPr { ws_id: String },
+    Cleanup { ws_id: String },
+    /// Archive an active workspace, or re-activate an archived one.
+    ArchiveToggle { ws_id: String },
+    NewSession { ws_id: String },
+    /// Switch to session tab `index` of an already-open workspace.
+    JumpTab { ws_id: String, index: usize },
+}
+
+/// One palette entry: the display label + muted detail, the text the query is
+/// scored against (label + workspace + branch + repo, so any of them narrows),
+/// and the action Enter runs.
 pub(crate) struct Candidate {
-    pub ws_id: String,
-    pub name: String,
-    pub repo: String,
+    pub label: String,
+    pub detail: String,
     pub match_text: String,
+    pub action: PaletteAction,
 }
 
 /// Live palette state: the typed query, the ranked result indices (into
@@ -89,12 +106,12 @@ impl Palette {
         }
     }
 
-    /// Workspace id under the current selection, if any.
-    pub fn selected_ws_id(&self) -> Option<&str> {
+    /// The action under the current selection, if any.
+    pub fn selected_action(&self) -> Option<&PaletteAction> {
         self.results
             .get(self.selected)
             .and_then(|&i| self.candidates.get(i))
-            .map(|c| c.ws_id.as_str())
+            .map(|c| &c.action)
     }
 }
 
@@ -161,7 +178,7 @@ pub(crate) fn render_palette(frame: &mut ratatui::Frame, p: &Palette, theme: The
     frame.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Go to workspace ")
+        .title(" Command palette ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(th.accent));
     let inner = Layout::vertical([
@@ -200,7 +217,7 @@ pub(crate) fn render_palette(frame: &mut ratatui::Frame, p: &Palette, theme: The
     let mut lines: Vec<Line> = Vec::new();
     if p.results.is_empty() {
         let msg = if p.candidates.is_empty() {
-            "  (no workspaces)"
+            "  (nothing to run)"
         } else {
             "  (no matches)"
         };
@@ -220,8 +237,8 @@ pub(crate) fn render_palette(frame: &mut ratatui::Frame, p: &Palette, theme: The
                 ("  ", Style::default().fg(th.text))
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{marker}{}", c.name), name_style),
-                Span::styled(format!("  —  {}", c.repo), Style::default().fg(th.muted)),
+                Span::styled(format!("{marker}{}", c.label), name_style),
+                Span::styled(format!("  —  {}", c.detail), Style::default().fg(th.muted)),
             ]));
         }
     }
@@ -231,7 +248,7 @@ pub(crate) fn render_palette(frame: &mut ratatui::Frame, p: &Palette, theme: The
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("Enter", Style::default().fg(th.accent)),
-            Span::raw(" jump  "),
+            Span::raw(" run  "),
             Span::styled("↑↓", Style::default().fg(th.accent)),
             Span::raw(" move  "),
             Span::styled("Esc", Style::default().fg(th.accent)),
@@ -252,10 +269,18 @@ mod tests {
             None => format!("{name} {repo}"),
         };
         Candidate {
-            ws_id: ws_id.into(),
-            name: name.into(),
-            repo: repo.into(),
+            label: name.into(),
+            detail: repo.into(),
             match_text,
+            action: PaletteAction::OpenWorkspace { ws_id: ws_id.into() },
+        }
+    }
+
+    /// The ws_id under the selection, if it's an OpenWorkspace entry.
+    fn sel_ws(p: &Palette) -> Option<&str> {
+        match p.selected_action() {
+            Some(PaletteAction::OpenWorkspace { ws_id }) => Some(ws_id.as_str()),
+            _ => None,
         }
     }
 
@@ -298,7 +323,7 @@ mod tests {
         p.push_char('h');
         // Only the two auth-ish rows match; the boundary match ranks first.
         assert_eq!(p.results.len(), 2);
-        assert_eq!(p.selected_ws_id(), Some("w2"));
+        assert_eq!(sel_ws(&p), Some("w2"));
 
         // Selection clamps when results shrink under it.
         p.move_down();
@@ -306,7 +331,7 @@ mod tests {
         p.push_char('x'); // "authx" matches nothing
         assert_eq!(p.results.len(), 0);
         assert_eq!(p.selected, 0);
-        assert_eq!(p.selected_ws_id(), None);
+        assert_eq!(sel_ws(&p), None);
     }
 
     #[test]
@@ -316,7 +341,29 @@ mod tests {
         for ch in "billing".chars() {
             p.push_char(ch);
         }
-        assert_eq!(p.selected_ws_id(), Some("w1"), "branch text is searchable");
+        assert_eq!(sel_ws(&p), Some("w1"), "branch text is searchable");
+    }
+
+    #[test]
+    fn action_entries_match_their_verb() {
+        let cands = vec![
+            cand("w2", "foo", "web", None),
+            Candidate {
+                label: "Open PR — foo".into(),
+                detail: "web".into(),
+                match_text: "open pr foo web".into(),
+                action: PaletteAction::OpenPr { ws_id: "w1".into() },
+            },
+        ];
+        let mut p = Palette::new(cands);
+        for ch in "pr".chars() {
+            p.push_char(ch);
+        }
+        assert_eq!(
+            p.selected_action(),
+            Some(&PaletteAction::OpenPr { ws_id: "w1".into() }),
+            "typing 'pr' surfaces the Open PR action over the plain workspace jump"
+        );
     }
 
     #[test]

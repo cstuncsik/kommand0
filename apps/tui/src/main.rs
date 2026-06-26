@@ -882,43 +882,163 @@ impl App {
         self.toggle_embedded();
     }
 
-    /// Build the palette's jump targets from every workspace (across all repos).
-    /// The match text folds in name + branch + repo so any of them narrows.
+    /// Build the palette entries: a jump-and-open for every workspace, then the
+    /// actions you can run on each (open PR / clean up / archive·activate / new
+    /// session), then a jump for each open session tab. Each entry's match text
+    /// folds in a verb + the workspace name + branch + repo so any of them
+    /// narrows (e.g. "pr foo", "clean", "tab 2").
     fn palette_candidates(&self) -> Vec<palette::Candidate> {
-        self.workspaces
-            .iter()
-            .map(|w| {
-                let repo = self
-                    .repos
-                    .iter()
-                    .find(|r| r.id == w.repo_id)
-                    .map(|r| r.name.clone())
-                    .unwrap_or_default();
-                let match_text = match &w.branch_name {
-                    Some(b) => format!("{} {} {}", w.name, b, repo),
-                    None => format!("{} {}", w.name, repo),
-                };
-                palette::Candidate { ws_id: w.id.clone(), name: w.name.clone(), repo, match_text }
-            })
-            .collect()
+        use palette::{Candidate, PaletteAction};
+        let repo_name = |repo_id: &str| {
+            self.repos.iter().find(|r| r.id == repo_id).map(|r| r.name.clone()).unwrap_or_default()
+        };
+        let mut out: Vec<Candidate> = Vec::new();
+
+        // 1) Jump-and-open per workspace — the primary entry, kept first so an
+        //    empty query still reads like the original "go to workspace" list.
+        for w in &self.workspaces {
+            let repo = repo_name(&w.repo_id);
+            let match_text = match &w.branch_name {
+                Some(b) => format!("{} {} {}", w.name, b, repo),
+                None => format!("{} {}", w.name, repo),
+            };
+            out.push(Candidate {
+                label: w.name.clone(),
+                detail: repo,
+                match_text,
+                action: PaletteAction::OpenWorkspace { ws_id: w.id.clone() },
+            });
+        }
+
+        // 2) Actions, each tagged with a verb so typing it narrows to them.
+        for w in &self.workspaces {
+            let repo = repo_name(&w.repo_id);
+            let mk = |verb: &str, label: String, action: PaletteAction| Candidate {
+                label,
+                detail: repo.clone(),
+                match_text: format!("{verb} {} {}", w.name, repo),
+                action,
+            };
+            out.push(mk(
+                "open pr",
+                format!("Open PR — {}", w.name),
+                PaletteAction::OpenPr { ws_id: w.id.clone() },
+            ));
+            out.push(mk(
+                "clean up cleanup",
+                format!("Clean up — {}", w.name),
+                PaletteAction::Cleanup { ws_id: w.id.clone() },
+            ));
+            let (verb, label) = if w.active {
+                ("archive", format!("Archive — {}", w.name))
+            } else {
+                ("activate archive", format!("Activate — {}", w.name))
+            };
+            out.push(mk(verb, label, PaletteAction::ArchiveToggle { ws_id: w.id.clone() }));
+            out.push(mk(
+                "new session",
+                format!("New session — {}", w.name),
+                PaletteAction::NewSession { ws_id: w.id.clone() },
+            ));
+        }
+
+        // 3) Jump to a specific session tab of each currently-open workspace.
+        for w in &self.workspaces {
+            let Some(sessions) = self.embedded.get(&w.id) else {
+                continue;
+            };
+            let repo = repo_name(&w.repo_id);
+            for i in 0..sessions.tabs.len() {
+                let n = i + 1;
+                out.push(Candidate {
+                    label: format!("Session {n} — {}", w.name),
+                    detail: repo.clone(),
+                    match_text: format!("session tab {n} {} {}", w.name, repo),
+                    action: PaletteAction::JumpTab { ws_id: w.id.clone(), index: i },
+                });
+            }
+        }
+
+        out
+    }
+
+    /// Run a chosen palette entry. Workspace-targeting actions first reveal +
+    /// select the workspace so their feedback (PR progress, the cleanup
+    /// confirmation, the new tab) lands on the right row even if it was hidden.
+    fn dispatch_palette_action(&mut self, action: palette::PaletteAction) {
+        use palette::PaletteAction::*;
+        match action {
+            OpenWorkspace { ws_id } => self.jump_to_workspace(&ws_id),
+            OpenPr { ws_id } => {
+                if self.reveal_workspace(&ws_id) {
+                    self.open_pr(&ws_id);
+                }
+            }
+            Cleanup { ws_id } => {
+                if self.reveal_workspace(&ws_id) {
+                    self.cleanup_workspace_prompt(&ws_id);
+                }
+            }
+            ArchiveToggle { ws_id } => self.archive_toggle(&ws_id),
+            NewSession { ws_id } => {
+                if self.reveal_workspace(&ws_id) {
+                    self.new_session(&ws_id);
+                }
+            }
+            JumpTab { ws_id, index } => {
+                if self.reveal_workspace(&ws_id) {
+                    self.select_session_tab(&ws_id, index);
+                }
+            }
+        }
     }
 
     /// Jump to a workspace from the palette: make it visible (expanding its repo
     /// and clearing any active filter so its row is in the rebuilt tree), then
     /// open its embedded session. Works for any workspace, even one currently
     /// hidden under a collapsed repo.
-    fn jump_to_workspace(&mut self, ws_id: &str) {
+    /// Make a workspace visible + selected: expand its repo, clear any active
+    /// filter, rebuild the tree, and select its row. Returns false for an
+    /// unknown id. Shared by the jump and by palette actions that target a
+    /// workspace which may be hidden under a collapsed repo or a filter.
+    fn reveal_workspace(&mut self, ws_id: &str) -> bool {
         let Some(repo_id) =
             self.workspaces.iter().find(|w| w.id == ws_id).map(|w| w.repo_id.clone())
         else {
-            return; // unknown workspace — nothing to jump to
+            return false; // unknown workspace
         };
         self.expanded.insert(repo_id);
         self.filter_query.clear();
         self.filter_input = false;
         self.rebuild_tree();
         self.select_workspace_row(ws_id);
-        self.toggle_embedded();
+        true
+    }
+
+    fn jump_to_workspace(&mut self, ws_id: &str) {
+        if self.reveal_workspace(ws_id) {
+            self.toggle_embedded();
+        }
+    }
+
+    /// Archive an active workspace, or re-activate an archived one (the `A`
+    /// action and the palette share this). Keeps the row selected across the
+    /// rebuild.
+    fn archive_toggle(&mut self, ws_id: &str) {
+        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
+            return;
+        };
+        let res = if ws.active {
+            self.state.archive_workspace(&ws.name)
+        } else {
+            self.state.activate_workspace(&ws.name)
+        };
+        if res.is_ok() {
+            self.workspaces = self.state.workspaces.clone();
+            self.rebuild_tree();
+            self.select_workspace_row(&ws.id);
+            self.clamp_selection();
+        }
     }
 
     /// Select session tab `index` of a workspace and focus the embedded pane.
@@ -1769,14 +1889,14 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     // borrow of `app.palette` is scoped so we can mutate `app` after it closes.
     if app.palette.is_some() {
         let mut close = false;
-        let mut jump: Option<String> = None;
+        let mut action: Option<palette::PaletteAction> = None;
         {
             let p = app.palette.as_mut().unwrap();
             match key.code {
                 KeyCode::Esc => close = true,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => close = true,
                 KeyCode::Enter => {
-                    jump = p.selected_ws_id().map(|s| s.to_string());
+                    action = p.selected_action().cloned();
                     close = true;
                 }
                 KeyCode::Up => p.move_up(),
@@ -1791,8 +1911,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         if close {
             app.palette = None;
         }
-        if let Some(ws_id) = jump {
-            app.jump_to_workspace(&ws_id);
+        if let Some(a) = action {
+            app.dispatch_palette_action(a);
         }
         return Ok(KeyOutcome::Continue);
     }
@@ -1929,18 +2049,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     app.palette = Some(palette::Palette::new(candidates));
                 }
                 Action::ArchiveToggle => {
-                    if let Some(ws) = app.selected_workspace().cloned() {
-                        let res = if ws.active {
-                            app.state.archive_workspace(&ws.name)
-                        } else {
-                            app.state.activate_workspace(&ws.name)
-                        };
-                        if res.is_ok() {
-                            app.workspaces = app.state.workspaces.clone();
-                            app.rebuild_tree();
-                            app.select_workspace_row(&ws.id);
-                            app.clamp_selection();
-                        }
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.archive_toggle(&ws_id);
                     }
                 }
                 Action::AddRepo => {
@@ -2754,7 +2864,13 @@ mod key_tests {
         for c in "ws-one".chars() {
             press(&mut app, KeyCode::Char(c)).await;
         }
-        assert_eq!(app.palette.as_ref().unwrap().selected_ws_id(), Some("w1"));
+        assert!(
+            matches!(
+                app.palette.as_ref().unwrap().selected_action(),
+                Some(palette::PaletteAction::OpenWorkspace { ws_id }) if ws_id == "w1"
+            ),
+            "the workspace jump for w1 is the top match for its name"
+        );
         press(&mut app, KeyCode::Enter).await;
 
         // The palette closed and the jump expanded r1 + selected w1 — even though
@@ -2763,6 +2879,63 @@ mod key_tests {
         assert!(app.palette.is_none(), "Enter closes the palette");
         assert!(app.expanded.contains("r1"), "jump expanded the target's repo");
         assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w1"));
+    }
+
+    #[tokio::test]
+    async fn palette_runs_an_action_not_just_a_jump() {
+        let mut app = test_app();
+        app.rebuild_tree();
+        assert!(app.workspaces.iter().find(|w| w.id == "w1").unwrap().active, "w1 starts active");
+
+        press(&mut app, KeyCode::Char(':')).await;
+        for c in "archive".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        // "archive" isn't a subsequence of the plain jump text, so only the
+        // Archive action matches — the palette runs actions, not just jumps.
+        assert!(
+            matches!(
+                app.palette.as_ref().unwrap().selected_action(),
+                Some(palette::PaletteAction::ArchiveToggle { ws_id }) if ws_id == "w1"
+            ),
+            "the Archive action is the match for 'archive'"
+        );
+        press(&mut app, KeyCode::Enter).await;
+        assert!(app.palette.is_none(), "Enter closes the palette");
+        assert!(
+            !app.workspaces.iter().find(|w| w.id == "w1").unwrap().active,
+            "running the action archived the workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn palette_jumps_to_a_specific_session_tab() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("s1", &["-c", "sleep 30"]), tab("s2", &["-c", "sleep 30"])],
+                active: 0,
+            },
+        );
+
+        press(&mut app, KeyCode::Char(':')).await;
+        for c in "tab 2".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        assert!(
+            matches!(
+                app.palette.as_ref().unwrap().selected_action(),
+                Some(palette::PaletteAction::JumpTab { ws_id, index }) if ws_id == "w1" && *index == 1
+            ),
+            "'tab 2' selects the second session tab"
+        );
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.embedded.get("w1").unwrap().active, 1, "jumped to tab 2 (index 1)");
+        assert_eq!(app.focus, Focus::Embedded, "and focused the embedded pane");
     }
 
     #[test]

@@ -122,7 +122,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `h` / `l` / `Left` / `Right` | Tree | Collapse repo (or jump to parent) / expand repo |
 | `gg` / `G` | Tree | Jump to first / last item |
 | `/` | Tree | Filter workspaces by name/branch (`Esc` clears) |
-| `:` | Tree | Go-to-workspace palette: fuzzy-jump to any workspace (across collapsed repos) and open it |
+| `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it — open PR, clean up, archive/activate, new session, or jump to a session tab |
 | `A` | Tree | Archive / activate the selected workspace |
 | `Enter` / `e` / `r` / `R` | Tree | Open the embedded Claude pane for the workspace |
 | `x` | Tree | Close the embedded Claude pane |

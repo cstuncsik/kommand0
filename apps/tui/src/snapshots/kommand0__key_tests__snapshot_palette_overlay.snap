@@ -8,9 +8,13 @@ expression: "render_to_string(&mut app, 100, 30)"
 │                            ││Workspaces: 1 active, 1 total                                       │
 │                            ││                                                                    │
 │                            ││                                                                    │
-│                   ┌ Go to workspace ─────────────────────────────────────────┐                   │
+│                   ┌ Command palette ─────────────────────────────────────────┐                   │
 │                   │ > █                                                      │                   │
 │                   │ ▸ ws-one  —  alpha                                       │                   │
+│                   │   Open PR — ws-one  —  alpha                             │                   │
+│                   │   Clean up — ws-one  —  alpha                            │                   │
+│                   │   Archive — ws-one  —  alpha                             │                   │
+│                   │   New session — ws-one  —  alpha                         │                   │
 │                   │                                                          │                   │
 │                   │                                                          │                   │
 │                   │                                                          │                   │
@@ -20,11 +24,7 @@ expression: "render_to_string(&mut app, 100, 30)"
 │                   │                                                          │                   │
 │                   │                                                          │                   │
 │                   │                                                          │                   │
-│                   │                                                          │                   │
-│                   │                                                          │                   │
-│                   │                                                          │                   │
-│                   │                                                          │                   │
-│                   │ Enter jump  ↑↓ move  Esc cancel                          │                   │
+│                   │ Enter run  ↑↓ move  Esc cancel                           │                   │
 │                   └──────────────────────────────────────────────────────────┘                   │
 │                            ││                                                                    │
 │                            ││                                                                    │

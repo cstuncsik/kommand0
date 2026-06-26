@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Command palette runs actions** — the `:` palette (previously jump-only) now
+  also runs an action on the matched workspace: open a PR, clean up, archive /
+  activate, start a new session, or jump straight to a specific session tab.
+  Type a verb to narrow (`pr`, `clean`, `archive`, `tab 2`); Enter runs it.
+
 ## [0.1.8] - 2026-06-26
 
 ## [0.1.7] - 2026-06-26
