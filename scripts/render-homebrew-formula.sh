@@ -28,7 +28,8 @@ cat <<EOF
 class Kommand0 < Formula
   desc "Keyboard-first local orchestrator for parallel Claude Code sessions"
   homepage "https://github.com/cstuncsik/kommand0"
-  version "$version"
+  # version is intentionally omitted: Homebrew derives it from the URL, and an
+  # explicit stanza would be flagged redundant by brew audit.
   license "MIT"
 
   on_macos do
