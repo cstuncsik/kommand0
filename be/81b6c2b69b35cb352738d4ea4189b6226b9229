@@ -1,0 +1,46 @@
+CHANGELOG.md
+  s_fc3d7618d36de0::t_7f1a180ee1c0ed 8-14
+apps/tui/tests/e2e.rs
+  s_fc3d7618d36de0::t_dc7b67d5d1f309 413-414,423
+  s_fc3d7618d36de0::t_b2d5c7cd719f51 434-452
+  s_fc3d7618d36de0::t_efa52dbb5fe3da 433
+apps/tui/src/palette.rs
+  s_fc3d7618d36de0::t_f15ca19ee7270e 220
+  s_fc3d7618d36de0::t_74a6353689174f 181
+  s_fc3d7618d36de0::t_a0b26408010231 251
+  s_fc3d7618d36de0::t_c8b91f894b2749 348-366
+  s_fc3d7618d36de0::t_dbab17e005d5d3 109-110,114
+  s_fc3d7618d36de0::t_d6e8411dda1e20 1-4,20-37,39-40,42
+  s_fc3d7618d36de0::t_630d8bd4f0f287 240-241
+  s_fc3d7618d36de0::t_9d2e4c05fc8948 272-273,275-283,345
+  s_fc3d7618d36de0::t_62f0cdc4ff328a 326,334,344
+  s_fc3d7618d36de0::t_d14b669b098820 346-347
+apps/tui/src/main.rs
+  s_fc3d7618d36de0::t_f22ab95af20e91 1892,1899,1914-1915
+  s_fc3d7618d36de0::t_5298a452f323ad 885-889,891-988,992-993
+  s_fc3d7618d36de0::t_9ead6041aa5dee 2052-2053
+  s_fc3d7618d36de0::t_faf774b3ef974b 1000-1004,1008,1015-1041
+  s_fc3d7618d36de0::t_6a40a03f16a8e1 989-991
+  s_fc3d7618d36de0::t_7f5350e21b68a0 2867-2873
+  s_fc3d7618d36de0::t_2787c4f9e91983 2884-2940
+README.md
+  s_fc3d7618d36de0::t_2a988c81ad225e 125
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_palette_overlay.snap
+  s_fc3d7618d36de0::t_454d60ef899bac 11,14-17,27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "be81b6c2b69b35cb352738d4ea4189b6226b9229",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
