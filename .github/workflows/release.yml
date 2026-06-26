@@ -172,8 +172,17 @@ jobs:
     name: Update Homebrew tap
     needs: [release, release-linux]
     runs-on: ubuntu-latest
+    # The release itself is already published by this point; a tap hiccup
+    # shouldn't mark the whole release run as failed (it stays visible to fix).
+    continue-on-error: true
     steps:
+      # `persist-credentials: false` is REQUIRED: otherwise actions/checkout
+      # configures a global git auth header with the default GITHUB_TOKEN, which
+      # overrides the PAT in our clone URL and gets a 403 pushing to the *tap*
+      # repo (the GITHUB_TOKEN can't write there).
       - uses: actions/checkout@v4 # for scripts/render-homebrew-formula.sh
+        with:
+          persist-credentials: false
 
       - name: Render + push formula
         env:
