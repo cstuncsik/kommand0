@@ -99,14 +99,30 @@ fn last_line(bytes: &[u8]) -> String {
 /// Run `gh <args>` in `cwd`, non-interactively (no prompts, no tty read, no
 /// pager, no update notifier) so it can never hang a background thread.
 fn run_gh(gh_bin: &str, cwd: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new(gh_bin)
-        .args(args)
-        .current_dir(cwd)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .env("GH_PAGER", "cat")
-        .stdin(Stdio::null())
-        .output()
+    // Retry on ETXTBSY ("text file busy"): exec'ing a binary that was just
+    // written can transiently fail when another thread's concurrent fork+exec
+    // still holds a write fd to it. This is a real race under parallel tests
+    // (which exec freshly-written `gh` stubs) on Linux, and possible in the wild
+    // right after a `gh` upgrade. It's transient — back off briefly and retry,
+    // rather than surfacing it as a bogus "gh not found".
+    let mut attempt = 0u32;
+    loop {
+        let result = Command::new(gh_bin)
+            .args(args)
+            .current_dir(cwd)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("GH_PAGER", "cat")
+            .stdin(Stdio::null())
+            .output();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 8 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt as u64));
+            }
+            other => return other,
+        }
+    }
 }
 
 /// [`open_pull_request`] with the `gh` binary injected, so tests can pass a stub
