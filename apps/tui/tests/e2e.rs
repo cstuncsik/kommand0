@@ -410,8 +410,8 @@ fn embedded_pane_renders_real_terminal_and_forwards_keys() {
 
 #[test]
 fn palette_jumps_to_and_opens_a_collapsed_repo_workspace() {
-    // `:` opens the "go to workspace" palette; typing fuzzy-matches a workspace
-    // hidden under a collapsed repo, and Enter jumps to + opens it.
+    // `:` opens the command palette; typing fuzzy-matches a workspace hidden
+    // under a collapsed repo, and Enter jumps to + opens it.
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());
     let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
@@ -420,11 +420,31 @@ fn palette_jumps_to_and_opens_a_collapsed_repo_workspace() {
     assert!(!tui.screen().contains("demo-ws"), "repo starts collapsed");
 
     tui.send(":");
-    tui.wait_for("Go to workspace");
+    tui.wait_for("Command palette");
     tui.send("demo-ws");
     tui.send("\r"); // Enter jumps + opens
 
     tui.wait_for("EMBED-STUB-READY"); // the previously-hidden workspace opened
+    tui.send("\x1d"); // Ctrl+] back to the tree
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn palette_runs_an_action_new_session() {
+    // The palette runs actions, not just jumps: "new session" narrows to the
+    // New session action and Enter opens a session for the workspace.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send(":");
+    tui.wait_for("Command palette");
+    tui.send("new session"); // only the New session action is a subsequence match
+    tui.send("\r");
+
+    tui.wait_for("EMBED-STUB-READY"); // the action opened a session
     tui.send("\x1d"); // Ctrl+] back to the tree
     tui.send("q");
     tui.wait_exit();
