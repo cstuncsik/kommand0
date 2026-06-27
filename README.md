@@ -2,6 +2,12 @@
 
 Keyboard-first local orchestrator for parallel Claude Code sessions.
 
+Run several Claude Code sessions at once, each in its own isolated git worktree,
+and drive them all from one fast TUI: a tree of repos and workspaces on the left,
+the live embedded `claude` (or a workspace's git status) on the right. Open PRs,
+clean up merged work, and get a nudge when a backgrounded session needs you —
+without leaving the keyboard. A `kmd` CLI mirrors the core actions for scripting.
+
 ## Prerequisites
 
 - Rust toolchain (edition 2024)

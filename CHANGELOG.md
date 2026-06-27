@@ -5,6 +5,28 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+First minor release — a maturity marker that promotes the stabilized 0.1.x line.
+No functional changes since 0.1.12; the dated sections below have the detail.
+Highlights of the 0.1.x arc:
+
+- **Parallel Claude sessions** in embedded PTYs, each a git-worktree workspace
+  with persistent, resumable session tabs.
+- **Cross-platform** — macOS (universal) and Linux x86_64 binaries, built and
+  published by a one-button release workflow.
+- **Three ways to install** — `curl | sh`, a Homebrew tap
+  (`brew install cstuncsik/tap/kommand0`), and `cargo-binstall`.
+- **Command palette** (`:`) — fuzzy-jump to any workspace, or run an action on
+  it (open PR, clean up, archive, new session, jump to a session tab).
+- **Attention notifications** — terminal bell or desktop notification when a
+  backgrounded session goes quiet with unseen output.
+- **Workspace from a branch** — adopt an existing local or remote branch (CLI
+  `--branch` and the add-workspace modal) to review a teammate's PR with Claude.
+- **Theming and rebindable keys**, **PR open** / **merged-workspace cleanup**
+  via `gh`, and live **branch/diff status** computed off the render loop.
+- **Hardened** — panic-safe terminal restore, atomic crash-proof state with a
+  3-way merge against concurrent `kmd` writes, resize-proof input, and a full
+  audit pass.
+
 ## [0.1.12] - 2026-06-27
 
 ### Added
