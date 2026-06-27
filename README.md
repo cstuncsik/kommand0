@@ -8,6 +8,11 @@ the live embedded `claude` (or a workspace's git status) on the right. Open PRs,
 clean up merged work, and get a nudge when a backgrounded session needs you —
 without leaving the keyboard. A `kmd` CLI mirrors the core actions for scripting.
 
+![kommand0 demo](demo/demo.gif)
+
+> The demo is generated with [vhs](https://github.com/charmbracelet/vhs) —
+> see [`demo/`](demo/) to regenerate it.
+
 ## Prerequisites
 
 - Rust toolchain (edition 2024)
