@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-06-27
+
 ### Fixed
 
 - **Mouse clicks select the right workspace once the tree scrolls** — a tree
@@ -174,7 +176,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/cstuncsik/kommand0/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/cstuncsik/kommand0/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/cstuncsik/kommand0/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/cstuncsik/kommand0/compare/v0.1.6...v0.1.7
