@@ -435,6 +435,22 @@ impl AppState {
             None => repo.name.clone(),
         };
 
+        // The name becomes a path segment under `worktrees/` and a branch suffix,
+        // so reject anything that could escape the dir or trip git's arg parsing:
+        // empty/whitespace, a path separator or `.`/`..`, or a leading dash.
+        if ws_name.trim().is_empty()
+            || ws_name == "."
+            || ws_name == ".."
+            || ws_name.contains('/')
+            || ws_name.contains('\\')
+            || ws_name.starts_with('-')
+        {
+            bail!(
+                "invalid workspace name {ws_name:?}: must not be empty, '.'/'..', \
+                 contain a path separator, or start with '-'"
+            );
+        }
+
         if self.workspaces.iter().any(|w| w.name == ws_name) {
             bail!("workspace already exists: {ws_name}");
         }

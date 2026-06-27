@@ -302,6 +302,9 @@ pub(crate) struct App {
     /// pane is gone), so a mid-turn pause that resumes can't strobe it on/off.
     pub(crate) attention: HashSet<String>,
     pub(crate) pane_areas: mouse::PaneAreas,
+    /// The tree list's scroll offset from the last render, so a mouse click on a
+    /// visible row maps to the right `tree_items` index once the tree scrolls.
+    pub(crate) tree_scroll_offset: usize,
     pub(crate) mouse_pos: Option<(u16, u16)>,
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
     pub(crate) pending_button_action: Option<buttons::HitAction>,
@@ -395,6 +398,7 @@ impl App {
             last_output_at: HashMap::new(),
             attention: HashSet::new(),
             pane_areas: mouse::PaneAreas::default(),
+            tree_scroll_offset: 0,
             mouse_pos: None,
             hit_regions: Vec::new(),
             pending_button_action: None,
@@ -2383,9 +2387,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             app.pr_result.remove(&ws_id);
                             app.cleanup_result.remove(&ws_id);
                             app.rebuild_tree();
-                            if app.selected_index >= app.tree_items.len() && !app.tree_items.is_empty() {
-                                app.selected_index = app.tree_items.len() - 1;
-                            }
+                            // clamp_selection re-seats off any hint row AND
+                            // re-syncs the active session (a raw clamp skipped
+                            // both, stranding focus/selection after cleanup).
+                            app.clamp_selection();
                         }
                     }
                     Err(msg) => {
@@ -2507,10 +2512,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.repos = app.state.repos.clone();
                                     app.workspaces = app.state.workspaces.clone();
                                     app.rebuild_tree();
-                                    if app.selected_index >= app.tree_items.len() && !app.tree_items.is_empty() {
-                                        app.selected_index = app.tree_items.len() - 1;
-                                    }
-                                    app.update_active_session();
+                                    // Re-seat off any hint row and re-sync the
+                                    // active session (clamp_selection does both).
+                                    app.clamp_selection();
                                 }
                             }
                         }
@@ -2536,10 +2540,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     app.repos = app.state.repos.clone();
                                     app.workspaces = app.state.workspaces.clone();
                                     app.rebuild_tree();
-                                    if app.selected_index >= app.tree_items.len() && !app.tree_items.is_empty() {
-                                        app.selected_index = app.tree_items.len() - 1;
-                                    }
-                                    app.update_active_session();
+                                    // Re-seat off any hint row and re-sync the
+                                    // active session (clamp_selection does both).
+                                    app.clamp_selection();
                                 }
                             }
                         }
@@ -2936,6 +2939,54 @@ mod key_tests {
         press(&mut app, KeyCode::Enter).await;
         assert_eq!(app.embedded.get("w1").unwrap().active, 1, "jumped to tab 2 (index 1)");
         assert_eq!(app.focus, Focus::Embedded, "and focused the embedded pane");
+    }
+
+    #[test]
+    fn mouse_tree_click_accounts_for_scroll_offset() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let click = |app: &mut App, row: u16| {
+            mouse::handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 2,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        };
+        let mut app = test_app();
+        // Enough workspace rows that the list could scroll.
+        for n in 2..=5 {
+            app.state.workspaces.push(Workspace {
+                id: format!("w{n}"),
+                name: format!("ws-{n}"),
+                repo_id: "r1".into(),
+                working_dir: "/tmp".into(),
+                active: true,
+                created_at: 0,
+                worktree_path: None,
+                branch_name: None,
+            });
+        }
+        app.workspaces = app.state.workspaces.clone();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 8);
+
+        // Screen row 2 = the 2nd in-pane row (viewport row 1), a workspace row
+        // (row 1 is the repo header). Offset 0 selects it directly.
+        app.tree_scroll_offset = 0;
+        click(&mut app, 2);
+        let base = app.selected_index;
+        // Same screen row, but the list has scrolled 2 rows: select 2 lower.
+        app.tree_scroll_offset = 2;
+        click(&mut app, 2);
+        assert_eq!(
+            app.selected_index,
+            base + 2,
+            "a tree click maps the viewport row through the scroll offset"
+        );
     }
 
     #[test]
