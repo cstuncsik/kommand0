@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-27
+
 ### Added
 
 - **Jump to the next waiting workspace** — press `n` (or `N` for the previous) in
@@ -241,7 +243,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/cstuncsik/kommand0/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cstuncsik/kommand0/compare/v0.1.12...v0.2.0
 [0.1.12]: https://github.com/cstuncsik/kommand0/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/cstuncsik/kommand0/compare/v0.1.10...v0.1.11
