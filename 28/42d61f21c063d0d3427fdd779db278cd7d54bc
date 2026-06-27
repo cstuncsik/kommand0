@@ -1,0 +1,29 @@
+README.md
+  s_fc3d7618d36de0::t_5f230cc9ccaf97 11-15
+demo/README.md
+  s_fc3d7618d36de0::t_d1e9426041b63a 1-32
+demo/demo.tape
+  s_fc3d7618d36de0::t_ad872f25230120 1-69
+demo/claude-demo
+  s_fc3d7618d36de0::t_ad5d797f267075 1-20
+demo/setup.sh
+  s_fc3d7618d36de0::t_730e3f284e399b 1-42
+.gitignore
+  s_fc3d7618d36de0::t_0611ecb9d4dbb6 19-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "2842d61f21c063d0d3427fdd779db278cd7d54bc",
+  "prompts": {},
+  "sessions": {
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
