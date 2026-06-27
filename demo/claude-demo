@@ -1,0 +1,20 @@
+#!/bin/sh
+# A stand-in for the `claude` CLI used only by the demo screencast, so the
+# recording needs no auth and stays deterministic. kommand0 launches this in the
+# embedded pane (via KOMMAND0_CLAUDE_BIN); it draws a believable Claude-Code-like
+# screen and idles until the pane is closed.
+stty -echo 2>/dev/null
+printf '\033[?1049h\033[2J\033[H' # alt-screen + clear
+printf '\r\n'
+printf '   \033[35m✻\033[0m \033[1mClaude Code\033[0m  \033[2m— demo\033[0m\r\n\r\n'
+printf '   \033[2m>\033[0m add a token-bucket rate limiter to the login route\r\n\r\n'
+printf '   I'\''ll add the limiter in \033[36msrc/auth/middleware.rs\033[0m and wire it\r\n'
+printf '   into the login handler, then run the tests.\r\n\r\n'
+printf '     \033[32m+\033[0m struct RateLimiter { capacity: u32, refill: Duration }\r\n'
+printf '     \033[32m+\033[0m fn check(&mut self, key: &str) -> Result<(), TooMany>\r\n\r\n'
+printf '   \033[32m✓\033[0m 14 tests passed\r\n\r\n'
+printf '   \033[2m──────────────────────────────────────────────\033[0m\r\n'
+printf '   \033[2m>\033[0m \033[7m \033[0m\r\n'
+# Idle, consuming any forwarded bytes, until kommand0 closes the pane (SIGHUP).
+while IFS= read -r _ 2>/dev/null; do :; done
+sleep 600
