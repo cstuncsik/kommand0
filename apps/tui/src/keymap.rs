@@ -25,6 +25,8 @@ pub(crate) enum Action {
     Cleanup,
     Filter,
     Palette,
+    NextWaiting,
+    PrevWaiting,
     ArchiveToggle,
     AddRepo,
     AddWorkspace,
@@ -48,6 +50,8 @@ pub(crate) const ALL_ACTIONS: &[Action] = &[
     Action::Cleanup,
     Action::Filter,
     Action::Palette,
+    Action::NextWaiting,
+    Action::PrevWaiting,
     Action::ArchiveToggle,
     Action::AddRepo,
     Action::AddWorkspace,
@@ -73,6 +77,8 @@ impl Action {
             Action::Cleanup => "cleanup",
             Action::Filter => "filter",
             Action::Palette => "palette",
+            Action::NextWaiting => "next-waiting",
+            Action::PrevWaiting => "prev-waiting",
             Action::ArchiveToggle => "archive",
             Action::AddRepo => "add-repo",
             Action::AddWorkspace => "add-workspace",
@@ -98,6 +104,8 @@ impl Action {
             Action::Cleanup => "Clean up a merged workspace",
             Action::Filter => "Filter workspaces (Esc clears)",
             Action::Palette => "Go to workspace",
+            Action::NextWaiting => "Next workspace that needs you",
+            Action::PrevWaiting => "Previous workspace that needs you",
             Action::ArchiveToggle => "Archive / activate workspace",
             Action::AddRepo => "Add repository",
             Action::AddWorkspace => "Add workspace",
@@ -272,6 +280,8 @@ const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("c", Action::Cleanup),
     ("/", Action::Filter),
     (":", Action::Palette),
+    ("n", Action::NextWaiting),
+    ("N", Action::PrevWaiting),
     ("A", Action::ArchiveToggle),
     ("a", Action::AddRepo),
     ("w", Action::AddWorkspace),
@@ -377,6 +387,10 @@ mod tests {
         assert_eq!(km.resolve(&ev(KeyCode::Right, KeyModifiers::NONE)), Some(Action::StepInto));
         assert_eq!(km.resolve(&ev(KeyCode::Char('e'), KeyModifiers::NONE)), Some(Action::OpenSession));
         assert_eq!(km.resolve(&ev(KeyCode::Char('R'), KeyModifiers::NONE)), Some(Action::OpenSession));
+        // n / N jump to the next / previous waiting workspace (distinct chords:
+        // SHIFT is carried by the char case, not a modifier).
+        assert_eq!(km.resolve(&ev(KeyCode::Char('n'), KeyModifiers::NONE)), Some(Action::NextWaiting));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('N'), KeyModifiers::SHIFT)), Some(Action::PrevWaiting));
     }
 
     #[test]

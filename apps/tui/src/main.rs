@@ -1035,6 +1035,32 @@ impl App {
         }
     }
 
+    /// Reveal + open the next (`forward`) or previous workspace flagged "needs
+    /// you", scanning from the current selection and wrapping. No-op when nothing
+    /// is waiting. Opening the session clears its attention, so repeated presses
+    /// cycle through every waiting workspace.
+    fn jump_to_waiting(&mut self, forward: bool) {
+        let n = self.workspaces.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self
+            .selected_workspace()
+            .and_then(|sel| self.workspaces.iter().position(|w| w.id == sel.id));
+        let target = (1..=n).find_map(|step| {
+            let idx = match cur {
+                Some(c) if forward => (c + step) % n,
+                Some(c) => (c + n - step) % n, // backward, wrapping
+                None => step - 1,              // no selection: scan from the top
+            };
+            let w = &self.workspaces[idx];
+            self.ws_needs_attention(&w.id).then(|| w.id.clone())
+        });
+        if let Some(id) = target {
+            self.jump_to_workspace(&id);
+        }
+    }
+
     /// Archive an active workspace, or re-activate an archived one (the `A`
     /// action and the palette share this). Keeps the row selected across the
     /// rebuild.
@@ -2109,6 +2135,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     let candidates = app.palette_candidates();
                     app.palette = Some(palette::Palette::new(candidates));
                 }
+                Action::NextWaiting => app.jump_to_waiting(true),
+                Action::PrevWaiting => app.jump_to_waiting(false),
                 Action::ArchiveToggle => {
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
                         app.archive_toggle(&ws_id);
@@ -3004,6 +3032,56 @@ mod key_tests {
         press(&mut app, KeyCode::Enter).await;
         assert_eq!(app.embedded.get("w1").unwrap().active, 1, "jumped to tab 2 (index 1)");
         assert_eq!(app.focus, Focus::Embedded, "and focused the embedded pane");
+    }
+
+    #[tokio::test]
+    async fn jump_to_next_waiting_cycles_through_needing_workspaces() {
+        let mut app = test_app();
+        for nth in 2..=4 {
+            app.state.workspaces.push(Workspace {
+                id: format!("w{nth}"),
+                name: format!("ws-{nth}"),
+                repo_id: "r1".into(),
+                working_dir: "/tmp".into(),
+                active: true,
+                created_at: 0,
+                worktree_path: None,
+                branch_name: None,
+            });
+        }
+        app.workspaces = app.state.workspaces.clone();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        // Mark w2 and w4 as "needs you": an embedded tab whose id is in attention.
+        for ws in ["w2", "w4"] {
+            let tab_id = format!("{ws}-s");
+            app.embedded.insert(
+                ws.to_string(),
+                WorkspaceSessions { tabs: vec![tab(&tab_id, &["-c", "sleep 30"])], active: 0 },
+            );
+            app.attention.insert(tab_id);
+        }
+        app.select_workspace_row("w1"); // start on a non-waiting row
+
+        app.jump_to_waiting(true);
+        assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w2"));
+        app.jump_to_waiting(true);
+        assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w4"), "skips non-waiting w3");
+        app.jump_to_waiting(true);
+        assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w2"), "wraps");
+        app.jump_to_waiting(false);
+        assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w4"), "previous wraps to w4");
+    }
+
+    #[tokio::test]
+    async fn jump_to_waiting_is_a_noop_when_nothing_waits() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        let before = app.selected_workspace().map(|w| w.id.clone());
+        app.jump_to_waiting(true);
+        assert_eq!(app.selected_workspace().map(|w| w.id.clone()), before, "nothing waiting: no move");
     }
 
     #[test]
