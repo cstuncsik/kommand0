@@ -5,6 +5,16 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Workspace from an existing branch** — `kmd workspace create --repo <r>
+  --branch <ref>` checks out an existing branch into the workspace's worktree
+  instead of forking a fresh `kommand0/<name>` one. `<ref>` may be a local
+  branch or a remote `origin/…` ref (a local tracking branch is created). Handy
+  for reviewing a teammate's PR branch with Claude. The workspace name defaults
+  to a path-safe form of the branch, and the adopted branch isn't
+  `kommand0/`-prefixed, so `cleanup` won't delete it.
+
 ## [0.1.11] - 2026-06-27
 
 ### Fixed
