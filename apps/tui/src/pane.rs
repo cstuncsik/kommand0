@@ -334,6 +334,44 @@ impl Pane {
     pub fn kill(&mut self) {
         self.terminate();
     }
+
+    /// Whether the child has exited (non-blocking).
+    pub fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Send the gentle hangup (SIGHUP) without waiting. Pairs with
+    /// [`Pane::force_kill_and_reap`] for a batched quit teardown that signals
+    /// every pane first and waits once, instead of a full grace poll per pane.
+    pub fn signal_hangup(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return; // already exited
+        }
+        let _ = self.killer.kill(); // SIGHUP (gentle)
+    }
+
+    /// SIGKILL a child that's still alive (by pid) and briefly reap it, so a
+    /// later `Drop`/`terminate` sees an exited child and skips a second grace
+    /// poll. Pairs with [`Pane::signal_hangup`].
+    pub fn force_kill_and_reap(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return; // already gone
+        }
+        if let Some(pid) = self.child.process_id() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        // SIGKILL can't be caught, so the child dies promptly; a short reap loop
+        // collects it so the subsequent Drop's try_wait returns Ok(Some(_)).
+        for _ in 0..20 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 impl Drop for Pane {

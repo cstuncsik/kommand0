@@ -262,6 +262,10 @@ pub(crate) struct App {
     pub(crate) repos: Vec<RepoEntry>,
     pub(crate) workspaces: Vec<Workspace>,
     pub(crate) state: AppState,
+    /// The state as we loaded it (the merge baseline). `save_state` merges our
+    /// in-memory state over the current on-disk file relative to this, so a `kmd`
+    /// command that wrote `state.json` while we were open isn't clobbered.
+    pub(crate) state_baseline: AppState,
     pub(crate) expanded: HashSet<String>,
     pub(crate) tree_items: Vec<TreeNode>,
     pub(crate) selected_index: usize,
@@ -375,11 +379,13 @@ impl App {
     fn new(state: AppState) -> Self {
         let repos = state.repos.clone();
         let workspaces = state.workspaces.clone();
+        let state_baseline = state.clone();
 
         let mut app = Self {
             repos,
             workspaces,
             state,
+            state_baseline,
             expanded: HashSet::new(),
             tree_items: Vec::new(),
             selected_index: 0,
@@ -651,7 +657,9 @@ impl App {
     /// Persist state, logging (not silently dropping) any failure — a save error
     /// is otherwise invisible while the TUI owns the terminal.
     pub(crate) fn save_state(&self) {
-        if let Err(e) = self.state.save() {
+        // Merge over the current on-disk state (a `kmd` command may have written
+        // it while we were open) rather than blindly overwriting it.
+        if let Err(e) = self.state.merge_save(&self.state_baseline) {
             tracing::warn!("failed to persist state: {e}");
         }
     }
@@ -778,7 +786,9 @@ impl App {
             Ok((pane, session_id, was_resume)) => {
                 if !was_resume {
                     self.state.add_embedded_session(ws_id, &session_id);
-                    if self.state.save().is_err() {
+                    // Merge over disk (like save_state) so this doesn't clobber a
+                    // concurrent `kmd` write; keep the Result to surface a failure.
+                    if self.state.merge_save(&self.state_baseline).is_err() {
                         self.embed_error = Some((
                             ws_id.to_string(),
                             "Couldn't persist this session — it may not resume \
@@ -1429,6 +1439,43 @@ impl App {
         for sessions in self.embedded.values_mut() {
             for tab in sessions.tabs.iter_mut() {
                 let _ = tab.pane.resize(content.height, content.width);
+            }
+        }
+    }
+
+    /// Tear down every embedded pane in ONE shared grace period at quit. Dropping
+    /// the panes one by one runs a full SIGHUP→250ms→SIGKILL per pane, so quitting
+    /// with N sessions that ignore SIGHUP (a Node `claude` does) froze the UI
+    /// ~N×250ms. Instead: broadcast SIGHUP to every child, wait once, then
+    /// SIGKILL+reap any straggler — the per-pane `Drop` then sees an exited child
+    /// and returns instantly.
+    fn shutdown_panes(&mut self) {
+        let mut any = false;
+        for sessions in self.embedded.values_mut() {
+            for tab in sessions.tabs.iter_mut() {
+                tab.pane.signal_hangup();
+                any = true;
+            }
+        }
+        if !any {
+            return;
+        }
+        // One shared grace window: poll up to ~250ms, breaking early once every
+        // child has exited (so SIGHUP-respecting children don't cost the full
+        // wait). Then SIGKILL+reap any straggler that ignored the hangup.
+        for _ in 0..5 {
+            let all_done = self
+                .embedded
+                .values_mut()
+                .all(|s| s.tabs.iter_mut().all(|t| t.pane.has_exited()));
+            if all_done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for sessions in self.embedded.values_mut() {
+            for tab in sessions.tabs.iter_mut() {
+                tab.pane.force_kill_and_reap();
             }
         }
     }
@@ -2602,6 +2649,8 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         }
     }
 
+    // Tear down all embedded panes in one shared grace period (not N×250ms).
+    app.shutdown_panes();
     Ok(())
 }
 

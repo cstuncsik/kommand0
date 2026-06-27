@@ -5,6 +5,24 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Concurrent `kmd` changes aren't clobbered by the TUI** — before each save the
+  TUI re-reads `state.json` and 3-way merges its in-memory state over it
+  (relative to what it loaded), so a repo/workspace/session a `kmd` command added
+  while the TUI was open survives the TUI's next save (and a TUI delete still
+  sticks). CLI-added rows show up in the TUI on its next launch. (A CLI *in-place
+  edit* to a row the TUI also holds is still overwritten — only adds/deletes are
+  protected.)
+- **Quitting with several sessions no longer freezes the UI** — embedded panes
+  are torn down in one shared grace period (broadcast SIGHUP → wait once →
+  SIGKILL stragglers) instead of a full ~250ms wait per pane.
+- **Detail-pane buttons click reliably on narrow panes** — the detail text no
+  longer wraps, so a clickable `[Open PR]` / `[Clean up]` button can't drift
+  below its hit region.
+- **Ids are unique across processes** — `generate_id` mixes in the process id, so
+  the CLI and a running TUI can't mint the same id in the same millisecond.
+
 ## [0.1.10] - 2026-06-27
 
 ### Fixed
