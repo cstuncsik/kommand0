@@ -1,0 +1,34 @@
+---
+source: apps/tui/src/main.rs
+expression: "render_to_string(&mut app, 100, 30)"
+---
+┌ Repos ────────────────── + ┐┌ Repo: alpha ───────────────────────────────────────────────────────┐
+│› alpha                  ✕ +││Name: alpha                                                         │
+│› beta                   ✕ +││Path: /tmp/alpha                                                    │
+│                            ││Workspaces: 1 active, 1 total                                       │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                     ┌ Add Workspace to demo ──────────────────────────────┐                      │
+│                     │ Workspace name:                                     │                      │
+│                     │ review                                              │                      │
+│                     │ Branch (blank = new):                               │                      │
+│                     │ origin/feat/x█                                      │                      │
+│                     │                                                     │                      │
+│                     │                                                     │                      │
+│                     │                                                     │                      │
+│                     │                                                     │                      │
+│                     │                                                     │                      │
+│                     │ Enter: submit  Tab: field  Esc: cancel              │                      │
+│                     └─────────────────────────────────────────────────────┘                      │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+└────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+ TREE  alpha  no live sessions                          Enter open · a repo · w ws · ? help · q quit

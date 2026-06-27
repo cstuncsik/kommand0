@@ -16,6 +16,23 @@ pub(crate) enum DeleteTarget {
     Repo { id: String, name: String, workspace_count: usize },
 }
 
+/// The focused field in the Add-Workspace modal.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AddWorkspaceField {
+    #[default]
+    Name,
+    Branch,
+}
+
+impl AddWorkspaceField {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Name => Self::Branch,
+            Self::Branch => Self::Name,
+        }
+    }
+}
+
 /// Modal dialog state.
 #[derive(Default)]
 pub(crate) enum ModalState {
@@ -31,8 +48,14 @@ pub(crate) enum ModalState {
     AddWorkspace {
         repo_id: String,
         repo_name: String,
+        /// Name field.
         input: String,
         cursor: usize,
+        /// Optional existing branch to check out (blank = fork a new branch).
+        branch: String,
+        branch_cursor: usize,
+        /// Which field has focus (Tab toggles).
+        field: AddWorkspaceField,
         error: Option<String>,
     },
     ConfirmDelete {
@@ -68,8 +91,9 @@ pub(crate) enum ModalResult {
     Cancelled,
     /// AddRepo submitted with path.
     SubmitRepo(String),
-    /// AddWorkspace submitted with (repo_id, name).
-    SubmitWorkspace(String, String),
+    /// AddWorkspace submitted with (repo_id, name, branch). An empty branch
+    /// means fork a new branch; otherwise check out that existing branch.
+    SubmitWorkspace(String, String, String),
     /// Delete confirmed.
     ConfirmDelete(DeleteTarget),
     /// Rename submitted with (ws_id, session_id, title); an empty title clears it.
@@ -194,6 +218,9 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
             repo_name: _,
             input,
             cursor,
+            branch,
+            branch_cursor,
+            field,
             error,
         } => {
             *error = None;
@@ -203,60 +230,61 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                     *modal = ModalState::None;
                     ModalResult::Cancelled
                 }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
+                }
+                // Tab (or up/down) moves focus between the Name and Branch fields.
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                    *field = field.toggle();
+                    ModalResult::Consumed
+                }
                 KeyCode::Enter => {
                     let name = input.trim().to_string();
                     if name.is_empty() {
                         *error = Some("Name cannot be empty".to_string());
                         ModalResult::Consumed
                     } else {
-                        let rid = repo_id.clone();
-                        let result = ModalResult::SubmitWorkspace(rid, name);
+                        let result = ModalResult::SubmitWorkspace(
+                            repo_id.clone(),
+                            name,
+                            branch.trim().to_string(),
+                        );
                         *modal = ModalState::None;
                         result
                     }
                 }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    *modal = ModalState::None;
-                    ModalResult::Cancelled
-                }
-                KeyCode::Char(c) => {
-                    input.insert(*cursor, c);
-                    *cursor += c.len_utf8();
-                    ModalResult::Consumed
-                }
-                KeyCode::Backspace => {
-                    if *cursor > 0 {
-                        let prev = input[..*cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        input.replace_range(prev..*cursor, "");
-                        *cursor = prev;
+                _ => {
+                    // Text editing acts on the focused field.
+                    let (buf, cur): (&mut String, &mut usize) = match field {
+                        AddWorkspaceField::Name => (input, cursor),
+                        AddWorkspaceField::Branch => (branch, branch_cursor),
+                    };
+                    match key.code {
+                        KeyCode::Char(c) => {
+                            buf.insert(*cur, c);
+                            *cur += c.len_utf8();
+                        }
+                        KeyCode::Backspace if *cur > 0 => {
+                            let prev =
+                                buf[..*cur].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+                            buf.replace_range(prev..*cur, "");
+                            *cur = prev;
+                        }
+                        KeyCode::Left if *cur > 0 => {
+                            *cur = buf[..*cur].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+                        }
+                        KeyCode::Right if *cur < buf.len() => {
+                            *cur = buf[*cur..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(i, _)| *cur + i)
+                                .unwrap_or(buf.len());
+                        }
+                        _ => {}
                     }
                     ModalResult::Consumed
                 }
-                KeyCode::Left => {
-                    if *cursor > 0 {
-                        *cursor = input[..*cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                    }
-                    ModalResult::Consumed
-                }
-                KeyCode::Right => {
-                    if *cursor < input.len() {
-                        *cursor = input[*cursor..]
-                            .char_indices()
-                            .nth(1)
-                            .map(|(i, _)| *cursor + i)
-                            .unwrap_or(input.len());
-                    }
-                    ModalResult::Consumed
-                }
-                _ => ModalResult::Consumed,
             }
         }
         ModalState::ConfirmDelete { target } => {
@@ -527,20 +555,25 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             );
         }
         ModalState::AddWorkspace {
+            repo_id: _,
             repo_name,
             input,
             cursor,
+            branch,
+            branch_cursor,
+            field,
             error,
-            ..
         } => {
-            let area = centered_rect(50, 25, frame.area());
+            let area = centered_rect(55, 40, frame.area());
             frame.render_widget(Clear, area);
 
             let inner = Layout::vertical([
-                Constraint::Length(2), // label
-                Constraint::Length(1), // input
+                Constraint::Length(1), // name label
+                Constraint::Length(1), // name input
+                Constraint::Length(1), // branch label
+                Constraint::Length(1), // branch input
                 Constraint::Length(1), // error
-                Constraint::Min(0),   // spacer
+                Constraint::Min(0),    // spacer
                 Constraint::Length(1), // footer
             ])
             .split(Rect::new(
@@ -550,47 +583,76 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 area.height.saturating_sub(2),
             ));
 
-            let title = format!(" Add Workspace to {repo_name} ");
-            let block = Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(th.accent));
-            frame.render_widget(block, area);
-
-            // Label
             frame.render_widget(
-                Paragraph::new(Line::styled(
-                    "Workspace name:",
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                )),
+                Block::default()
+                    .title(format!(" Add Workspace to {repo_name} "))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(th.accent)),
+                area,
+            );
+
+            let name_focused = *field == AddWorkspaceField::Name;
+            let lbl = |focused: bool| {
+                if focused {
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th.muted)
+                }
+            };
+
+            // Name field — the cursor is drawn only on the focused field.
+            frame.render_widget(
+                Paragraph::new(Line::styled("Workspace name:", lbl(name_focused))),
                 inner[0],
             );
-
-            // Input
-            let display_input = render_input_with_cursor(input, *cursor, inner[1].width as usize, th);
-            frame.render_widget(
-                Paragraph::new(display_input)
-                    .style(Style::default().fg(th.text).bg(th.muted)),
-                inner[1],
-            );
-
-            // Error
-            if let Some(err) = error {
+            if name_focused {
                 frame.render_widget(
-                    Paragraph::new(err.as_str()).style(Style::default().fg(th.error)),
-                    inner[2],
+                    Paragraph::new(render_input_with_cursor(input, *cursor, inner[1].width as usize, th))
+                        .style(Style::default().fg(th.text).bg(th.muted)),
+                    inner[1],
+                );
+            } else {
+                frame.render_widget(
+                    Paragraph::new(input.as_str()).style(Style::default().fg(th.text)),
+                    inner[1],
                 );
             }
 
-            // Footer
+            // Branch field.
+            frame.render_widget(
+                Paragraph::new(Line::styled("Branch (blank = new):", lbl(!name_focused))),
+                inner[2],
+            );
+            if name_focused {
+                frame.render_widget(
+                    Paragraph::new(branch.as_str()).style(Style::default().fg(th.text)),
+                    inner[3],
+                );
+            } else {
+                frame.render_widget(
+                    Paragraph::new(render_input_with_cursor(branch, *branch_cursor, inner[3].width as usize, th))
+                        .style(Style::default().fg(th.text).bg(th.muted)),
+                    inner[3],
+                );
+            }
+
+            if let Some(err) = error {
+                frame.render_widget(
+                    Paragraph::new(err.as_str()).style(Style::default().fg(th.error)),
+                    inner[4],
+                );
+            }
+
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("Enter", Style::default().fg(th.accent)),
                     Span::raw(": submit  "),
+                    Span::styled("Tab", Style::default().fg(th.accent)),
+                    Span::raw(": field  "),
                     Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(": cancel"),
                 ])),
-                inner[4],
+                inner[6],
             );
         }
         ModalState::ConfirmDelete { target } => {
@@ -819,4 +881,73 @@ pub(crate) fn render_input_with_cursor(input: &str, cursor: usize, width: usize,
     spans.push(Span::raw(after.to_string()));
 
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn add_workspace_modal() -> ModalState {
+        ModalState::AddWorkspace {
+            repo_id: "r1".into(),
+            repo_name: "demo".into(),
+            input: String::new(),
+            cursor: 0,
+            branch: String::new(),
+            branch_cursor: 0,
+            field: AddWorkspaceField::Name,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn add_workspace_edits_both_fields_and_submits_the_branch() {
+        let mut modal = add_workspace_modal();
+        for c in "ws".chars() {
+            handle_modal_key(&mut modal, key(KeyCode::Char(c)));
+        }
+        // Tab moves focus to the branch field; typing now edits the branch.
+        handle_modal_key(&mut modal, key(KeyCode::Tab));
+        for c in "feat/x".chars() {
+            handle_modal_key(&mut modal, key(KeyCode::Char(c)));
+        }
+        match handle_modal_key(&mut modal, key(KeyCode::Enter)) {
+            ModalResult::SubmitWorkspace(repo_id, name, branch) => {
+                assert_eq!(repo_id, "r1");
+                assert_eq!(name, "ws", "name field unaffected by editing the branch");
+                assert_eq!(branch, "feat/x", "branch field is carried in the submit");
+            }
+            _ => panic!("expected SubmitWorkspace"),
+        }
+        assert!(matches!(modal, ModalState::None), "submit closes the modal");
+    }
+
+    #[test]
+    fn add_workspace_blank_branch_submits_empty() {
+        let mut modal = add_workspace_modal();
+        for c in "ws".chars() {
+            handle_modal_key(&mut modal, key(KeyCode::Char(c)));
+        }
+        match handle_modal_key(&mut modal, key(KeyCode::Enter)) {
+            ModalResult::SubmitWorkspace(_, name, branch) => {
+                assert_eq!(name, "ws");
+                assert!(branch.is_empty(), "a blank branch means fork a new one");
+            }
+            _ => panic!("expected SubmitWorkspace"),
+        }
+    }
+
+    #[test]
+    fn add_workspace_empty_name_is_rejected() {
+        let mut modal = add_workspace_modal();
+        // Type only into the branch field, leaving the name blank.
+        handle_modal_key(&mut modal, key(KeyCode::Tab));
+        handle_modal_key(&mut modal, key(KeyCode::Char('x')));
+        assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Enter)), ModalResult::Consumed));
+        assert!(matches!(modal, ModalState::AddWorkspace { error: Some(_), .. }), "stays open with an error");
+    }
 }
