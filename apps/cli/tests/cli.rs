@@ -116,6 +116,49 @@ fn open_pr_prints_the_url() {
 }
 
 #[test]
+fn workspace_create_from_an_existing_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("a.txt"), "1").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "init"]);
+    run_git(&repo, &["branch", "feat/login"]); // an existing branch to adopt
+
+    let add = kmd(&state_dir, &[], &["repo", "add", repo.to_str().unwrap()]);
+    assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+
+    let out = kmd(
+        &state_dir,
+        &[],
+        &["workspace", "create", "--repo", repo.to_str().unwrap(), "--branch", "feat/login"],
+    );
+    assert!(out.status.success(), "create --branch: {}", String::from_utf8_lossy(&out.stderr));
+
+    // The workspace adopted feat/login (not a fresh kommand0/ branch).
+    let status = kmd(&state_dir, &[], &["workspace", "status"]);
+    assert!(stdout(&status).contains("feat/login"), "shows the adopted branch: {}", stdout(&status));
+
+    // --branch with --no-worktree is a clear error.
+    let bad = kmd(
+        &state_dir,
+        &[],
+        &["workspace", "create", "x", "--repo", repo.to_str().unwrap(), "--branch", "feat/login", "--no-worktree"],
+    );
+    assert!(!bad.status.success(), "conflicting flags should fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("can't be combined"),
+        "clear error: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+#[test]
 fn cleanup_removes_a_merged_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());

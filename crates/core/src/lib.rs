@@ -495,7 +495,7 @@ impl AppState {
         repo_ref: &str,
         base: &Path,
     ) -> anyhow::Result<Workspace> {
-        self.create_workspace_impl(name, repo_ref, base, true)
+        self.create_workspace_impl(name, repo_ref, base, true, None)
     }
 
     /// Create a workspace, optionally skipping worktree creation.
@@ -506,7 +506,31 @@ impl AppState {
         base: &Path,
         use_worktree: bool,
     ) -> anyhow::Result<Workspace> {
-        self.create_workspace_impl(name, repo_ref, base, use_worktree)
+        self.create_workspace_impl(name, repo_ref, base, use_worktree, None)
+    }
+
+    /// Create a workspace whose worktree checks out an EXISTING branch (local or
+    /// a remote `origin/…` ref) instead of forking a new one. The name defaults
+    /// to a path-safe form of the branch when omitted.
+    pub fn create_workspace_from_branch(
+        &mut self,
+        name: Option<&str>,
+        repo_ref: &str,
+        branch: &str,
+    ) -> anyhow::Result<Workspace> {
+        self.create_workspace_from_branch_with_base(name, repo_ref, Self::state_dir().as_path(), branch)
+    }
+
+    /// [`create_workspace_from_branch`](Self::create_workspace_from_branch) with an
+    /// explicit base dir (for tests).
+    pub fn create_workspace_from_branch_with_base(
+        &mut self,
+        name: Option<&str>,
+        repo_ref: &str,
+        base: &Path,
+        branch: &str,
+    ) -> anyhow::Result<Workspace> {
+        self.create_workspace_impl(name, repo_ref, base, true, Some(branch))
     }
 
     fn create_workspace_impl(
@@ -515,12 +539,18 @@ impl AppState {
         repo_ref: &str,
         base: &Path,
         use_worktree: bool,
+        from_branch: Option<&str>,
     ) -> anyhow::Result<Workspace> {
         let repo = self.resolve_repo(repo_ref)?.clone();
 
         let ws_name = match name {
             Some(n) => n.to_string(),
-            None => repo.name.clone(),
+            // Default the name from the branch when checking one out (path-safe:
+            // drop a leading `origin/`, then `/` -> `-`), else from the repo.
+            None => match from_branch {
+                Some(b) => b.strip_prefix("origin/").unwrap_or(b).replace('/', "-"),
+                None => repo.name.clone(),
+            },
         };
 
         // The name becomes a path segment under `worktrees/` and a branch suffix,
@@ -548,17 +578,28 @@ impl AppState {
             .expect("time went backwards")
             .as_secs();
 
-        // Try to create a git worktree
-        let (working_dir, worktree_path, branch_name) = if use_worktree {
-            match worktree::create_worktree(&repo.path, &ws_name, base) {
-                worktree::WorktreeResult::Created {
-                    worktree_path,
-                    branch_name,
-                } => (worktree_path.clone(), Some(worktree_path), Some(branch_name)),
-                worktree::WorktreeResult::Fallback { reason: _ } => (repo.path.clone(), None, None),
+        // Create a git worktree: on an existing branch if one was requested, else
+        // on a fresh `kommand0/<name>` branch.
+        let (working_dir, worktree_path, branch_name) = if !use_worktree {
+            (repo.path.clone(), None, None)
+        } else if let Some(branch_ref) = from_branch {
+            match worktree::create_worktree_from_branch(&repo.path, &ws_name, base, branch_ref) {
+                worktree::WorktreeResult::Created { worktree_path, branch_name } => {
+                    (worktree_path.clone(), Some(worktree_path), Some(branch_name))
+                }
+                // An explicit branch request that can't be satisfied is an error,
+                // not a silent fall back to the repo root.
+                worktree::WorktreeResult::Fallback { reason } => {
+                    bail!("couldn't check out branch {branch_ref:?}: {reason}");
+                }
             }
         } else {
-            (repo.path.clone(), None, None)
+            match worktree::create_worktree(&repo.path, &ws_name, base) {
+                worktree::WorktreeResult::Created { worktree_path, branch_name } => {
+                    (worktree_path.clone(), Some(worktree_path), Some(branch_name))
+                }
+                worktree::WorktreeResult::Fallback { reason: _ } => (repo.path.clone(), None, None),
+            }
         };
 
         let ws = Workspace {
@@ -876,6 +917,44 @@ mod tests {
         let ids: std::collections::HashSet<&str> =
             on_disk.workspaces.iter().map(|w| w.id.as_str()).collect();
         assert!(ids.contains("cli") && ids.contains("tui"), "both survive the save: {ids:?}");
+    }
+
+    #[test]
+    fn create_workspace_from_branch_defaults_name_and_adopts_the_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&repo_dir).output().unwrap()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "--allow-empty", "-m", "init"]);
+        git(&["branch", "feat/login"]);
+
+        let base = tmp.path().join("base");
+        let mut state = AppState {
+            repos: vec![RepoEntry {
+                id: "r".into(),
+                name: "repo".into(),
+                path: repo_dir.to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        };
+
+        let ws = state.create_workspace_from_branch_with_base(None, "r", &base, "feat/login").unwrap();
+        assert_eq!(ws.name, "feat-login", "name defaults to a path-safe form of the branch");
+        assert_eq!(
+            ws.branch_name.as_deref(),
+            Some("feat/login"),
+            "adopts the existing branch (so cleanup, which only deletes kommand0/, won't remove it)"
+        );
+        assert!(ws.worktree_path.is_some());
+
+        // A branch that doesn't exist is an error, not a silent repo-root fallback.
+        let err = state.create_workspace_from_branch_with_base(None, "r", &base, "ghost").unwrap_err();
+        assert!(err.to_string().contains("couldn't check out branch"), "got: {err}");
     }
 
     #[test]

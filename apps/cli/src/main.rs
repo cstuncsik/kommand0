@@ -56,11 +56,15 @@ enum RepoAction {
 enum WorkspaceAction {
     /// Create a new workspace
     Create {
-        /// Workspace name (auto-generated from repo name if omitted)
+        /// Workspace name (auto-generated from the repo or branch if omitted)
         name: Option<String>,
         /// Repo reference (name, path, or ID)
         #[arg(long)]
         repo: String,
+        /// Check out an EXISTING branch (local, or a remote `origin/…` ref)
+        /// instead of forking a new one
+        #[arg(long)]
+        branch: Option<String>,
         /// Skip git worktree creation (use repo root as working directory)
         #[arg(long)]
         no_worktree: bool,
@@ -233,17 +237,22 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name, repo, no_worktree } => {
+            WorkspaceAction::Create { name, repo, branch, no_worktree } => {
                 let mut state = AppState::load()?;
-                let ws = if no_worktree {
-                    state.create_workspace_with_options(
+                let ws = match (branch, no_worktree) {
+                    (Some(_), true) => {
+                        anyhow::bail!("--branch and --no-worktree can't be combined")
+                    }
+                    (Some(b), false) => {
+                        state.create_workspace_from_branch(name.as_deref(), &repo, &b)?
+                    }
+                    (None, true) => state.create_workspace_with_options(
                         name.as_deref(),
                         &repo,
                         AppState::state_dir().as_path(),
                         false,
-                    )?
-                } else {
-                    state.create_workspace(name.as_deref(), &repo)?
+                    )?,
+                    (None, false) => state.create_workspace(name.as_deref(), &repo)?,
                 };
                 let repo_name = state
                     .repos

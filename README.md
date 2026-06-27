@@ -71,7 +71,7 @@ kmd repo list
 kmd repo delete <name-or-path> [--force]
 
 # Workspaces
-kmd workspace create --repo <name-or-path>
+kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>]
 kmd workspace list [--all] [--repo <name>]
 kmd workspace show <name>
 kmd workspace status [<name>]          # git branch / ahead-behind / dirty
