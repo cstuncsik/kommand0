@@ -5,6 +5,23 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Mouse clicks select the right workspace once the tree scrolls** — a tree
+  click ignored the list scroll offset, so on a long tree it selected a
+  workspace several rows off (and disagreed with the icon click targets, which
+  already accounted for the offset).
+- **Selection no longer strands on a hint row after cleanup/delete** — those
+  paths now re-seat the selection and re-sync the active session like the
+  keyboard delete paths, instead of a raw clamp that could land on a
+  non-selectable hint row.
+- **Unsafe workspace names are rejected** — a name with a path separator,
+  `.`/`..`, a leading dash, or that's empty is refused at creation instead of
+  escaping the worktrees directory.
+- **The `Ctrl+A` prefix no longer leaks across a mouse-leave** — clicking out of
+  the embedded pane clears a half-typed prefix so the next keystroke isn't
+  misread as a tab command.
+
 ## [0.1.9] - 2026-06-26
 
 ### Added

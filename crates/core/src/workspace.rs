@@ -76,6 +76,25 @@ mod tests {
     }
 
     #[test]
+    fn create_workspace_rejects_unsafe_names() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, _) = make_state_with_repo(&tmp);
+        // Names that would escape the worktrees dir or trip git arg parsing.
+        for bad in ["", "   ", ".", "..", "../escape", "a/b", "a\\b", "-rf"] {
+            let err = state
+                .create_workspace_with_base(Some(bad), "myapp", tmp.path())
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid workspace name"),
+                "{bad:?} should be rejected, got: {err}"
+            );
+        }
+        // A dot or internal dash in an otherwise plain name is still fine.
+        assert!(state.create_workspace_with_base(Some("feat.v2"), "myapp", tmp.path()).is_ok());
+        assert!(state.create_workspace_with_base(Some("my-feature"), "myapp", tmp.path()).is_ok());
+    }
+
+    #[test]
     fn create_workspace_unknown_repo_error() {
         let tmp = TempDir::new().unwrap();
         let mut state = AppState::default();

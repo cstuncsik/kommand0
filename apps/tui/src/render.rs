@@ -414,8 +414,11 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
         frame.render_stateful_widget(list, area, &mut list_state);
 
-        // Register hit regions using scroll offset from rendered list state
+        // Register hit regions using scroll offset from rendered list state.
+        // Stash it so mouse clicks (handled outside render) map a viewport row
+        // back to the right tree_items index once the list has scrolled.
         let scroll_offset = list_state.offset();
+        app.tree_scroll_offset = scroll_offset;
         let all_icons: Vec<&(usize, IconCluster)> =
             workspace_icons.iter().chain(repo_icons.iter()).collect();
         for (item_idx, icons) in all_icons {

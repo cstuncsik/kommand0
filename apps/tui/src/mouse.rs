@@ -45,9 +45,15 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
 
     if contains(areas.tree, col, row) {
         app.focus = super::Focus::Tree;
+        // Leaving the embedded pane by click must not carry a half-typed Ctrl+A
+        // prefix into the next session (it would mis-fire the next keystroke).
+        app.embedded_prefix = false;
 
-        // Calculate which tree item was clicked
-        let item_row = (row.saturating_sub(areas.tree.y + 1)) as usize; // +1 for border
+        // Map the clicked viewport row to a tree_items index. The click row is
+        // relative to the visible top, but the list scrolls, so add the offset
+        // recorded at render time (the icon hit regions use the same offset).
+        let viewport_row = row.saturating_sub(areas.tree.y + 1) as usize; // +1 for border
+        let item_row = viewport_row + app.tree_scroll_offset;
         if item_row < app.tree_items.len() {
             // Don't select hint nodes
             if !app.is_hint(item_row) {
