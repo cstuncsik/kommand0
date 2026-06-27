@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Jump to the next waiting workspace** — press `n` (or `N` for the previous) in
+  the tree to jump to and open the next workspace flagged "needs you" (the
+  magenta dot / "N waiting"), wrapping. Pairs with attention notifications: hear
+  the bell, press `n`, land on the session that came back. Rebindable as
+  `next-waiting` / `prev-waiting`.
+
 ## [0.2.0] - 2026-06-27
 
 First minor release — a maturity marker that promotes the stabilized 0.1.x line.
