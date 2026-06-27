@@ -1885,14 +1885,20 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     }
                 }
             }
-            modal::ModalResult::SubmitWorkspace(repo_id, name) => {
+            modal::ModalResult::SubmitWorkspace(repo_id, name, branch) => {
                 let repo_name = app
                     .repos
                     .iter()
                     .find(|r| r.id == repo_id)
                     .map(|r| r.name.clone())
                     .unwrap_or_default();
-                match app.state.create_workspace(Some(&name), &repo_name) {
+                // A branch checks out an existing one; blank forks a new branch.
+                let result = if branch.is_empty() {
+                    app.state.create_workspace(Some(&name), &repo_name)
+                } else {
+                    app.state.create_workspace_from_branch(Some(&name), &repo_name, &branch)
+                };
+                match result {
                     Ok(_) => {
                         app.workspaces = app.state.workspaces.clone();
                         // Auto-expand the repo
@@ -1902,11 +1908,15 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         app.request_branch_status_refresh();
                     }
                     Err(e) => {
+                        // Reopen with both fields kept so the user can fix it.
                         app.modal = modal::ModalState::AddWorkspace {
                             repo_id,
                             repo_name,
                             input: name,
                             cursor: 0,
+                            branch,
+                            branch_cursor: 0,
+                            field: modal::AddWorkspaceField::Name,
                             error: Some(e.to_string()),
                         };
                     }
@@ -2127,6 +2137,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             repo_name,
                             input: String::new(),
                             cursor: 0,
+                            branch: String::new(),
+                            branch_cursor: 0,
+                            field: modal::AddWorkspaceField::Name,
                             error: None,
                         };
                     }
@@ -2601,6 +2614,9 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                                     repo_name: repo.name,
                                     input: String::new(),
                                     cursor: 0,
+                                    branch: String::new(),
+                                    branch_cursor: 0,
+                                    field: modal::AddWorkspaceField::Name,
                                     error: None,
                                 };
                             }
@@ -3290,6 +3306,22 @@ mod key_tests {
             error: None,
             completions: Vec::new(),
             completion_index: None,
+        };
+        insta::assert_snapshot!(render_to_string(&mut app, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn snapshot_add_workspace_modal() {
+        let mut app = test_app();
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "r1".to_string(),
+            repo_name: "demo".to_string(),
+            input: "review".to_string(),
+            cursor: "review".len(),
+            branch: "origin/feat/x".to_string(),
+            branch_cursor: "origin/feat/x".len(),
+            field: modal::AddWorkspaceField::Branch,
+            error: None,
         };
         insta::assert_snapshot!(render_to_string(&mut app, 100, 30));
     }
