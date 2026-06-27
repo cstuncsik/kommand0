@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AppState {
     pub repos: Vec<RepoEntry>,
     #[serde(default)]
@@ -180,6 +180,94 @@ impl AppState {
     /// Save state to the default state directory.
     pub fn save(&self) -> anyhow::Result<()> {
         self.save_to(Self::state_dir().as_path())
+    }
+
+    /// Reload the on-disk state, merge ours over it relative to `baseline`, and
+    /// write the result atomically — so a `kmd` command that changed `state.json`
+    /// while the TUI was open isn't clobbered on the next save. Best-effort: if
+    /// the on-disk file can't be reloaded (corrupt), write ours rather than fail.
+    pub fn merge_save_to(&self, baseline: &AppState, base: &Path) -> anyhow::Result<()> {
+        let merged = match Self::load_from(base) {
+            Ok(disk) => self.merged_over(baseline, disk),
+            Err(_) => self.clone(),
+        };
+        merged.save_to(base)
+    }
+
+    /// [`merge_save_to`](Self::merge_save_to) against the default state dir.
+    pub fn merge_save(&self, baseline: &AppState) -> anyhow::Result<()> {
+        self.merge_save_to(baseline, Self::state_dir().as_path())
+    }
+
+    /// 3-way merge: this in-memory state ("mine") over the current `disk` state,
+    /// relative to the `baseline` we loaded. Start from `disk` (so entries a
+    /// concurrent CLI added survive), drop entries we deleted since `baseline`,
+    /// and let our copy win for entries we still hold ("mine wins on conflict").
+    /// We do NOT adopt the result in memory — it only protects the on-disk file
+    /// from being overwritten; CLI-added rows appear in the TUI on its next load.
+    ///
+    /// Scope: this protects concurrent CLI *adds* and *deletes*. A CLI *in-place
+    /// edit* to a row the TUI also holds is still lost on the TUI's next save —
+    /// there's no per-field/version comparison, and "mine wins" overwrites it.
+    pub fn merged_over(&self, baseline: &AppState, disk: AppState) -> AppState {
+        use std::collections::HashSet;
+
+        // Keep disk entries we neither hold nor deleted-since-baseline, then
+        // append ours (so ours wins for ids present in both).
+        fn merge_vec<T: Clone>(
+            mine: &[T],
+            baseline: &[T],
+            disk: Vec<T>,
+            id: impl Fn(&T) -> &str,
+        ) -> Vec<T> {
+            let mine_ids: HashSet<&str> = mine.iter().map(&id).collect();
+            let deleted: HashSet<&str> =
+                baseline.iter().map(&id).filter(|i| !mine_ids.contains(i)).collect();
+            let mut out: Vec<T> = disk
+                .into_iter()
+                .filter(|d| {
+                    let i = id(d);
+                    !mine_ids.contains(i) && !deleted.contains(i)
+                })
+                .collect();
+            out.extend(mine.iter().cloned());
+            out
+        }
+
+        fn merge_map<V: Clone>(
+            mine: &HashMap<String, V>,
+            baseline: &HashMap<String, V>,
+            disk: HashMap<String, V>,
+        ) -> HashMap<String, V> {
+            let deleted: HashSet<&str> =
+                baseline.keys().map(|k| k.as_str()).filter(|k| !mine.contains_key(*k)).collect();
+            let mut out: HashMap<String, V> = disk
+                .into_iter()
+                .filter(|(k, _)| !mine.contains_key(k) && !deleted.contains(k.as_str()))
+                .collect();
+            for (k, v) in mine {
+                out.insert(k.clone(), v.clone());
+            }
+            out
+        }
+
+        AppState {
+            repos: merge_vec(&self.repos, &baseline.repos, disk.repos, |r| r.id.as_str()),
+            workspaces: merge_vec(&self.workspaces, &baseline.workspaces, disk.workspaces, |w| {
+                w.id.as_str()
+            }),
+            sessions: merge_vec(&self.sessions, &baseline.sessions, disk.sessions, |s| s.id.as_str()),
+            embedded_sessions: merge_map(
+                &self.embedded_sessions,
+                &baseline.embedded_sessions,
+                disk.embedded_sessions,
+            ),
+            embedded_titles: merge_map(
+                &self.embedded_titles,
+                &baseline.embedded_titles,
+                disk.embedded_titles,
+            ),
+        }
     }
 
     /// A fresh Claude session id (UUID v4) to assign to a new embedded session.
@@ -715,6 +803,80 @@ impl AppState {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn ws(id: &str, name: &str) -> Workspace {
+        Workspace {
+            id: id.into(),
+            name: name.into(),
+            repo_id: "r".into(),
+            working_dir: "/tmp".into(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+            branch_name: None,
+        }
+    }
+
+    #[test]
+    fn merge_preserves_cli_adds_and_respects_tui_deletes() {
+        // baseline = what the TUI loaded; mine = TUI's in-memory state (deleted B,
+        // added C); disk = the file now (a CLI added D; B not yet deleted on disk).
+        let baseline = AppState { workspaces: vec![ws("A", "a"), ws("B", "b")], ..Default::default() };
+        let mine = AppState { workspaces: vec![ws("A", "a"), ws("C", "c")], ..Default::default() };
+        let disk =
+            AppState { workspaces: vec![ws("A", "a"), ws("B", "b"), ws("D", "d")], ..Default::default() };
+
+        let merged = mine.merged_over(&baseline, disk);
+        let ids: std::collections::HashSet<&str> =
+            merged.workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert!(ids.contains("A"), "untouched entry kept");
+        assert!(!ids.contains("B"), "a TUI delete wins over the disk copy");
+        assert!(ids.contains("C"), "a TUI add is present");
+        assert!(ids.contains("D"), "a concurrent CLI add survives");
+        assert_eq!(merged.workspaces.len(), 3);
+    }
+
+    #[test]
+    fn merge_lets_mine_win_on_a_conflicting_edit() {
+        let baseline = AppState { workspaces: vec![ws("A", "v1")], ..Default::default() };
+        let mine = AppState { workspaces: vec![ws("A", "mine")], ..Default::default() };
+        let disk = AppState { workspaces: vec![ws("A", "disk")], ..Default::default() };
+        let merged = mine.merged_over(&baseline, disk);
+        assert_eq!(merged.workspaces.len(), 1);
+        assert_eq!(merged.workspaces[0].name, "mine", "in-memory copy wins for a shared id");
+    }
+
+    #[test]
+    fn merge_applies_the_same_rules_to_maps() {
+        let mk = |pairs: &[(&str, &str)]| -> HashMap<String, Vec<String>> {
+            pairs.iter().map(|(k, v)| (k.to_string(), vec![v.to_string()])).collect()
+        };
+        let baseline = AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b")]), ..Default::default() };
+        // TUI deleted B and re-tabbed A; a CLI added C.
+        let mine = AppState { embedded_sessions: mk(&[("A", "a2")]), ..Default::default() };
+        let disk =
+            AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b"), ("C", "c")]), ..Default::default() };
+        let merged = mine.merged_over(&baseline, disk);
+        assert_eq!(merged.embedded_sessions.get("A").unwrap(), &vec!["a2".to_string()], "mine wins");
+        assert!(!merged.embedded_sessions.contains_key("B"), "TUI delete respected");
+        assert!(merged.embedded_sessions.contains_key("C"), "CLI add preserved");
+    }
+
+    #[test]
+    fn merge_save_reloads_and_preserves_a_concurrent_add() {
+        let tmp = TempDir::new().unwrap();
+        // Disk already has a workspace the TUI never saw (a CLI added it).
+        let disk = AppState { workspaces: vec![ws("cli", "from-cli")], ..Default::default() };
+        disk.save_to(tmp.path()).unwrap();
+        // The TUI loaded an empty baseline, created its own workspace, and saves.
+        let baseline = AppState::default();
+        let mine = AppState { workspaces: vec![ws("tui", "from-tui")], ..Default::default() };
+        mine.merge_save_to(&baseline, tmp.path()).unwrap();
+        let on_disk = AppState::load_from(tmp.path()).unwrap();
+        let ids: std::collections::HashSet<&str> =
+            on_disk.workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert!(ids.contains("cli") && ids.contains("tui"), "both survive the save: {ids:?}");
+    }
 
     #[test]
     fn load_from_returns_default_when_no_file() {

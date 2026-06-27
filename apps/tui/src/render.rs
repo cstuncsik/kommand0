@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -972,9 +972,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         ));
     }
 
-    let paragraph = Paragraph::new(right_content)
-        .wrap(Wrap { trim: true })
-        .block(
+    // No wrap: the clickable button hit-regions below are positioned by logical
+    // line count, so each line must occupy exactly one row (a wrapped line would
+    // push the rendered buttons below their hit region). Value lines (Path, etc.)
+    // are already truncated to fit; a rare over-long line clips instead.
+    let paragraph = Paragraph::new(right_content).block(
             Block::default()
                 .title(right_title)
                 .borders(Borders::ALL)
