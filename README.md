@@ -112,7 +112,7 @@ cargo run -p kommand0-tui   # from a checkout
 
 - **Two-pane layout**: Tree (repos/workspaces) on the left; the embedded Claude pane or workspace details on the right
 - **Embedded Claude**: opening a workspace launches a real interactive `claude` in a pseudo-terminal, composited into the right pane — full fidelity (its own input box, slash commands, `/model`, colours), not a reimplemented chat UI
-- **Session tabs**: a workspace can run several Claude sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click, open a new one with `Ctrl+A c` or the `[+]` tab (up to 9). Each tab persists its own session and resumes on reopen
+- **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9). Open a new **Claude** tab with `Ctrl+A c` (or the `[+]` tab), or a **shell** tab with `Ctrl+A s` — a `$SHELL` session in the worktree, for running anything (codex, lazygit, or `tmux`/`zellij` for splits inside the pane). Shell tabs are marked `$` and are ephemeral; Claude tabs persist their session and resume on reopen
 - **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items and scroll the tree; inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead
@@ -144,7 +144,8 @@ cargo run -p kommand0-tui   # from a checkout
 | `w` | Tree | Add workspace to selected repo (modal) |
 | `d` / `D` | Tree | Delete / force-delete selected |
 | _typing_ | Embedded | Goes straight to the embedded Claude |
-| `Ctrl+A` then `c` | Embedded | New session tab |
+| `Ctrl+A` then `c` | Embedded | New Claude session tab |
+| `Ctrl+A` then `s` | Embedded | New shell tab (`$SHELL` / `shell` config; ephemeral) |
 | `Ctrl+A` then `[` / `]` | Embedded | Previous / next tab |
 | `Ctrl+A` then `1`–`9` | Embedded | Jump to tab N |
 | `Ctrl+A` then `x` | Embedded | Close the active tab |
@@ -194,7 +195,8 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
   "keybindings": { "quit": ["ctrl+q"], "open": ["o"] },
   "theme": "high-contrast",
   "theme_colors": { "accent": "blue", "attention": "#ff8800" },
-  "notify": "bell"
+  "notify": "bell",
+  "shell": "zsh"
 }
 ```
 
@@ -205,6 +207,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `theme` — a built-in palette for the app chrome: `"default"` or `"high-contrast"` (the embedded `claude` pane keeps its own colours either way). Unknown names warn and fall back to default.
 - `theme_colors` — per-role overrides applied on top of `theme`: `"<role>": "<color>"`. Roles: `accent`, `selected`, `active`, `attention`, `dirty`, `error`, `muted`, `text`, `inverse`. Colors: a named color (`cyan`, `light-red`, `darkgray`), an `#rrggbb` hex, a 0–255 palette index, or `reset`/`default` (the terminal's own default color — not the role's built-in). Unknown roles / unparseable colors are warned (tree border + log), not fatal.
 - `notify` — alert when a backgrounded session goes quiet with unseen output (the same "needs you" edge as the magenta dot): `"off"` (default), `"bell"` (terminal bell), `"desktop"` (an OS notification — `osascript` on macOS, `notify-send` on Linux; silently skipped if unavailable), or `"both"`. Fires once per rising edge (the latch means it won't repeat until you view the session and it comes back). Unknown values warn and fall back to `off`.
+- `shell` — command for a shell session tab (`Ctrl+A s`); defaults to `$SHELL`, then `/bin/sh`. Can be any command — e.g. `"tmux"` to open a tmux session (with its own splits) directly. The `KOMMAND0_SHELL` env var takes precedence.
 
 The config is read once at startup, so edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border.
 

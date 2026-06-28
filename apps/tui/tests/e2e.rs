@@ -546,6 +546,35 @@ fn embedded_prefix_q_quits_directly() {
 }
 
 #[test]
+fn ctrl_a_s_opens_a_shell_tab() {
+    // The "shell" is the embed-stub too (via KOMMAND0_SHELL), so the new tab is
+    // deterministic and needs no real $SHELL.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[("KOMMAND0_CLAUDE_BIN", "embed-stub"), ("KOMMAND0_SHELL", "embed-stub")],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY"); // Claude tab (1)
+
+    // Ctrl+A s opens a shell tab; the tab strip marks it with `$`.
+    tui.send("\x01");
+    tui.send("s");
+    tui.wait_for("2$"); // a second, shell-marked tab
+
+    tui.send("\x01");
+    tui.send("t");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn enter_opens_embedded_claude_by_default() {
     // Phase 3: opening a workspace (Enter) launches the embedded claude — no more
     // old stream output+composer.

@@ -126,6 +126,17 @@ fn pick_claude_bin(env_bin: Option<String>, config_bin: Option<&str>) -> String 
         .unwrap_or_else(|| "claude".to_string())
 }
 
+/// The command for a shell tab: the configured `shell`, else `$SHELL`, else
+/// `/bin/sh`. The `KOMMAND0_SHELL` env var takes precedence (used by tests).
+fn pick_shell(config_shell: Option<&str>) -> String {
+    std::env::var("KOMMAND0_SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| config_shell.filter(|s| !s.is_empty()).map(str::to_string))
+        .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
 /// Whether an exited embedded pane looks like a failed `--resume` (the Claude
 /// session was purged): it was resumed, died within the window, and exited with
 /// a non-zero code (a clean `/exit` is code 0 and must not trip this).
@@ -201,12 +212,22 @@ pub(crate) enum TreeNode {
 
 /// One Claude session tab within a workspace: a live PTY pane plus the metadata
 /// to persist/resume it and to detect a failed resume.
+/// What a session tab runs. Claude tabs persist + resume across restarts; shell
+/// tabs are ephemeral (a fresh `$SHELL`, gone on quit — nothing to resume).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabKind {
+    Claude,
+    Shell,
+}
+
 pub(crate) struct SessionTab {
-    /// Claude session id (UUID) — also the stable key for activity tracking.
+    /// Claude session id (UUID) for a Claude tab, else a generated id — the
+    /// stable key for activity tracking either way.
     pub(crate) id: String,
     pub(crate) pane: pane::Pane,
     was_resume: bool,
     spawned: Instant,
+    pub(crate) kind: TabKind,
 }
 
 /// A workspace's open session tabs (tab order = creation order) and the active
@@ -743,16 +764,6 @@ impl App {
             std::env::var("KOMMAND0_CLAUDE_BIN").ok(),
             self.config.claude_bin.as_deref(),
         );
-        let wake: Option<Box<dyn Fn() + Send>> = self.embedded_wake.clone().map(|tx| {
-            Box::new(move || {
-                let _ = tx.send(());
-            }) as Box<dyn Fn() + Send>
-        });
-        // Spawn at the pane's final inner size so the first render needs no resize
-        // (claude drops its first screen on a SIGWINCH mid-render).
-        let inner = pane_content_rect(self.right_pane_area);
-        let rows = if inner.height > 0 { inner.height } else { 24 };
-        let cols = if inner.width > 0 { inner.width } else { 80 };
         let (mut args, new_id) = claude_args(resume_id);
         // Append the user's configured passthrough args (e.g. `--model sonnet`).
         args.extend(self.config.claude_args.iter().cloned());
@@ -761,15 +772,30 @@ impl App {
             .map(String::from)
             .unwrap_or_else(|| new_id.unwrap());
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let pane = pane::Pane::spawn_with_wake(
-            &bin,
-            &arg_refs,
-            std::path::Path::new(ws_dir),
-            rows,
-            cols,
-            wake,
-        )?;
+        let pane = self.spawn_pane_cmd(ws_dir, &bin, &arg_refs)?;
         Ok((pane, session_id, was_resume))
+    }
+
+    /// Spawn a pane running `bin args` in `ws_dir`, sized to the content area and
+    /// wired to the repaint waker. The generic core of both Claude and shell tabs.
+    fn spawn_pane_cmd(&self, ws_dir: &str, bin: &str, args: &[&str]) -> anyhow::Result<pane::Pane> {
+        let wake: Option<Box<dyn Fn() + Send>> = self.embedded_wake.clone().map(|tx| {
+            Box::new(move || {
+                let _ = tx.send(());
+            }) as Box<dyn Fn() + Send>
+        });
+        // Spawn at the pane's final inner size so the first render needs no resize
+        // (a TUI child drops its first screen on a SIGWINCH mid-render).
+        let inner = pane_content_rect(self.right_pane_area);
+        let rows = if inner.height > 0 { inner.height } else { 24 };
+        let cols = if inner.width > 0 { inner.width } else { 80 };
+        pane::Pane::spawn_with_wake(bin, args, std::path::Path::new(ws_dir), rows, cols, wake)
+    }
+
+    /// Spawn a shell pane (`$SHELL`, or the configured `shell`) in `ws_dir`.
+    fn spawn_shell_pane(&self, ws_dir: &str) -> anyhow::Result<pane::Pane> {
+        let shell = pick_shell(self.config.shell.as_deref());
+        self.spawn_pane_cmd(ws_dir, &shell, &[])
     }
 
     /// Spawn one Claude session (a tab) for a workspace and append it. `resume_id`
@@ -805,6 +831,7 @@ impl App {
                         pane,
                         was_resume,
                         spawned: Instant::now(),
+                        kind: TabKind::Claude,
                     });
                 true
             }
@@ -850,6 +877,7 @@ impl App {
                         pane,
                         was_resume,
                         spawned: now,
+                        kind: TabKind::Claude,
                     };
                 }
                 self.embed_error = Some((
@@ -1114,7 +1142,8 @@ impl App {
             };
             (tab_id, sessions.remove_tab(active))
         };
-        // Closing a tab forgets its session (it won't resume next time).
+        // Closing a tab forgets its session (it won't resume next time). A shell
+        // tab's id was never persisted, so this is a harmless no-op for it.
         self.state.remove_embedded_session(&ws_id, &tab_id);
         self.save_state();
         if now_empty {
@@ -1133,14 +1162,20 @@ impl App {
         let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
             return;
         };
-        let Some(session_id) = self
+        let Some((session_id, kind)) = self
             .embedded
             .get(&ws_id)
             .and_then(|s| s.active_tab())
-            .map(|t| t.id.clone())
+            .map(|t| (t.id.clone(), t.kind))
         else {
             return;
         };
+        // A shell tab is ephemeral, so its title isn't persisted — renaming would
+        // silently do nothing. Say so rather than open a dead-end modal.
+        if kind == TabKind::Shell {
+            self.embed_error = Some((ws_id, "Shell tabs can't be renamed.".to_string()));
+            return;
+        }
         let current = self
             .state
             .embedded_session_title(&ws_id, &session_id)
@@ -1174,6 +1209,40 @@ impl App {
         if self.spawn_session_tab(ws_id, &ws.working_dir, &ws.name, None) {
             self.focus = Focus::Embedded;
             self.embedded_prefix = false;
+        }
+    }
+
+    /// Open a new shell tab for a workspace — `$SHELL` (or the configured `shell`)
+    /// in the worktree. Ephemeral: a generated id, not persisted, never resumed.
+    fn new_shell_session(&mut self, ws_id: &str) {
+        self.select_workspace_row(ws_id);
+        let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
+        if count >= MAX_SESSION_TABS {
+            self.embed_error = Some((
+                ws_id.to_string(),
+                format!("Maximum {MAX_SESSION_TABS} session tabs reached."),
+            ));
+            return;
+        }
+        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
+            return;
+        };
+        match self.spawn_shell_pane(&ws.working_dir) {
+            Ok(pane) => {
+                self.embed_error = None;
+                self.embedded.entry(ws_id.to_string()).or_default().push(SessionTab {
+                    id: kommand0_core::generate_id(),
+                    pane,
+                    was_resume: false,
+                    spawned: Instant::now(),
+                    kind: TabKind::Shell,
+                });
+                self.focus = Focus::Embedded;
+                self.embedded_prefix = false;
+            }
+            Err(e) => {
+                self.embed_error = Some((ws_id.to_string(), format!("Failed to start shell: {e}")));
+            }
         }
     }
 
@@ -1740,6 +1809,13 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 KeyCode::Char('c') if !ctrl => {
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
                         app.new_session(&ws_id);
+                    }
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('s') if !ctrl => {
+                    // New shell tab ($SHELL / configured shell), ephemeral.
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.new_shell_session(&ws_id);
                     }
                     return Ok(KeyOutcome::Continue);
                 }
@@ -3074,6 +3150,55 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn new_shell_session_adds_an_ephemeral_shell_tab() {
+        let mut app = test_app();
+        app.config.shell = Some("sh".to_string()); // deterministic, not the real $SHELL
+        // Make sure the spawn cwd exists.
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+
+        app.new_shell_session("w1");
+        let s = app.embedded.get("w1").expect("a tab was opened");
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(s.tabs[0].kind, TabKind::Shell, "it's a shell tab");
+        assert_eq!(app.focus, Focus::Embedded);
+        // Ephemeral: a shell tab is NOT persisted for resume.
+        assert!(
+            app.state.embedded_session_ids("w1").is_empty(),
+            "shell tab must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_drops_an_exited_shell_tab_but_keeps_claude() {
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "claude-1"); // a persisted Claude session
+        let claude = tab("claude-1", &["-c", "sleep 30"]); // stays alive
+        let mut shell = tab("shell-1", &["-c", "exit 0"]); // exits immediately
+        shell.kind = TabKind::Shell;
+        let mut s = WorkspaceSessions { tabs: vec![claude, shell], active: 1 };
+        wait_exit(&mut s.tabs[1].pane);
+        app.embedded.insert("w1".to_string(), s);
+
+        app.reap_embedded(Instant::now());
+
+        let ids: Vec<String> = app
+            .embedded
+            .get("w1")
+            .map(|s| s.tabs.iter().map(|t| t.id.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(ids, vec!["claude-1".to_string()], "exited shell dropped, Claude kept");
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &["claude-1".to_string()],
+            "the persisted Claude id stays aligned"
+        );
+    }
+
+    #[tokio::test]
     async fn jump_to_waiting_is_a_noop_when_nothing_waits() {
         let mut app = test_app();
         app.expanded.insert("r1".to_string());
@@ -3942,6 +4067,7 @@ mod key_tests {
             pane: pane::Pane::spawn("sh", args, std::path::Path::new("/tmp"), 24, 80).unwrap(),
             was_resume: false,
             spawned: Instant::now(),
+            kind: TabKind::Claude,
         }
     }
 
@@ -4068,6 +4194,7 @@ mod key_tests {
                     .unwrap(),
                     was_resume: true,
                     spawned: Instant::now(),
+                    kind: TabKind::Claude,
                 },
                 tab("b", &["-c", "sleep 30"]),
             ],
