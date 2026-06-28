@@ -1,0 +1,21 @@
+README.md
+  s_164243679ec02c::t_5a93db6b29fdb8 188,193
+crates/core/src/worktree.rs
+  s_164243679ec02c::t_0fcc9af6e668f5 228-235,669-692
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "9c1e90b99bbe10885adca7bb4c06a6faee3827d7",
+  "prompts": {},
+  "sessions": {
+    "s_164243679ec02c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8eb123a-c396-4394-8625-f41817ed3acb",
+        "model": "unknown"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
