@@ -1417,8 +1417,10 @@ impl App {
         }
     }
 
-    /// Refresh `waiting_response` (the activity-spinner set) from per-session
-    /// output deltas across all tabs of all workspaces. Called every tick.
+    /// Refresh `waiting_response` (the activity-spinner set): output deltas
+    /// across all tabs via [`Self::apply_pane_activity`], then
+    /// [`Self::apply_shell_busy`] overrides shell tabs by their PTY foreground
+    /// process group. Called every tick.
     fn update_pane_activity(&mut self, now: Instant) {
         let seqs: Vec<(String, u64)> = self
             .embedded
@@ -1429,7 +1431,7 @@ impl App {
         // Shell tabs report activity by their PTY foreground process group (a
         // command is running), not output — so a silent build/server/`sleep`
         // still spins. Claude tabs keep the output-based signal above (claude
-        // streams while it works). `None` (can't tell) leaves the output result.
+        // streams while it works).
         let shell_busy: Vec<(String, Option<bool>)> = self
             .embedded
             .values()
@@ -1440,17 +1442,7 @@ impl App {
                     .map(|t| (t.id.clone(), t.pane.foreground_busy()))
             })
             .collect();
-        for (id, busy) in shell_busy {
-            match busy {
-                Some(true) => {
-                    self.waiting_response.insert(id);
-                }
-                Some(false) => {
-                    self.waiting_response.remove(&id);
-                }
-                None => {}
-            }
-        }
+        self.apply_shell_busy(&shell_busy);
         // Keep the on-screen session marked seen, then latch any others that went
         // quiet with unseen output. Order matters: clear before latching so the
         // session you're watching is never flagged.
@@ -1791,6 +1783,28 @@ impl App {
             .filter(|(_, until)| **until > now)
             .map(|(id, _)| id.clone())
             .collect();
+    }
+
+    /// Fold the shell-tab foreground-process signal into `waiting_response`,
+    /// after [`Self::apply_pane_activity`] has rebuilt it from output deltas.
+    /// `Some(true)` marks a shell busy even with no output (a silent
+    /// build/server/`sleep`), `Some(false)` clears it, and `None` ("can't tell")
+    /// leaves the output-based result untouched. Split out from
+    /// [`Self::update_pane_activity`] so the override is unit-testable without a
+    /// live PTY. Only touches `waiting_response` — never `attention`, so a
+    /// silently-busy shell spins without raising a "needs you" notification.
+    fn apply_shell_busy(&mut self, shell_busy: &[(String, Option<bool>)]) {
+        for (id, busy) in shell_busy {
+            match busy {
+                Some(true) => {
+                    self.waiting_response.insert(id.clone());
+                }
+                Some(false) => {
+                    self.waiting_response.remove(id);
+                }
+                None => {}
+            }
+        }
     }
 
     /// Get the selected workspace, if any
@@ -3659,6 +3673,63 @@ mod key_tests {
         assert!(app.pane_pending.is_empty());
         assert!(app.pane_active_until.is_empty());
         assert!(app.last_output_at.is_empty());
+    }
+
+    #[test]
+    fn apply_shell_busy_overrides_waiting_response_per_tristate() {
+        let mut app = test_app();
+
+        // `Some(true)` marks a shell tab active even with no output delta (the
+        // output-based pass never added it) — the whole point of the override.
+        app.apply_shell_busy(&[("sh1".to_string(), Some(true))]);
+        assert!(
+            app.waiting_response.contains("sh1"),
+            "a foreground-busy shell must spin even without output"
+        );
+
+        // `Some(false)` clears it (the command returned to the prompt).
+        app.apply_shell_busy(&[("sh1".to_string(), Some(false))]);
+        assert!(
+            !app.waiting_response.contains("sh1"),
+            "an idle shell must stop spinning"
+        );
+
+        // `None` ("can't tell") must leave the output-based result untouched —
+        // neither clearing an active tab nor adding an idle one.
+        app.waiting_response.insert("sh2".to_string());
+        app.apply_shell_busy(&[("sh2".to_string(), None), ("sh3".to_string(), None)]);
+        assert!(
+            app.waiting_response.contains("sh2"),
+            "None must not clear an output-active tab"
+        );
+        assert!(!app.waiting_response.contains("sh3"), "None must not add a tab");
+    }
+
+    #[test]
+    fn shell_busy_override_does_not_leak_into_attention() {
+        // A silently-busy shell spins (waiting_response) but must never raise the
+        // "needs you" flag: attention is output-based, the override is not. This
+        // guards the decoupling against a future refactor that reads
+        // `waiting_response` from the attention path.
+        let mut app = test_app();
+        let t = Instant::now();
+
+        // Force the shell busy with no output (its seq stays 0 — never produced).
+        app.apply_shell_busy(&[("sh1".to_string(), Some(true))]);
+        assert!(app.waiting_response.contains("sh1"), "shell shows active");
+
+        // Even well past the settle window, no output => no attention.
+        let later = t + Duration::from_millis(2000);
+        let newly = app.recompute_attention(later, &[("sh1".to_string(), 0)]);
+        assert!(
+            newly.is_empty(),
+            "a silently-busy shell fires no attention notification"
+        );
+        assert!(
+            !app.attention.contains("sh1"),
+            "no 'needs you' dot for a busy-but-silent shell"
+        );
+        assert!(app.waiting_response.contains("sh1"), "and it keeps spinning");
     }
 
     #[test]

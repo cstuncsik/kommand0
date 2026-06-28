@@ -213,11 +213,12 @@ impl Pane {
         let child_pid = self.child.process_id()? as i32;
         // The terminal's current foreground process group.
         let fg = self._master.process_group_leader()?;
-        // The child's own group. portable_pty `setsid`s the child, so its pgid
-        // equals its pid; `getpgid` is the robust read, with that as fallback.
+        // The child's own group via `getpgid`. If it can't be read (e.g. the
+        // child just exited), return `None` so the caller keeps the output-based
+        // signal rather than guessing a stale group as "busy".
         let child_pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(child_pid)))
-            .map(|p| p.as_raw())
-            .unwrap_or(child_pid);
+            .ok()?
+            .as_raw();
         Some(fg != child_pgid)
     }
 

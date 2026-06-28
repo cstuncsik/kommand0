@@ -1060,6 +1060,13 @@ pub(crate) fn workspace_icon_cluster(
         let prompt_glyph = if is_thinking {
             let spin = SPINNER_FRAMES[spinner_tick as usize % SPINNER_FRAMES.len()];
             if active_tabs >= 2 {
+                // The count must stay one digit to keep the glyph 2 cols (and the
+                // hit regions below aligned). Guaranteed by MAX_SESSION_TABS = 9;
+                // fail loudly in tests if that cap ever grows past a digit.
+                debug_assert!(
+                    active_tabs < 10,
+                    "active_tabs={active_tabs} would widen the count past one digit"
+                );
                 format!("{active_tabs}{spin}")
             } else {
                 format!(" {spin}")
