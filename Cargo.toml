@@ -26,6 +26,7 @@ nix = { version = "0.30", features = ["process", "signal"] }
 uuid = { version = "1", features = ["v4"] }
 unicode-width = "0.2"
 dirs = "6"
+glob = "0.3"
 portable-pty = "0.9.0"
 vt100 = "0.15"
 kommand0-core = { path = "crates/core" }
