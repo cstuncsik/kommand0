@@ -200,6 +200,28 @@ impl Pane {
         self.output_seq.load(Ordering::Relaxed)
     }
 
+    /// Whether a foreground command is running in this PTY: the terminal's
+    /// foreground process group differs from the child's own group. For a shell
+    /// this means a command is executing (build, server, `sleep`) — a *busy*
+    /// signal that holds even when the command produces no output, which the
+    /// output-based [`Self::output_seq`] activity check would miss.
+    ///
+    /// Returns `None` when it can't be determined (no child pid, or the platform
+    /// reports no foreground group), so callers can fall back to the
+    /// output-based signal rather than treat "unknown" as "idle".
+    pub fn foreground_busy(&self) -> Option<bool> {
+        let child_pid = self.child.process_id()? as i32;
+        // The terminal's current foreground process group.
+        let fg = self._master.process_group_leader()?;
+        // The child's own group via `getpgid`. If it can't be read (e.g. the
+        // child just exited), return `None` so the caller keeps the output-based
+        // signal rather than guessing a stale group as "busy".
+        let child_pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(child_pid)))
+            .ok()?
+            .as_raw();
+        Some(fg != child_pgid)
+    }
+
     /// Current emulated size (rows, cols).
     pub fn size(&self) -> (u16, u16) {
         (self.rows, self.cols)
@@ -723,6 +745,47 @@ mod tests {
         assert!(wait_until(&pane, "PANE-READY"), "screen:\n{}", pane.screen_contents());
         assert!(pane.output_seq() > 0);
         assert_eq!(pane.size(), (24, 80));
+    }
+
+    fn busy_within(pane: &Pane, want: Option<bool>, tries: u32) -> bool {
+        for _ in 0..tries {
+            if pane.foreground_busy() == want {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        pane.foreground_busy() == want
+    }
+
+    #[test]
+    fn foreground_busy_tracks_running_command() {
+        // An interactive shell enables job control, so a foreground command runs
+        // in its own process group — exactly what `foreground_busy` keys off.
+        let mut pane =
+            Pane::spawn("bash", &["--noprofile", "--norc", "-i"], &tmp(), 24, 80).unwrap();
+        // At the prompt the shell is the foreground group → idle.
+        assert!(
+            busy_within(&pane, Some(false), 60),
+            "idle at prompt, got {:?}\n{}",
+            pane.foreground_busy(),
+            pane.screen_contents()
+        );
+        // Run a command that produces no output: a pure foreground-process signal.
+        pane.send(b"sleep 3\n").unwrap();
+        assert!(
+            busy_within(&pane, Some(true), 60),
+            "busy while sleep runs, got {:?}\n{}",
+            pane.foreground_busy(),
+            pane.screen_contents()
+        );
+        // Command exits → control returns to the prompt → idle again.
+        assert!(
+            busy_within(&pane, Some(false), 120),
+            "idle after the command exits, got {:?}\n{}",
+            pane.foreground_busy(),
+            pane.screen_contents()
+        );
+        pane.kill();
     }
 
     #[test]

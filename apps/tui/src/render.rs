@@ -308,13 +308,13 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
                         // Build icon cluster from session state
                         let session = app.state.find_session_by_workspace(&ws.id);
-                        let is_thinking = app.ws_has_active_session(&ws.id);
+                        let active_tabs = app.ws_active_tab_count(&ws.id);
                         let is_expanded_narrow = app.expanded_icon_rows.contains(&ws.id);
                         let icons = workspace_icon_cluster(
                             th,
                             session,
                             &ws.id,
-                            is_thinking,
+                            active_tabs,
                             app.spinner_tick,
                             pane_inner_width,
                             is_expanded_narrow,
@@ -1014,12 +1014,15 @@ pub(crate) fn workspace_icon_cluster(
     th: Theme,
     session: Option<&kommand0_core::Session>,
     workspace_id: &str,
-    is_thinking: bool,
+    active_tabs: usize,
     spinner_tick: u8,
     pane_inner_width: usize,
     is_expanded_narrow: bool,
     embedded: bool,
 ) -> IconCluster {
+    // Any active tab animates the prompt into a spinner; two or more also show
+    // the count (see the embedded branch below).
+    let is_thinking = active_tabs > 0;
     let ws_id = workspace_id.to_string();
     let icon_style = Style::default().fg(th.accent);
     let delete_text = " \u{2715}".to_string(); // " ✕"
@@ -1050,10 +1053,24 @@ pub(crate) fn workspace_icon_cluster(
     if embedded {
         let prompt_text = " \u{276F}".to_string(); // " ❯"
         let stop_text = " \u{25A0}".to_string(); // " ■"
-        // While the pane is producing output, animate the prompt glyph into a
-        // spinner (same width, so the hit regions below are unaffected).
+        // While a pane is producing output, animate the prompt glyph into a
+        // spinner. With two or more active tabs the leading space becomes the
+        // count — width stays 2 cols (MAX_SESSION_TABS is 9, one digit), so the
+        // hit regions below are unaffected.
         let prompt_glyph = if is_thinking {
-            format!(" {}", SPINNER_FRAMES[spinner_tick as usize % SPINNER_FRAMES.len()])
+            let spin = SPINNER_FRAMES[spinner_tick as usize % SPINNER_FRAMES.len()];
+            if active_tabs >= 2 {
+                // The count must stay one digit to keep the glyph 2 cols (and the
+                // hit regions below aligned). Guaranteed by MAX_SESSION_TABS = 9;
+                // fail loudly in tests if that cap ever grows past a digit.
+                debug_assert!(
+                    active_tabs < 10,
+                    "active_tabs={active_tabs} would widen the count past one digit"
+                );
+                format!("{active_tabs}{spin}")
+            } else {
+                format!(" {spin}")
+            }
         } else {
             prompt_text.clone()
         };
@@ -1457,7 +1474,7 @@ mod tests {
 
     #[test]
     fn icon_cluster_no_session() {
-        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", 0, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // start + delete
         assert_eq!(cluster.hit_regions.len(), 2);
         assert_eq!(
@@ -1478,7 +1495,7 @@ mod tests {
     fn icon_cluster_embedded_overrides_no_session() {
         // A live embedded pane (no stream session) must show the running
         // prompt/stop/delete cluster, never the green "start" affordance.
-        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", false, 0, 40, false, true);
+        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", 0, 0, 40, false, true);
         assert_eq!(cluster.total_width, 6); // prompt + stop + delete
         assert_eq!(cluster.hit_regions.len(), 3);
         assert_eq!(
@@ -1504,14 +1521,14 @@ mod tests {
         // The live shipping path: an embedded pane that is producing output must
         // animate its prompt glyph into a spinner (the no-session/Running branches
         // below are unreachable now that the TUI creates no stream sessions).
-        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", /*is_thinking*/ true, 3, 40, false, true);
+        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", /*active_tabs*/ 1, 3, 40, false, true);
         let prompt = &cluster.spans[0].content;
         assert!(
             SPINNER_FRAMES.iter().any(|f| prompt.contains(f)),
             "active embedded pane should show a spinner, got: {prompt:?}"
         );
         // Idle embedded pane keeps the static prompt glyph.
-        let idle = workspace_icon_cluster(Theme::default(), None, "ws-1", false, 3, 40, false, true);
+        let idle = workspace_icon_cluster(Theme::default(), None, "ws-1", 0, 3, 40, false, true);
         assert!(
             idle.spans[0].content.contains('\u{276F}'),
             "idle embedded pane should show the ❯ prompt, got: {:?}",
@@ -1520,9 +1537,34 @@ mod tests {
     }
 
     #[test]
+    fn icon_cluster_multiple_active_tabs_shows_count() {
+        // Two or more active tabs: the spinner's leading space becomes the count,
+        // staying 2 cols so the hit regions are unaffected.
+        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", 3, 3, 40, false, true);
+        let prompt: &str = &cluster.spans[0].content;
+        assert!(prompt.contains('3'), "expected active-tab count, got {prompt:?}");
+        assert!(
+            SPINNER_FRAMES.iter().any(|f| prompt.contains(f)),
+            "still a spinner, got {prompt:?}"
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(prompt),
+            2,
+            "count + spinner must stay 2 cols, got {prompt:?}"
+        );
+        // A single active tab shows just the spinner — no count digit.
+        let one = workspace_icon_cluster(Theme::default(), None, "ws-1", 1, 3, 40, false, true);
+        assert!(
+            !one.spans[0].content.contains('1'),
+            "single active tab shows no count, got {:?}",
+            one.spans[0].content
+        );
+    }
+
+    #[test]
     fn icon_cluster_running_thinking_returns_spinner() {
         let session = make_session(SessionStatus::Running);
-        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", true, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", 1, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // spinner + delete
         // Should contain a braille spinner character
         let text = &cluster.spans[0].content;
@@ -1541,7 +1583,7 @@ mod tests {
     #[test]
     fn icon_cluster_running_idle_returns_prompt_stop_delete() {
         let session = make_session(SessionStatus::Running);
-        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", 0, 0, 40, false, false);
         assert_eq!(cluster.total_width, 6); // prompt + stop + delete
         assert_eq!(cluster.spans.len(), 3);
         assert_eq!(cluster.hit_regions.len(), 3);
@@ -1571,7 +1613,7 @@ mod tests {
     fn icon_cluster_running_narrow_drops_to_stop_only() {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 20 but >= 12: keep stop only
-        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 15, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", 0, 0, 15, false, false);
         assert_eq!(cluster.total_width, 2);
         assert_eq!(cluster.hit_regions.len(), 1);
         assert_eq!(
@@ -1586,7 +1628,7 @@ mod tests {
     fn icon_cluster_very_narrow_shows_ellipsis() {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 12, not expanded: ellipsis
-        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 10, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", 0, 0, 10, false, false);
         assert_eq!(cluster.total_width, 2);
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1601,7 +1643,7 @@ mod tests {
     fn icon_cluster_very_narrow_expanded_shows_normal() {
         let session = make_session(SessionStatus::Running);
         // pane_inner_width < 12, but is_expanded_narrow=true: normal icons
-        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 10, true, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", 0, 0, 10, true, false);
         // Should NOT be ellipsis -- should be stop icon (narrow < 20 drops others)
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1614,7 +1656,7 @@ mod tests {
     #[test]
     fn icon_cluster_stopped() {
         let session = make_session(SessionStatus::Stopped);
-        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", 0, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // resume + delete
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1633,7 +1675,7 @@ mod tests {
     #[test]
     fn icon_cluster_exited() {
         let session = make_session(SessionStatus::Exited);
-        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", 0, 0, 40, false, false);
         assert_eq!(
             cluster.hit_regions[0].0,
             HitAction::ResumeSessionFor {
@@ -1645,7 +1687,7 @@ mod tests {
     #[test]
     fn icon_cluster_failed() {
         let session = make_session(SessionStatus::Failed);
-        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", false, 0, 40, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), Some(&session), "ws-1", 0, 0, 40, false, false);
         assert_eq!(cluster.total_width, 4); // retry + delete
         assert_eq!(
             cluster.hit_regions[0].0,
@@ -1659,7 +1701,7 @@ mod tests {
 
     #[test]
     fn icon_cluster_no_session_narrow_drops_delete() {
-        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", false, 0, 15, false, false);
+        let cluster = workspace_icon_cluster(Theme::default(), None, "ws-1", 0, 0, 15, false, false);
         assert_eq!(cluster.total_width, 2); // start only
         assert_eq!(cluster.hit_regions.len(), 1);
     }
