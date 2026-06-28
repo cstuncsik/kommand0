@@ -225,7 +225,14 @@ fn copy_pattern(root: &Path, dest_root: &Path, pattern: &str) {
         }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!("worktree-copy glob walk error: {e}");
+                continue;
+            }
+        };
         let Ok(rel) = entry.strip_prefix(root) else {
             tracing::warn!(entry = %entry.display(), "worktree-copy match outside repo root; skipping");
             continue;
@@ -657,6 +664,30 @@ mod tests {
 
         // The blocker file is untouched (the copy was skipped, not forced).
         assert_eq!(std::fs::read_to_string(dest.path().join("sub")).unwrap(), "blocker");
+    }
+
+    #[test]
+    fn copy_worktree_files_swallows_errors_and_keeps_going() {
+        // Locks the invariant `finish_worktree_add` relies on: the copy entrypoint
+        // it calls returns `()` and never propagates — so a copy failure can't flip
+        // a `Created` worktree into a `Fallback`. (A real fault can't be injected
+        // through `create_worktree` itself: the worktree is created and copied into
+        // atomically, and the shared work-tree makes a dest-type collision
+        // impossible, so we lock the contract at the function it invokes.)
+        let root = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        // Manifest: a doomed pattern (its dest parent is a blocking file) followed
+        // by a good one — the good copy must still happen after the failure.
+        write_file(root.path(), ".worktree-copy", "sub/x.txt\nok.txt\n");
+        write_file(root.path(), "sub/x.txt", "x");
+        write_file(root.path(), "ok.txt", "good");
+        std::fs::write(dest.path().join("sub"), "blocker").unwrap();
+
+        // Returns `()`, must not panic.
+        copy_worktree_files(root.path().to_str().unwrap(), dest.path().to_str().unwrap());
+
+        assert_eq!(std::fs::read_to_string(dest.path().join("sub")).unwrap(), "blocker", "failure skipped");
+        assert_eq!(std::fs::read_to_string(dest.path().join("ok.txt")).unwrap(), "good", "later copy still ran");
     }
 
     #[test]

@@ -185,12 +185,12 @@ The state directory is resolved in this order:
 
 ## Copying files into a worktree (`.worktree-copy`)
 
-Each workspace gets a fresh git worktree, which doesn't carry over git-ignored files (local `.env`, editor configs, etc.). Drop a `.worktree-copy` file in the repo root to copy selected files into every new worktree: one glob pattern per line (`*`, `?`, `[...]`, `**`), paths relative to the repo root, with blank lines and `#` comments ignored. Each match is copied into the worktree preserving its relative path. A bare `*` skips dotfiles (zsh-style); a pattern that leads with a dot (e.g. `.env*`) matches them.
+Each workspace gets a fresh git worktree, which doesn't carry over git-ignored files (local `.env`, editor configs, etc.). Drop a `.worktree-copy` file in the repo root to copy selected files into every new worktree: one glob pattern per line (`*`, `?`, `[...]`, `**`), paths relative to the repo root, with blank lines and `#` comments ignored. Each match is copied into the worktree preserving its relative path. A bare `*` skips dotfiles (zsh-style); a pattern that leads with a dot (e.g. `.env*`) matches them. `**` matches directories, so use `**/*` to reach files at any depth. Symlinks are skipped.
 
 ```
 .env*
 config/local.json
-.vscode/**
+.vscode/**/*
 ```
 
 When there's no `.worktree-copy`, kommand0 falls back to copying the repo root's `.env*` files. Copying is best-effort — any failure is logged to `kommand0.log` and never blocks worktree creation.
