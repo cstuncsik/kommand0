@@ -899,12 +899,19 @@ impl App {
         self.embedded.get_mut(&ws_id)?.active_pane_mut()
     }
 
-    /// Whether any of a workspace's session tabs is currently producing output.
-    pub(crate) fn ws_has_active_session(&self, ws_id: &str) -> bool {
+    /// How many of a workspace's session tabs are currently active (a Claude tab
+    /// producing output, or a shell tab running a foreground command). Zero means
+    /// idle; the row shows the count alongside the spinner when two or more.
+    pub(crate) fn ws_active_tab_count(&self, ws_id: &str) -> usize {
         self.embedded
             .get(ws_id)
-            .map(|s| s.tabs.iter().any(|t| self.waiting_response.contains(&t.id)))
-            .unwrap_or(false)
+            .map(|s| {
+                s.tabs
+                    .iter()
+                    .filter(|t| self.waiting_response.contains(&t.id))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Move the tree selection to a workspace row (if present).
@@ -1419,6 +1426,31 @@ impl App {
             .flat_map(|s| s.tabs.iter().map(|t| (t.id.clone(), t.pane.output_seq())))
             .collect();
         self.apply_pane_activity(now, &seqs);
+        // Shell tabs report activity by their PTY foreground process group (a
+        // command is running), not output — so a silent build/server/`sleep`
+        // still spins. Claude tabs keep the output-based signal above (claude
+        // streams while it works). `None` (can't tell) leaves the output result.
+        let shell_busy: Vec<(String, Option<bool>)> = self
+            .embedded
+            .values()
+            .flat_map(|s| {
+                s.tabs
+                    .iter()
+                    .filter(|t| t.kind == TabKind::Shell)
+                    .map(|t| (t.id.clone(), t.pane.foreground_busy()))
+            })
+            .collect();
+        for (id, busy) in shell_busy {
+            match busy {
+                Some(true) => {
+                    self.waiting_response.insert(id);
+                }
+                Some(false) => {
+                    self.waiting_response.remove(&id);
+                }
+                None => {}
+            }
+        }
         // Keep the on-screen session marked seen, then latch any others that went
         // quiet with unseen output. Order matters: clear before latching so the
         // session you're watching is never flagged.
