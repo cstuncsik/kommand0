@@ -522,12 +522,20 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     }
     // Snapshot what we need (incl. the session id, to look up its title) so we
     // can mutate app.hit_regions afterward.
-    let snapshot: Vec<(usize, bool, bool, String)> = match app.embedded.get(ws_id) {
+    let snapshot: Vec<(usize, bool, bool, String, bool)> = match app.embedded.get(ws_id) {
         Some(s) => s
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| (i, i == s.active, app.waiting_response.contains(&t.id), t.id.clone()))
+            .map(|(i, t)| {
+                (
+                    i,
+                    i == s.active,
+                    app.waiting_response.contains(&t.id),
+                    t.id.clone(),
+                    matches!(t.kind, super::TabKind::Shell),
+                )
+            })
             .collect(),
         None => return,
     };
@@ -540,7 +548,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     let mut regions: Vec<(Rect, HitAction)> = Vec::new();
     let mut x = strip.x;
     let right = strip.x + strip.width;
-    for (i, is_active, producing, id) in &snapshot {
+    for (i, is_active, producing, id, is_shell) in &snapshot {
         // Producing replaces the number with the spinner (unchanged); a user
         // title, when set, is appended so the tab is identifiable by name too.
         let glyph = if *producing {
@@ -548,18 +556,20 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
         } else {
             (i + 1).to_string()
         };
+        // A `$` suffix marks a shell tab (vs a Claude tab).
+        let marker = if *is_shell { "$" } else { "" };
         let label = match app.state.embedded_session_title(ws_id, id) {
             Some(title) if !title.is_empty() => {
                 if UnicodeWidthStr::width(title) > MAX_TITLE_COLS {
                     // Reserve one column for the ellipsis so the title block stays
                     // within MAX_TITLE_COLS.
                     let shown = truncate_to_width(title, MAX_TITLE_COLS - 1);
-                    format!(" {glyph} {shown}… ")
+                    format!(" {glyph}{marker} {shown}… ")
                 } else {
-                    format!(" {glyph} {title} ")
+                    format!(" {glyph}{marker} {title} ")
                 }
             }
-            _ => format!(" {glyph} "),
+            _ => format!(" {glyph}{marker} "),
         };
         let w = UnicodeWidthStr::width(label.as_str()) as u16;
         let style = if *is_active {

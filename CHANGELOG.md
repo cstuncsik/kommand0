@@ -5,6 +5,15 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Shell session tabs** — open a `$SHELL` tab in a workspace's worktree with
+  `Ctrl+A s` (alongside Claude tabs via `Ctrl+A c`). Run anything in it — codex,
+  lazygit, a REPL, or `tmux`/`zellij` for splits inside the pane. Shell tabs are
+  marked `$` in the tab strip and are ephemeral (a fresh process, not resumed);
+  Claude tabs still persist + resume. Set the command with the `shell` config
+  (default `$SHELL`, then `/bin/sh`); `KOMMAND0_SHELL` overrides.
+
 ## [0.2.1] - 2026-06-27
 
 ### Added

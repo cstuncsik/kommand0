@@ -38,6 +38,9 @@ pub struct Config {
     /// `"off"` (default), `"bell"` (terminal bell), `"desktop"` (OS
     /// notification), or `"both"`. Parsed by the TUI; an unknown value warns.
     pub notify: Option<String>,
+    /// Command for a shell session tab (`Ctrl+A s`). Defaults to `$SHELL`, then
+    /// `/bin/sh`. Can be any command — e.g. `"tmux"` for splits inside the tab.
+    pub shell: Option<String>,
 }
 
 impl Config {
