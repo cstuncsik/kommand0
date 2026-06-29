@@ -5,6 +5,16 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`.worktree-copy` manifest** — copy files from the repo root into each new
+  workspace worktree (ports the personal `wt` shell helper). Put one glob per
+  line in `<repo>/.worktree-copy` (`#` comments and blank lines ignored, paths
+  relative to the repo root); every match is copied into the worktree preserving
+  its relative path. With no manifest it falls back to copying `.env*` — the
+  usual case of carrying local env files across worktrees. Best-effort: copy
+  failures are logged, never block worktree creation.
+
 ## [0.2.3] - 2026-06-28
 
 ## [0.2.2] - 2026-06-28

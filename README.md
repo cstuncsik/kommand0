@@ -183,6 +183,18 @@ The state directory is resolved in this order:
 
 `state.json` (repos, workspaces, sessions) lives at the root of that directory; session logs are written as JSON lines files in its `sessions/` subdirectory. The app's own diagnostics (warnings/errors that can't go to the terminal while the TUI is running) are appended to `kommand0.log` there. It's append-only and not rotated — safe to delete anytime.
 
+## Copying files into a worktree (`.worktree-copy`)
+
+Each workspace gets a fresh git worktree, which doesn't carry over git-ignored files (local `.env`, editor configs, etc.). Drop a `.worktree-copy` file in the repo root to copy selected files into every new worktree: one glob pattern per line (`*`, `?`, `[...]`, `**`), paths relative to the repo root, with blank lines and `#` comments ignored. Each match is copied into the worktree preserving its relative path; a matched directory is copied with its whole subtree. Matching is case-sensitive (like zsh): a bare `*` skips dotfiles, while a pattern whose last segment leads with a dot (e.g. `.env*`) matches them. `**` matches any number of directories — `config/**/*` copies everything under `config/`. Symlinks are skipped, and matches that resolve outside the repo are ignored.
+
+```
+.env*
+config/local.json
+.vscode/**/*
+```
+
+When there's no `.worktree-copy`, kommand0 falls back to copying the repo root's `.env*` files. Copying is best-effort — any failure is logged to `kommand0.log` and never blocks worktree creation.
+
 ## Config
 
 Optional, hand-edited `config.json` (in the state directory, or at the path in `KOMMAND0_CONFIG`). Every field is optional and a missing/invalid file falls back to defaults:
