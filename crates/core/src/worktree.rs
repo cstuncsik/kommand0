@@ -159,10 +159,11 @@ fn finish_worktree_add(
 /// The manifest is `<repo>/.worktree-copy`: one glob pattern per line (relative
 /// to the repo root), with blank lines and `#` comments ignored. Every match is
 /// copied into the worktree preserving its path relative to the root. When the
-/// manifest is **absent or unreadable** the patterns fall back to `[".env*"]`
-/// (the common case of carrying local env files across worktrees); a
-/// **present-but-empty** manifest (all blank/comment lines) is an explicit
-/// "copy nothing" and does NOT fall back.
+/// manifest is **absent** the patterns fall back to `[".env*"]` (the common case
+/// of carrying local env files across worktrees); a **present-but-empty**
+/// manifest (all blank/comment lines) is an explicit "copy nothing" and does NOT
+/// fall back, and a present-but-unreadable one copies nothing (no surprise env
+/// copy on a permission/UTF-8 error).
 ///
 /// Best-effort throughout: every failure is `tracing::warn!`-logged (never
 /// stdout — that would corrupt the TUI's alt-screen) and skipped. The worktree
@@ -171,8 +172,9 @@ fn copy_worktree_files(repo_path: &str, worktree_path: &str) {
     let root = Path::new(repo_path);
     let dest_root = Path::new(worktree_path);
 
-    // Fallback is keyed on file PRESENCE (read error), not on an empty pattern
-    // list: an empty-but-present manifest means "copy nothing".
+    // Fallback fires only when the manifest is ABSENT. A present-but-empty file
+    // means "copy nothing"; a present-but-unreadable one (permissions, non-UTF-8)
+    // also copies nothing rather than silently falling back to `.env*`.
     let patterns: Vec<String> = match std::fs::read_to_string(root.join(".worktree-copy")) {
         Ok(contents) => contents
             .lines()
@@ -180,7 +182,11 @@ fn copy_worktree_files(repo_path: &str, worktree_path: &str) {
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .map(String::from)
             .collect(),
-        Err(_) => vec![".env*".to_string()],
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![".env*".to_string()],
+        Err(e) => {
+            tracing::warn!("worktree-copy: cannot read .worktree-copy ({e}); copying nothing");
+            return;
+        }
     };
 
     for pattern in &patterns {
@@ -191,36 +197,44 @@ fn copy_worktree_files(repo_path: &str, worktree_path: &str) {
 /// Expand one glob `pattern` (relative to `root`) and copy each match into
 /// `dest_root`, preserving the match's path relative to `root`.
 ///
-/// The pattern is anchored to `root` by **string** concatenation
-/// (`format!("{}/{}", root.display(), pattern)`), not `Path::join` — joining an
-/// absolute pattern would discard `root`, and the `glob` crate otherwise walks
-/// from the process cwd.
+/// Anchoring: the pattern is glued to `root` by string concatenation (not
+/// `Path::join`, which would discard an absolute pattern), with `root` escaped so
+/// glob metacharacters in the repo path itself (`[`, `*`) are treated literally;
+/// `glob` would otherwise walk from the process cwd.
 ///
-/// `require_literal_leading_dot` is gated per-pattern to be zsh-faithful: zsh
-/// matches dot-leading names only when the pattern's filename component itself
-/// begins with a literal `.`. So a bare `*` (or `*.rs`, `src/**/*.rs`) keeps the
-/// guard ON and won't sweep `.git`/`.env`, while `.env*` (final component leads
-/// with `.`) turns it OFF and matches the dotfiles. (The glob crate's directory
-/// iterator drops *all* dot-leading children when the option is on, regardless
-/// of the pattern — unlike its `Pattern::matches_with` — so a single fixed value
-/// can't satisfy both cases; the gate replicates zsh.)
+/// Matching mirrors zsh: **case-sensitive** (unlike `MatchOptions::default()`),
+/// and `require_literal_leading_dot` is gated per pattern off its FINAL component
+/// so `.env*` matches dotfiles while a bare `*` (or `src/**/*.rs`) does not. The
+/// gate keys on the last segment only; exotic patterns mixing dot and non-dot
+/// directory segments (e.g. `*/.env*`) may differ slightly from zsh.
 ///
-/// Each match's relative path is rejected if it contains a `..` or root
-/// component, so a copy can never land outside the worktree. All failures are
-/// warned and skipped.
+/// Escapes are blocked on both sides: a match whose relative path has a `..`/root
+/// component, or whose real (canonicalized) path leaves `root`, is skipped —
+/// `glob` follows symlinked directories, so `link/secret` can resolve outside the
+/// repo with a clean-looking `rel`. A destination that would be written through a
+/// pre-existing symlink in the worktree is also skipped. All failures are warned
+/// and skipped.
 fn copy_pattern(root: &Path, dest_root: &Path, pattern: &str) {
-    let pat = format!("{}/{}", root.display(), pattern);
-    // zsh matches dotfiles only when the filename component leads with a literal
-    // `.`; mirror that by turning the guard off exactly for such patterns.
+    let pat = format!("{}/{}", glob::Pattern::escape(&root.to_string_lossy()), pattern);
+    // zsh matches dotfiles only when the final component leads with a literal `.`.
     let final_dot = pattern.rsplit('/').next().is_some_and(|c| c.starts_with('.'));
     let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
         require_literal_leading_dot: !final_dot,
-        ..Default::default()
     };
     let entries = match glob::glob_with(&pat, options) {
         Ok(entries) => entries,
         Err(e) => {
             tracing::warn!(pattern, "bad worktree-copy glob pattern: {e}");
+            return;
+        }
+    };
+    // Real repo root, to confirm each match stays inside it once symlinks resolve.
+    let canon_root = match root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("worktree-copy: cannot canonicalize repo root: {e}");
             return;
         }
     };
@@ -237,15 +251,27 @@ fn copy_pattern(root: &Path, dest_root: &Path, pattern: &str) {
             tracing::warn!(entry = %entry.display(), "worktree-copy match outside repo root; skipping");
             continue;
         };
-        // Traversal guard: `strip_prefix` does not normalize, so a glob match
-        // could still resolve with `..`/root components and escape the worktree.
-        // Reject those rather than write outside it.
+        // Source guard: cheap `..`/root reject (strip_prefix doesn't normalize),
+        // then a canonical-containment check, since `glob` follows symlinked dirs.
         if rel.components().any(|c| matches!(c, Component::ParentDir | Component::RootDir)) {
             tracing::warn!(rel = %rel.display(), "worktree-copy path escapes worktree; skipping");
             continue;
         }
+        match entry.canonicalize() {
+            Ok(real) if real.starts_with(&canon_root) => {}
+            _ => {
+                tracing::warn!(entry = %entry.display(), "worktree-copy match resolves outside repo (symlink?); skipping");
+                continue;
+            }
+        }
 
         let dest = dest_root.join(rel);
+        // Dest guard: don't write THROUGH a pre-existing symlink in the worktree
+        // (a committed symlink could redirect the write outside it).
+        if !dest_path_is_safe(dest_root, rel) {
+            tracing::warn!(dest = %dest.display(), "worktree-copy dest crosses a symlink; skipping");
+            continue;
+        }
         if let Some(parent) = dest.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
@@ -258,12 +284,31 @@ fn copy_pattern(root: &Path, dest_root: &Path, pattern: &str) {
     }
 }
 
+/// True if no already-existing ancestor of `rel` under `dest_root` is a symlink —
+/// i.e. writing `dest_root/rel` won't follow a link out of the worktree. Missing
+/// components are fine (created later as real dirs); only an existing symlink
+/// component is unsafe.
+fn dest_path_is_safe(dest_root: &Path, rel: &Path) -> bool {
+    let mut p = dest_root.to_path_buf();
+    for comp in rel.components() {
+        p.push(comp);
+        if let Ok(meta) = std::fs::symlink_metadata(&p)
+            && meta.file_type().is_symlink()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Recursively copy `src` to `dest`, mirroring `cp -r`.
 ///
 /// A directory is created and its entries copied recursively; a regular file is
-/// copied with [`std::fs::copy`]. A symlink is skipped (logged) — unlike `cp -r`
-/// we don't follow it, which avoids symlink cycles and links that escape the
-/// worktree. A small, deliberate divergence from `cp -r`.
+/// copied with [`std::fs::copy`]. A symlink encountered during the walk is
+/// skipped (logged) — unlike `cp -r` we don't follow it, avoiding cycles and
+/// stray link targets. A small, deliberate divergence from `cp -r`. (Matches that
+/// escape the repo via a symlinked component are already rejected in
+/// `copy_pattern`; this skip covers symlinks found while recursing a copied dir.)
 fn copy_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(src)?;
     if meta.file_type().is_symlink() {
@@ -724,6 +769,97 @@ mod tests {
         // A regular file still copies (sanity that we only special-case symlinks).
         copy_recursive(&root.path().join("real.txt"), &dest.path().join("real.txt")).unwrap();
         assert_eq!(std::fs::read_to_string(dest.path().join("real.txt")).unwrap(), "r");
+    }
+
+    #[test]
+    fn manifest_copies_a_whole_directory_subtree() {
+        // A pattern matching a DIRECTORY exercises copy_recursive's dir arm
+        // (read_dir recursion); a symlink found *inside* it is skipped.
+        let root = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        write_file(root.path(), "assets/a.txt", "a");
+        write_file(root.path(), "assets/nested/b.txt", "b");
+        write_file(root.path(), ".worktree-copy", "assets\n");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.path().join("assets/a.txt"), root.path().join("assets/link.txt")).unwrap();
+
+        copy_worktree_files(root.path().to_str().unwrap(), dest.path().to_str().unwrap());
+
+        assert_eq!(std::fs::read_to_string(dest.path().join("assets/a.txt")).unwrap(), "a");
+        assert_eq!(std::fs::read_to_string(dest.path().join("assets/nested/b.txt")).unwrap(), "b", "subtree copied recursively");
+        #[cfg(unix)]
+        assert!(!dest.path().join("assets/link.txt").exists(), "symlink inside a copied dir is skipped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_source_dir_does_not_escape() {
+        // `glob` follows symlinked dirs, so a match can resolve outside the repo
+        // with a clean `rel`. The canonical-containment guard must reject it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "LEAKED").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let dest = TempDir::new().unwrap();
+
+        // A direct cross and a recursive sweep must both copy nothing from outside.
+        copy_pattern(&root, dest.path(), "link/*");
+        copy_pattern(&root, dest.path(), "**/*");
+
+        assert!(!dest.path().join("link/secret.txt").exists(), "no copy through a symlinked dir");
+        assert!(std::fs::read_dir(dest.path()).unwrap().next().is_none(), "nothing escaped into the worktree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dest_symlink_is_not_followed() {
+        // A pre-existing symlinked dir at the dest path must not redirect the
+        // write outside the worktree.
+        let root = TempDir::new().unwrap();
+        write_file(root.path(), "cfg/app.conf", "x");
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("wt");
+        std::fs::create_dir(&dest).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("cfg")).unwrap();
+
+        copy_pattern(root.path(), &dest, "cfg/app.conf");
+
+        assert!(!outside.join("app.conf").exists(), "did not write through the dest symlink");
+    }
+
+    #[test]
+    fn matching_is_case_sensitive() {
+        // Unlike glob's case-insensitive Default, wildcard matching is
+        // case-sensitive (zsh-like). A LITERAL pattern can't test this — a
+        // case-insensitive filesystem resolves it regardless — so use a wildcard.
+        let root = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        write_file(root.path(), "config.txt", "c");
+
+        // Wrong-case extension must not match (would copy under glob's Default).
+        copy_pattern(root.path(), dest.path(), "*.TXT");
+        assert!(!dest.path().join("config.txt").exists(), "wrong-case wildcard must not match");
+
+        // Sanity: the correct case still matches, so we didn't just break globbing.
+        copy_pattern(root.path(), dest.path(), "*.txt");
+        assert_eq!(std::fs::read_to_string(dest.path().join("config.txt")).unwrap(), "c");
+    }
+
+    #[test]
+    fn bad_glob_pattern_is_skipped() {
+        // An invalid glob (unclosed `[`) must not panic and must copy nothing.
+        let root = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        write_file(root.path(), "a.txt", "a");
+
+        copy_pattern(root.path(), dest.path(), "[");
+
+        assert!(std::fs::read_dir(dest.path()).unwrap().next().is_none());
     }
 
     #[test]
