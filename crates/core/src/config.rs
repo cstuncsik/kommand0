@@ -41,9 +41,9 @@ pub struct Config {
     /// Command for a shell session tab (`Ctrl+A s`). Defaults to `$SHELL`, then
     /// `/bin/sh`. Can be any command — e.g. `"tmux"` for splits inside the tab.
     pub shell: Option<String>,
-    /// Tree (left) pane width as a percent of the terminal (default 30).
-    /// Parsed here; clamped to 15–60 by the TUI (matching the `notify`/`theme`
-    /// "parsed by the TUI" convention). Live `<`/`>` adjust from here.
+    /// Tree (left) pane width as a percent of the terminal. Parsed here; clamped
+    /// into a sane range by the TUI (matching the `notify`/`theme` "parsed by the
+    /// TUI" convention). Live `<`/`>` adjust from here.
     pub tree_width_pct: Option<u16>,
 }
 
