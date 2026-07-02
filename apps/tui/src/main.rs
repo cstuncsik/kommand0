@@ -346,6 +346,9 @@ pub(crate) struct App {
     /// visible row maps to the right `tree_items` index once the tree scrolls.
     pub(crate) tree_scroll_offset: usize,
     pub(crate) mouse_pos: Option<(u16, u16)>,
+    /// True while the tree/content border is being dragged to resize the tree
+    /// (ephemeral, not persisted — like `mouse_pos`).
+    pub(crate) dragging_divider: bool,
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
     pub(crate) pending_button_action: Option<buttons::HitAction>,
     pub(crate) modal: modal::ModalState,
@@ -446,6 +449,7 @@ impl App {
             pane_areas: mouse::PaneAreas::default(),
             tree_scroll_offset: 0,
             mouse_pos: None,
+            dragging_divider: false,
             hit_regions: Vec::new(),
             pending_button_action: None,
             modal: modal::ModalState::default(),
@@ -615,18 +619,18 @@ impl App {
         self.update_active_session();
     }
 
+    /// The single clamp home for `tree_width_pct` — keeps the `[15,60]`
+    /// invariant for every write-path (seed, keys, drag).
+    pub(crate) fn set_tree_width_pct(&mut self, pct: u16) {
+        self.tree_width_pct = pct.clamp(TREE_WIDTH_MIN, TREE_WIDTH_MAX);
+    }
+
     pub(crate) fn widen_tree(&mut self) {
-        self.tree_width_pct = self
-            .tree_width_pct
-            .saturating_add(TREE_WIDTH_STEP)
-            .clamp(TREE_WIDTH_MIN, TREE_WIDTH_MAX);
+        self.set_tree_width_pct(self.tree_width_pct.saturating_add(TREE_WIDTH_STEP));
     }
 
     pub(crate) fn shrink_tree(&mut self) {
-        self.tree_width_pct = self
-            .tree_width_pct
-            .saturating_sub(TREE_WIDTH_STEP)
-            .clamp(TREE_WIDTH_MIN, TREE_WIDTH_MAX);
+        self.set_tree_width_pct(self.tree_width_pct.saturating_sub(TREE_WIDTH_STEP));
     }
 
     pub(crate) fn toggle_expand(&mut self) {
@@ -2684,6 +2688,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             // stray clicks to the tree/embedded claude behind it; a
                             // leaked click could even open a modal and orphan the
                             // palette, which captures keys after the modal block).
+                            // An overlay opening mid-drag must not strand the flag.
+                            app.dragging_divider = false;
+                        } else if mouse::handle_divider_drag(&mut app, mouse_event) {
+                            // A tree/content border drag — consumed; don't route on.
                         } else if app.focus == Focus::Embedded {
                             app.handle_embedded_mouse(mouse_event);
                         } else {
@@ -2949,6 +2957,82 @@ mod key_tests {
         app.tree_width_pct = 30;
         app.widen_tree();
         assert_eq!(app.tree_width_pct, 35);
+    }
+
+    #[test]
+    fn set_tree_width_pct_clamps() {
+        let mut app = test_app();
+        app.set_tree_width_pct(5);
+        assert_eq!(app.tree_width_pct, TREE_WIDTH_MIN); // below min
+        app.set_tree_width_pct(95);
+        assert_eq!(app.tree_width_pct, TREE_WIDTH_MAX); // above max
+        app.set_tree_width_pct(40);
+        assert_eq!(app.tree_width_pct, 40); // in range, unchanged
+    }
+
+    #[test]
+    fn divider_drag_lifecycle() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut app = test_app();
+        // tree width 30 in a body of 100 → divider col 29.
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 8);
+        app.pane_areas.body = ratatui::layout::Rect::new(0, 0, 100, 8);
+        app.tree_width_pct = 30;
+
+        // Down on the divider grabs it; width unchanged until the drag.
+        assert!(mouse::handle_divider_drag(
+            &mut app,
+            ev(MouseEventKind::Down(MouseButton::Left), 29)
+        ));
+        assert!(app.dragging_divider);
+        assert_eq!(app.tree_width_pct, 30, "grab alone must not resize");
+
+        // Drag far from the divider still resizes (no per-Drag hit-test): col 49
+        // in a width-100 body → 50%, and the event stays consumed.
+        assert!(mouse::handle_divider_drag(
+            &mut app,
+            ev(MouseEventKind::Drag(MouseButton::Left), 49)
+        ));
+        assert_eq!(app.tree_width_pct, 50);
+
+        // A drag past the max clamps to TREE_WIDTH_MAX.
+        assert!(mouse::handle_divider_drag(
+            &mut app,
+            ev(MouseEventKind::Drag(MouseButton::Left), 90)
+        ));
+        assert_eq!(app.tree_width_pct, TREE_WIDTH_MAX);
+
+        // Up ends the drag.
+        assert!(mouse::handle_divider_drag(
+            &mut app,
+            ev(MouseEventKind::Up(MouseButton::Left), 90)
+        ));
+        assert!(!app.dragging_divider);
+
+        // A Down off the divider is not consumed (normal routing still runs).
+        assert!(!mouse::handle_divider_drag(
+            &mut app,
+            ev(MouseEventKind::Down(MouseButton::Left), 5)
+        ));
+
+        // With the flag clear, Drag/Up are not consumed and don't resize —
+        // the gate that keeps drag-select / scroll routing alive.
+        let before = app.tree_width_pct;
+        assert!(!mouse::handle_divider_drag(
+            &mut app,
+            ev(MouseEventKind::Drag(MouseButton::Left), 10)
+        ));
+        assert!(!mouse::handle_divider_drag(
+            &mut app,
+            ev(MouseEventKind::Up(MouseButton::Left), 10)
+        ));
+        assert_eq!(app.tree_width_pct, before, "no resize while not dragging");
     }
 
     fn mk_ws(id: &str, name: &str, repo: &str, branch: Option<&str>) -> Workspace {

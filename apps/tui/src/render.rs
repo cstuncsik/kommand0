@@ -54,6 +54,7 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         .split(body);
 
     app.pane_areas.tree = chunks[0];
+    app.pane_areas.body = body;
 
     // Left pane: tree view
     render_tree(frame, app, chunks[0]);
