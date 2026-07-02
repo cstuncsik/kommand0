@@ -3033,6 +3033,21 @@ mod key_tests {
             ev(MouseEventKind::Up(MouseButton::Left), 10)
         ));
         assert_eq!(app.tree_width_pct, before, "no resize while not dragging");
+
+        // Release-safety: a stray non-Drag/Up event mid-drag (the `_` arm) ends
+        // the grab and routes on — the flag can never get stranded true.
+        assert!(mouse::handle_divider_drag(
+            &mut app,
+            ev(MouseEventKind::Down(MouseButton::Left), 29)
+        ));
+        assert!(app.dragging_divider, "re-grabbed the divider");
+        let held = app.tree_width_pct;
+        assert!(
+            !mouse::handle_divider_drag(&mut app, ev(MouseEventKind::ScrollDown, 5)),
+            "a stray event mid-drag is not consumed"
+        );
+        assert!(!app.dragging_divider, "stray event cleared the drag flag");
+        assert_eq!(app.tree_width_pct, held, "stray event didn't resize");
     }
 
     fn mk_ws(id: &str, name: &str, repo: &str, branch: Option<&str>) -> Workspace {

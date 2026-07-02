@@ -94,21 +94,23 @@ fn width_pct_at(body: Rect, col: u16) -> u16 {
         return 0;
     }
     let off = col.saturating_sub(body.x) as u32 + 1;
-    (off * 100 / body.width as u32) as u16 // ≤ 100, fits u16
+    (off * 100 / body.width as u32) as u16 // fits u16 (bounded by terminal width); caller clamps
 }
 
-/// Whether `(col, row)` lands on the tree's right border grab-zone: `col`
-/// within ±1 of `tree.x + tree.width - 1` (via `abs_diff`, no underflow) and
-/// `row` inside the pane's vertical span (so the status row can't start a drag).
+/// Whether `(col, row)` lands on the tree/content seam: `col` is the tree's
+/// right border (`tree.x + tree.width - 1`) or the content's left border just
+/// right of it — a 2-col grab that deliberately excludes the tree's last content
+/// column, so a row click there still selects. `row` must be inside the pane's
+/// vertical span (so the status row can't start a drag).
 fn on_divider(tree: Rect, col: u16, row: u16) -> bool {
     let divider = tree.x + tree.width - 1;
-    col.abs_diff(divider) <= 1 && row >= tree.y && row < tree.y + tree.height
+    (col == divider || col == divider + 1) && row >= tree.y && row < tree.y + tree.height
 }
 
 /// Handle a border-drag resize of the tree pane, before the focus-based split
 /// so it works whether the tree or the embedded pane is focused. Keyed on
-/// `app.dragging_divider` (NOT re-hit-testing `on_divider` per `Drag`, so a fast
-/// drag that outruns the ±1 zone keeps resizing). Returns whether it consumed
+/// `app.dragging_divider` (not re-hit-testing `on_divider` per `Drag`, so a fast
+/// drag that outruns the grab zone keeps resizing). Returns whether it consumed
 /// the event.
 pub(crate) fn handle_divider_drag(app: &mut App, mouse: MouseEvent) -> bool {
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -127,6 +129,8 @@ pub(crate) fn handle_divider_drag(app: &mut App, mouse: MouseEvent) -> bool {
                 app.dragging_divider = false;
                 true
             }
+            // A stray event mid-drag (jitter: a button-less Moved, a scroll, a
+            // second button) ends the grab and routes normally — never stranded.
             _ => {
                 app.dragging_divider = false;
                 false
@@ -149,6 +153,8 @@ mod tests {
         assert_eq!(width_pct_at(Rect::new(10, 0, 100, 8), 59), 50);
         // Overflow guard: (4000 - 0 + 1) * 100 wraps under u16; u32 keeps it right.
         assert_eq!(width_pct_at(Rect::new(0, 0, 5000, 8), 4000), 80);
+        // Far-right column → 100% raw (the caller clamps); pins the +1-bias ceiling.
+        assert_eq!(width_pct_at(Rect::new(0, 0, 100, 8), 99), 100);
         // Zero-width body must not divide by zero.
         assert_eq!(width_pct_at(Rect::new(0, 0, 0, 8), 40), 0);
     }
@@ -157,10 +163,10 @@ mod tests {
     fn on_divider_hits_border_zone_and_span() {
         // Divider col for a width-30 tree at x=0 is 29 (last col inside).
         let tree = Rect::new(0, 0, 30, 8);
-        assert!(on_divider(tree, 29, 0));
-        assert!(on_divider(tree, 28, 0)); // -1 zone
-        assert!(on_divider(tree, 30, 0)); // +1 zone (content's left border)
-        assert!(!on_divider(tree, 27, 0)); // outside the ±1 zone
+        assert!(on_divider(tree, 29, 0)); // tree's right border
+        assert!(on_divider(tree, 30, 0)); // content's left border (seam's other side)
+        assert!(!on_divider(tree, 28, 0)); // tree's last content col — a row click still selects
+        assert!(!on_divider(tree, 31, 0)); // past the seam
         assert!(!on_divider(tree, 5, 0)); // tree middle
         // Vertical span: rows 0..8 count, 8 is past it.
         assert!(on_divider(tree, 29, 7)); // last pane row
