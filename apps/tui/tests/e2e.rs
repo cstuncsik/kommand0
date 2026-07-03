@@ -525,6 +525,38 @@ fn mouse_click_is_forwarded_to_embedded_pane() {
 }
 
 #[test]
+fn clicking_panes_switches_focus() {
+    // Click-to-focus: from the embedded pane a click in the (mostly empty) tree
+    // pane returns focus to the tree, and a click back in the content pane
+    // returns focus to claude. The focus-dependent footer hint is the signal.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("Ctrl+A t tree"); // embedded footer → focus is on claude
+
+    // Left-click (press+release) in empty tree space, well below the few rows.
+    tui.send("\x1b[<0;5;20M");
+    tui.send("\x1b[<0;5;20m");
+    tui.wait_for("Enter open"); // tree footer → the click moved focus to the tree
+
+    // Click back inside the content pane → focus returns to the embedded session.
+    tui.send("\x1b[<0;60;12M");
+    tui.send("\x1b[<0;60;12m");
+    tui.wait_for("Ctrl+A t tree"); // embedded footer again → focus back on claude
+
+    tui.send("\x1d"); // Ctrl+] leaves
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn embedded_prefix_quits_and_returns_to_tree() {
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());
