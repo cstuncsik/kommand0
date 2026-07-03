@@ -1897,6 +1897,20 @@ enum KeyOutcome {
     Quit,
 }
 
+/// Append pasted text to the tree filter query (sanitized for a single line via
+/// [`modal::sanitize_paste`]), then re-apply the filter. Extracted from the
+/// event loop so it's unit-testable and consistent with the modal/palette paste
+/// sinks. A paste that sanitizes to nothing is a no-op — the query and the
+/// current selection are left untouched (no needless re-rank).
+fn handle_filter_paste(app: &mut App, text: &str) {
+    let clean = modal::sanitize_paste(text);
+    if clean.is_empty() {
+        return;
+    }
+    app.filter_query.push_str(&clean);
+    app.apply_filter();
+}
+
 /// Handle one key press. Extracted from the main event loop so tests can
 /// drive the app without a real terminal.
 async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> {
@@ -2508,6 +2522,18 @@ fn cli_short_circuit(args: &[String]) -> Option<String> {
     None
 }
 
+/// Keyboard-enhancement flags requested when the terminal supports the Kitty
+/// protocol. `REPORT_ALL_KEYS_AS_ESCAPE_CODES` routes even plain keys through
+/// the CSI-u path; `REPORT_ALTERNATE_KEYS` must accompany it so the terminal
+/// also reports the *shifted* codepoint. Without it `?` (Shift+/) arrives as
+/// `Char('/')` + SHIFT, and `normalize()` drops SHIFT — collapsing `?`→`/`
+/// (and `:`→`;`, `<`→`,`, `>`→`.`, uppercase letters, …), so help opened the
+/// filter instead and the embedded pane typed `/` for `?`.
+fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
+    use crossterm::event::KeyboardEnhancementFlags as Flags;
+    Flags::DISAMBIGUATE_ESCAPE_CODES | Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES | Flags::REPORT_ALTERNATE_KEYS
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Answer `--version`/`--help` before entering the alt-screen, where stdout
@@ -2548,10 +2574,7 @@ async fn main() -> anyhow::Result<()> {
     if supports_enhanced_keys {
         let _ = crossterm::execute!(
             std::io::stdout(),
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-            )
+            crossterm::event::PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     let result = run(&mut terminal).await;
@@ -2719,11 +2742,20 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         // EventStream wedges on a rapid resize burst.)
                     }
                     Event::Paste(text) => {
-                        // Only the embedded pane consumes paste; forward it as a
-                        // bracketed paste (claude enables bracketed paste, so a
-                        // multi-line paste stays one block). A modal over the pane
-                        // (e.g. Rename Session) suppresses the passthrough.
+                        // Bracketed paste arrives as one event (not Char keys).
+                        // Route it with the SAME precedence handle_key uses: the
+                        // embedded pane wins unless a modal is up, then modal →
+                        // palette → filter. The pane must be checked first because
+                        // a stale `/` filter can coexist with a mouse-opened pane
+                        // (toggle_embedded leaves filter_input set, and handle_key
+                        // checks embedded before filter too) — routing filter first
+                        // would steal the pane's paste. Help swallows keys and
+                        // implies Focus::Tree, so it falls through to a no-op here,
+                        // matching its key behavior.
                         if app.focus == Focus::Embedded && !app.modal.is_active() {
+                            // Forward raw to the embedded app as a bracketed paste
+                            // (claude enables it, so a multi-line paste stays one
+                            // block). Keep newlines here — the pane wants them.
                             let sent = app.active_pane_mut().map(|pane| {
                                 let mut bytes = b"\x1b[200~".to_vec();
                                 bytes.extend_from_slice(text.as_bytes());
@@ -2733,6 +2765,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             if sent.is_none() {
                                 app.focus = Focus::Tree;
                             }
+                        } else if app.modal.is_active() {
+                            modal::handle_modal_paste(&mut app.modal, &text);
+                        } else if let Some(p) = app.palette.as_mut() {
+                            p.paste(&text);
+                        } else if app.filter_input {
+                            handle_filter_paste(&mut app, &text);
                         }
                     }
                     Event::Mouse(mouse_event) => {
@@ -2925,6 +2963,18 @@ mod key_tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // These two Kitty-protocol flags must travel together: REPORT_ALL_KEYS_AS_ESCAPE_CODES
+    // routes shifted keys through CSI-u, and REPORT_ALTERNATE_KEYS is what makes the
+    // terminal report the shifted codepoint. The behavioral contract they enable
+    // (`?` resolves to Help, not Filter) is pinned in keymap.rs::shifted_symbols_resolve.
+    #[test]
+    fn enhancement_flags_pair_alternate_with_report_all() {
+        use crossterm::event::KeyboardEnhancementFlags as Flags;
+        let flags = keyboard_enhancement_flags();
+        assert!(flags.contains(Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+        assert!(flags.contains(Flags::REPORT_ALTERNATE_KEYS));
     }
 
     #[test]
@@ -3161,6 +3211,31 @@ mod key_tests {
         app.filter_query.clear();
         app.rebuild_tree();
         assert_eq!(ws_names(&app).len(), 4);
+    }
+
+    #[test]
+    fn paste_appends_to_filter_query_and_reapplies() {
+        let mut app = test_app();
+        app.workspaces = vec![
+            mk_ws("w1", "auth", "r1", None),
+            mk_ws("w2", "docs", "r1", None),
+        ];
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.filter_input = true;
+
+        handle_filter_paste(&mut app, "au\n"); // newline stripped
+        assert_eq!(app.filter_query, "au", "control chars stripped, text appended");
+        assert_eq!(ws_names(&app), vec!["auth"], "the filter is re-applied after paste");
+    }
+
+    #[test]
+    fn paste_of_only_control_chars_leaves_the_filter_untouched() {
+        let mut app = test_app();
+        app.filter_query = "keep".into();
+        app.filter_input = true;
+        handle_filter_paste(&mut app, "\n\t");
+        assert_eq!(app.filter_query, "keep", "a paste that sanitizes to nothing is a no-op");
     }
 
     #[tokio::test]

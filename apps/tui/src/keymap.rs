@@ -437,6 +437,23 @@ mod tests {
     }
 
     #[test]
+    fn shifted_symbols_resolve_to_their_action() {
+        let km = KeyMap::default();
+        // With REPORT_ALTERNATE_KEYS the terminal reports the shifted codepoint, so a
+        // shifted symbol arrives as its character (with or without a stray SHIFT bit,
+        // which normalize() strips) and resolves to its bound action.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('?'), KeyModifiers::NONE)), Some(Action::Help));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('?'), KeyModifiers::SHIFT)), Some(Action::Help));
+        assert_eq!(km.resolve(&ev(KeyCode::Char(':'), KeyModifiers::SHIFT)), Some(Action::Palette));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('<'), KeyModifiers::SHIFT)), Some(Action::ShrinkTree));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('>'), KeyModifiers::SHIFT)), Some(Action::WidenTree));
+        // Failure mode this fix prevents: without REPORT_ALTERNATE_KEYS a Kitty-protocol
+        // terminal reports `?` as `/`+SHIFT, which normalize() collapses to `/` → Filter,
+        // not Help. That is WHY main.rs must request REPORT_ALTERNATE_KEYS.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('/'), KeyModifiers::SHIFT)), Some(Action::Filter));
+    }
+
+    #[test]
     fn config_rebinds_and_clears_the_old_key() {
         let mut cfg = HashMap::new();
         cfg.insert("quit".to_string(), vec!["ctrl+q".to_string()]);
