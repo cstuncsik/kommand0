@@ -489,7 +489,10 @@ pub(crate) fn handle_modal_paste(modal: &mut ModalState, text: &str) {
             *error = None;
             (input, cursor)
         }
-        ModalState::None | ModalState::ConfirmDelete { .. } | ModalState::ConfirmCleanup { .. } => {
+        ModalState::None
+        | ModalState::ConfirmDelete { .. }
+        | ModalState::ConfirmCleanup { .. }
+        | ModalState::ConfirmBranchCheckout { .. } => {
             return;
         }
     };
