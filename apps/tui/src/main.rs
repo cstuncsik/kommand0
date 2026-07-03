@@ -1565,7 +1565,10 @@ impl App {
     /// Returns the session ids that *newly* entered the "needs you" set on this
     /// pass (the rising edge) — used to fire one-shot attention notifications.
     fn recompute_attention(&mut self, now: Instant, seqs: &[(String, u64)]) -> Vec<String> {
-        const ATTENTION_SETTLE: Duration = Duration::from_millis(1500);
+        // Only flag "needs you" once a session has been genuinely idle a while,
+        // not on a brief mid-turn pause. Kept above ACTIVE_WINDOW so the spinner
+        // has faded first (no overlap between "working" and "needs you").
+        const ATTENTION_SETTLE: Duration = Duration::from_millis(3000);
         let mut newly = Vec::new();
         for (id, seq) in seqs {
             let seen = self.viewed_seq.get(id).copied().unwrap_or(0);
@@ -1828,7 +1831,11 @@ impl App {
     /// active only after two consecutive ticks of new output (debounce), let it
     /// decay after `ACTIVE_WINDOW`, and prune sessions no longer present.
     fn apply_pane_activity(&mut self, now: Instant, seqs: &[(String, u64)]) {
-        const ACTIVE_WINDOW: Duration = Duration::from_millis(500);
+        // Generous so the spinner rides through Claude's bursty output without
+        // flicker; it decays only after a real ~2s pause (feel over accuracy).
+        // Kept below ATTENTION_SETTLE so the spinner fades before the "needs you"
+        // dot can appear — the two never show at once.
+        const ACTIVE_WINDOW: Duration = Duration::from_millis(2000);
         for (id, seq) in seqs {
             let had_new = self.pane_seen.get(id) != Some(seq);
             self.pane_seen.insert(id.clone(), *seq);
@@ -4130,8 +4137,16 @@ mod key_tests {
             "two consecutive output ticks should mark the pane active"
         );
 
+        // A gap shorter than the window keeps it active (bridges bursty output
+        // so the spinner reads as continuous, not flickering).
+        app.apply_pane_activity(t + Duration::from_millis(800), &[("w1".to_string(), 2)]);
+        assert!(
+            app.waiting_response.contains("w1"),
+            "a sub-window output gap must not drop the spinner"
+        );
+
         // No new output past the active window: decays to idle.
-        app.apply_pane_activity(t + Duration::from_millis(600), &[("w1".to_string(), 2)]);
+        app.apply_pane_activity(t + Duration::from_millis(2100), &[("w1".to_string(), 2)]);
         assert!(
             !app.waiting_response.contains("w1"),
             "a stale pane should decay to idle"
@@ -4250,7 +4265,7 @@ mod key_tests {
         assert!(newly.is_empty(), "no rising edge before settle");
 
         // Unseen + quiet past the settle window -> latched (rising edge reported).
-        let later = t + Duration::from_millis(1500);
+        let later = t + Duration::from_millis(3000);
         let newly = app.recompute_attention(later, &[("s1".to_string(), 1)]);
         assert!(app.attention.contains("s1"), "unseen + settled => needs you");
         assert_eq!(newly, vec!["s1".to_string()], "rising edge reported once");
@@ -4330,7 +4345,7 @@ mod key_tests {
         let mut app = test_app(); // focus Tree
         let t = Instant::now();
         app.apply_pane_activity(t, &[("s1".to_string(), 1)]);
-        app.recompute_attention(t + Duration::from_millis(1500), &[("s1".to_string(), 1)]);
+        app.recompute_attention(t + Duration::from_millis(3000), &[("s1".to_string(), 1)]);
         assert!(app.attention.contains("s1"), "first latch");
 
         // Simulate viewing it (seen up to seq 1, cleared).
@@ -4344,7 +4359,7 @@ mod key_tests {
         assert!(!app.attention.contains("s1"), "fresh post-view output isn't attention yet");
 
         // ...once it settles, it re-latches.
-        app.recompute_attention(t2 + Duration::from_millis(1500), &[("s1".to_string(), 2)]);
+        app.recompute_attention(t2 + Duration::from_millis(3000), &[("s1".to_string(), 2)]);
         assert!(app.attention.contains("s1"), "unseen output after a view re-latches");
     }
 
