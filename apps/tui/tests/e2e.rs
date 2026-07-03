@@ -15,8 +15,21 @@ use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
+/// vt100 0.16 moved the audible-bell counter off `Screen` onto the `Callbacks`
+/// trait; this counts BEL for `bell_count()`/`wait_for_bell()`.
+#[derive(Default)]
+struct BellCounter {
+    count: usize,
+}
+
+impl vt100::Callbacks for BellCounter {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.count += 1;
+    }
+}
+
 struct Tui {
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<BellCounter>>>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -79,7 +92,12 @@ impl Tui {
         let master = pair.master; // keep the master alive so we can resize()
         drop(pair.slave); // the child owns its end; release ours
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            ROWS,
+            COLS,
+            0,
+            BellCounter::default(),
+        )));
         let parser_clone = parser.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
@@ -107,7 +125,7 @@ impl Tui {
         self.master
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .unwrap();
-        self.parser.lock().unwrap().set_size(rows, cols);
+        self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
     }
 
     fn screen(&self) -> String {
@@ -199,7 +217,7 @@ impl Tui {
 
     /// Number of audible bells (BEL) the app has emitted, per vt100's counter.
     fn bell_count(&self) -> usize {
-        self.parser.lock().unwrap().screen().audible_bell_count()
+        self.parser.lock().unwrap().callbacks().count
     }
 
     /// Wait until the app has rung the terminal bell at least once.

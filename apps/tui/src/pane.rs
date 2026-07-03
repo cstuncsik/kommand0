@@ -139,7 +139,7 @@ impl Pane {
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .context("pty resize failed")?;
         if let Ok(mut p) = self.parser.lock() {
-            p.set_size(rows, cols);
+            p.screen_mut().set_size(rows, cols);
         }
         self.rows = rows;
         self.cols = cols;
@@ -285,6 +285,11 @@ impl Pane {
                 if cell.bold() {
                     style = style.add_modifier(Modifier::BOLD);
                 }
+                // SGR 2 / faint — e.g. Claude Code's ghosted input suggestions,
+                // which should render dimmed rather than solid.
+                if cell.dim() {
+                    style = style.add_modifier(Modifier::DIM);
+                }
                 if cell.italic() {
                     style = style.add_modifier(Modifier::ITALIC);
                 }
@@ -303,7 +308,7 @@ impl Pane {
                 let symbol = if contents.is_empty() || straddles_edge {
                     " "
                 } else {
-                    &contents
+                    contents
                 };
                 let target = &mut buf[(x, y)];
                 target.set_symbol(symbol);
@@ -866,6 +871,9 @@ mod tests {
         pane.blit(&mut buf, Rect::new(0, 0, 20, 5));
         let row0: String = (0..5).map(|x| buf[(x, 0)].symbol()).collect();
         assert_eq!(row0, "HELLO");
+        // Plain text emits no SGR 2, so it must not be dimmed — proves the dim
+        // mapping is conditional on cell.dim(), not applied unconditionally.
+        assert!(!buf[(0, 0)].style().add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -899,6 +907,19 @@ mod tests {
         assert_eq!(buf[(6, 2)].symbol(), "Y");
         // Untouched cell stays default.
         assert_eq!(buf[(0, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn blit_maps_dim_cell_to_dim_modifier() {
+        // SGR 2 (faint) is what Claude Code's ghosted input suggestions use;
+        // blit must surface it as Modifier::DIM (and not conflate it with BOLD).
+        let pane = Pane::spawn("sh", &["-c", "printf '\\033[2mD'"], &tmp(), 3, 10).unwrap();
+        assert!(wait_until(&pane, "D"));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        pane.blit(&mut buf, Rect::new(0, 0, 10, 3));
+        let m = buf[(0, 0)].style().add_modifier;
+        assert!(m.contains(Modifier::DIM));
+        assert!(!m.contains(Modifier::BOLD)); // DIM must not be conflated with BOLD (SGR 1 vs 2)
     }
 
     fn k(code: KeyCode) -> KeyEvent {

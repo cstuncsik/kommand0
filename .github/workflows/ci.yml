@@ -26,3 +26,15 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest # advisory DB is OS-independent — one runner suffices
+    steps:
+      - uses: actions/checkout@v4
+
+      # Scans Cargo.lock against the RustSec advisory DB; fails on a vulnerability.
+      # If advisories on unrelated PRs get noisy, move this to a scheduled run.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
