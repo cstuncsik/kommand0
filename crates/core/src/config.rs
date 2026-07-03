@@ -41,6 +41,10 @@ pub struct Config {
     /// Command for a shell session tab (`Ctrl+A s`). Defaults to `$SHELL`, then
     /// `/bin/sh`. Can be any command — e.g. `"tmux"` for splits inside the tab.
     pub shell: Option<String>,
+    /// Tree (left) pane width as a percent of the terminal. Parsed here; clamped
+    /// into a sane range by the TUI (matching the `notify`/`theme` "parsed by the
+    /// TUI" convention). Live `<`/`>` adjust from here.
+    pub tree_width_pct: Option<u16>,
 }
 
 impl Config {
@@ -107,6 +111,17 @@ mod tests {
         let cfg = Config::load_from(tmp.path());
         assert_eq!(cfg.claude_args, vec!["--model", "sonnet"]);
         assert_eq!(cfg.claude_bin, None); // absent field defaults
+    }
+
+    #[test]
+    fn tree_width_pct_parses_and_defaults_to_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, r#"{ "tree_width_pct": 45 }"#).unwrap();
+        assert_eq!(Config::load_from(tmp.path()).tree_width_pct, Some(45));
+        // Absent field defaults to None (the TUI then seeds the default).
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(Config::load_from(tmp.path()).tree_width_pct, None);
     }
 
     #[test]

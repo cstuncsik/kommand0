@@ -5,6 +5,15 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Resizable tree pane** — adjust the left tree pane's width with `<` (shrink)
+  and `>` (widen) in 5% steps, clamped to 15–60%, or drag the border between the
+  tree and content panes with the mouse. The live value is per-session
+  (resets next launch); set a persistent default with the new `tree_width_pct`
+  config knob (default 30, clamped to the same range). Both keys are rebindable
+  (`shrink-tree` / `widen-tree`).
+
 ## [0.3.0] - 2026-06-29
 
 ### Added

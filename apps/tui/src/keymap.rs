@@ -18,6 +18,8 @@ pub(crate) enum Action {
     CollapseOrParent,
     StepInto,
     SelectLast,
+    WidenTree,
+    ShrinkTree,
     ActivateSelection,
     OpenSession,
     CloseSession,
@@ -43,6 +45,8 @@ pub(crate) const ALL_ACTIONS: &[Action] = &[
     Action::CollapseOrParent,
     Action::StepInto,
     Action::SelectLast,
+    Action::WidenTree,
+    Action::ShrinkTree,
     Action::ActivateSelection,
     Action::OpenSession,
     Action::CloseSession,
@@ -70,6 +74,8 @@ impl Action {
             Action::CollapseOrParent => "collapse",
             Action::StepInto => "expand",
             Action::SelectLast => "last",
+            Action::WidenTree => "widen-tree",
+            Action::ShrinkTree => "shrink-tree",
             Action::ActivateSelection => "activate",
             Action::OpenSession => "open",
             Action::CloseSession => "close",
@@ -97,6 +103,8 @@ impl Action {
             Action::CollapseOrParent => "Collapse repo / jump to parent",
             Action::StepInto => "Expand repo / step in",
             Action::SelectLast => "Last item (gg = first)",
+            Action::WidenTree => "Widen tree pane",
+            Action::ShrinkTree => "Shrink tree pane",
             Action::ActivateSelection => "Open workspace / expand repo",
             Action::OpenSession => "Open embedded claude",
             Action::CloseSession => "Close embedded claude",
@@ -270,6 +278,8 @@ const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("Right", Action::StepInto),
     ("l", Action::StepInto),
     ("G", Action::SelectLast),
+    (">", Action::WidenTree),
+    ("<", Action::ShrinkTree),
     ("Enter", Action::ActivateSelection),
     ("e", Action::OpenSession),
     ("r", Action::OpenSession),
@@ -391,6 +401,9 @@ mod tests {
         // SHIFT is carried by the char case, not a modifier).
         assert_eq!(km.resolve(&ev(KeyCode::Char('n'), KeyModifiers::NONE)), Some(Action::NextWaiting));
         assert_eq!(km.resolve(&ev(KeyCode::Char('N'), KeyModifiers::SHIFT)), Some(Action::PrevWaiting));
+        // < shrinks the tree pane, > widens it.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('<'), KeyModifiers::NONE)), Some(Action::ShrinkTree));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('>'), KeyModifiers::NONE)), Some(Action::WidenTree));
     }
 
     #[test]
@@ -435,6 +448,20 @@ mod tests {
         assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), None);
         // An unmodified action is unaffected by the rebind.
         assert_eq!(km.resolve(&ev(KeyCode::Char('j'), KeyModifiers::NONE)), Some(Action::MoveDown));
+    }
+
+    #[test]
+    fn config_rebinds_widen_tree() {
+        let mut cfg = HashMap::new();
+        cfg.insert("widen-tree".to_string(), vec!["ctrl+l".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.is_empty(), "{warns:?}");
+        // New chord widens; the old `>` no longer does.
+        let cl = parse_chord("ctrl+l").unwrap();
+        assert_eq!(km.resolve(&ev(cl.code, cl.mods)), Some(Action::WidenTree));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('>'), KeyModifiers::NONE)), None);
+        // Shrink keeps its default.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('<'), KeyModifiers::NONE)), Some(Action::ShrinkTree));
     }
 
     #[test]

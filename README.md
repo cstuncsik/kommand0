@@ -132,6 +132,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `j` / `k` / `Up` / `Down` | Tree | Navigate workspaces |
 | `h` / `l` / `Left` / `Right` | Tree | Collapse repo (or jump to parent) / expand repo |
 | `gg` / `G` | Tree | Jump to first / last item |
+| `<` / `>` | Tree | Shrink / widen the tree pane (5% steps, 15–60%; this session only — set `tree_width_pct` for a persistent default) |
 | `/` | Tree | Filter workspaces by name/branch (`Esc` clears) |
 | `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it — open PR, clean up, archive/activate, new session, or jump to a session tab |
 | `n` / `N` | Tree | Jump to + open the next / previous workspace that needs you (cycles the "N waiting") |
@@ -204,6 +205,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
   "claude_args": ["--model", "sonnet"],
   "claude_bin": "/usr/local/bin/claude",
   "status_refresh_secs": 2,
+  "tree_width_pct": 30,
   "keybindings": { "quit": ["ctrl+q"], "open": ["o"] },
   "theme": "high-contrast",
   "theme_colors": { "accent": "blue", "attention": "#ff8800" },
@@ -215,7 +217,8 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `claude_args` — extra args appended to every embedded `claude` spawn (e.g. `--model`, `--permission-mode`). Don't put `--session-id`/`--resume` here — kommand0 manages those.
 - `claude_bin` — override the `claude` binary (the `KOMMAND0_CLAUDE_BIN` env var still takes precedence).
 - `status_refresh_secs` — how often the background git-status refresh runs (default 2; floored at 1).
-- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `activate`, `open`, `close`, `open-pr`, `cleanup`, `filter`, `palette`, `next-waiting`, `prev-waiting`, `archive`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
+- `tree_width_pct` — the tree (left) pane width as a percent of the terminal (default 30; clamped to 15–60). This is the persistent baseline; the live `<`/`>` keys adjust a per-session value seeded from it (and reset to it next launch). You can also drag the border between the tree and content panes with the mouse to resize it live.
+- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `widen-tree`, `shrink-tree`, `activate`, `open`, `close`, `open-pr`, `cleanup`, `filter`, `palette`, `next-waiting`, `prev-waiting`, `archive`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
 - `theme` — a built-in palette for the app chrome: `"default"` or `"high-contrast"` (the embedded `claude` pane keeps its own colours either way). Unknown names warn and fall back to default.
 - `theme_colors` — per-role overrides applied on top of `theme`: `"<role>": "<color>"`. Roles: `accent`, `selected`, `active`, `attention`, `dirty`, `error`, `muted`, `text`, `inverse`. Colors: a named color (`cyan`, `light-red`, `darkgray`), an `#rrggbb` hex, a 0–255 palette index, or `reset`/`default` (the terminal's own default color — not the role's built-in). Unknown roles / unparseable colors are warned (tree border + log), not fatal.
 - `notify` — alert when a backgrounded session goes quiet with unseen output (the same "needs you" edge as the magenta dot): `"off"` (default), `"bell"` (terminal bell), `"desktop"` (an OS notification — `osascript` on macOS, `notify-send` on Linux; silently skipped if unavailable), or `"both"`. Fires once per rising edge (the latch means it won't repeat until you view the session and it comes back). Unknown values warn and fall back to `off`.
