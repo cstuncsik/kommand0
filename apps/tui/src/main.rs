@@ -1835,8 +1835,8 @@ impl App {
     /// `waiting_response` — never `attention`, so a busy shell spins without
     /// raising a "needs you" notification.
     fn apply_shell_busy(&mut self, now: Instant, shell_busy: &[(String, Option<bool>)]) {
-        // ponytail: 3s bridges bursty build/test output between lines; bump if a
-        // slow step (linker, quiet compile) flickers idle mid-run.
+        // 3s bridges bursty build/test output between lines; bump if a slow step
+        // (linker, quiet compile) flickers idle mid-run.
         const SHELL_BUSY_IDLE: Duration = Duration::from_secs(3);
         for (id, busy) in shell_busy {
             match busy {
@@ -3899,6 +3899,25 @@ mod key_tests {
             "None must not clear an output-active tab"
         );
         assert!(!app.waiting_response.contains("sh3"), "None must not add a tab");
+    }
+
+    #[test]
+    fn apply_shell_busy_ignores_a_foreground_process_that_never_emitted() {
+        // The commit's headline case: a shell with a live foreground command
+        // (an open nvim/less/pager) that has produced *no* output — so there is
+        // no `last_output_at` entry at all — must not spin. `is_some_and` on the
+        // missing entry is false, so `Some(true)` takes the clear branch.
+        let mut app = test_app();
+        let now = Instant::now();
+        assert!(
+            !app.last_output_at.contains_key("sh1"),
+            "precondition: the shell has never emitted output"
+        );
+        app.apply_shell_busy(now, &[("sh1".to_string(), Some(true))]);
+        assert!(
+            !app.waiting_response.contains("sh1"),
+            "a foreground-busy shell that never produced output must not spin"
+        );
     }
 
     #[test]
