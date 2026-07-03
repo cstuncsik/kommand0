@@ -1,0 +1,24 @@
+crates/core/src/worktree.rs
+  s_164243679ec02c::t_0a9861a168968a 54-58
+  s_164243679ec02c::t_e7aa2e12a6fb86 622-632
+  s_164243679ec02c::t_6a5eab6dd77232 621
+crates/core/src/lib.rs
+  s_164243679ec02c::t_29e36b15e7d585 536-558
+  s_164243679ec02c::t_f6842d50260b4c 579
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "d69a943e1724eb0ef2b676c8300f41b17bc40c15",
+  "prompts": {},
+  "sessions": {
+    "s_164243679ec02c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8eb123a-c396-4394-8625-f41817ed3acb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
