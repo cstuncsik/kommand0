@@ -1,0 +1,21 @@
+apps/tui/src/main.rs
+  s_c8cd322a8037ef::t_165d43e8ff97e5 2458-2469
+  s_c8cd322a8037ef::t_6e9ef5dea9d33d 2886-2901
+  s_c8cd322a8037ef::t_45434235b3faee 2510
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "c94d3c6085624f8f0789abc7a01558dc3fd18676",
+  "prompts": {},
+  "sessions": {
+    "s_c8cd322a8037ef": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aa571ffd-4694-4701-bae1-b59a84852cff",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
