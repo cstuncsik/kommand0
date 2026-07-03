@@ -51,6 +51,11 @@ fn verify_ref(repo_path: &str, full_ref: &str) -> bool {
 /// `kommand0/<name>` branch does NOT count — using `git show-ref --verify`
 /// (exact ref lookup), so revision syntax like `main^{commit}` never matches.
 pub fn branch_exists_bare(repo_path: &str, name: &str) -> bool {
+    // "HEAD" is never a branch: `refs/remotes/origin/HEAD` is a symbolic pointer
+    // to the default branch, so treat it as no match rather than a false positive.
+    if name == "HEAD" {
+        return false;
+    }
     verify_ref(repo_path, &format!("refs/heads/{name}"))
         || verify_ref(repo_path, &format!("refs/remotes/origin/{name}"))
 }
@@ -611,6 +616,18 @@ mod tests {
         let rp = repo.path().to_str().unwrap();
         Command::new("git").args(["-C", rp, "branch", "kommand0/feat"]).output().unwrap();
         assert!(!branch_exists_bare(rp, "feat"), "kommand0/<name> is not a bare-name match");
+    }
+
+    #[test]
+    fn branch_exists_bare_false_for_head() {
+        // A clone has `refs/remotes/origin/HEAD` (a symbolic default-branch
+        // pointer), but "HEAD" is not a branch name — must not false-match.
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+        let work = TempDir::new().unwrap();
+        let clone = work.path().join("repo");
+        Command::new("git").args(["clone", origin.path().to_str().unwrap(), clone.to_str().unwrap()]).output().unwrap();
+        assert!(!branch_exists_bare(clone.to_str().unwrap(), "HEAD"), "HEAD is not a branch");
     }
 
     #[test]
