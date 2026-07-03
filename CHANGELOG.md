@@ -16,6 +16,19 @@ All notable changes to kommand0 are documented here. The format is based on
   it on stderr; a new `--fork` flag forces a new branch (`--branch` still checks
   one out explicitly).
 
+### Fixed
+
+- **Paste into TUI text inputs** — bracketed paste now works in the add-repo and
+  add-workspace modals, the command palette, and the workspace filter. Previously
+  a terminal paste was only forwarded to the embedded Claude pane and silently
+  dropped in every other input.
+- **`?` opens help on Kitty-protocol terminals** — on Ghostty, Kitty, WezTerm,
+  foot, and recent iTerm2, pressing `?` now opens the help overlay instead of
+  typing `/` into the tree filter.
+- **No false activity spinner for an idle foreground shell** — an interactive
+  foreground program in a shell tab (nvim, `less`, a pager, `htop`) no longer
+  holds the activity indicator busy indefinitely.
+
 ## [0.4.0] - 2026-07-03
 
 ### Added
