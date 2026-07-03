@@ -274,7 +274,7 @@ fn main() -> anyhow::Result<()> {
                         let offer = match (&name, fork) {
                             (Some(n), false) => state.validate_new_workspace_name(n).is_ok()
                                 && kommand0_core::worktree::branch_exists_bare(
-                                    &state.resolve_repo(&repo)?.path.clone(),
+                                    &state.resolve_repo(&repo)?.path,
                                     n,
                                 ),
                             _ => false,
@@ -295,9 +295,14 @@ fn main() -> anyhow::Result<()> {
                                 }
                             } else {
                                 let ws = state.create_workspace(Some(n), &repo)?;
-                                eprintln!(
-                                    "note: branch '{n}' exists; forked kommand0/{n} (use --branch {n} to check it out)"
-                                );
+                                // Report the branch actually created — `unique_branch_name`
+                                // may suffix it (`kommand0/{n}-2`), and a worktree fallback
+                                // leaves `branch_name` None (nothing forked → no note).
+                                if let Some(b) = &ws.branch_name {
+                                    eprintln!(
+                                        "note: branch '{n}' exists; forked {b} (use --branch {n} to check it out)"
+                                    );
+                                }
                                 ws
                             }
                         }

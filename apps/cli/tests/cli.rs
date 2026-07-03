@@ -195,7 +195,10 @@ fn workspace_create_over_existing_branch_forks_and_notes_when_non_interactive() 
 
     // Forked, not adopted: the branch is `kommand0/feat`, not `feat`.
     let status = stdout(&kmd(&state, &[], &["workspace", "status", "feat"]));
-    assert!(status.contains("kommand0/feat"), "forked the workspace branch: {status}");
+    assert!(
+        status.contains("kommand0/feat") && !status.contains("kommand0/feat-"),
+        "forked exactly kommand0/feat (not adopted 'feat' or a suffixed variant): {status}"
+    );
 }
 
 #[test]
@@ -213,7 +216,29 @@ fn workspace_create_with_fork_forks_silently() {
     );
 
     let status = stdout(&kmd(&state, &[], &["workspace", "status", "feat"]));
-    assert!(status.contains("kommand0/feat"), "forked the workspace branch: {status}");
+    assert!(
+        status.contains("kommand0/feat") && !status.contains("kommand0/feat-"),
+        "forked exactly kommand0/feat (not adopted 'feat' or a suffixed variant): {status}"
+    );
+}
+
+#[test]
+fn non_interactive_note_names_the_actual_forked_branch() {
+    // When `kommand0/feat` already exists, the fork is suffixed to `kommand0/feat-2`;
+    // the note must name the branch actually created (read from `ws.branch_name`),
+    // not a hardcoded `kommand0/feat`.
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo) = repo_with_branch_feat(tmp.path());
+    // Occupy the default fork name so `unique_branch_name` has to suffix.
+    run_git(std::path::Path::new(&repo), &["branch", "kommand0/feat"]);
+
+    let out = kmd(&state, &[], &["workspace", "create", "feat", "--repo", &repo]);
+    assert!(out.status.success(), "create feat: {}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("forked kommand0/feat-2"),
+        "note names the real (suffixed) fork branch, not the hardcoded default: {err}"
+    );
 }
 
 #[test]
