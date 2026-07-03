@@ -2463,8 +2463,8 @@ fn cli_short_circuit(args: &[String]) -> Option<String> {
 /// (and `:`→`;`, `<`→`,`, `>`→`.`, uppercase letters, …), so help opened the
 /// filter instead and the embedded pane typed `/` for `?`.
 fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
-    use crossterm::event::KeyboardEnhancementFlags as F;
-    F::DISAMBIGUATE_ESCAPE_CODES | F::REPORT_ALL_KEYS_AS_ESCAPE_CODES | F::REPORT_ALTERNATE_KEYS
+    use crossterm::event::KeyboardEnhancementFlags as Flags;
+    Flags::DISAMBIGUATE_ESCAPE_CODES | Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES | Flags::REPORT_ALTERNATE_KEYS
 }
 
 #[tokio::main]
@@ -2883,20 +2883,16 @@ mod key_tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    // Regression: reporting all keys as escape codes without alternate keys made
-    // the terminal omit the shifted codepoint, so `?` (Shift+/) arrived as
-    // `Char('/')` + SHIFT and opened the filter instead of help.
+    // These two Kitty-protocol flags must travel together: REPORT_ALL_KEYS_AS_ESCAPE_CODES
+    // routes shifted keys through CSI-u, and REPORT_ALTERNATE_KEYS is what makes the
+    // terminal report the shifted codepoint. The behavioral contract they enable
+    // (`?` resolves to Help, not Filter) is pinned in keymap.rs::shifted_symbols_resolve.
     #[test]
-    fn report_all_keys_requires_alternate_keys() {
-        use crossterm::event::KeyboardEnhancementFlags as F;
+    fn enhancement_flags_pair_alternate_with_report_all() {
+        use crossterm::event::KeyboardEnhancementFlags as Flags;
         let flags = keyboard_enhancement_flags();
-        if flags.contains(F::REPORT_ALL_KEYS_AS_ESCAPE_CODES) {
-            assert!(
-                flags.contains(F::REPORT_ALTERNATE_KEYS),
-                "REPORT_ALL_KEYS_AS_ESCAPE_CODES needs REPORT_ALTERNATE_KEYS so shifted \
-                 keys (?, :, <, >, uppercase) resolve to their character, not the base key",
-            );
-        }
+        assert!(flags.contains(Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+        assert!(flags.contains(Flags::REPORT_ALTERNATE_KEYS));
     }
 
     #[test]
