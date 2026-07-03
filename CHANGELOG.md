@@ -7,6 +7,22 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [0.6.0] - 2026-07-03
 
+### Added
+
+- **Dimmed text in the embedded pane** — faint output (SGR 2), such as Claude
+  Code's ghosted input suggestions, now renders dimmed instead of solid white,
+  so a suggestion no longer reads like text you already typed.
+
+### Changed
+
+- **Terminal stack upgraded** — ratatui 0.29 → 0.30, vt100 0.15 → 0.16 (which is
+  what unlocks the dim attribute above), and crossterm 0.28 → 0.29 to match
+  ratatui's default backend. The minimum supported Rust version is now **1.88**,
+  declared via `rust-version`.
+- **Supply-chain guard** — CI now runs `cargo audit` against the RustSec
+  advisory database on every push and PR, and `anyhow` was bumped to 1.0.103 to
+  clear RUSTSEC-2026-0190.
+
 ## [0.5.1] - 2026-07-03
 
 ### Changed
