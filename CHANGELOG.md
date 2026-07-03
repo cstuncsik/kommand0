@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Add-workspace branch detection** — when adding a workspace by name with the
+  Branch field blank, if a git branch with that exact name already exists (local
+  or `origin`), a prompt offers to check it out instead of silently forking a new
+  `kommand0/<name>` branch. An explicitly-filled Branch field is unchanged.
+
 ## [0.4.0] - 2026-07-03
 
 ### Added
