@@ -397,13 +397,13 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
             _ => ModalResult::Consumed,
         },
         ModalState::ConfirmBranchCheckout { repo_id, name, .. } => {
-            // Ctrl+C cancels first (every modal treats it so) — before the bare
-            // `c` confirm, which must not fire on Ctrl+C.
-            if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
-                *modal = ModalState::None;
-                return ModalResult::Cancelled;
-            }
             match key.code {
+                // Ctrl+C cancels (every modal treats it so). Guard arms are tried
+                // top-down, so this wins over the bare-`c` confirm below.
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
+                }
                 KeyCode::Enter | KeyCode::Char('c') => {
                     let (repo_id, name) = (repo_id.clone(), name.clone());
                     *modal = ModalState::None;
@@ -414,7 +414,7 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                     *modal = ModalState::None;
                     ModalResult::BranchCheckoutChoice { repo_id, name, checkout: false }
                 }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                KeyCode::Esc => {
                     *modal = ModalState::None;
                     ModalResult::Cancelled
                 }
@@ -1073,12 +1073,16 @@ mod tests {
     }
 
     #[test]
-    fn confirm_branch_checkout_esc_and_n_cancel() {
-        for k in [KeyCode::Esc, KeyCode::Char('n')] {
-            let mut modal = confirm_branch_checkout_modal();
-            assert!(matches!(handle_modal_key(&mut modal, key(k)), ModalResult::Cancelled), "{k:?} cancels");
-            assert!(matches!(modal, ModalState::None), "{k:?} closes the modal with no result");
-        }
+    fn confirm_branch_checkout_esc_cancels_and_n_is_a_noop() {
+        let mut modal = confirm_branch_checkout_modal();
+        assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Esc)), ModalResult::Cancelled), "Esc cancels");
+        assert!(matches!(modal, ModalState::None), "Esc closes the modal with no result");
+
+        // In a 3-way choice `n` is ambiguous (the footer offers only Esc), so it's
+        // a no-op that leaves the prompt open rather than cancelling.
+        let mut modal = confirm_branch_checkout_modal();
+        assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Char('n'))), ModalResult::Consumed), "n is a no-op");
+        assert!(matches!(modal, ModalState::ConfirmBranchCheckout { .. }), "n leaves the prompt open");
     }
 
     #[test]
