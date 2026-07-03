@@ -389,6 +389,59 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
     }
 }
 
+/// Insert pasted text into the focused text field of a modal.
+///
+/// Bracketed paste arrives as one `Event::Paste`, not as `Char` keys, so the
+/// key handler above never sees it — without this, paste is dropped in every
+/// modal. Confirm-only modals (delete/cleanup) have no field and ignore it.
+/// Control chars (newlines, tabs) are stripped: these are single-line fields,
+/// and a pasted trailing newline must not corrupt the buffer or act like Enter.
+pub(crate) fn handle_modal_paste(modal: &mut ModalState, text: &str) {
+    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    if clean.is_empty() {
+        return;
+    }
+    let (buf, cur): (&mut String, &mut usize) = match modal {
+        ModalState::AddRepo {
+            input,
+            cursor,
+            error,
+            completions,
+            completion_index,
+        } => {
+            // Paste is like typing: clear the error and stale completions.
+            *error = None;
+            completions.clear();
+            *completion_index = None;
+            (input, cursor)
+        }
+        ModalState::AddWorkspace {
+            input,
+            cursor,
+            branch,
+            branch_cursor,
+            field,
+            error,
+            ..
+        } => {
+            *error = None;
+            match field {
+                AddWorkspaceField::Name => (input, cursor),
+                AddWorkspaceField::Branch => (branch, branch_cursor),
+            }
+        }
+        ModalState::RenameSession { input, cursor, error, .. } => {
+            *error = None;
+            (input, cursor)
+        }
+        ModalState::None | ModalState::ConfirmDelete { .. } | ModalState::ConfirmCleanup { .. } => {
+            return;
+        }
+    };
+    buf.insert_str(*cur, &clean);
+    *cur += clean.len();
+}
+
 /// Generate path completions for the given partial input.
 fn complete_path(partial: &str) -> Vec<String> {
     let path = if partial.is_empty() {
@@ -939,6 +992,51 @@ mod tests {
             }
             _ => panic!("expected SubmitWorkspace"),
         }
+    }
+
+    #[test]
+    fn paste_inserts_at_cursor_and_strips_newlines() {
+        let mut modal = ModalState::AddRepo {
+            input: "ab".into(),
+            cursor: 1, // between 'a' and 'b'
+            error: Some("stale".into()),
+            completions: vec!["x".into()],
+            completion_index: Some(0),
+        };
+        handle_modal_paste(&mut modal, "/tmp\n");
+        match modal {
+            ModalState::AddRepo { input, cursor, error, completions, .. } => {
+                assert_eq!(input, "a/tmpb", "text lands at the cursor, newline stripped");
+                assert_eq!(cursor, 5, "cursor advances past the pasted bytes");
+                assert!(error.is_none() && completions.is_empty(), "paste clears error+completions");
+            }
+            _ => panic!("modal changed variant"),
+        }
+    }
+
+    #[test]
+    fn paste_targets_the_focused_workspace_field() {
+        let mut modal = add_workspace_modal();
+        handle_modal_paste(&mut modal, "my-ws");
+        handle_modal_key(&mut modal, key(KeyCode::Tab)); // focus Branch
+        handle_modal_paste(&mut modal, "feat/paste");
+        match handle_modal_key(&mut modal, key(KeyCode::Enter)) {
+            ModalResult::SubmitWorkspace(_, name, branch) => {
+                assert_eq!(name, "my-ws");
+                assert_eq!(branch, "feat/paste");
+            }
+            _ => panic!("expected SubmitWorkspace"),
+        }
+    }
+
+    #[test]
+    fn paste_is_a_noop_on_confirm_modals() {
+        // Confirm-only modals have no field — must not panic or change variant.
+        let mut modal = ModalState::ConfirmDelete {
+            target: DeleteTarget::Workspace { name: "w".into() },
+        };
+        handle_modal_paste(&mut modal, "ignored");
+        assert!(matches!(modal, ModalState::ConfirmDelete { .. }));
     }
 
     #[test]

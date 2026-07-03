@@ -94,6 +94,17 @@ impl Palette {
         self.rerank();
     }
 
+    /// Append pasted text to the query (control chars stripped — the query is a
+    /// single line). Reranks once for the whole paste rather than per char.
+    pub fn paste(&mut self, text: &str) {
+        let before = self.query.len();
+        self.query.extend(text.chars().filter(|c| !c.is_control()));
+        if self.query.len() != before {
+            self.selected = 0;
+            self.rerank();
+        }
+    }
+
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
@@ -364,6 +375,19 @@ mod tests {
             Some(&PaletteAction::OpenPr { ws_id: "w1".into() }),
             "typing 'pr' surfaces the Open PR action over the plain workspace jump"
         );
+    }
+
+    #[test]
+    fn paste_appends_to_query_reranks_and_strips_control() {
+        let cands = vec![
+            cand("w1", "reauthorize", "api", None),
+            cand("w2", "auth-refactor", "web", None),
+        ];
+        let mut p = Palette::new(cands);
+        p.paste("auth\n"); // newline stripped; query narrows to the two auth rows
+        assert_eq!(p.query, "auth");
+        assert_eq!(p.results.len(), 2);
+        assert_eq!(sel_ws(&p), Some("w2"), "boundary match ranks first after paste");
     }
 
     #[test]

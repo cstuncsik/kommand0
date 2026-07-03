@@ -2666,11 +2666,22 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         // EventStream wedges on a rapid resize burst.)
                     }
                     Event::Paste(text) => {
-                        // Only the embedded pane consumes paste; forward it as a
-                        // bracketed paste (claude enables bracketed paste, so a
-                        // multi-line paste stays one block). A modal over the pane
-                        // (e.g. Rename Session) suppresses the passthrough.
-                        if app.focus == Focus::Embedded && !app.modal.is_active() {
+                        // Bracketed paste arrives as one event (not Char keys), so
+                        // route it to whatever text input owns the screen — same
+                        // precedence as keys (modal → palette → filter → pane).
+                        // Without this, paste is silently dropped in every overlay.
+                        if app.modal.is_active() {
+                            modal::handle_modal_paste(&mut app.modal, &text);
+                        } else if let Some(p) = app.palette.as_mut() {
+                            p.paste(&text);
+                        } else if app.filter_input {
+                            app.filter_query
+                                .extend(text.chars().filter(|c| !c.is_control()));
+                            app.apply_filter();
+                        } else if app.focus == Focus::Embedded {
+                            // Forward raw to the embedded app as a bracketed paste
+                            // (claude enables it, so a multi-line paste stays one
+                            // block). Keep newlines here — the pane wants them.
                             let sent = app.active_pane_mut().map(|pane| {
                                 let mut bytes = b"\x1b[200~".to_vec();
                                 bytes.extend_from_slice(text.as_bytes());
