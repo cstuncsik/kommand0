@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Calmer activity indicators** — the "working" spinner now rides through a
+  Claude session's bursty output (a ~2s window) instead of flickering on every
+  sub-second pause, and a workspace is only flagged idle / "needs you" after it
+  has been genuinely quiet for ~3s. Feel over accuracy: fewer rapid state flips,
+  a clearer "is this actually idle" read.
+
 ## [0.5.0] - 2026-07-03
 
 ### Added
