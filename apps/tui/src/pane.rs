@@ -139,7 +139,7 @@ impl Pane {
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .context("pty resize failed")?;
         if let Ok(mut p) = self.parser.lock() {
-            p.set_size(rows, cols);
+            p.screen_mut().set_size(rows, cols);
         }
         self.rows = rows;
         self.cols = cols;
