@@ -389,15 +389,35 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
     }
 }
 
+/// Sanitize pasted text for a single-line input. Drops control chars (so a
+/// pasted newline can't submit or corrupt the buffer) plus line/paragraph
+/// separators, bidi overrides, and zero-width/BOM format chars — which would
+/// otherwise allow Trojan-Source-style visual spoofing of a name/path. Shared
+/// by every paste sink (modal, palette, filter) so they stay in step.
+pub(crate) fn sanitize_paste(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    *c,
+                    '\u{2028}' | '\u{2029}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{feff}'
+                )
+        })
+        .collect()
+}
+
 /// Insert pasted text into the focused text field of a modal.
 ///
 /// Bracketed paste arrives as one `Event::Paste`, not as `Char` keys, so the
 /// key handler above never sees it — without this, paste is dropped in every
 /// modal. Confirm-only modals (delete/cleanup) have no field and ignore it.
-/// Control chars (newlines, tabs) are stripped: these are single-line fields,
-/// and a pasted trailing newline must not corrupt the buffer or act like Enter.
+/// Text is sanitized via [`sanitize_paste`] (these are single-line fields).
 pub(crate) fn handle_modal_paste(modal: &mut ModalState, text: &str) {
-    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    let clean = sanitize_paste(text);
     if clean.is_empty() {
         return;
     }
@@ -1037,6 +1057,70 @@ mod tests {
         };
         handle_modal_paste(&mut modal, "ignored");
         assert!(matches!(modal, ModalState::ConfirmDelete { .. }));
+    }
+
+    #[test]
+    fn paste_multibyte_keeps_cursor_on_a_char_boundary() {
+        // "áb": á is 2 bytes (0..2), b at byte 2 — cursor 2 is a valid boundary.
+        // Guards the byte-index invariant: a refactor to chars().count() would
+        // land the cursor mid-codepoint here and panic in render's slice.
+        let mut modal = ModalState::AddRepo {
+            input: "áb".into(),
+            cursor: 2,
+            error: None,
+            completions: vec![],
+            completion_index: None,
+        };
+        handle_modal_paste(&mut modal, "é"); // 2 bytes
+        match modal {
+            ModalState::AddRepo { input, cursor, .. } => {
+                assert_eq!(input, "áéb");
+                assert_eq!(cursor, 4, "cursor advances by byte length, not char count");
+                assert!(input.is_char_boundary(cursor), "cursor must stay slice-safe");
+            }
+            _ => panic!("modal changed variant"),
+        }
+    }
+
+    #[test]
+    fn paste_into_rename_session_inserts_and_clears_error() {
+        let mut modal = ModalState::RenameSession {
+            ws_id: "w".into(),
+            session_id: "s".into(),
+            input: "ab".into(),
+            cursor: 1,
+            error: Some("stale".into()),
+        };
+        handle_modal_paste(&mut modal, "/x\n");
+        match modal {
+            ModalState::RenameSession { input, cursor, error, .. } => {
+                assert_eq!(input, "a/xb", "text lands at the cursor, newline stripped");
+                assert_eq!(cursor, 3);
+                assert!(error.is_none(), "paste clears the error like typing does");
+            }
+            _ => panic!("modal changed variant"),
+        }
+    }
+
+    #[test]
+    fn paste_of_only_control_chars_is_a_noop_in_modals() {
+        // Sanitizes to empty -> early return, before touching error/completions.
+        let mut modal = ModalState::AddRepo {
+            input: "ab".into(),
+            cursor: 1,
+            error: Some("stale".into()),
+            completions: vec!["x".into()],
+            completion_index: Some(0),
+        };
+        handle_modal_paste(&mut modal, "\n\t");
+        match modal {
+            ModalState::AddRepo { input, cursor, error, completions, .. } => {
+                assert_eq!(input, "ab", "nothing inserted");
+                assert_eq!(cursor, 1, "cursor unchanged");
+                assert!(error.is_some() && completions.len() == 1, "no-op leaves state untouched");
+            }
+            _ => panic!("modal changed variant"),
+        }
     }
 
     #[test]

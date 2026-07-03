@@ -14,7 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use super::modal::render_input_with_cursor;
+use super::modal::{render_input_with_cursor, sanitize_paste};
 use super::theme::Theme;
 
 /// What running a palette entry does. Dispatched by the app once the palette
@@ -94,15 +94,17 @@ impl Palette {
         self.rerank();
     }
 
-    /// Append pasted text to the query (control chars stripped — the query is a
-    /// single line). Reranks once for the whole paste rather than per char.
+    /// Append pasted text to the query (sanitized for a single line via
+    /// [`sanitize_paste`]). Reranks once for the whole paste, not per char; a
+    /// paste that sanitizes to nothing is a no-op and keeps the selection.
     pub fn paste(&mut self, text: &str) {
-        let before = self.query.len();
-        self.query.extend(text.chars().filter(|c| !c.is_control()));
-        if self.query.len() != before {
-            self.selected = 0;
-            self.rerank();
+        let clean = sanitize_paste(text);
+        if clean.is_empty() {
+            return;
         }
+        self.query.push_str(&clean);
+        self.selected = 0;
+        self.rerank();
     }
 
     pub fn move_up(&mut self) {
@@ -388,6 +390,15 @@ mod tests {
         assert_eq!(p.query, "auth");
         assert_eq!(p.results.len(), 2);
         assert_eq!(sel_ws(&p), Some("w2"), "boundary match ranks first after paste");
+    }
+
+    #[test]
+    fn paste_of_only_control_chars_is_a_noop_and_keeps_selection() {
+        let mut p = Palette::new(vec![cand("w1", "a", "r", None), cand("w2", "b", "r", None)]);
+        p.move_down(); // selected = 1
+        p.paste("\n\t"); // sanitizes to empty
+        assert_eq!(p.query, "");
+        assert_eq!(p.selected, 1, "a no-op paste must not rerank or reset the selection");
     }
 
     #[test]

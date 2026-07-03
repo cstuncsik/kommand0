@@ -1861,6 +1861,20 @@ enum KeyOutcome {
     Quit,
 }
 
+/// Append pasted text to the tree filter query (sanitized for a single line via
+/// [`modal::sanitize_paste`]), then re-apply the filter. Extracted from the
+/// event loop so it's unit-testable and consistent with the modal/palette paste
+/// sinks. A paste that sanitizes to nothing is a no-op — the query and the
+/// current selection are left untouched (no needless re-rank).
+fn handle_filter_paste(app: &mut App, text: &str) {
+    let clean = modal::sanitize_paste(text);
+    if clean.is_empty() {
+        return;
+    }
+    app.filter_query.push_str(&clean);
+    app.apply_filter();
+}
+
 /// Handle one key press. Extracted from the main event loop so tests can
 /// drive the app without a real terminal.
 async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> {
@@ -2666,19 +2680,17 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         // EventStream wedges on a rapid resize burst.)
                     }
                     Event::Paste(text) => {
-                        // Bracketed paste arrives as one event (not Char keys), so
-                        // route it to whatever text input owns the screen — same
-                        // precedence as keys (modal → palette → filter → pane).
-                        // Without this, paste is silently dropped in every overlay.
-                        if app.modal.is_active() {
-                            modal::handle_modal_paste(&mut app.modal, &text);
-                        } else if let Some(p) = app.palette.as_mut() {
-                            p.paste(&text);
-                        } else if app.filter_input {
-                            app.filter_query
-                                .extend(text.chars().filter(|c| !c.is_control()));
-                            app.apply_filter();
-                        } else if app.focus == Focus::Embedded {
+                        // Bracketed paste arrives as one event (not Char keys).
+                        // Route it with the SAME precedence handle_key uses: the
+                        // embedded pane wins unless a modal is up, then modal →
+                        // palette → filter. The pane must be checked first because
+                        // a stale `/` filter can coexist with a mouse-opened pane
+                        // (toggle_embedded leaves filter_input set, and handle_key
+                        // checks embedded before filter too) — routing filter first
+                        // would steal the pane's paste. Help swallows keys and
+                        // implies Focus::Tree, so it falls through to a no-op here,
+                        // matching its key behavior.
+                        if app.focus == Focus::Embedded && !app.modal.is_active() {
                             // Forward raw to the embedded app as a bracketed paste
                             // (claude enables it, so a multi-line paste stays one
                             // block). Keep newlines here — the pane wants them.
@@ -2691,6 +2703,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             if sent.is_none() {
                                 app.focus = Focus::Tree;
                             }
+                        } else if app.modal.is_active() {
+                            modal::handle_modal_paste(&mut app.modal, &text);
+                        } else if let Some(p) = app.palette.as_mut() {
+                            p.paste(&text);
+                        } else if app.filter_input {
+                            handle_filter_paste(&mut app, &text);
                         }
                     }
                     Event::Mouse(mouse_event) => {
@@ -3119,6 +3137,31 @@ mod key_tests {
         app.filter_query.clear();
         app.rebuild_tree();
         assert_eq!(ws_names(&app).len(), 4);
+    }
+
+    #[test]
+    fn paste_appends_to_filter_query_and_reapplies() {
+        let mut app = test_app();
+        app.workspaces = vec![
+            mk_ws("w1", "auth", "r1", None),
+            mk_ws("w2", "docs", "r1", None),
+        ];
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.filter_input = true;
+
+        handle_filter_paste(&mut app, "au\n"); // newline stripped
+        assert_eq!(app.filter_query, "au", "control chars stripped, text appended");
+        assert_eq!(ws_names(&app), vec!["auth"], "the filter is re-applied after paste");
+    }
+
+    #[test]
+    fn paste_of_only_control_chars_leaves_the_filter_untouched() {
+        let mut app = test_app();
+        app.filter_query = "keep".into();
+        app.filter_input = true;
+        handle_filter_paste(&mut app, "\n\t");
+        assert_eq!(app.filter_query, "keep", "a paste that sanitizes to nothing is a no-op");
     }
 
     #[tokio::test]
