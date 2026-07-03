@@ -533,6 +533,29 @@ impl AppState {
         self.create_workspace_impl(name, repo_ref, base, true, Some(branch))
     }
 
+    /// Validate a would-be workspace name: it becomes a path segment under
+    /// `worktrees/` and a branch suffix, so reject anything that could escape the
+    /// dir or trip git's arg parsing (empty/whitespace, `.`/`..`, a path
+    /// separator, or a leading dash), and reject a name already in use.
+    pub fn validate_new_workspace_name(&self, name: &str) -> anyhow::Result<()> {
+        if name.trim().is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || name.starts_with('-')
+        {
+            bail!(
+                "invalid workspace name {name:?}: must not be empty, '.'/'..', \
+                 contain a path separator, or start with '-'"
+            );
+        }
+        if self.workspaces.iter().any(|w| w.name == name) {
+            bail!("workspace already exists: {name}");
+        }
+        Ok(())
+    }
+
     fn create_workspace_impl(
         &mut self,
         name: Option<&str>,
@@ -553,25 +576,7 @@ impl AppState {
             },
         };
 
-        // The name becomes a path segment under `worktrees/` and a branch suffix,
-        // so reject anything that could escape the dir or trip git's arg parsing:
-        // empty/whitespace, a path separator or `.`/`..`, or a leading dash.
-        if ws_name.trim().is_empty()
-            || ws_name == "."
-            || ws_name == ".."
-            || ws_name.contains('/')
-            || ws_name.contains('\\')
-            || ws_name.starts_with('-')
-        {
-            bail!(
-                "invalid workspace name {ws_name:?}: must not be empty, '.'/'..', \
-                 contain a path separator, or start with '-'"
-            );
-        }
-
-        if self.workspaces.iter().any(|w| w.name == ws_name) {
-            bail!("workspace already exists: {ws_name}");
-        }
+        self.validate_new_workspace_name(&ws_name)?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

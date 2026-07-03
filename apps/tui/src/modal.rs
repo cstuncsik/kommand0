@@ -75,6 +75,13 @@ pub(crate) enum ModalState {
         dirty: bool,
         unpushed: bool,
     },
+    /// A branch named `name` already exists (local or origin); offer to check it
+    /// out instead of forking a fresh `kommand0/<name>`.
+    ConfirmBranchCheckout {
+        repo_id: String,
+        repo_name: String,
+        name: String,
+    },
 }
 
 impl ModalState {
@@ -100,6 +107,9 @@ pub(crate) enum ModalResult {
     SubmitRename(String, String, String),
     /// Cleanup confirmed for a workspace id.
     ConfirmCleanup(String),
+    /// Choice from the branch-exists prompt: check out the existing branch when
+    /// `checkout`, else fork a fresh `kommand0/<name>`.
+    BranchCheckoutChoice { repo_id: String, name: String, checkout: bool },
 }
 
 /// Handle a key event when a modal is active.
@@ -386,6 +396,31 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
             }
             _ => ModalResult::Consumed,
         },
+        ModalState::ConfirmBranchCheckout { repo_id, name, .. } => {
+            match key.code {
+                // Ctrl+C cancels (every modal treats it so). Guard arms are tried
+                // top-down, so this wins over the bare-`c` confirm below.
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
+                }
+                KeyCode::Enter | KeyCode::Char('c') => {
+                    let (repo_id, name) = (repo_id.clone(), name.clone());
+                    *modal = ModalState::None;
+                    ModalResult::BranchCheckoutChoice { repo_id, name, checkout: true }
+                }
+                KeyCode::Char('f') => {
+                    let (repo_id, name) = (repo_id.clone(), name.clone());
+                    *modal = ModalState::None;
+                    ModalResult::BranchCheckoutChoice { repo_id, name, checkout: false }
+                }
+                KeyCode::Esc => {
+                    *modal = ModalState::None;
+                    ModalResult::Cancelled
+                }
+                _ => ModalResult::Consumed,
+            }
+        }
     }
 }
 
@@ -454,7 +489,10 @@ pub(crate) fn handle_modal_paste(modal: &mut ModalState, text: &str) {
             *error = None;
             (input, cursor)
         }
-        ModalState::None | ModalState::ConfirmDelete { .. } | ModalState::ConfirmCleanup { .. } => {
+        ModalState::None
+        | ModalState::ConfirmDelete { .. }
+        | ModalState::ConfirmCleanup { .. }
+        | ModalState::ConfirmBranchCheckout { .. } => {
             return;
         }
     };
@@ -925,6 +963,48 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[5],
             );
         }
+        ModalState::ConfirmBranchCheckout { repo_name, name, .. } => {
+            let area = centered_rect(55, 20, frame.area());
+            frame.render_widget(Clear, area);
+
+            let inner = Layout::vertical([
+                Constraint::Length(2), // message
+                Constraint::Min(0),   // spacer
+                Constraint::Length(1), // footer
+            ])
+            .split(Rect::new(
+                area.x + 2,
+                area.y + 1,
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(2),
+            ));
+
+            let block = Block::default()
+                .title(format!(" Add Workspace to {repo_name} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th.accent));
+            frame.render_widget(block, area);
+
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!("Branch '{name}' already exists."),
+                    Style::default().fg(th.text),
+                )),
+                inner[0],
+            );
+
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Enter", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+                    Span::raw(" check it out   "),
+                    Span::styled("f", Style::default().fg(th.accent)),
+                    Span::raw(format!(" fork kommand0/{name}   ")),
+                    Span::styled("Esc", Style::default().fg(th.accent)),
+                    Span::raw(" cancel"),
+                ])),
+                inner[2],
+            );
+        }
     }
 }
 
@@ -1131,5 +1211,71 @@ mod tests {
         handle_modal_key(&mut modal, key(KeyCode::Char('x')));
         assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Enter)), ModalResult::Consumed));
         assert!(matches!(modal, ModalState::AddWorkspace { error: Some(_), .. }), "stays open with an error");
+    }
+
+    fn confirm_branch_checkout_modal() -> ModalState {
+        ModalState::ConfirmBranchCheckout {
+            repo_id: "r1".into(),
+            repo_name: "demo".into(),
+            name: "feat".into(),
+        }
+    }
+
+    #[test]
+    fn confirm_branch_checkout_enter_checks_out() {
+        let mut modal = confirm_branch_checkout_modal();
+        match handle_modal_key(&mut modal, key(KeyCode::Enter)) {
+            ModalResult::BranchCheckoutChoice { repo_id, name, checkout } => {
+                assert_eq!(repo_id, "r1");
+                assert_eq!(name, "feat");
+                assert!(checkout, "Enter checks out the existing branch");
+            }
+            _ => panic!("expected BranchCheckoutChoice"),
+        }
+        assert!(matches!(modal, ModalState::None), "choice closes the modal");
+    }
+
+    #[test]
+    fn confirm_branch_checkout_c_checks_out() {
+        let mut modal = confirm_branch_checkout_modal();
+        match handle_modal_key(&mut modal, key(KeyCode::Char('c'))) {
+            ModalResult::BranchCheckoutChoice { checkout, .. } => assert!(checkout, "bare c checks out"),
+            _ => panic!("expected BranchCheckoutChoice"),
+        }
+    }
+
+    #[test]
+    fn confirm_branch_checkout_f_forks() {
+        let mut modal = confirm_branch_checkout_modal();
+        match handle_modal_key(&mut modal, key(KeyCode::Char('f'))) {
+            ModalResult::BranchCheckoutChoice { repo_id, name, checkout } => {
+                assert_eq!(repo_id, "r1");
+                assert_eq!(name, "feat");
+                assert!(!checkout, "f forks a new branch");
+            }
+            _ => panic!("expected BranchCheckoutChoice"),
+        }
+    }
+
+    #[test]
+    fn confirm_branch_checkout_esc_cancels_and_n_is_a_noop() {
+        let mut modal = confirm_branch_checkout_modal();
+        assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Esc)), ModalResult::Cancelled), "Esc cancels");
+        assert!(matches!(modal, ModalState::None), "Esc closes the modal with no result");
+
+        // In a 3-way choice `n` is ambiguous (the footer offers only Esc), so it's
+        // a no-op that leaves the prompt open rather than cancelling.
+        let mut modal = confirm_branch_checkout_modal();
+        assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Char('n'))), ModalResult::Consumed), "n is a no-op");
+        assert!(matches!(modal, ModalState::ConfirmBranchCheckout { .. }), "n leaves the prompt open");
+    }
+
+    #[test]
+    fn confirm_branch_checkout_ctrl_c_cancels_not_checks_out() {
+        // Ctrl+C must cancel (like every other modal), not fire the bare-c confirm.
+        let mut modal = confirm_branch_checkout_modal();
+        let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(handle_modal_key(&mut modal, ev), ModalResult::Cancelled));
+        assert!(matches!(modal, ModalState::None), "Ctrl+C closes the modal with no result");
     }
 }

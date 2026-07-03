@@ -1677,6 +1677,42 @@ impl App {
         });
     }
 
+    /// Post-process a workspace-create attempt from the add-workspace flow. On
+    /// success: sync workspaces, expand the repo, rebuild, refresh branch status.
+    /// On failure: reopen the Add-Workspace modal with the typed `name`, the given
+    /// `branch` (the explicit-branch path passes the user's typed branch so it
+    /// isn't wiped on error; the fork/blank paths pass an empty string), and the
+    /// error.
+    fn finish_add_workspace(
+        &mut self,
+        result: anyhow::Result<Workspace>,
+        repo_id: String,
+        repo_name: String,
+        name: String,
+        branch: String,
+    ) {
+        match result {
+            Ok(_) => {
+                self.workspaces = self.state.workspaces.clone();
+                self.expanded.insert(repo_id);
+                self.rebuild_tree();
+                self.request_branch_status_refresh();
+            }
+            Err(e) => {
+                self.modal = modal::ModalState::AddWorkspace {
+                    repo_id,
+                    repo_name,
+                    input: name,
+                    cursor: 0,
+                    branch,
+                    branch_cursor: 0,
+                    field: modal::AddWorkspaceField::Name,
+                    error: Some(e.to_string()),
+                };
+            }
+        }
+    }
+
     /// Open a GitHub PR for a workspace's branch off the render loop: push the
     /// branch and run `gh pr create`. No-op if one is already in flight; sets a
     /// `pr_result` error immediately when the workspace has no own branch.
@@ -2103,41 +2139,58 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 }
             }
             modal::ModalResult::SubmitWorkspace(repo_id, name, branch) => {
+                // Look the repo up once. `repo_id` (not name) is the create ref:
+                // resolve_repo matches name before id, so a duplicate basename
+                // could target the wrong repo. `repo.name` is for the modal text,
+                // `repo.path` for the branch detector.
+                let repo = app.repos.iter().find(|r| r.id == repo_id).cloned();
+                if !branch.is_empty() {
+                    // An explicitly-filled Branch field checks out that branch as
+                    // today — the detect-and-offer flow is only for a blank one.
+                    let repo_name = repo.map(|r| r.name).unwrap_or_default();
+                    let result =
+                        app.state.create_workspace_from_branch(Some(&name), &repo_id, &branch);
+                    app.finish_add_workspace(result, repo_id, repo_name, name, branch);
+                } else if let Some(repo) = repo {
+                    // Blank branch: offer the checkout only for a valid, unused
+                    // name whose bare branch already exists — otherwise fall
+                    // through to create, which surfaces core's canonical error
+                    // (a duplicate or invalid name never opens the offer).
+                    if app.state.validate_new_workspace_name(&name).is_ok()
+                        && kommand0_core::worktree::branch_exists_bare(&repo.path, &name)
+                    {
+                        app.modal = modal::ModalState::ConfirmBranchCheckout {
+                            repo_id,
+                            repo_name: repo.name,
+                            name,
+                        };
+                    } else {
+                        let result = app.state.create_workspace(Some(&name), &repo_id);
+                        app.finish_add_workspace(result, repo_id, repo.name, name, String::new());
+                    }
+                } else {
+                    // Repo not found: fall through to create so its resolve error
+                    // surfaces (don't call the detector with an empty path).
+                    let result = app.state.create_workspace(Some(&name), &repo_id);
+                    app.finish_add_workspace(result, repo_id, String::new(), name, String::new());
+                }
+            }
+            modal::ModalResult::BranchCheckoutChoice { repo_id, name, checkout } => {
+                // Route directly — never back through SubmitWorkspace, or a fork
+                // would re-trigger detection and loop. repo_name is only needed
+                // for the Err-reopen text.
                 let repo_name = app
                     .repos
                     .iter()
                     .find(|r| r.id == repo_id)
                     .map(|r| r.name.clone())
                     .unwrap_or_default();
-                // A branch checks out an existing one; blank forks a new branch.
-                let result = if branch.is_empty() {
-                    app.state.create_workspace(Some(&name), &repo_name)
+                let result = if checkout {
+                    app.state.create_workspace_from_branch(Some(&name), &repo_id, &name)
                 } else {
-                    app.state.create_workspace_from_branch(Some(&name), &repo_name, &branch)
+                    app.state.create_workspace(Some(&name), &repo_id)
                 };
-                match result {
-                    Ok(_) => {
-                        app.workspaces = app.state.workspaces.clone();
-                        // Auto-expand the repo
-                        app.expanded.insert(repo_id);
-                        app.rebuild_tree();
-                        // Surface the new workspace's branch status promptly.
-                        app.request_branch_status_refresh();
-                    }
-                    Err(e) => {
-                        // Reopen with both fields kept so the user can fix it.
-                        app.modal = modal::ModalState::AddWorkspace {
-                            repo_id,
-                            repo_name,
-                            input: name,
-                            cursor: 0,
-                            branch,
-                            branch_cursor: 0,
-                            field: modal::AddWorkspaceField::Name,
-                            error: Some(e.to_string()),
-                        };
-                    }
-                }
+                app.finish_add_workspace(result, repo_id, repo_name, name, String::new());
             }
             modal::ModalResult::SubmitRename(ws_id, session_id, title) => {
                 // Only title a session that's still live — reap can heal/drop the
@@ -3309,6 +3362,167 @@ mod key_tests {
             )),
             "the new empty repo guides the user to press w"
         );
+    }
+
+    /// A real git repo at `dir` with an initial commit and an extra branch named
+    /// `branch`. Mirrors the `init_git_repo` harness in `worktree.rs`/`lib.rs`.
+    fn git_repo_with_branch(dir: &std::path::Path, branch: &str) {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(dir).output().unwrap()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "--allow-empty", "-m", "init"]);
+        git(&["branch", branch]);
+    }
+
+    /// Add a real git repo (id `real`) to the app, returning its TempDir guard.
+    fn add_real_repo(app: &mut App, branch: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_repo_with_branch(dir.path(), branch);
+        let repo = RepoEntry {
+            id: "real".into(),
+            name: "real".into(),
+            path: dir.path().to_string_lossy().into_owned(),
+        };
+        app.state.repos.push(repo.clone());
+        app.repos.push(repo);
+        dir
+    }
+
+    fn add_workspace_modal_for(repo_id: &str, name: &str) -> modal::ModalState {
+        modal::ModalState::AddWorkspace {
+            repo_id: repo_id.to_string(),
+            repo_name: "real".to_string(),
+            input: name.to_string(),
+            cursor: name.len(),
+            branch: String::new(),
+            branch_cursor: 0,
+            field: modal::AddWorkspaceField::Name,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_branch_matching_existing_branch_offers_checkout() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        // Name matches the existing branch, Branch blank, Enter.
+        app.modal = add_workspace_modal_for("real", "feat");
+        press(&mut app, KeyCode::Enter).await;
+
+        match &app.modal {
+            modal::ModalState::ConfirmBranchCheckout { repo_id, name, .. } => {
+                assert_eq!(repo_id, "real");
+                assert_eq!(name, "feat");
+            }
+            _ => panic!("expected the branch-exists confirm modal to open"),
+        }
+        // Creation is deferred — no workspace yet.
+        assert!(!app.workspaces.iter().any(|w| w.name == "feat"), "creation deferred until the choice");
+    }
+
+    #[tokio::test]
+    async fn blank_branch_no_matching_branch_creates_workspace() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        // A name with no matching branch forks a fresh one immediately.
+        app.modal = add_workspace_modal_for("real", "fresh");
+        press(&mut app, KeyCode::Enter).await;
+
+        assert!(matches!(app.modal, modal::ModalState::None), "no prompt, modal closes");
+        let ws = app.workspaces.iter().find(|w| w.name == "fresh").expect("workspace created");
+        assert_eq!(
+            ws.branch_name.as_deref(),
+            Some("kommand0/fresh"),
+            "forked a fresh kommand0/ branch (not a worktree fallback to the repo root)"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_choice_fork_on_taken_name_reopens_with_blank_branch() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        // A workspace named "feat" already exists, so the create fails; the fork
+        // route must reopen AddWorkspace with the error and a BLANK branch.
+        app.state.workspaces.push(Workspace {
+            id: "taken".into(),
+            name: "feat".into(),
+            repo_id: "real".into(),
+            working_dir: "/tmp/x".into(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+            branch_name: None,
+        });
+        app.workspaces = app.state.workspaces.clone();
+        app.modal = modal::ModalState::ConfirmBranchCheckout {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            name: "feat".into(),
+        };
+        // `f` forks; the create bails "workspace already exists".
+        press(&mut app, KeyCode::Char('f')).await;
+
+        match &app.modal {
+            modal::ModalState::AddWorkspace { error: Some(e), branch, input, .. } => {
+                assert!(e.contains("already exists"), "surfaces the create error: {e}");
+                assert!(branch.is_empty(), "branch reopens blank, not the checkout name");
+                assert_eq!(input, "feat", "the typed name is preserved for a retry");
+            }
+            _ => panic!("expected AddWorkspace reopened with an error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_choice_checks_out_the_existing_bare_branch() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        // The branch-exists prompt is open for the real local `feat`; Enter checks
+        // it out (the bare branch, NOT a fresh kommand0/feat).
+        app.modal = modal::ModalState::ConfirmBranchCheckout {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            name: "feat".into(),
+        };
+        press(&mut app, KeyCode::Enter).await;
+
+        assert!(matches!(app.modal, modal::ModalState::None), "the choice closes the modal");
+        let ws = app.workspaces.iter().find(|w| w.name == "feat").expect("workspace created");
+        assert_eq!(
+            ws.branch_name.as_deref(),
+            Some("feat"),
+            "checked out the existing bare branch, not kommand0/feat"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_branch_preserves_typed_branch_on_error() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        // Submit a name with an EXPLICIT branch that doesn't exist: the checkout
+        // fails, and the reopened modal must keep the typed branch (not blank it).
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            input: "ws".into(),
+            cursor: 2,
+            branch: "ghost".into(),
+            branch_cursor: 5,
+            field: modal::AddWorkspaceField::Name,
+            error: None,
+        };
+        press(&mut app, KeyCode::Enter).await;
+
+        match &app.modal {
+            modal::ModalState::AddWorkspace { error: Some(e), branch, input, .. } => {
+                assert!(e.contains("couldn't check out branch"), "surfaces the create error: {e}");
+                assert_eq!(branch, "ghost", "the typed branch is preserved on error, not wiped");
+                assert_eq!(input, "ws", "the typed name is preserved too");
+            }
+            _ => panic!("expected AddWorkspace reopened with an error"),
+        }
     }
 
     #[tokio::test]

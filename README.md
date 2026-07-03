@@ -82,7 +82,7 @@ kmd repo list
 kmd repo delete <name-or-path> [--force]
 
 # Workspaces
-kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>]
+kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--fork]
 kmd workspace list [--all] [--repo <name>]
 kmd workspace show <name>
 kmd workspace status [<name>]          # git branch / ahead-behind / dirty
@@ -98,6 +98,12 @@ kmd session stop <workspace>
 kmd session list [--workspace <name>]
 kmd session clear <workspace>
 ```
+
+`workspace create <name>` (without `--branch`) detects an existing branch: if a
+branch matching `<name>` already exists (local or `origin`), on a terminal it
+prompts to check it out instead of forking a new `kommand0/<name>` branch;
+non-interactively (piped/CI) it forks as before and notes it on stderr. Pass
+`--fork` to force a new branch, or `--branch <name>` to check one out explicitly.
 
 > Replace `kmd` with `cargo run -p kommand0-cli --` during development.
 
@@ -115,7 +121,7 @@ cargo run -p kommand0-tui   # from a checkout
 - **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9). Open a new **Claude** tab with `Ctrl+A c` (or the `[+]` tab), or a **shell** tab with `Ctrl+A s` — a `$SHELL` session in the worktree, for running anything (codex, lazygit, or `tmux`/`zellij` for splits inside the pane). Shell tabs are marked `$` and are ephemeral; Claude tabs persist their session and resume on reopen
 - **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items and scroll the tree; inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive
-- **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead
+- **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead. With the Branch field blank, if the workspace **name** matches an existing branch (local or `origin`), a prompt offers to check it out instead of forking
 - **Filter & archive**: press `/` to live-filter the workspace tree by name or branch (matched repos auto-expand, `Esc` clears); press `A` to archive/activate a workspace — so the tree stays navigable as you accumulate repos and workspaces
 - **Git worktrees**: each workspace gets an isolated git worktree branch
 - **Branch/diff status**: each workspace shows its git branch and how far it is ahead/behind its upstream plus whether it has uncommitted changes — a compact `↑2↓1*` segment in the tree row and full detail (`Branch:` / `Changes:`) in the detail pane. Computed off the render loop (never blocks keystrokes), refreshed every couple of seconds and on workspace create/close

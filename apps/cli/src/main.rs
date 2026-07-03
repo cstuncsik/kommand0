@@ -68,6 +68,10 @@ enum WorkspaceAction {
         /// Skip git worktree creation (use repo root as working directory)
         #[arg(long)]
         no_worktree: bool,
+        /// Force a new `kommand0/<name>` branch even if a branch `<name>` exists
+        /// (skip the existing-branch checkout prompt)
+        #[arg(long, conflicts_with_all = ["branch", "no_worktree"])]
+        fork: bool,
     },
     /// List workspaces
     List {
@@ -176,6 +180,14 @@ fn print_status_row(ws: &Workspace) {
     println!("{:<20} {:<26} {ahead:>6} {behind:>6}  {dirty}", ws.name, branch);
 }
 
+/// Interpret the reply to the existing-branch checkout prompt. Case-insensitive
+/// and whitespace-trimmed; `n`/`no` fork, everything else (empty Enter, `y`/`yes`,
+/// or an unrecognised reply) defaults to checkout — it's non-destructive, so the
+/// safe default is yes (deliberately unlike cleanup's destructive `[y/N]`).
+fn wants_checkout(answer: &str) -> bool {
+    !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no")
+}
+
 fn main() -> anyhow::Result<()> {
     // Surface core's diagnostics (e.g. a failed worktree removal on delete/
     // cleanup) on stderr — fine for a CLI (no alt-screen to corrupt).
@@ -237,7 +249,7 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name, repo, branch, no_worktree } => {
+            WorkspaceAction::Create { name, repo, branch, no_worktree, fork } => {
                 let mut state = AppState::load()?;
                 let ws = match (branch, no_worktree) {
                     (Some(_), true) => {
@@ -252,7 +264,49 @@ fn main() -> anyhow::Result<()> {
                         AppState::state_dir().as_path(),
                         false,
                     )?,
-                    (None, false) => state.create_workspace(name.as_deref(), &repo)?,
+                    (None, false) => {
+                        // Gate exactly like the TUI (tui/main.rs): only a valid,
+                        // unused name whose bare branch already exists opens the
+                        // offer — otherwise fall through to create, which surfaces
+                        // core's canonical error (so the note never lies about a
+                        // fork that then fails). `--fork` and the no-name case skip
+                        // detection entirely.
+                        let offer = match (&name, fork) {
+                            (Some(n), false) => state.validate_new_workspace_name(n).is_ok()
+                                && kommand0_core::worktree::branch_exists_bare(
+                                    &state.resolve_repo(&repo)?.path,
+                                    n,
+                                ),
+                            _ => false,
+                        };
+                        if !offer {
+                            state.create_workspace(name.as_deref(), &repo)?
+                        } else {
+                            let n = name.as_deref().expect("offer implies Some(name)");
+                            if std::io::stdin().is_terminal() {
+                                print!("Branch '{n}' already exists. Check it out? [Y/n] ");
+                                std::io::stdout().flush()?;
+                                let mut input = String::new();
+                                std::io::stdin().read_line(&mut input)?;
+                                if wants_checkout(&input) {
+                                    state.create_workspace_from_branch(Some(n), &repo, n)?
+                                } else {
+                                    state.create_workspace(Some(n), &repo)?
+                                }
+                            } else {
+                                let ws = state.create_workspace(Some(n), &repo)?;
+                                // Report the branch actually created — `unique_branch_name`
+                                // may suffix it (`kommand0/{n}-2`), and a worktree fallback
+                                // leaves `branch_name` None (nothing forked → no note).
+                                if let Some(b) = &ws.branch_name {
+                                    eprintln!(
+                                        "note: branch '{n}' exists; forked {b} (use --branch {n} to check it out)"
+                                    );
+                                }
+                                ws
+                            }
+                        }
+                    }
                 };
                 let repo_name = state
                     .repos
@@ -566,4 +620,40 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wants_checkout_defaults_to_yes() {
+        // Empty (bare Enter) and any affirmative → check out.
+        for yes in ["", "y", "yes", "Y", "maybe"] {
+            assert!(wants_checkout(yes), "{yes:?} should check out");
+        }
+        // Only an explicit no forks (case- and whitespace-insensitive).
+        for no in ["n", "no", "N", "No", "n\n", " n "] {
+            assert!(!wants_checkout(no), "{no:?} should fork");
+        }
+    }
+
+    #[test]
+    fn fork_conflicts_with_branch_and_no_worktree() {
+        // `conflicts_with_all` rejects these declaratively — no hand-rolled bail.
+        assert!(
+            Cli::try_parse_from([
+                "kmd", "workspace", "create", "x", "--repo", "r", "--fork", "--branch", "b",
+            ])
+            .is_err(),
+            "--fork + --branch must be rejected"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "kmd", "workspace", "create", "x", "--repo", "r", "--fork", "--no-worktree",
+            ])
+            .is_err(),
+            "--fork + --no-worktree must be rejected"
+        );
+    }
 }

@@ -33,15 +33,31 @@ fn branch_exists(repo_path: &str, branch: &str) -> bool {
 }
 
 /// Whether a fully-qualified ref (e.g. `refs/heads/foo`, `refs/remotes/origin/foo`)
-/// resolves in the repo.
+/// exists in the repo. Uses `show-ref --verify` (exact ref lookup), not
+/// `rev-parse` (which applies revision syntax, so e.g. `main^{commit}` would
+/// false-positively resolve).
 fn verify_ref(repo_path: &str, full_ref: &str) -> bool {
     Command::new("git")
-        .args(["-C", repo_path, "rev-parse", "--verify", "--quiet", full_ref])
+        .args(["-C", repo_path, "show-ref", "--verify", "--quiet", full_ref])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// True if a branch named exactly `name` exists locally (`refs/heads/<name>`) or
+/// on origin (`refs/remotes/origin/<name>`). Checks the BARE name — a
+/// `kommand0/<name>` branch does NOT count — using `git show-ref --verify`
+/// (exact ref lookup), so revision syntax like `main^{commit}` never matches.
+pub fn branch_exists_bare(repo_path: &str, name: &str) -> bool {
+    // "HEAD" is never a branch: `refs/remotes/origin/HEAD` is a symbolic pointer
+    // to the default branch, so treat it as no match rather than a false positive.
+    if name == "HEAD" {
+        return false;
+    }
+    verify_ref(repo_path, &format!("refs/heads/{name}"))
+        || verify_ref(repo_path, &format!("refs/remotes/origin/{name}"))
 }
 
 /// Resolve `<base_dir>/worktrees/<name>` to an absolute path string, clearing a
@@ -555,6 +571,96 @@ mod tests {
             }
             WorktreeResult::Fallback { reason } => panic!("expected Created, got: {reason}"),
         }
+    }
+
+    #[test]
+    fn branch_exists_bare_true_for_local_branch() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        Command::new("git").args(["-C", rp, "branch", "feat"]).output().unwrap();
+        assert!(branch_exists_bare(rp, "feat"), "local branch is detected");
+    }
+
+    #[test]
+    fn branch_exists_bare_true_for_origin_only_branch() {
+        // An "origin" repo with a branch only present there, cloned so the clone
+        // has `origin/feat` but no local `feat` (same harness as the tracking test).
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+        let op = origin.path().to_str().unwrap();
+        Command::new("git").args(["-C", op, "branch", "feat"]).output().unwrap();
+        let work = TempDir::new().unwrap();
+        let clone = work.path().join("repo");
+        Command::new("git").args(["clone", op, clone.to_str().unwrap()]).output().unwrap();
+
+        assert!(
+            branch_exists_bare(clone.to_str().unwrap(), "feat"),
+            "an origin-only branch is detected via refs/remotes/origin/"
+        );
+    }
+
+    #[test]
+    fn branch_exists_bare_false_when_no_branch() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        assert!(!branch_exists_bare(repo.path().to_str().unwrap(), "nope"));
+    }
+
+    #[test]
+    fn branch_exists_bare_ignores_kommand0_prefixed_branch() {
+        // A `kommand0/<name>` branch must NOT make the BARE name match — otherwise
+        // every forked workspace would trigger the checkout offer on re-add.
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        Command::new("git").args(["-C", rp, "branch", "kommand0/feat"]).output().unwrap();
+        assert!(!branch_exists_bare(rp, "feat"), "kommand0/<name> is not a bare-name match");
+    }
+
+    #[test]
+    fn branch_exists_bare_false_for_head() {
+        // A clone has `refs/remotes/origin/HEAD` (a symbolic default-branch
+        // pointer), but "HEAD" is not a branch name — must not false-match.
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+        let work = TempDir::new().unwrap();
+        let clone = work.path().join("repo");
+        Command::new("git").args(["clone", origin.path().to_str().unwrap(), clone.to_str().unwrap()]).output().unwrap();
+        assert!(!branch_exists_bare(clone.to_str().unwrap(), "HEAD"), "HEAD is not a branch");
+    }
+
+    #[test]
+    fn branch_exists_bare_ignores_a_tag() {
+        // A tag named `<name>` is not a branch; show-ref --verify refs/heads/<name>
+        // and refs/remotes/origin/<name> both miss it.
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        Command::new("git").args(["-C", rp, "tag", "rel"]).output().unwrap();
+        assert!(!branch_exists_bare(rp, "rel"), "a tag is not a branch");
+    }
+
+    #[test]
+    fn branch_exists_bare_rejects_revision_syntax() {
+        // Pins the show-ref (exact) vs rev-parse (revision-syntax) fix: `main^{commit}`
+        // resolves under rev-parse but is not a ref name, so it must be false even
+        // though `main` exists.
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        assert!(!branch_exists_bare(rp, "main^{commit}"), "revision syntax must not match");
+    }
+
+    #[test]
+    fn branch_exists_bare_discriminates_among_branches() {
+        // `false` in a repo that HAS other branches proves it checks the exact
+        // name, not just "any branch exists".
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        Command::new("git").args(["-C", rp, "branch", "other"]).output().unwrap();
+        assert!(!branch_exists_bare(rp, "feat"), "a different existing branch must not match");
     }
 
     #[test]
