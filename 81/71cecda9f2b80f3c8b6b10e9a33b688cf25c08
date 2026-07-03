@@ -1,0 +1,34 @@
+apps/tui/src/modal.rs
+  s_c0f9d8745a298b::t_9d4f1e40444352 997-1041
+  s_c0f9d8745a298b::t_444f8598ca7a1c 392-444
+apps/tui/src/main.rs
+  s_c0f9d8745a298b::t_c0228a1eb08292 2669-2684
+apps/tui/src/palette.rs
+  s_c0f9d8745a298b::t_6b1124bb13c2c8 97-107
+  s_c0f9d8745a298b::t_707e12e38af630 381-392
+  s_42cdf3eed50e69::t_4b78f042e1cb7b 380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "8171cecda9f2b80f3c8b6b10e9a33b688cf25c08",
+  "prompts": {},
+  "sessions": {
+    "s_42cdf3eed50e69": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f2645-b302-7903-b2ea-f176b118a04d",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    },
+    "s_c0f9d8745a298b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "28c4a9e4-772c-4b38-88f9-621a17b2683b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
