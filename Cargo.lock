@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "kommand0-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "kommand0-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "kommand0-tui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "crossterm",

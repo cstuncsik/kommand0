@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-03
+
 ### Changed
 
 - **Calmer activity indicators** — the "working" spinner now rides through a
@@ -313,7 +315,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/cstuncsik/kommand0/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/cstuncsik/kommand0/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/cstuncsik/kommand0/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cstuncsik/kommand0/compare/v0.2.3...v0.3.0
