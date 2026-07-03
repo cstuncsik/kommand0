@@ -1,0 +1,31 @@
+apps/tui/src/main.rs
+  s_c8cd322a8037ef::t_7bf15327c2fff7 2466-2467
+  s_c8cd322a8037ef::t_44770f5c08f45a 2886-2889,2891-2892,2894-2895
+apps/tui/src/keymap.rs
+  s_c8cd322a8037ef::t_b0c694e35dcd41 440-455
+  s_3eeb2ab9e821a4::t_600158d0f1af51 439
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "6e409c77a3b227d889dfd74421736fcd8c270a2e",
+  "prompts": {},
+  "sessions": {
+    "s_3eeb2ab9e821a4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f265b-13b8-7820-9a87-56b0de41d9c5",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    },
+    "s_c8cd322a8037ef": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aa571ffd-4694-4701-bae1-b59a84852cff",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
