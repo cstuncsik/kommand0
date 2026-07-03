@@ -10,7 +10,11 @@ All notable changes to kommand0 are documented here. The format is based on
 - **Add-workspace branch detection** — when adding a workspace by name with the
   Branch field blank, if a git branch with that exact name already exists (local
   or `origin`), a prompt offers to check it out instead of silently forking a new
-  `kommand0/<name>` branch. An explicitly-filled Branch field is unchanged.
+  `kommand0/<name>` branch. An explicitly-filled Branch field is unchanged. The
+  `kmd workspace create <name>` CLI has the same detection: on a terminal it
+  prompts to check the branch out, non-interactively it forks as before and notes
+  it on stderr; a new `--fork` flag forces a new branch (`--branch` still checks
+  one out explicitly).
 
 ## [0.4.0] - 2026-07-03
 

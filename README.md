@@ -82,7 +82,7 @@ kmd repo list
 kmd repo delete <name-or-path> [--force]
 
 # Workspaces
-kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>]
+kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--fork]
 kmd workspace list [--all] [--repo <name>]
 kmd workspace show <name>
 kmd workspace status [<name>]          # git branch / ahead-behind / dirty
@@ -98,6 +98,12 @@ kmd session stop <workspace>
 kmd session list [--workspace <name>]
 kmd session clear <workspace>
 ```
+
+`workspace create <name>` (without `--branch`) detects an existing branch: if a
+branch matching `<name>` already exists (local or `origin`), on a terminal it
+prompts to check it out instead of forking a new `kommand0/<name>` branch;
+non-interactively (piped/CI) it forks as before and notes it on stderr. Pass
+`--fork` to force a new branch, or `--branch <name>` to check one out explicitly.
 
 > Replace `kmd` with `cargo run -p kommand0-cli --` during development.
 
