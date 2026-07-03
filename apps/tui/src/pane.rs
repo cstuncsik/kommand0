@@ -303,7 +303,7 @@ impl Pane {
                 let symbol = if contents.is_empty() || straddles_edge {
                     " "
                 } else {
-                    &contents
+                    contents
                 };
                 let target = &mut buf[(x, y)];
                 target.set_symbol(symbol);
