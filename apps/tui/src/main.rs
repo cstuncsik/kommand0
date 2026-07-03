@@ -2455,6 +2455,18 @@ fn cli_short_circuit(args: &[String]) -> Option<String> {
     None
 }
 
+/// Keyboard-enhancement flags requested when the terminal supports the Kitty
+/// protocol. `REPORT_ALL_KEYS_AS_ESCAPE_CODES` routes even plain keys through
+/// the CSI-u path; `REPORT_ALTERNATE_KEYS` must accompany it so the terminal
+/// also reports the *shifted* codepoint. Without it `?` (Shift+/) arrives as
+/// `Char('/')` + SHIFT, and `normalize()` drops SHIFT — collapsing `?`→`/`
+/// (and `:`→`;`, `<`→`,`, `>`→`.`, uppercase letters, …), so help opened the
+/// filter instead and the embedded pane typed `/` for `?`.
+fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
+    use crossterm::event::KeyboardEnhancementFlags as F;
+    F::DISAMBIGUATE_ESCAPE_CODES | F::REPORT_ALL_KEYS_AS_ESCAPE_CODES | F::REPORT_ALTERNATE_KEYS
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Answer `--version`/`--help` before entering the alt-screen, where stdout
@@ -2495,10 +2507,7 @@ async fn main() -> anyhow::Result<()> {
     if supports_enhanced_keys {
         let _ = crossterm::execute!(
             std::io::stdout(),
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-            )
+            crossterm::event::PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     let result = run(&mut terminal).await;
@@ -2872,6 +2881,22 @@ mod key_tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // Regression: reporting all keys as escape codes without alternate keys made
+    // the terminal omit the shifted codepoint, so `?` (Shift+/) arrived as
+    // `Char('/')` + SHIFT and opened the filter instead of help.
+    #[test]
+    fn report_all_keys_requires_alternate_keys() {
+        use crossterm::event::KeyboardEnhancementFlags as F;
+        let flags = keyboard_enhancement_flags();
+        if flags.contains(F::REPORT_ALL_KEYS_AS_ESCAPE_CODES) {
+            assert!(
+                flags.contains(F::REPORT_ALTERNATE_KEYS),
+                "REPORT_ALL_KEYS_AS_ESCAPE_CODES needs REPORT_ALTERNATE_KEYS so shifted \
+                 keys (?, :, <, >, uppercase) resolve to their character, not the base key",
+            );
+        }
     }
 
     #[test]
