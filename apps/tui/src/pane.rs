@@ -871,6 +871,9 @@ mod tests {
         pane.blit(&mut buf, Rect::new(0, 0, 20, 5));
         let row0: String = (0..5).map(|x| buf[(x, 0)].symbol()).collect();
         assert_eq!(row0, "HELLO");
+        // Plain text emits no SGR 2, so it must not be dimmed — proves the dim
+        // mapping is conditional on cell.dim(), not applied unconditionally.
+        assert!(!buf[(0, 0)].style().add_modifier.contains(Modifier::DIM));
     }
 
     #[test]

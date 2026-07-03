@@ -7,7 +7,6 @@
 //! `KOMMAND0_CLAUDE_BIN` env var (see the embedded-pane tests).
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,12 +19,12 @@ const ROWS: u16 = 30;
 /// trait; this counts BEL for `bell_count()`/`wait_for_bell()`.
 #[derive(Default)]
 struct BellCounter {
-    count: Arc<AtomicUsize>,
+    count: usize,
 }
 
 impl vt100::Callbacks for BellCounter {
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
-        self.count.fetch_add(1, Ordering::Relaxed);
+        self.count += 1;
     }
 }
 
@@ -218,7 +217,7 @@ impl Tui {
 
     /// Number of audible bells (BEL) the app has emitted, per vt100's counter.
     fn bell_count(&self) -> usize {
-        self.parser.lock().unwrap().callbacks().count.load(Ordering::Relaxed)
+        self.parser.lock().unwrap().callbacks().count
     }
 
     /// Wait until the app has rung the terminal bell at least once.
