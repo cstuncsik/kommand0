@@ -1,7 +1,7 @@
 //! Command palette: a flat, fuzzy list over every workspace (across all repos,
 //! regardless of tree expand state) *and* the actions you can run on them —
-//! jump-and-open, open a PR, clean up, archive/activate, new session, and jump
-//! to a specific session tab. Opened with `:`; Enter runs the selection.
+//! jump-and-open, clean up, archive/activate, new session, and jump to a
+//! specific session tab. Opened with `:`; Enter runs the selection.
 //!
 //! This is presentation logic, so it lives in the TUI (not core). The fuzzy
 //! ranker is a small hand-rolled subsequence scorer — no dependency, and pure
@@ -23,7 +23,6 @@ use super::theme::Theme;
 pub(crate) enum PaletteAction {
     /// Reveal + open the workspace's embedded session (the original jump).
     OpenWorkspace { ws_id: String },
-    OpenPr { ws_id: String },
     Cleanup { ws_id: String },
     /// Archive an active workspace, or re-activate an archived one.
     ArchiveToggle { ws_id: String },
@@ -362,20 +361,20 @@ mod tests {
         let cands = vec![
             cand("w2", "foo", "web", None),
             Candidate {
-                label: "Open PR — foo".into(),
+                label: "Clean up — foo".into(),
                 detail: "web".into(),
-                match_text: "open pr foo web".into(),
-                action: PaletteAction::OpenPr { ws_id: "w1".into() },
+                match_text: "clean up cleanup foo web".into(),
+                action: PaletteAction::Cleanup { ws_id: "w1".into() },
             },
         ];
         let mut p = Palette::new(cands);
-        for ch in "pr".chars() {
+        for ch in "cleanup".chars() {
             p.push_char(ch);
         }
         assert_eq!(
             p.selected_action(),
-            Some(&PaletteAction::OpenPr { ws_id: "w1".into() }),
-            "typing 'pr' surfaces the Open PR action over the plain workspace jump"
+            Some(&PaletteAction::Cleanup { ws_id: "w1".into() }),
+            "typing 'cleanup' surfaces the Clean up action over the plain workspace jump"
         );
     }
 

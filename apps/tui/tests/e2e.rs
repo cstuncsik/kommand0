@@ -906,50 +906,6 @@ fn run_git(cwd: &std::path::Path, args: &[&str]) {
 }
 
 #[test]
-fn p_opens_a_pr_and_shows_the_url() {
-    // A real repo + bare remote + a worktree on a feature branch, so the `git
-    // push` inside open_pull_request actually succeeds; `gh` is the stub.
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let repo = root.join("repo");
-    let remote = root.join("remote.git");
-    let wt = root.join("wt");
-    std::fs::create_dir_all(&repo).unwrap();
-    std::fs::create_dir_all(&remote).unwrap();
-    run_git(&remote, &["init", "--bare", "-b", "main"]);
-    run_git(&repo, &["init", "-b", "main"]);
-    run_git(&repo, &["config", "user.email", "t@t"]);
-    run_git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "1").unwrap();
-    run_git(&repo, &["add", "."]);
-    run_git(&repo, &["commit", "-m", "init"]);
-    run_git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
-    run_git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "kommand0/demo-ws"]);
-
-    let state = serde_json::json!({
-        "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
-        "workspaces": [{
-            "id": "w1", "name": "demo-ws", "repo_id": "r1",
-            "working_dir": wt.to_str().unwrap(), "active": true, "created_at": 0,
-            "worktree_path": wt.to_str().unwrap(), "branch_name": "kommand0/demo-ws"
-        }],
-        "sessions": []
-    })
-    .to_string();
-
-    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "gh-stub")]);
-    tui.wait_for("demo");
-    tui.send("l");
-    tui.wait_for("demo-ws");
-    tui.send("j"); // select the workspace row
-    tui.send("p"); // open a PR for it (push + gh stub, off-loop)
-    tui.wait_for("pull/42"); // the PR URL lands in the detail pane
-
-    tui.send("q");
-    tui.wait_exit();
-}
-
-#[test]
 fn c_cleans_up_a_merged_workspace() {
     // A real repo + worktree on a kommand0/ branch; `gh` (stubbed) reports the
     // PR merged, so confirming cleanup removes the worktree + branch and drops

@@ -98,24 +98,6 @@ fn workspace_status_shows_the_branch() {
 }
 
 #[test]
-fn open_pr_prints_the_url() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = setup(tmp.path());
-    let gh = tmp.path().join("gh");
-    write_stub(
-        &gh,
-        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = create ]; then echo https://github.com/x/y/pull/7; exit 0; fi\nexit 1\n",
-    );
-    let out = kmd(
-        &state,
-        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
-        &["workspace", "open-pr", "feat"],
-    );
-    assert!(out.status.success(), "open-pr: {}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(stdout(&out).trim(), "https://github.com/x/y/pull/7");
-}
-
-#[test]
 fn workspace_create_from_an_existing_branch() {
     let tmp = tempfile::tempdir().unwrap();
     let state_dir = tmp.path().join("state");
@@ -282,32 +264,6 @@ fn cleanup_removes_a_merged_workspace() {
     // The workspace is gone from `workspace list`.
     let list = kmd(&state, &[], &["workspace", "list", "--all"]);
     assert!(!stdout(&list).contains("feat"), "workspace dropped: {}", stdout(&list));
-}
-
-#[test]
-fn open_pr_without_a_branch_errors() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state_dir = tmp.path().join("state");
-    std::fs::create_dir_all(&state_dir).unwrap();
-    // Seed a fallback workspace (no worktree/branch) directly.
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    let json = serde_json::json!({
-        "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
-        "workspaces": [{
-            "id": "w1", "name": "fallback", "repo_id": "r1",
-            "working_dir": repo.to_str().unwrap(), "active": true, "created_at": 0
-        }],
-        "sessions": []
-    });
-    std::fs::write(state_dir.join("state.json"), json.to_string()).unwrap();
-    let out = kmd(&state_dir, &[], &["workspace", "open-pr", "fallback"]);
-    assert!(!out.status.success(), "should fail");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no branch"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 #[test]

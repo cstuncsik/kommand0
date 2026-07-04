@@ -11,10 +11,10 @@ expression: "render_to_string(&mut app, 100, 30)"
 │                   ┌ Command palette ─────────────────────────────────────────┐                   │
 │                   │ > █                                                      │                   │
 │                   │ ▸ ws-one  —  alpha                                       │                   │
-│                   │   Open PR — ws-one  —  alpha                             │                   │
 │                   │   Clean up — ws-one  —  alpha                            │                   │
 │                   │   Archive — ws-one  —  alpha                             │                   │
 │                   │   New session — ws-one  —  alpha                         │                   │
+│                   │                                                          │                   │
 │                   │                                                          │                   │
 │                   │                                                          │                   │
 │                   │                                                          │                   │

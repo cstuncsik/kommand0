@@ -18,8 +18,6 @@ pub(crate) enum HitAction {
     SelectSessionTab { workspace_id: String, index: usize },
     /// Open a new session tab for a workspace (click on the `[+]` tab).
     NewSessionTab { workspace_id: String },
-    /// Open a GitHub PR for a workspace's branch (the detail-pane `[Open PR]`).
-    OpenPrFor { workspace_id: String },
     /// Clean up a merged workspace (the detail-pane `[Clean up]`).
     CleanupWorkspaceFor { workspace_id: String },
 }
