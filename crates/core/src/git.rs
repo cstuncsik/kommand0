@@ -166,8 +166,12 @@ fn last_line(bytes: &[u8]) -> String {
 }
 
 /// Run `gh <args>` in `cwd`, non-interactively (no prompts, no tty read, no
-/// pager, no update notifier) so it can never hang a background thread.
+/// pager, no update notifier). Bounded by a wall-clock timeout because `gh` is a
+/// network call: a caller off the UI thread guards a latch on this returning, and
+/// gh wedged on the network (proxy black-hole, hung TLS) must not pin it forever.
 fn run_gh(gh_bin: &str, cwd: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    // Generous — a slow GraphQL query is fine; this only trips on a true hang.
+    const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
     // Retry on ETXTBSY ("text file busy"): exec'ing a binary that was just
     // written can transiently fail when another thread's concurrent fork+exec
     // still holds a write fd to it. This is a real race under parallel tests
@@ -176,21 +180,36 @@ fn run_gh(gh_bin: &str, cwd: &str, args: &[&str]) -> std::io::Result<std::proces
     // rather than surfacing it as a bogus "gh not found".
     let mut attempt = 0u32;
     loop {
-        let result = Command::new(gh_bin)
+        let spawned = Command::new(gh_bin)
             .args(args)
             .current_dir(cwd)
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1")
             .env("GH_PAGER", "cat")
             .stdin(Stdio::null())
-            .output();
-        match result {
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let child = match spawned {
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 8 => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(10 * attempt as u64));
+                continue;
             }
-            other => return other,
-        }
+            Err(e) => return Err(e),
+            Ok(child) => child,
+        };
+        // Collect output on a helper thread so the pipe can't deadlock; if it
+        // outruns the deadline we give up (gh has its own HTTP timeouts, and the
+        // OS reaps the abandoned child on exit) rather than block indefinitely.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        return match rx.recv_timeout(GH_TIMEOUT) {
+            Ok(out) => out,
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "gh timed out")),
+        };
     }
 }
 
@@ -330,18 +349,32 @@ fn pr_statuses_with(repo_dir: &str, gh_bin: &str) -> std::collections::HashMap<S
             .get("statusCheckRollup")
             .map(aggregate_checks)
             .unwrap_or(PrChecks::None);
-        map.insert(
-            branch.to_string(),
-            PrStatus {
-                number: pr.get("number").and_then(|v| v.as_u64()).unwrap_or(0),
-                state,
-                checks,
-                review,
-                url: pr.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            },
-        );
+        let status = PrStatus {
+            number: pr.get("number").and_then(|v| v.as_u64()).unwrap_or(0),
+            state,
+            checks,
+            review,
+            url: pr.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        };
+        // A branch name can carry several PRs over time (a reused `kommand0/<name>`
+        // branch may have an old merged/closed PR and a newer open one, and
+        // `gh pr list` order isn't guaranteed). Keep the most relevant: an OPEN PR
+        // wins over non-open, then the higher (newer) number wins.
+        map.entry(branch.to_string())
+            .and_modify(|existing| {
+                if pr_supersedes(&status, existing) {
+                    *existing = status.clone();
+                }
+            })
+            .or_insert(status);
     }
     map
+}
+
+/// Whether `a` should replace `b` as the PR shown for a shared branch name.
+fn pr_supersedes(a: &PrStatus, b: &PrStatus) -> bool {
+    let open_rank = |s: PrState| u8::from(s == PrState::Open);
+    (open_rank(a.state), a.number) > (open_rank(b.state), b.number)
 }
 
 /// Remove a merged workspace's worktree and delete its branch — but only when it
@@ -839,14 +872,18 @@ mod tests {
           {"number":6,"headRefName":"closed","state":"CLOSED","url":"https://x/6","reviewDecision":null,
            "statusCheckRollup":[{"state":"ERROR"}]},
           {"number":7,"headRefName":"statusctx-pending","state":"OPEN","url":"https://x/7","reviewDecision":"APPROVED",
-           "statusCheckRollup":[{"state":"PENDING"}]}
+           "statusCheckRollup":[{"state":"PENDING"}]},
+          {"number":8,"headRefName":"neutral","state":"OPEN","url":"https://x/8","reviewDecision":"APPROVED",
+           "statusCheckRollup":[{"conclusion":"NEUTRAL","status":"COMPLETED"},{"conclusion":"SKIPPED","status":"COMPLETED"}]},
+          {"number":9,"headRefName":"statusctx-fail","state":"OPEN","url":"https://x/9","reviewDecision":"APPROVED",
+           "statusCheckRollup":[{"state":"FAILURE"}]}
         ]"#;
         let tmp = TempDir::new().unwrap();
         let gh = tmp.path().join("gh");
         gh_list_stub(&gh, json);
         let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap());
 
-        assert_eq!(m.len(), 7);
+        assert_eq!(m.len(), 9);
 
         let pass = &m["pass"];
         assert_eq!(pass.number, 1);
@@ -877,6 +914,31 @@ mod tests {
 
         // A StatusContext PENDING (no conclusion field at all) reads as pending.
         assert_eq!(m["statusctx-pending"].checks, PrChecks::Pending);
+
+        // NEUTRAL/SKIPPED are benign completed conclusions — not failing, not
+        // pending, so a rollup of only those is Passing.
+        assert_eq!(m["neutral"].checks, PrChecks::Passing);
+
+        // A StatusContext state FAILURE (distinct literal from ERROR) is a failure.
+        assert_eq!(m["statusctx-fail"].checks, PrChecks::Failing);
+    }
+
+    #[test]
+    fn pr_statuses_dedupes_reused_branch_to_the_open_pr() {
+        // Same headRefName across two PRs (an old merged one and a new open one):
+        // the OPEN PR must win regardless of gh's list order.
+        let json = r#"[
+          {"number":20,"headRefName":"kommand0/feat","state":"OPEN","url":"https://x/20","reviewDecision":"APPROVED",
+           "statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}]},
+          {"number":9,"headRefName":"kommand0/feat","state":"MERGED","url":"https://x/9","reviewDecision":"APPROVED",
+           "statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}]}
+        ]"#;
+        let tmp = TempDir::new().unwrap();
+        let gh = tmp.path().join("gh");
+        gh_list_stub(&gh, json);
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap());
+        assert_eq!(m["kommand0/feat"].number, 20, "the open PR wins over the merged one");
+        assert_eq!(m["kommand0/feat"].state, PrState::Open);
     }
 
     #[test]
