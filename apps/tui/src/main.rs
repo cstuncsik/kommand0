@@ -1777,16 +1777,24 @@ impl App {
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
             return;
         };
+        self.diff_scroll = 0;
+        self.show_diff = true;
+        // Own-branch workspaces only: a fallback workspace's `working_dir` is the
+        // shared repo root, not a branch to review (mirrors open_pr / branch_status,
+        // which gate on `worktree_path`).
+        let Some(worktree) = ws.worktree_path.clone() else {
+            self.diff_title = ws.name.clone();
+            self.diff_text = "This workspace has no branch to review.".to_string();
+            return;
+        };
         self.diff_title = match &ws.branch_name {
             Some(b) => format!("{} ({b})", ws.name),
             None => ws.name.clone(),
         };
-        self.diff_text = match kommand0_core::diff_vs_default_branch(&ws.working_dir) {
+        self.diff_text = match kommand0_core::diff_vs_default_branch(&worktree) {
             Some(d) => d,
-            None => "Couldn't compute a diff — no branch, or not a git repo.".to_string(),
+            None => "Couldn't compute a diff — not a git repo.".to_string(),
         };
-        self.diff_scroll = 0;
-        self.show_diff = true;
     }
 
     /// Open the cleanup confirmation modal for a workspace (own-branch only),
@@ -2845,7 +2853,10 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         // would steal the pane's paste. Help swallows keys and
                         // implies Focus::Tree, so it falls through to a no-op here,
                         // matching its key behavior.
-                        if app.focus == Focus::Embedded && !app.modal.is_active() {
+                        if app.show_diff {
+                            // The diff overlay owns input (its key handler swallows
+                            // too) — don't leak a paste to the tree/filter behind it.
+                        } else if app.focus == Focus::Embedded && !app.modal.is_active() {
                             // Forward raw to the embedded app as a bracketed paste
                             // (claude enables it, so a multi-line paste stays one
                             // block). Keep newlines here — the pane wants them.
@@ -2867,7 +2878,11 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         }
                     }
                     Event::Mouse(mouse_event) => {
-                        if app.show_help || app.modal.is_active() || app.palette.is_some() {
+                        if app.show_help
+                            || app.show_diff
+                            || app.modal.is_active()
+                            || app.palette.is_some()
+                        {
                             // An overlay owns the screen — ignore mouse (don't leak
                             // stray clicks to the tree/embedded claude behind it; a
                             // leaked click could even open a modal and orphan the
@@ -3888,6 +3903,40 @@ mod key_tests {
             },
         );
         assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn diff_overlay_renders_no_changes_note_for_an_empty_diff() {
+        let mut app = test_app();
+        app.show_diff = true;
+        app.diff_title = "ws-one".into();
+        app.diff_text = String::new(); // empty diff → the "no changes" branch
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(
+            text.contains("No committed changes"),
+            "an empty diff renders the note, not a blank overlay:\n{text}"
+        );
+    }
+
+    #[test]
+    fn open_diff_titles_by_branch_and_gates_on_worktree() {
+        let mut app = test_app();
+        app.workspaces = app.state.workspaces.clone();
+        // With a worktree + branch, the title carries the branch.
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.worktree_path = Some("/nonexistent/worktree".into());
+            w.branch_name = Some("feat".into());
+        }
+        app.open_diff("w1");
+        assert!(app.show_diff);
+        assert_eq!(app.diff_title, "ws-one (feat)");
+        // Without a worktree (fallback workspace) it shows the no-branch note.
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.worktree_path = None;
+        }
+        app.open_diff("w1");
+        assert_eq!(app.diff_title, "ws-one");
+        assert!(app.diff_text.contains("no branch to review"));
     }
 
     #[test]

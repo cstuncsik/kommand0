@@ -390,12 +390,12 @@ fn review_diff_overlay_opens_and_closes() {
     tui.wait_for("demo-ws");
     tui.send("j");
     tui.send("v"); // review the selected workspace's diff
-    // The seeded working_dir isn't a git repo, so the overlay reports that —
-    // which proves the key opened it and the diff computation ran.
-    tui.wait_for("Couldn't compute");
+    // The seeded workspace has no worktree/branch, so the overlay says so —
+    // which proves the key opened it and open_diff ran.
+    tui.wait_for("no branch to review");
 
     tui.send_esc(); // Esc closes
-    tui.wait_gone("Couldn't compute");
+    tui.wait_gone("no branch to review");
 
     tui.send("q");
     tui.wait_exit();

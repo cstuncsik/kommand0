@@ -31,28 +31,36 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 /// Colour a single diff line by its leading marker. `+++`/`---` file headers are
-/// matched before the `+`/`-` add/remove lines so they aren't mis-coloured.
-fn styled_diff_line(raw: &str, th: Theme) -> Line<'static> {
-    let style = if raw.starts_with("diff --git")
-        || raw.starts_with("index ")
-        || raw.starts_with("+++")
-        || raw.starts_with("---")
-        || raw.starts_with("new file")
-        || raw.starts_with("deleted file")
-        || raw.starts_with("rename ")
-        || raw.starts_with("similarity ")
-    {
-        Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
-    } else if raw.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
-    } else if raw.starts_with('+') {
-        Style::default().fg(Color::Green)
-    } else if raw.starts_with('-') {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(th.text)
-    };
-    Line::styled(raw.to_string(), style)
+/// Colour a diff line, tracking whether we're inside a hunk via `in_hunk`. This
+/// is stateful on purpose: outside a hunk, `+++`/`---` are file headers; *inside*
+/// a hunk the first byte decides, so an added/removed line whose content begins
+/// with `++`/`--` is coloured as an add/remove, not mis-read as a header.
+fn diff_line_style(raw: &str, in_hunk: &mut bool, th: Theme) -> Style {
+    if raw.starts_with("@@") {
+        *in_hunk = true; // hunk header; body lines follow
+        return Style::default().fg(Color::Cyan);
+    }
+    if raw.starts_with("diff --git") {
+        *in_hunk = false; // next file's header block starts
+        return Style::default().fg(th.muted).add_modifier(Modifier::BOLD);
+    }
+    if !*in_hunk {
+        // Header region (index/mode/+++/--- etc.) — all metadata.
+        return Style::default().fg(th.muted).add_modifier(Modifier::BOLD);
+    }
+    match raw.as_bytes().first() {
+        Some(b'+') => Style::default().fg(Color::Green),
+        Some(b'-') => Style::default().fg(Color::Red),
+        _ => Style::default().fg(th.text), // context, "\ No newline", blank
+    }
+}
+
+/// Replace C0 control bytes (except tab) with the replacement char so a crafted
+/// file in the reviewed diff can't emit raw terminal escapes into the overlay.
+fn sanitize(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() && c != '\t' { '\u{fffd}' } else { c })
+        .collect()
 }
 
 /// Render the review-diff overlay. `title` is the workspace label; `text` is the
@@ -76,8 +84,10 @@ pub fn render_diff_overlay(
             Style::default().fg(th.muted),
         ));
     } else {
+        let mut in_hunk = false;
         for raw in text.lines().take(MAX_LINES) {
-            lines.push(styled_diff_line(raw, th));
+            let style = diff_line_style(raw, &mut in_hunk, th);
+            lines.push(Line::styled(sanitize(raw), style));
         }
         if text.lines().nth(MAX_LINES).is_some() {
             lines.push(Line::styled(
@@ -110,22 +120,35 @@ pub fn render_diff_overlay(
 mod tests {
     use super::*;
 
-    fn fg(line: Line) -> Option<Color> {
-        line.style.fg
+    #[test]
+    fn diff_lines_are_coloured_by_hunk_state() {
+        let th = Theme::default();
+        let mut in_hunk = false;
+        // Header region (before any @@): file metadata is muted + bold.
+        let hdr = diff_line_style("diff --git a/x b/x", &mut in_hunk, th);
+        assert_eq!(hdr.fg, Some(th.muted));
+        assert!(hdr.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(diff_line_style("+++ b/x.rs", &mut in_hunk, th).fg, Some(th.muted));
+        assert_eq!(diff_line_style("--- a/x.rs", &mut in_hunk, th).fg, Some(th.muted));
+        // The hunk header flips us into the hunk body.
+        assert_eq!(diff_line_style("@@ -1 +1 @@", &mut in_hunk, th).fg, Some(Color::Cyan));
+        assert!(in_hunk);
+        // Inside a hunk the first byte wins — INCLUDING content starting with ++/--
+        // (the whole point of the stateful classifier).
+        assert_eq!(diff_line_style("+added", &mut in_hunk, th).fg, Some(Color::Green));
+        assert_eq!(diff_line_style("-removed", &mut in_hunk, th).fg, Some(Color::Red));
+        assert_eq!(diff_line_style("++still added", &mut in_hunk, th).fg, Some(Color::Green));
+        assert_eq!(diff_line_style("--still removed", &mut in_hunk, th).fg, Some(Color::Red));
+        assert_eq!(diff_line_style(" context", &mut in_hunk, th).fg, Some(th.text));
+        // The next file's header resets the hunk state.
+        assert_eq!(diff_line_style("diff --git a/y b/y", &mut in_hunk, th).fg, Some(th.muted));
+        assert!(!in_hunk);
     }
 
     #[test]
-    fn diff_lines_are_coloured_by_marker() {
-        let th = Theme::default();
-        // `+++`/`---`/`diff --git` are file headers — matched BEFORE the `+`/`-`
-        // add/remove branches, or a `+++` line would render green.
-        assert_eq!(fg(styled_diff_line("+++ b/x.rs", th)), Some(th.muted));
-        assert_eq!(fg(styled_diff_line("--- a/x.rs", th)), Some(th.muted));
-        assert_eq!(fg(styled_diff_line("diff --git a/x b/x", th)), Some(th.muted));
-        // Real add / remove / hunk / context.
-        assert_eq!(fg(styled_diff_line("+added", th)), Some(Color::Green));
-        assert_eq!(fg(styled_diff_line("-removed", th)), Some(Color::Red));
-        assert_eq!(fg(styled_diff_line("@@ -1 +1 @@", th)), Some(Color::Cyan));
-        assert_eq!(fg(styled_diff_line(" context", th)), Some(th.text));
+    fn sanitize_neutralises_escapes_but_keeps_tabs() {
+        // A crafted diff line with a raw ESC must not reach the terminal.
+        assert_eq!(sanitize("+\x1b[31mred\x07"), "+\u{fffd}[31mred\u{fffd}");
+        assert_eq!(sanitize("\tindented"), "\tindented", "tabs are preserved");
     }
 }

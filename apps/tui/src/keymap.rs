@@ -82,7 +82,7 @@ impl Action {
             Action::OpenSession => "open",
             Action::CloseSession => "close",
             Action::OpenPr => "open-pr",
-            Action::ReviewDiff => "review",
+            Action::ReviewDiff => "review-diff",
             Action::Cleanup => "cleanup",
             Action::Filter => "filter",
             Action::Palette => "palette",
