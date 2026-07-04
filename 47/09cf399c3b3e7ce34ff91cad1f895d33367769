@@ -1,0 +1,31 @@
+apps/tui/src/main.rs
+  s_164243679ec02c::t_f5b1f6e016464e 3908-3940
+  s_164243679ec02c::t_3dcd9820c05248 2856-2859
+  s_164243679ec02c::t_a5acb24ee18f06 2881-2885
+  s_164243679ec02c::t_d6b134f2eefdad 1780-1789,1794,1796
+  s_164243679ec02c::t_7d254a27efa811 3941
+apps/tui/src/keymap.rs
+  s_164243679ec02c::t_567e0c89183636 85
+apps/tui/src/diff.rs
+  s_164243679ec02c::t_a04bb6d72fa86a 87,89-90
+  s_164243679ec02c::t_fda7ecb439ce92 123-145,149-152
+  s_164243679ec02c::t_e657721cc0a721 34-63
+apps/tui/tests/e2e.rs
+  s_164243679ec02c::t_1af836e6bc7dd6 393-395,398
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4709cf399c3b3e7ce34ff91cad1f895d33367769",
+  "prompts": {},
+  "sessions": {
+    "s_164243679ec02c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8eb123a-c396-4394-8625-f41817ed3acb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
