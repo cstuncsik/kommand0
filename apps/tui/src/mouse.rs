@@ -16,7 +16,16 @@ pub(crate) struct PaneAreas {
 pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            handle_click(app, mouse.column, mouse.row);
+            // A click the tree/buttons didn't consume, landing in the content
+            // pane with a live session, focuses claude and passes through to it.
+            if !handle_click(app, mouse.column, mouse.row)
+                && contains(app.right_pane_area, mouse.column, mouse.row)
+                && app.active_pane_mut().is_some()
+            {
+                app.focus = super::Focus::Embedded;
+                app.embedded_prefix = false;
+                app.forward_mouse_to_embedded(mouse);
+            }
         }
         MouseEventKind::ScrollUp => {
             handle_scroll(app, mouse.column, mouse.row, true);
@@ -35,12 +44,15 @@ fn contains(area: Rect, col: u16, row: u16) -> bool {
     col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
 }
 
-fn handle_click(app: &mut App, col: u16, row: u16) {
+/// Returns whether the click was consumed (hit a button region or the tree
+/// pane). A `false` return means the click landed elsewhere (e.g. the content
+/// pane), so the caller can decide to focus it.
+fn handle_click(app: &mut App, col: u16, row: u16) -> bool {
     // Check button hit regions first
     for region in &app.hit_regions {
         if contains(region.area, col, row) {
             app.pending_button_action = Some(region.action.clone());
-            return;
+            return true;
         }
     }
 
@@ -69,7 +81,10 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
                 }
             }
         }
+        return true;
     }
+
+    false
 }
 
 fn handle_scroll(app: &mut App, col: u16, row: u16, up: bool) {

@@ -1333,6 +1333,13 @@ impl App {
                 self.forward_mouse_to_embedded(mouse);
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // A click in the tree pane (including the empty space below the
+                // rows) focuses it — the mirror of clicking the content pane to
+                // focus claude. Delegate to the tree handler for focus + select.
+                if buttons::is_hovered(Some((mouse.column, mouse.row)), self.pane_areas.tree) {
+                    mouse::handle_mouse(self, mouse);
+                    return;
+                }
                 let pos = Some((mouse.column, mouse.row));
                 let tab_action = self.hit_regions.iter().find_map(|r| {
                     if buttons::is_hovered(pos, r.area)
@@ -3779,6 +3786,46 @@ mod key_tests {
             base + 2,
             "a tree click maps the viewport row through the scroll offset"
         );
+    }
+
+    #[test]
+    fn embedded_tree_click_returns_focus_to_tree() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 20);
+        app.right_pane_area = ratatui::layout::Rect::new(30, 0, 70, 20);
+        app.focus = Focus::Embedded;
+        // A left-click in empty tree space (well below any row) must focus the
+        // tree — with one repo/one workspace the tree is mostly empty, so this
+        // is the only way to click back out of the embedded pane.
+        app.handle_embedded_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 15,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn content_click_without_a_session_keeps_tree_focus() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 20);
+        app.right_pane_area = ratatui::layout::Rect::new(30, 0, 70, 20);
+        app.focus = Focus::Tree;
+        // No embedded session is live, so a click in the content pane must not
+        // steal focus into a dead pane.
+        mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 50,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.focus, Focus::Tree);
     }
 
     #[test]
