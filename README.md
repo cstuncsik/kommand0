@@ -4,8 +4,9 @@ Keyboard-first local orchestrator for parallel Claude Code sessions.
 
 Run several Claude Code sessions at once, each in its own isolated git worktree,
 and drive them all from one fast TUI: a tree of repos and workspaces on the left,
-the live embedded `claude` (or a workspace's git status) on the right. Open PRs,
-clean up merged work, and get a nudge when a backgrounded session needs you —
+the live embedded `claude` (or a workspace's git status) on the right. See each
+branch's PR and CI status at a glance, clean up merged work, and get a nudge when
+a backgrounded session needs you —
 without leaving the keyboard. A `kmd` CLI mirrors the core actions for scripting.
 
 ![kommand0 demo](demo/demo.gif)
@@ -86,7 +87,6 @@ kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--for
 kmd workspace list [--all] [--repo <name>]
 kmd workspace show <name>
 kmd workspace status [<name>]          # git branch / ahead-behind / dirty
-kmd workspace open-pr <name>           # push branch + open a GitHub PR (gh)
 kmd workspace cleanup <name> [--force] # remove a merged worktree + branch
 kmd workspace archive <name>
 kmd workspace activate <name>
@@ -125,7 +125,7 @@ cargo run -p kommand0-tui   # from a checkout
 - **Filter & archive**: press `/` to live-filter the workspace tree by name or branch (matched repos auto-expand, `Esc` clears); press `A` to archive/activate a workspace — so the tree stays navigable as you accumulate repos and workspaces
 - **Git worktrees**: each workspace gets an isolated git worktree branch
 - **Branch/diff status**: each workspace shows its git branch and how far it is ahead/behind its upstream plus whether it has uncommitted changes — a compact `↑2↓1*` segment in the tree row and full detail (`Branch:` / `Changes:`) in the detail pane. Computed off the render loop (never blocks keystrokes), refreshed every couple of seconds and on workspace create/close
-- **Open a PR**: press `p` (or click `[Open PR]` in the detail pane) to push a workspace's branch and open a GitHub PR via the `gh` CLI. Runs off the render loop with progress (`Opening PR…`) and shows the resulting URL (or a readable error); idempotent — re-running on a branch that already has a PR returns its URL. Requires `gh` installed and authenticated
+- **PR/CI status**: each own-branch workspace surfaces its GitHub PR at a glance — a compact `#12 ✓` in the tree row (`✓` checks passing · `✗` failing · `◍` pending · `⬤` merged · `✕` closed) and a full `PR #12 · open · CI passing · approved` line + URL in the detail pane. One read-only `gh pr list` per repo, off the render loop, refreshed periodically. Requires `gh` installed and authenticated; nothing shows without it
 - **Clean up merged workspaces**: press `c` (or click `[Clean up]`) to remove a workspace's worktree and delete its branch once its PR is merged. Behind a confirmation, and it only proceeds when it's provably safe — the PR is `MERGED` (per `gh`), the worktree is clean, and the branch has no commits beyond what the PR merged (squash-safe); otherwise it refuses and tells you why. On success the workspace is dropped from the tree
 - **Status bar**: bottom row shows the current mode (TREE / CLAUDE), the selected repo/workspace, the live-session count (and how many are active / waiting), and context key hints
 - **Activity indicator**: a workspace's tree row animates its prompt into a spinner while its embedded Claude is actively producing output (debounced, so a stray keystroke doesn't flicker it)
@@ -140,12 +140,11 @@ cargo run -p kommand0-tui   # from a checkout
 | `gg` / `G` | Tree | Jump to first / last item |
 | `<` / `>` | Tree | Shrink / widen the tree pane (5% steps, 15–60%; this session only — set `tree_width_pct` for a persistent default) |
 | `/` | Tree | Filter workspaces by name/branch (`Esc` clears) |
-| `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it — open PR, clean up, archive/activate, new session, or jump to a session tab |
+| `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it — clean up, archive/activate, new session, or jump to a session tab |
 | `n` / `N` | Tree | Jump to + open the next / previous workspace that needs you (cycles the "N waiting") |
 | `A` | Tree | Archive / activate the selected workspace |
 | `Enter` / `e` / `r` / `R` | Tree | Open the embedded Claude pane for the workspace |
 | `x` | Tree | Close the embedded Claude pane |
-| `p` | Tree | Open a GitHub PR for the selected workspace (`gh`) |
 | `c` | Tree | Clean up the selected merged workspace (worktree + branch) |
 | `a` | Tree | Add repository (modal) |
 | `w` | Tree | Add workspace to selected repo (modal) |
@@ -224,7 +223,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `claude_bin` — override the `claude` binary (the `KOMMAND0_CLAUDE_BIN` env var still takes precedence).
 - `status_refresh_secs` — how often the background git-status refresh runs (default 2; floored at 1).
 - `tree_width_pct` — the tree (left) pane width as a percent of the terminal (default 30; clamped to 15–60). This is the persistent baseline; the live `<`/`>` keys adjust a per-session value seeded from it (and reset to it next launch). You can also drag the border between the tree and content panes with the mouse to resize it live.
-- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `widen-tree`, `shrink-tree`, `activate`, `open`, `close`, `open-pr`, `cleanup`, `filter`, `palette`, `next-waiting`, `prev-waiting`, `archive`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
+- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `widen-tree`, `shrink-tree`, `activate`, `open`, `close`, `review-diff`, `cleanup`, `filter`, `palette`, `next-waiting`, `prev-waiting`, `archive`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
 - `theme` — a built-in palette for the app chrome: `"default"` or `"high-contrast"` (the embedded `claude` pane keeps its own colours either way). Unknown names warn and fall back to default.
 - `theme_colors` — per-role overrides applied on top of `theme`: `"<role>": "<color>"`. Roles: `accent`, `selected`, `active`, `attention`, `dirty`, `error`, `muted`, `text`, `inverse`. Colors: a named color (`cyan`, `light-red`, `darkgray`), an `#rrggbb` hex, a 0–255 palette index, or `reset`/`default` (the terminal's own default color — not the role's built-in). Unknown roles / unparseable colors are warned (tree border + log), not fatal.
 - `notify` — alert when a backgrounded session goes quiet with unseen output (the same "needs you" edge as the magenta dot): `"off"` (default), `"bell"` (terminal bell), `"desktop"` (an OS notification — `osascript` on macOS, `notify-send` on Linux; silently skipped if unavailable), or `"both"`. Fires once per rising edge (the latch means it won't repeat until you view the session and it comes back). Unknown values warn and fall back to `off`.

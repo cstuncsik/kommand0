@@ -1731,6 +1731,9 @@ impl App {
                 .push((w.id.clone(), branch.clone()));
         }
         if by_repo.is_empty() {
+            // No own-branch workspaces to query — drop any stale entries (e.g.
+            // after the last workspace was deleted) instead of caching forever.
+            self.pr_status.clear();
             return;
         }
         self.pr_status_inflight = true;
@@ -4685,8 +4688,10 @@ mod key_tests {
             "detail shows the PR status line:\n{text}"
         );
         assert!(text.contains("pull/42"), "detail shows the PR url:\n{text}");
-        // Tree row: the compact " #42 <glyph>" segment (green check for passing).
-        assert!(text.contains("#42"), "tree row shows the PR number:\n{text}");
+        // Tree row: assert the passing glyph `✓`, which ONLY the tree row emits
+        // (the detail label spells "passing") — so this proves the `#N <glyph>`
+        // segment actually reached the row, not just the detail pane.
+        assert!(text.contains('\u{2713}'), "tree row shows the passing glyph:\n{text}");
     }
 
     #[tokio::test]

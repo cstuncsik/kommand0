@@ -5,6 +5,21 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **PR/CI status column** — each own-branch workspace surfaces its GitHub PR at a
+  glance: a compact `#12 ✓` in the tree row (`✓` checks passing · `✗` failing ·
+  `◍` pending · `⬤` merged · `✕` closed) and a full `PR #12 · open · CI passing ·
+  approved` line + URL in the detail pane. One read-only `gh pr list` per repo,
+  off the render loop, refreshed periodically. Requires `gh` installed and authed.
+
+### Removed
+
+- **Open PR** — the `p` action, palette entry, `[Open PR]` detail button, and the
+  `kmd workspace open-pr` CLI subcommand are gone. The diff review (`v`) and the
+  new PR/CI status column replace it; create PRs from the embedded Claude or a
+  shell tab (which write a real description rather than `--fill` from commits).
+
 ## [0.7.0] - 2026-07-04
 
 ### Added

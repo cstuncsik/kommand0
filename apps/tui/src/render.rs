@@ -451,7 +451,13 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         let pr_num_seg =
                             pr.map(|p| format!(" #{} ", p.number)).unwrap_or_default();
                         let pr_w_raw = pr
-                            .map(|_| UnicodeWidthStr::width(pr_num_seg.as_str()) + 1) // +1 for the glyph
+                            .map(|p| {
+                                // Measure the actual glyph — the merged `⬤` is 2 cols
+                                // wide in many terminals, so a fixed +1 would misalign
+                                // the right-anchored icon hit-regions on merged rows.
+                                UnicodeWidthStr::width(pr_num_seg.as_str())
+                                    + UnicodeWidthStr::width(pr_glyph(p).to_string().as_str())
+                            })
                             .unwrap_or(0);
                         let pr_w = if fixed_width + icons.total_width as usize + git_w + pr_w_raw
                             < pane_inner_width
