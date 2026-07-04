@@ -7,6 +7,15 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [0.6.1] - 2026-07-04
 
+### Added
+
+- **Click to focus a pane** — clicking the tree or the content pane now focuses
+  it, mirroring the keyboard. A click in the content pane focuses the embedded
+  session and passes through to Claude; a click anywhere in the tree pane —
+  including the empty space below the rows — focuses the tree, so a
+  one-repo/one-workspace layout is no longer keyboard-only for getting back out
+  of Claude.
+
 ## [0.6.0] - 2026-07-03
 
 ### Added
