@@ -9,7 +9,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::buttons::HitAction;
 use super::theme::Theme;
-use super::{App, Focus, TreeNode, buttons, help, modal, palette};
+use super::{App, Focus, TreeNode, buttons, diff, help, modal, palette};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -69,6 +69,17 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     if app.show_help {
         let tree_rows = app.keymap.help_rows();
         help::render_help_overlay(frame, app.focus, &mut app.help_scroll, &tree_rows, app.theme);
+    }
+
+    // Review-diff overlay (PR-style diff of the selected workspace).
+    if app.show_diff {
+        diff::render_diff_overlay(
+            frame,
+            &app.diff_title,
+            &app.diff_text,
+            &mut app.diff_scroll,
+            app.theme,
+        );
     }
 
     // Modal overlay on top of everything

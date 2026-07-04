@@ -1,4 +1,5 @@
 mod buttons;
+mod diff;
 mod help;
 mod keymap;
 mod modal;
@@ -311,6 +312,11 @@ pub(crate) struct App {
     // UX state
     pub(crate) show_help: bool,
     pub(crate) help_scroll: u16,
+    /// Review-diff overlay: the selected workspace's PR-style diff.
+    pub(crate) show_diff: bool,
+    pub(crate) diff_scroll: u16,
+    pub(crate) diff_title: String,
+    pub(crate) diff_text: String,
     /// True when a `g` was pressed and we're waiting for a second `g` (vim `gg`).
     pub(crate) pending_g: bool,
     /// Tree filter query (case-insensitive; empty = no filter). Matches a
@@ -435,6 +441,10 @@ impl App {
             focus: Focus::Tree,
             show_help: false,
             help_scroll: 0,
+            show_diff: false,
+            diff_scroll: 0,
+            diff_title: String::new(),
+            diff_text: String::new(),
             pending_g: false,
             filter_query: String::new(),
             filter_input: false,
@@ -1759,6 +1769,26 @@ impl App {
         });
     }
 
+    /// Populate and open the review-diff overlay for a workspace: the PR-style
+    /// `git diff <default>...HEAD` of its worktree (committed changes only).
+    /// Computed synchronously — a local git diff is fast; move off-loop if a
+    /// huge worktree ever hitches the render loop.
+    fn open_diff(&mut self, ws_id: &str) {
+        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
+            return;
+        };
+        self.diff_title = match &ws.branch_name {
+            Some(b) => format!("{} ({b})", ws.name),
+            None => ws.name.clone(),
+        };
+        self.diff_text = match kommand0_core::diff_vs_default_branch(&ws.working_dir) {
+            Some(d) => d,
+            None => "Couldn't compute a diff — no branch, or not a git repo.".to_string(),
+        };
+        self.diff_scroll = 0;
+        self.show_diff = true;
+    }
+
     /// Open the cleanup confirmation modal for a workspace (own-branch only),
     /// pre-filling the branch and any cached uncommitted/unpushed warnings.
     fn cleanup_workspace_prompt(&mut self, ws_id: &str) {
@@ -2063,6 +2093,33 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 app.help_scroll = u16::MAX;
             }
             KeyCode::Home => app.help_scroll = 0,
+            _ => {} // swallow all other keys
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
+    // Review-diff overlay: scrollable, dismissed with v/Esc/q, swallows the rest.
+    if app.show_diff {
+        let g_was_pending = std::mem::take(&mut app.pending_g);
+        match key.code {
+            KeyCode::Char('v') | KeyCode::Char('q') | KeyCode::Esc => app.show_diff = false,
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.diff_scroll = app.diff_scroll.saturating_add(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.diff_scroll = app.diff_scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => app.diff_scroll = app.diff_scroll.saturating_add(10),
+            KeyCode::PageUp => app.diff_scroll = app.diff_scroll.saturating_sub(10),
+            KeyCode::Char('g') => {
+                if g_was_pending {
+                    app.diff_scroll = 0;
+                } else {
+                    app.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => app.diff_scroll = u16::MAX,
+            KeyCode::Home => app.diff_scroll = 0,
             _ => {} // swallow all other keys
         }
         return Ok(KeyOutcome::Continue);
@@ -2378,6 +2435,11 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Action::OpenPr => {
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
                         app.open_pr(&ws_id);
+                    }
+                }
+                Action::ReviewDiff => {
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.open_diff(&ws_id);
                     }
                 }
                 Action::Cleanup => {
