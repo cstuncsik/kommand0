@@ -4,7 +4,7 @@ use std::os::unix::process::CommandExt; // for Command::process_group
 use clap::{Parser, Subcommand};
 use kommand0_core::workspace::format_timestamp;
 use kommand0_core::{
-    AppState, SessionStatus, Workspace, branch_status, cleanup_merged_workspace, open_pull_request,
+    AppState, SessionStatus, Workspace, branch_status, cleanup_merged_workspace,
 };
 
 #[derive(Parser)]
@@ -109,11 +109,6 @@ enum WorkspaceAction {
     Status {
         /// Workspace name (omit for all)
         name: Option<String>,
-    },
-    /// Push the workspace's branch and open a GitHub PR (via `gh`)
-    OpenPr {
-        /// Workspace name
-        name: String,
     },
     /// Remove a merged workspace's worktree and delete its branch
     Cleanup {
@@ -406,19 +401,6 @@ fn main() -> anyhow::Result<()> {
                     for ws in targets {
                         print_status_row(ws);
                     }
-                }
-            }
-            WorkspaceAction::OpenPr { name } => {
-                let state = AppState::load()?;
-                let ws = state.show_workspace(&name)?;
-                let (Some(worktree), Some(branch)) =
-                    (ws.worktree_path.clone(), ws.branch_name.clone())
-                else {
-                    anyhow::bail!("workspace '{name}' has no branch to open a PR from");
-                };
-                match open_pull_request(&worktree, &branch) {
-                    Ok(url) => println!("{url}"),
-                    Err(e) => anyhow::bail!("{e}"),
                 }
             }
             WorkspaceAction::Cleanup { name, force } => {

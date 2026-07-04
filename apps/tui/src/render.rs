@@ -877,54 +877,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 });
             }
 
-            // Open-PR affordance + last outcome (own-branch workspaces).
             let has_branch = ws.worktree_path.is_some() && ws.branch_name.is_some();
-            let pr_inflight = app.pr_inflight.contains(&ws.id);
-            if has_branch || pr_inflight || app.pr_result.contains_key(&ws.id) {
-                lines.push(Line::raw(""));
-                if pr_inflight {
-                    let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
-                    lines.push(Line::styled(
-                        format!("{spin} Opening PR…"),
-                        Style::default().fg(th.accent),
-                    ));
-                } else if has_branch {
-                    let btn_y = area.y + 1 + lines.len() as u16;
-                    let btn_x = area.x + 2;
-                    let btn_label = "Open PR";
-                    let btn_rect = Rect::new(btn_x, btn_y, (btn_label.len() + 2) as u16, 1);
-                    let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
-                    let style = if hovered {
-                        Style::default()
-                            .fg(th.inverse)
-                            .bg(th.active)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(th.active).add_modifier(Modifier::BOLD)
-                    };
-                    lines.push(Line::styled(format!("[{btn_label}]"), style));
-                    app.hit_regions.push(buttons::HitRegion {
-                        area: btn_rect,
-                        action: buttons::HitAction::OpenPrFor {
-                            workspace_id: ws.id.clone(),
-                        },
-                    });
-                }
-                match app.pr_result.get(&ws.id) {
-                    Some(Ok(url)) => lines.push(Line::from(vec![
-                        Span::styled("PR: ", label_style),
-                        Span::styled(url.clone(), Style::default().fg(th.active)),
-                    ])),
-                    Some(Err(msg)) => lines.push(Line::from(vec![
-                        Span::styled(
-                            "PR failed: ",
-                            Style::default().fg(th.error).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(msg.clone(), Style::default().fg(th.error)),
-                    ])),
-                    None => {}
-                }
-            }
 
             // Clean-up affordance + last failure (own-branch workspaces).
             let cleanup_inflight = app.cleanup_inflight.contains(&ws.id);

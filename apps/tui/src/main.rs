@@ -64,21 +64,6 @@ impl Drop for StatusRefreshGuard {
     }
 }
 
-/// Carries a PR-open result `(workspace_id, Ok(url) | Err(msg))` to the event
-/// loop, sending on drop so a worker panic still clears `pr_inflight`.
-struct PrOpenGuard {
-    tx: tokio::sync::mpsc::UnboundedSender<(String, Result<String, String>)>,
-    payload: Option<(String, Result<String, String>)>,
-}
-
-impl Drop for PrOpenGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.payload.take() {
-            let _ = self.tx.send(p);
-        }
-    }
-}
-
 /// Carries a cleanup result `(workspace_id, Ok(()) | Err(msg))` to the event
 /// loop, sending on drop so a worker panic still clears `cleanup_inflight`.
 struct CleanupGuard {
@@ -396,13 +381,6 @@ pub(crate) struct App {
     /// depend on the wrapping tick counter).
     last_status_refresh: Option<Instant>,
 
-    /// Workspaces with a PR-open in flight (gates re-triggering; shows progress).
-    pub(crate) pr_inflight: HashSet<String>,
-    /// Last PR-open outcome per workspace: `Ok(url)` or `Err(message)`.
-    pub(crate) pr_result: HashMap<String, Result<String, String>>,
-    /// PR worker → event-loop channel carrying `(workspace_id, result)`.
-    pr_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<String, String>)>>,
-
     /// Workspaces with a cleanup in flight (gates re-triggering; shows progress).
     pub(crate) cleanup_inflight: HashSet<String>,
     /// Last cleanup *failure* per workspace (a success deletes the workspace).
@@ -477,9 +455,6 @@ impl App {
             status_inflight: false,
             status_tx: None,
             last_status_refresh: None,
-            pr_inflight: HashSet::new(),
-            pr_result: HashMap::new(),
-            pr_tx: None,
             cleanup_inflight: HashSet::new(),
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
@@ -1017,11 +992,6 @@ impl App {
                 action,
             };
             out.push(mk(
-                "open pr",
-                format!("Open PR — {}", w.name),
-                PaletteAction::OpenPr { ws_id: w.id.clone() },
-            ));
-            out.push(mk(
                 "clean up cleanup",
                 format!("Clean up — {}", w.name),
                 PaletteAction::Cleanup { ws_id: w.id.clone() },
@@ -1066,11 +1036,6 @@ impl App {
         use palette::PaletteAction::*;
         match action {
             OpenWorkspace { ws_id } => self.jump_to_workspace(&ws_id),
-            OpenPr { ws_id } => {
-                if self.reveal_workspace(&ws_id) {
-                    self.open_pr(&ws_id);
-                }
-            }
             Cleanup { ws_id } => {
                 if self.reveal_workspace(&ws_id) {
                     self.cleanup_workspace_prompt(&ws_id);
@@ -1733,42 +1698,6 @@ impl App {
         }
     }
 
-    /// Open a GitHub PR for a workspace's branch off the render loop: push the
-    /// branch and run `gh pr create`. No-op if one is already in flight; sets a
-    /// `pr_result` error immediately when the workspace has no own branch.
-    fn open_pr(&mut self, ws_id: &str) {
-        if self.pr_inflight.contains(ws_id) || self.cleanup_inflight.contains(ws_id) {
-            return; // don't race a cleanup of the same worktree
-        }
-        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
-            return;
-        };
-        let (Some(worktree), Some(branch)) = (ws.worktree_path.clone(), ws.branch_name.clone())
-        else {
-            self.pr_result.insert(
-                ws_id.to_string(),
-                Err("this workspace has no branch to open a PR from".to_string()),
-            );
-            return;
-        };
-        let Some(tx) = self.pr_tx.clone() else {
-            return; // not wired (unit tests drive pr_result/pr_inflight directly)
-        };
-        self.pr_inflight.insert(ws_id.to_string());
-        self.pr_result.remove(ws_id); // clear any stale outcome
-        let id = ws_id.to_string();
-        std::thread::spawn(move || {
-            // Default to an error so a panic before completion still clears the
-            // inflight flag with a sensible message.
-            let mut guard = PrOpenGuard {
-                tx,
-                payload: Some((id.clone(), Err("opening the PR was interrupted".to_string()))),
-            };
-            let result = kommand0_core::open_pull_request(&worktree, &branch);
-            guard.payload = Some((id, result));
-        });
-    }
-
     /// Populate and open the review-diff overlay for a workspace: the PR-style
     /// `git diff <default>...HEAD` of its worktree (committed changes only).
     /// Computed synchronously — a local git diff is fast; move off-loop if a
@@ -1780,8 +1709,8 @@ impl App {
         self.diff_scroll = 0;
         self.show_diff = true;
         // Own-branch workspaces only: a fallback workspace's `working_dir` is the
-        // shared repo root, not a branch to review (mirrors open_pr / branch_status,
-        // which gate on `worktree_path`).
+        // shared repo root, not a branch to review (mirrors branch_status, which
+        // gates on `worktree_path`).
         let Some(worktree) = ws.worktree_path.clone() else {
             self.diff_title = ws.name.clone();
             self.diff_text = "This workspace has no branch to review.".to_string();
@@ -1826,8 +1755,8 @@ impl App {
     /// branch deletion happen in core, which enforces the safety guards). Tears
     /// down any live embedded pane first so its cwd isn't yanked out from under it.
     fn start_cleanup(&mut self, ws_id: &str) {
-        if self.cleanup_inflight.contains(ws_id) || self.pr_inflight.contains(ws_id) {
-            return; // don't remove the worktree while a PR push runs in it
+        if self.cleanup_inflight.contains(ws_id) {
+            return;
         }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
             return;
@@ -2440,11 +2369,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         }
                     }
                 }
-                Action::OpenPr => {
-                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                        app.open_pr(&ws_id);
-                    }
-                }
                 Action::ReviewDiff => {
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
                         app.open_diff(&ws_id);
@@ -2767,11 +2691,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     app.request_branch_status_refresh();
     app.last_status_refresh = Some(Instant::now());
 
-    // PR-open worker → event loop, carrying `(workspace_id, Ok(url) | Err(msg))`.
-    let (pr_tx, mut pr_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, Result<String, String>)>();
-    app.pr_tx = Some(pr_tx);
-
     // Cleanup worker → event loop, carrying `(workspace_id, Ok(()) | Err(msg))`.
     let (cleanup_tx, mut cleanup_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
@@ -2794,13 +2713,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 app.branch_status = status;
                 app.status_inflight = false;
             }
-            Some((ws_id, result)) = pr_rx.recv() => {
-                // A PR-open finished: record the outcome, clear in-flight, and
-                // refresh branch status (the push changed ahead/behind).
-                app.pr_inflight.remove(&ws_id);
-                app.pr_result.insert(ws_id, result);
-                app.request_branch_status_refresh();
-            }
             Some((ws_id, result)) = cleanup_rx.recv() => {
                 app.cleanup_inflight.remove(&ws_id);
                 match result {
@@ -2812,7 +2724,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             let _ = app.state.delete_workspace(&name);
                             app.workspaces = app.state.workspaces.clone();
                             app.expanded_icon_rows.remove(&ws_id);
-                            app.pr_result.remove(&ws_id);
                             app.cleanup_result.remove(&ws_id);
                             app.rebuild_tree();
                             // clamp_selection re-seats off any hint row AND
@@ -2919,9 +2830,6 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         }
                         buttons::HitAction::NewSessionTab { workspace_id } => {
                             app.new_session(&workspace_id);
-                        }
-                        buttons::HitAction::OpenPrFor { workspace_id } => {
-                            app.open_pr(&workspace_id);
                         }
                         buttons::HitAction::CleanupWorkspaceFor { workspace_id } => {
                             app.cleanup_workspace_prompt(&workspace_id);
@@ -4632,56 +4540,6 @@ mod key_tests {
         assert!(text.contains("uncommitted changes"), "detail shows dirty state");
         // Tree row segment (compact, no spaces): " ↑2↓1*".
         assert!(text.contains("↑2↓1*"), "tree row shows the compact status segment:\n{text}");
-    }
-
-    #[test]
-    fn open_pr_without_a_branch_records_an_error() {
-        let mut app = test_app(); // w1 has worktree_path: None
-        let id = app.workspaces[0].id.clone();
-        app.open_pr(&id);
-        match app.pr_result.get(&id) {
-            Some(Err(msg)) => assert!(msg.contains("no branch"), "got: {msg}"),
-            other => panic!("expected a no-branch error, got {other:?}"),
-        }
-        assert!(!app.pr_inflight.contains(&id), "no worker spawned for a branchless workspace");
-    }
-
-    #[tokio::test]
-    async fn pr_affordance_and_states_render() {
-        let mut app = test_app();
-        app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
-        app.workspaces[0].branch_name = Some("kommand0/ws-one".into());
-        app.expanded.insert("r1".to_string());
-        app.rebuild_tree();
-        app.select_workspace_row("w1");
-
-        let draw = |app: &mut App| {
-            let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
-            t.draw(|frame| render::ui(frame, app)).unwrap();
-            buffer_text(&t)
-        };
-
-        // Idle: the button is offered.
-        assert!(draw(&mut app).contains("[Open PR]"), "idle shows the button");
-
-        // In flight: progress instead of the button.
-        app.pr_inflight.insert("w1".to_string());
-        let text = draw(&mut app);
-        assert!(text.contains("Opening PR"), "in-flight shows progress");
-        assert!(!text.contains("[Open PR]"), "button hidden while in flight");
-        app.pr_inflight.remove("w1");
-
-        // Success: the URL.
-        app.pr_result
-            .insert("w1".to_string(), Ok("https://github.com/x/y/pull/1".to_string()));
-        let text = draw(&mut app);
-        assert!(text.contains("pull/1"), "shows the PR URL:\n{text}");
-
-        // Failure: the error.
-        app.pr_result
-            .insert("w1".to_string(), Err("boom".to_string()));
-        let text = draw(&mut app);
-        assert!(text.contains("PR failed:") && text.contains("boom"), "shows the error:\n{text}");
     }
 
     #[tokio::test]
