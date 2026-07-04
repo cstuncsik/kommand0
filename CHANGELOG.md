@@ -7,6 +7,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [0.7.0] - 2026-07-04
 
+### Added
+
+- **Review a workspace's diff in-pane** — press `v` on a workspace to open a
+  scrollable overlay of its PR-style diff (`git diff <default>...HEAD` — the
+  committed changes a PR would show), coloured by add / remove / hunk. `j`/`k`,
+  `PgUp`/`PgDn`, and `g`/`G` scroll; `Esc`/`v`/`q` close. Rebindable as
+  `review-diff`.
+
 ## [0.6.1] - 2026-07-04
 
 ### Added
