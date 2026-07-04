@@ -380,6 +380,28 @@ fn help_overlay_opens_scrolls_and_closes() {
 }
 
 #[test]
+fn review_diff_overlay_opens_and_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("v"); // review the selected workspace's diff
+    // The seeded workspace has no worktree/branch, so the overlay says so —
+    // which proves the key opened it and open_diff ran.
+    tui.wait_for("no branch to review");
+
+    tui.send_esc(); // Esc closes
+    tui.wait_gone("no branch to review");
+
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn tree_navigation_expands_repo_with_l() {
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());

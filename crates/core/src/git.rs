@@ -70,6 +70,83 @@ pub fn branch_status(working_dir: &str) -> Option<BranchStatus> {
     Some(s)
 }
 
+/// Resolve the ref to diff a branch against: the repository's default branch.
+/// Prefer the remote's advertised default (`origin/HEAD`), then the common
+/// remote/local names, returning the first ref that actually exists. `None`
+/// when none resolve (e.g. not a git repo).
+fn default_branch_ref(working_dir: &str) -> Option<String> {
+    // Fully-qualified refs (`refs/remotes/…`, `refs/heads/…`) so a tag or local
+    // branch named e.g. `origin/main` can't shadow the intended ref — gitrevisions
+    // ranks `refs/tags/*` above `refs/remotes/*` for a bare name. `^{commit}`
+    // dereferences the symbolic `origin/HEAD` and rejects non-commit refs.
+    for cand in [
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+        "refs/heads/main",
+        "refs/heads/master",
+    ] {
+        let exists = Command::new("git")
+            .args([
+                "-C",
+                working_dir,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{cand}^{{commit}}"),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if exists {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
+/// The `git diff <default>...HEAD` for a worktree — the "PR-style" diff of every
+/// change the current branch has committed since it diverged from the default
+/// branch (the `A...B` form excludes the working tree, matching what a PR shows).
+///
+/// `Some("")` means no difference (HEAD is the default branch, or nothing is
+/// committed ahead of it). `None` means the directory isn't a git repo or the
+/// default branch couldn't be resolved. Panic-free, meant to run off the UI
+/// thread like [`branch_status`].
+pub fn diff_vs_default_branch(working_dir: &str) -> Option<String> {
+    let base = default_branch_ref(working_dir)?;
+    // `--no-ext-diff` avoids slow user-configured external diff drivers on the UI
+    // thread; `--no-color` keeps ANSI codes out of the captured text regardless of
+    // the user's `color.diff` config (the overlay does its own colouring).
+    let out = Command::new("git")
+        .args([
+            "-C",
+            working_dir,
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            &format!("{base}...HEAD"),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    // Bound the retained/rendered diff so a pathological worktree can't pin an
+    // unbounded string in memory (the overlay separately caps rendered lines).
+    const MAX_BYTES: usize = 1 << 20; // 1 MiB
+    if text.len() > MAX_BYTES {
+        let mut end = MAX_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n… diff truncated (over 1 MiB) — use a shell tab for the full diff\n");
+    }
+    Some(text)
+}
+
 /// The `gh` binary to invoke (overridable via `KOMMAND0_GH_BIN`, mirroring the
 /// `KOMMAND0_CLAUDE_BIN` override used for the embedded pane).
 fn gh_bin() -> String {
@@ -485,6 +562,90 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("gh CLI not found"), "friendly gh-missing error: {err}");
+    }
+
+    // --- diff_vs_default_branch ---
+
+    #[test]
+    fn diff_shows_committed_branch_changes() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path()); // main + a.txt "hello"
+        git(tmp.path(), &["switch", "-c", "feature"]);
+        std::fs::write(tmp.path().join("a.txt"), "hello world").unwrap();
+        git(tmp.path(), &["commit", "-am", "edit"]);
+        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert!(d.contains("a.txt"), "names the changed file: {d}");
+        assert!(d.contains("+hello world"), "shows the added line: {d}");
+    }
+
+    #[test]
+    fn diff_is_empty_on_the_default_branch() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path()); // HEAD == main
+        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert!(d.is_empty(), "HEAD is the default branch → no diff: {d:?}");
+    }
+
+    #[test]
+    fn diff_excludes_uncommitted_changes() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        git(tmp.path(), &["switch", "-c", "feature"]);
+        // Working-tree change only — never committed.
+        std::fs::write(tmp.path().join("a.txt"), "dirty").unwrap();
+        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert!(d.is_empty(), "committed-only diff excludes the working tree: {d:?}");
+    }
+
+    #[test]
+    fn diff_is_none_outside_a_repo() {
+        let tmp = TempDir::new().unwrap();
+        assert!(diff_vs_default_branch(tmp.path().to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn diff_is_pr_style_when_default_branch_advances() {
+        // The load-bearing property of the three-dot `A...B` form: after the
+        // branch diverges, later commits on the default branch must NOT show as
+        // removals (two-dot `A..B` would show them). Pins the merge-base semantics.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path()); // main + a.txt
+        git(tmp.path(), &["switch", "-c", "feature"]);
+        std::fs::write(tmp.path().join("feat.txt"), "feature").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-m", "add feat"]);
+        // main advances independently after the branch diverged.
+        git(tmp.path(), &["switch", "main"]);
+        std::fs::write(tmp.path().join("main.txt"), "main").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-m", "add main"]);
+        git(tmp.path(), &["switch", "feature"]);
+
+        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert!(d.contains("feat.txt"), "shows the branch's own change: {d}");
+        assert!(
+            !d.contains("main.txt"),
+            "three-dot must not show the default branch's later commits: {d}"
+        );
+    }
+
+    #[test]
+    fn diff_resolves_master_when_main_is_absent() {
+        // Exercises the fallback walk past refs/heads/main to refs/heads/master
+        // (the base-resolution chain, not just the last-resort local `main`).
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-b", "master"]);
+        git(tmp.path(), &["config", "user.email", "t@t"]);
+        git(tmp.path(), &["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-m", "init"]);
+        git(tmp.path(), &["switch", "-c", "feature"]);
+        std::fs::write(tmp.path().join("a.txt"), "hello world").unwrap();
+        git(tmp.path(), &["commit", "-am", "edit"]);
+
+        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert!(d.contains("+hello world"), "based against master: {d}");
     }
 
     // --- cleanup_merged_workspace ---
