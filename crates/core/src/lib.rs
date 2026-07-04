@@ -7,7 +7,10 @@ pub mod workspace;
 pub mod worktree;
 
 pub use config::Config;
-pub use git::{BranchStatus, branch_status, cleanup_merged_workspace, diff_vs_default_branch};
+pub use git::{
+    BranchStatus, PrChecks, PrReview, PrState, PrStatus, branch_status, cleanup_merged_workspace,
+    diff_vs_default_branch, pr_statuses,
+};
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
 pub use session::{Session, SessionStatus};

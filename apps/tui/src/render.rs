@@ -1,7 +1,7 @@
-use kommand0_core::{SessionStatus, workspace::format_timestamp};
+use kommand0_core::{PrChecks, PrReview, PrState, PrStatus, SessionStatus, workspace::format_timestamp};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
@@ -12,6 +12,66 @@ use super::theme::Theme;
 use super::{App, Focus, TreeNode, buttons, diff, help, modal, palette};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Compact tree-row glyph for a PR: state first (merged/closed short-circuit),
+/// else the CI outcome of an open PR. `⬤` merged · `✕` closed · `✓` passing ·
+/// `✗` failing · `◍` pending · `◇` no checks.
+fn pr_glyph(pr: &PrStatus) -> char {
+    match pr.state {
+        PrState::Merged => '\u{2B24}', // ⬤
+        PrState::Closed => '\u{2715}', // ✕
+        PrState::Open => match pr.checks {
+            PrChecks::Passing => '\u{2713}', // ✓
+            PrChecks::Failing => '\u{2717}', // ✗
+            PrChecks::Pending => '\u{25CD}', // ◍
+            PrChecks::None => '\u{25C7}',    // ◇
+        },
+    }
+}
+
+/// Colour for a PR's tree-row glyph. Merged uses the theme accent; closed/no-CI
+/// are muted; open-PR CI states use fixed green/red/yellow (like the diff view),
+/// which read the same across themes.
+fn pr_glyph_color(pr: &PrStatus, th: Theme) -> Color {
+    match pr.state {
+        PrState::Merged => th.accent,
+        PrState::Closed => th.muted,
+        PrState::Open => match pr.checks {
+            PrChecks::Passing => Color::Green,
+            PrChecks::Failing => Color::Red,
+            PrChecks::Pending => Color::Yellow,
+            PrChecks::None => th.muted,
+        },
+    }
+}
+
+/// Detail-pane one-liner for a PR, e.g. `PR #12 · open · CI passing · approved`.
+/// Review is omitted when there's no decision.
+fn pr_detail_label(pr: &PrStatus) -> String {
+    let state = match pr.state {
+        PrState::Open => "open",
+        PrState::Merged => "merged",
+        PrState::Closed => "closed",
+    };
+    let checks = match pr.checks {
+        PrChecks::Passing => "CI passing",
+        PrChecks::Failing => "CI failing",
+        PrChecks::Pending => "CI pending",
+        PrChecks::None => "no checks",
+    };
+    let mut label = format!("PR #{} · {state} · {checks}", pr.number);
+    let review = match pr.review {
+        PrReview::Approved => Some("approved"),
+        PrReview::ChangesRequested => Some("changes requested"),
+        PrReview::ReviewRequired => Some("review required"),
+        PrReview::None => None,
+    };
+    if let Some(r) = review {
+        label.push_str(" · ");
+        label.push_str(r);
+    }
+    label
+}
 
 fn truncate_path(path: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(path) <= max_width {
@@ -379,12 +439,39 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         };
                         let git_seg = if git_w == 0 { String::new() } else { git_seg };
 
+                        // Compact PR/CI segment for own-branch workspaces with a
+                        // PR, e.g. " #12 ✓". Reserved like the git segment so the
+                        // icon hit-regions (measured from the right) stay aligned;
+                        // dropped first when the row is too narrow.
+                        let pr = ws
+                            .worktree_path
+                            .is_some()
+                            .then(|| app.pr_status.get(&ws.id))
+                            .flatten();
+                        let pr_num_seg =
+                            pr.map(|p| format!(" #{} ", p.number)).unwrap_or_default();
+                        let pr_w_raw = pr
+                            .map(|_| UnicodeWidthStr::width(pr_num_seg.as_str()) + 1) // +1 for the glyph
+                            .unwrap_or(0);
+                        let pr_w = if fixed_width + icons.total_width as usize + git_w + pr_w_raw
+                            < pane_inner_width
+                        {
+                            pr_w_raw
+                        } else {
+                            0 // too narrow — drop the PR segment
+                        };
+                        let pr = if pr_w == 0 { None } else { pr };
+
                         let name_max_width = pane_inner_width
-                            .saturating_sub(fixed_width + git_w + icons.total_width as usize);
+                            .saturating_sub(fixed_width + git_w + pr_w + icons.total_width as usize);
                         let display_name = truncate_to_width(&ws.name, name_max_width);
                         let name_display_width = UnicodeWidthStr::width(display_name.as_str());
                         let fill_width = pane_inner_width.saturating_sub(
-                            fixed_width + name_display_width + git_w + icons.total_width as usize,
+                            fixed_width
+                                + name_display_width
+                                + git_w
+                                + pr_w
+                                + icons.total_width as usize,
                         );
 
                         let mut spans = vec![
@@ -395,6 +482,13 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         ];
                         if git_w > 0 {
                             spans.push(Span::styled(git_seg, Style::default().fg(th.dirty)));
+                        }
+                        if let Some(p) = pr {
+                            spans.push(Span::styled(pr_num_seg, style));
+                            spans.push(Span::styled(
+                                pr_glyph(p).to_string(),
+                                Style::default().fg(pr_glyph_color(p, th)),
+                            ));
                         }
                         spans.extend(icons.spans.clone());
 
@@ -878,6 +972,19 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
 
             let has_branch = ws.worktree_path.is_some() && ws.branch_name.is_some();
+
+            // PR/CI status (own-branch workspaces with a PR on their branch),
+            // from the off-loop `gh pr list` cache.
+            if let Some(pr) = app.pr_status.get(&ws.id) {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    pr_detail_label(pr),
+                    Style::default().fg(pr_glyph_color(pr, th)).add_modifier(Modifier::BOLD),
+                ));
+                if !pr.url.is_empty() {
+                    lines.push(Line::styled(pr.url.clone(), Style::default().fg(th.active)));
+                }
+            }
 
             // Clean-up affordance + last failure (own-branch workspaces).
             let cleanup_inflight = app.cleanup_inflight.contains(&ws.id);
@@ -1718,5 +1825,62 @@ mod tests {
         let result = truncate_to_width("\u{4F60}\u{597D}x", 3);
         assert_eq!(result, "\u{4F60}");
         assert!(UnicodeWidthStr::width(result.as_str()) <= 3);
+    }
+
+    fn pr(state: PrState, checks: PrChecks, review: PrReview) -> PrStatus {
+        PrStatus { number: 12, state, checks, review, url: "https://x/12".into() }
+    }
+
+    #[test]
+    fn pr_glyph_reflects_state_then_ci() {
+        // State short-circuits: merged/closed ignore the CI field.
+        assert_eq!(pr_glyph(&pr(PrState::Merged, PrChecks::Failing, PrReview::None)), '\u{2B24}');
+        assert_eq!(pr_glyph(&pr(PrState::Closed, PrChecks::Passing, PrReview::None)), '\u{2715}');
+        // Open PRs surface the CI outcome.
+        assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Passing, PrReview::None)), '\u{2713}');
+        assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Failing, PrReview::None)), '\u{2717}');
+        assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Pending, PrReview::None)), '\u{25CD}');
+        assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::None, PrReview::None)), '\u{25C7}');
+    }
+
+    #[test]
+    fn pr_glyph_color_maps_state_and_ci() {
+        let th = Theme::default();
+        assert_eq!(pr_glyph_color(&pr(PrState::Merged, PrChecks::None, PrReview::None), th), th.accent);
+        assert_eq!(pr_glyph_color(&pr(PrState::Closed, PrChecks::None, PrReview::None), th), th.muted);
+        assert_eq!(
+            pr_glyph_color(&pr(PrState::Open, PrChecks::Passing, PrReview::None), th),
+            Color::Green
+        );
+        assert_eq!(
+            pr_glyph_color(&pr(PrState::Open, PrChecks::Failing, PrReview::None), th),
+            Color::Red
+        );
+        assert_eq!(
+            pr_glyph_color(&pr(PrState::Open, PrChecks::Pending, PrReview::None), th),
+            Color::Yellow
+        );
+        assert_eq!(pr_glyph_color(&pr(PrState::Open, PrChecks::None, PrReview::None), th), th.muted);
+    }
+
+    #[test]
+    fn pr_detail_label_words_and_omits_no_review() {
+        assert_eq!(
+            pr_detail_label(&pr(PrState::Open, PrChecks::Passing, PrReview::Approved)),
+            "PR #12 · open · CI passing · approved"
+        );
+        assert_eq!(
+            pr_detail_label(&pr(PrState::Merged, PrChecks::None, PrReview::ChangesRequested)),
+            "PR #12 · merged · no checks · changes requested"
+        );
+        assert_eq!(
+            pr_detail_label(&pr(PrState::Closed, PrChecks::Failing, PrReview::ReviewRequired)),
+            "PR #12 · closed · CI failing · review required"
+        );
+        // No review decision → the review clause is omitted entirely.
+        assert_eq!(
+            pr_detail_label(&pr(PrState::Open, PrChecks::Pending, PrReview::None)),
+            "PR #12 · open · CI pending"
+        );
     }
 }

@@ -48,6 +48,11 @@ pub(crate) const MAX_SESSION_TABS: usize = 9;
 /// the 50ms tick; on-demand triggers (workspace create/close) keep it snappy.
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How often the periodic PR/CI-status refresh runs (off the render loop). A `gh
+/// pr list` per repo is a network call, so it runs far less often than the local
+/// git status.
+const PR_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Carries a status-refresh result to the event loop, sending on drop so the
 /// loop always gets a message (and clears `status_inflight`) even if the worker
 /// thread panics before finishing.
@@ -57,6 +62,22 @@ struct StatusRefreshGuard {
 }
 
 impl Drop for StatusRefreshGuard {
+    fn drop(&mut self) {
+        if let Some(map) = self.result.take() {
+            let _ = self.tx.send(map);
+        }
+    }
+}
+
+/// Carries a PR-status refresh result (`ws_id` → [`kommand0_core::PrStatus`]) to
+/// the event loop, sending on drop so a worker panic still clears
+/// `pr_status_inflight`.
+struct PrStatusRefreshGuard {
+    tx: tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::PrStatus>>,
+    result: Option<HashMap<String, kommand0_core::PrStatus>>,
+}
+
+impl Drop for PrStatusRefreshGuard {
     fn drop(&mut self) {
         if let Some(map) = self.result.take() {
             let _ = self.tx.send(map);
@@ -381,6 +402,18 @@ pub(crate) struct App {
     /// depend on the wrapping tick counter).
     last_status_refresh: Option<Instant>,
 
+    /// Per-workspace PR/CI status, refreshed off the render loop via one
+    /// `gh pr list` per repo. Keyed by workspace id; absent until a PR exists on
+    /// the workspace's branch (or until the first refresh lands).
+    pub(crate) pr_status: HashMap<String, kommand0_core::PrStatus>,
+    /// A PR-status refresh worker is running; gates re-spawning (always cleared
+    /// when its result arrives, even on a partial/empty map).
+    pr_status_inflight: bool,
+    /// Worker → event-loop channel carrying a fresh `ws_id` → PrStatus map.
+    pr_status_tx: Option<tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::PrStatus>>>,
+    /// When the periodic PR-status refresh last fired (time-based).
+    last_pr_status_refresh: Option<Instant>,
+
     /// Workspaces with a cleanup in flight (gates re-triggering; shows progress).
     pub(crate) cleanup_inflight: HashSet<String>,
     /// Last cleanup *failure* per workspace (a success deletes the workspace).
@@ -455,6 +488,10 @@ impl App {
             status_inflight: false,
             status_tx: None,
             last_status_refresh: None,
+            pr_status: HashMap::new(),
+            pr_status_inflight: false,
+            pr_status_tx: None,
+            last_pr_status_refresh: None,
             cleanup_inflight: HashSet::new(),
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
@@ -1662,6 +1699,60 @@ impl App {
         });
     }
 
+    /// Kick off an off-loop PR/CI-status refresh (no-op if one is running or the
+    /// channel isn't wired). Runs one [`kommand0_core::pr_statuses`] per repo, then
+    /// matches each worktree-backed workspace's `branch_name` against that repo's
+    /// `headRefName` → PrStatus map. Sends the whole `ws_id` → PrStatus map back;
+    /// the event loop replaces the cache wholesale (deleted workspaces / closed
+    /// PRs drop out on the next refresh).
+    fn request_pr_status_refresh(&mut self) {
+        if self.pr_status_inflight {
+            return;
+        }
+        let Some(tx) = self.pr_status_tx.clone() else {
+            return; // not wired (e.g. unit tests drive the cache directly)
+        };
+        // Group workspaces by their repo's path (one `gh pr list` per repo).
+        // Only own-branch workspaces have a PR to look up.
+        let mut by_repo: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for w in &self.workspaces {
+            let Some(branch) = &w.branch_name else {
+                continue;
+            };
+            if w.worktree_path.is_none() {
+                continue;
+            }
+            let Some(repo) = self.repos.iter().find(|r| r.id == w.repo_id) else {
+                continue;
+            };
+            by_repo
+                .entry(repo.path.clone())
+                .or_default()
+                .push((w.id.clone(), branch.clone()));
+        }
+        if by_repo.is_empty() {
+            return;
+        }
+        self.pr_status_inflight = true;
+        std::thread::spawn(move || {
+            // The guard sends `result` on drop — including on panic — so the
+            // event loop always clears `pr_status_inflight`.
+            let mut guard = PrStatusRefreshGuard {
+                tx,
+                result: Some(HashMap::new()),
+            };
+            let map = guard.result.as_mut().expect("result present until drop");
+            for (repo_path, workspaces) in by_repo {
+                let prs = kommand0_core::pr_statuses(&repo_path);
+                for (ws_id, branch) in workspaces {
+                    if let Some(status) = prs.get(&branch) {
+                        map.insert(ws_id, status.clone());
+                    }
+                }
+            }
+        });
+    }
+
     /// Post-process a workspace-create attempt from the add-workspace flow. On
     /// success: sync workspaces, expand the repo, rebuild, refresh branch status.
     /// On failure: reopen the Add-Workspace modal with the typed `name`, the given
@@ -2691,6 +2782,14 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     app.request_branch_status_refresh();
     app.last_status_refresh = Some(Instant::now());
 
+    // Off-loop PR/CI-status worker → event loop. Seeded once, then refreshed on a
+    // slow interval (one `gh pr list` per repo is a network call).
+    let (pr_status_tx, mut pr_status_rx) =
+        tokio::sync::mpsc::unbounded_channel::<HashMap<String, kommand0_core::PrStatus>>();
+    app.pr_status_tx = Some(pr_status_tx);
+    app.request_pr_status_refresh();
+    app.last_pr_status_refresh = Some(Instant::now());
+
     // Cleanup worker → event loop, carrying `(workspace_id, Ok(()) | Err(msg))`.
     let (cleanup_tx, mut cleanup_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
@@ -2712,6 +2811,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 // entries for deleted workspaces) and allow the next refresh.
                 app.branch_status = status;
                 app.status_inflight = false;
+            }
+            Some(pr_status) = pr_status_rx.recv() => {
+                // A PR-status refresh finished: replace the cache wholesale (drops
+                // entries for deleted workspaces / closed PRs) and allow the next.
+                app.pr_status = pr_status;
+                app.pr_status_inflight = false;
             }
             Some((ws_id, result)) = cleanup_rx.recv() => {
                 app.cleanup_inflight.remove(&ws_id);
@@ -2962,6 +3067,15 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 {
                     app.last_status_refresh = Some(now);
                     app.request_branch_status_refresh();
+                }
+                // Periodic PR/CI-status refresh (off-loop, slow interval — it's a
+                // network call per repo).
+                if app
+                    .last_pr_status_refresh
+                    .is_none_or(|t| now.duration_since(t) >= PR_STATUS_REFRESH_INTERVAL)
+                {
+                    app.last_pr_status_refresh = Some(now);
+                    app.request_pr_status_refresh();
                 }
             }
         }
@@ -4540,6 +4654,39 @@ mod key_tests {
         assert!(text.contains("uncommitted changes"), "detail shows dirty state");
         // Tree row segment (compact, no spaces): " ↑2↓1*".
         assert!(text.contains("↑2↓1*"), "tree row shows the compact status segment:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn pr_status_shows_in_detail_and_tree() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+        app.workspaces[0].branch_name = Some("kommand0/ws-one".into());
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.pr_status.insert(
+            "w1".to_string(),
+            kommand0_core::PrStatus {
+                number: 42,
+                state: kommand0_core::PrState::Open,
+                checks: kommand0_core::PrChecks::Passing,
+                review: kommand0_core::PrReview::Approved,
+                url: "https://github.com/x/y/pull/42".into(),
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        // Detail pane: the label line + the URL.
+        assert!(
+            text.contains("PR #42 · open · CI passing · approved"),
+            "detail shows the PR status line:\n{text}"
+        );
+        assert!(text.contains("pull/42"), "detail shows the PR url:\n{text}");
+        // Tree row: the compact " #42 <glyph>" segment (green check for passing).
+        assert!(text.contains("#42"), "tree row shows the PR number:\n{text}");
     }
 
     #[tokio::test]

@@ -194,6 +194,156 @@ fn run_gh(gh_bin: &str, cwd: &str, args: &[&str]) -> std::io::Result<std::proces
     }
 }
 
+/// A pull request's lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+}
+
+/// Aggregate CI outcome across a PR's `statusCheckRollup` (see [`pr_statuses`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrChecks {
+    Passing,
+    Failing,
+    Pending,
+    None,
+}
+
+/// A PR's review decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrReview {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+    None,
+}
+
+/// One pull request's status, as surfaced in the tree/detail panes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrStatus {
+    pub number: u64,
+    pub state: PrState,
+    pub checks: PrChecks,
+    pub review: PrReview,
+    pub url: String,
+}
+
+/// One `gh pr list` per repo → a map of `headRefName` → [`PrStatus`]. Panic-free:
+/// returns an empty map on any gh failure (not installed, not authenticated, not
+/// a gh-recognised repo) or parse error. Shells out to `gh` (a network call), so
+/// callers should run it off the UI thread — like [`branch_status`].
+pub fn pr_statuses(repo_dir: &str) -> std::collections::HashMap<String, PrStatus> {
+    pr_statuses_with(repo_dir, &gh_bin())
+}
+
+/// Classify a single `statusCheckRollup` item as (is_failure, is_pending). A
+/// CheckRun carries `conclusion` (null until it completes) + `status`; a
+/// StatusContext carries `state`.
+fn classify_check(item: &serde_json::Value) -> (bool, bool) {
+    let conclusion = item.get("conclusion").and_then(|v| v.as_str());
+    let status = item.get("status").and_then(|v| v.as_str());
+    let state = item.get("state").and_then(|v| v.as_str());
+
+    let is_failure = matches!(
+        conclusion,
+        Some("FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE")
+    ) || matches!(state, Some("FAILURE" | "ERROR"));
+    if is_failure {
+        return (true, false);
+    }
+
+    // Still running: a CheckRun with no conclusion and no terminal state, one not
+    // COMPLETED, or a StatusContext explicitly pending/expected.
+    let is_pending = (conclusion.is_none() && state.is_none())
+        || matches!(status, Some(s) if s != "COMPLETED")
+        || matches!(state, Some("PENDING" | "EXPECTED"));
+    (false, is_pending)
+}
+
+/// Aggregate a PR's `statusCheckRollup` array into a single [`PrChecks`].
+/// Precedence: Failing > Pending > Passing > None (empty array).
+fn aggregate_checks(rollup: &serde_json::Value) -> PrChecks {
+    let Some(items) = rollup.as_array() else {
+        return PrChecks::None;
+    };
+    if items.is_empty() {
+        return PrChecks::None;
+    }
+    let mut any_pending = false;
+    for item in items {
+        let (is_failure, is_pending) = classify_check(item);
+        if is_failure {
+            return PrChecks::Failing;
+        }
+        any_pending |= is_pending;
+    }
+    if any_pending {
+        PrChecks::Pending
+    } else {
+        PrChecks::Passing
+    }
+}
+
+/// [`pr_statuses`] with the `gh` binary injected, so tests can pass a stub path
+/// instead of mutating the process environment.
+fn pr_statuses_with(repo_dir: &str, gh_bin: &str) -> std::collections::HashMap<String, PrStatus> {
+    let mut map = std::collections::HashMap::new();
+    let out = match run_gh(
+        gh_bin,
+        repo_dir,
+        &[
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--limit",
+            "100",
+            "--json",
+            "number,headRefName,state,url,reviewDecision,statusCheckRollup",
+        ],
+    ) {
+        Ok(o) if o.status.success() => o,
+        // Any failure (gh missing, not authed, not a gh repo) → empty map.
+        _ => return map,
+    };
+    let Ok(prs) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
+        return map;
+    };
+    for pr in prs {
+        let Some(branch) = pr.get("headRefName").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let state = match pr.get("state").and_then(|v| v.as_str()) {
+            Some("OPEN") => PrState::Open,
+            Some("MERGED") => PrState::Merged,
+            _ => PrState::Closed,
+        };
+        let review = match pr.get("reviewDecision").and_then(|v| v.as_str()) {
+            Some("APPROVED") => PrReview::Approved,
+            Some("CHANGES_REQUESTED") => PrReview::ChangesRequested,
+            Some("REVIEW_REQUIRED") => PrReview::ReviewRequired,
+            _ => PrReview::None,
+        };
+        let checks = pr
+            .get("statusCheckRollup")
+            .map(aggregate_checks)
+            .unwrap_or(PrChecks::None);
+        map.insert(
+            branch.to_string(),
+            PrStatus {
+                number: pr.get("number").and_then(|v| v.as_u64()).unwrap_or(0),
+                state,
+                checks,
+                review,
+                url: pr.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            },
+        );
+    }
+    map
+}
+
 /// Remove a merged workspace's worktree and delete its branch — but only when it
 /// is provably safe. Returns a message (deleting nothing) unless ALL hold:
 /// - the branch is workspace-owned (`kommand0/…`) — never the default branch;
@@ -656,5 +806,107 @@ mod tests {
         gh_view_stub(&gh, "MERGED", &sha);
         assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
         assert!(!branch_exists(&repo, &branch), "orphaned branch deleted");
+    }
+
+    // --- pr_statuses ---
+
+    /// A `gh` stub whose `pr list` prints the given JSON array verbatim (and
+    /// fails any other subcommand, so a stray call is caught).
+    fn gh_list_stub(path: &Path, json: &str) {
+        write_stub(
+            path,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ]; then\n  cat <<'JSON'\n{json}\nJSON\n  exit 0\nfi\nexit 1\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn pr_statuses_parses_states_checks_and_reviews() {
+        // One repo, many branches: a single `gh pr list` returns them all, keyed
+        // by headRefName. Each branch exercises a distinct combination.
+        let json = r#"[
+          {"number":1,"headRefName":"pass","state":"OPEN","url":"https://x/1","reviewDecision":"APPROVED",
+           "statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"},{"state":"SUCCESS"}]},
+          {"number":2,"headRefName":"fail","state":"OPEN","url":"https://x/2","reviewDecision":"CHANGES_REQUESTED",
+           "statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"},{"conclusion":"FAILURE","status":"COMPLETED"}]},
+          {"number":3,"headRefName":"pending","state":"OPEN","url":"https://x/3","reviewDecision":"REVIEW_REQUIRED",
+           "statusCheckRollup":[{"conclusion":null,"status":"IN_PROGRESS"}]},
+          {"number":4,"headRefName":"merged","state":"MERGED","url":"https://x/4","reviewDecision":"APPROVED",
+           "statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}]},
+          {"number":5,"headRefName":"empty","state":"OPEN","url":"https://x/5","reviewDecision":"",
+           "statusCheckRollup":[]},
+          {"number":6,"headRefName":"closed","state":"CLOSED","url":"https://x/6","reviewDecision":null,
+           "statusCheckRollup":[{"state":"ERROR"}]},
+          {"number":7,"headRefName":"statusctx-pending","state":"OPEN","url":"https://x/7","reviewDecision":"APPROVED",
+           "statusCheckRollup":[{"state":"PENDING"}]}
+        ]"#;
+        let tmp = TempDir::new().unwrap();
+        let gh = tmp.path().join("gh");
+        gh_list_stub(&gh, json);
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap());
+
+        assert_eq!(m.len(), 7);
+
+        let pass = &m["pass"];
+        assert_eq!(pass.number, 1);
+        assert_eq!(pass.state, PrState::Open);
+        assert_eq!(pass.checks, PrChecks::Passing);
+        assert_eq!(pass.review, PrReview::Approved);
+        assert_eq!(pass.url, "https://x/1");
+
+        // A failure anywhere in the rollup wins over passing checks.
+        assert_eq!(m["fail"].checks, PrChecks::Failing);
+        assert_eq!(m["fail"].review, PrReview::ChangesRequested);
+
+        // A null conclusion (not-yet-complete CheckRun) reads as pending.
+        assert_eq!(m["pending"].checks, PrChecks::Pending);
+        assert_eq!(m["pending"].review, PrReview::ReviewRequired);
+
+        assert_eq!(m["merged"].state, PrState::Merged);
+
+        // An empty rollup → no checks; an empty reviewDecision → no review.
+        assert_eq!(m["empty"].checks, PrChecks::None);
+        assert_eq!(m["empty"].review, PrReview::None);
+
+        // A non-open/merged state is Closed; a StatusContext ERROR is a failure;
+        // a null reviewDecision → no review.
+        assert_eq!(m["closed"].state, PrState::Closed);
+        assert_eq!(m["closed"].checks, PrChecks::Failing);
+        assert_eq!(m["closed"].review, PrReview::None);
+
+        // A StatusContext PENDING (no conclusion field at all) reads as pending.
+        assert_eq!(m["statusctx-pending"].checks, PrChecks::Pending);
+    }
+
+    #[test]
+    fn pr_statuses_failing_beats_pending() {
+        // Precedence guard: a failure and a still-running check together → Failing.
+        let json = r#"[
+          {"number":9,"headRefName":"br","state":"OPEN","url":"https://x/9","reviewDecision":"APPROVED",
+           "statusCheckRollup":[{"conclusion":null,"status":"QUEUED"},{"conclusion":"TIMED_OUT","status":"COMPLETED"}]}
+        ]"#;
+        let tmp = TempDir::new().unwrap();
+        let gh = tmp.path().join("gh");
+        gh_list_stub(&gh, json);
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap());
+        assert_eq!(m["br"].checks, PrChecks::Failing);
+    }
+
+    #[test]
+    fn pr_statuses_is_empty_when_gh_missing() {
+        let tmp = TempDir::new().unwrap();
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), "/nonexistent/definitely/not/gh");
+        assert!(m.is_empty(), "a missing gh yields an empty map, never a panic");
+    }
+
+    #[test]
+    fn pr_statuses_is_empty_on_gh_failure() {
+        // gh present but exits non-zero (e.g. not a gh repo / not authed).
+        let tmp = TempDir::new().unwrap();
+        let gh = tmp.path().join("gh");
+        write_stub(&gh, "#!/bin/sh\nexit 1\n");
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap());
+        assert!(m.is_empty());
     }
 }
