@@ -1,0 +1,37 @@
+apps/tui/src/main.rs
+  s_164243679ec02c::t_685bdca12c6362 220-234,319-334,352-353,356-371,503-511,1848-1851,1857-1862,1868,1875-1956,1960-2032,2034-2063,2065-2077,2389-2390,2395-2411,3175-3194,4231-4233,4237,4259-4452
+  s_164243679ec02c::t_beaa43ab3f39c5 2033,2064,2078-2079
+crates/core/src/git.rs
+  s_164243679ec02c::t_25883a718f5028 108-120,122,126,157-179
+  s_164243679ec02c::t_878a573acd12ec 640,643-645,650-665,672-673,683-684,690,711-713,715-716,735-738
+README.md
+  s_164243679ec02c::t_1662dd493663f3 128-129
+  s_164243679ec02c::t_461f4c3af24c8e 149-150
+  s_164243679ec02c::t_4129520f51b1b4 229
+apps/tui/src/render.rs
+  s_164243679ec02c::t_10f4793cb4ac9a 134,136
+apps/tui/tests/e2e.rs
+  s_164243679ec02c::t_bd46efd2f6b343 393-397,400
+apps/tui/src/diff.rs
+  s_164243679ec02c::t_89ecf259907547 1-4,14,67-68,70-75,77,81-82,84-91,93-94,97-123,125-227
+CHANGELOG.md
+  s_164243679ec02c::t_bc72732ef40e26 8-19
+crates/core/src/lib.rs
+  s_164243679ec02c::t_559cab9fd88539 11-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6134debbd225de39c2bd4461830d4049150959cc",
+  "prompts": {},
+  "sessions": {
+    "s_164243679ec02c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8eb123a-c396-4394-8625-f41817ed3acb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
