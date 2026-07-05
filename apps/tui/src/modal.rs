@@ -500,6 +500,79 @@ pub(crate) fn handle_modal_paste(modal: &mut ModalState, text: &str) {
     *cur += clean.len();
 }
 
+/// A single-line edit buffer with a byte cursor — the editing logic the modal
+/// arms above hand-inline, factored for new consumers (the settings page).
+/// The cursor is always on a char boundary. Rendered with
+/// [`render_input_with_cursor`]. Existing modal arms are not retrofitted.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LineEdit {
+    pub(crate) buf: String,
+    pub(crate) cursor: usize,
+}
+
+impl LineEdit {
+    /// Start editing seeded with `text`, cursor at the end.
+    pub(crate) fn new(text: String) -> Self {
+        let cursor = text.len();
+        Self { buf: text, cursor }
+    }
+
+    pub(crate) fn insert_char(&mut self, c: char) {
+        self.buf.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let prev = self.buf[..self.cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.buf.replace_range(prev..self.cursor, "");
+            self.cursor = prev;
+        }
+    }
+
+    pub(crate) fn left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.buf[..self.cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    pub(crate) fn right(&mut self) {
+        if self.cursor < self.buf.len() {
+            self.cursor = self.buf[self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor + i)
+                .unwrap_or(self.buf.len());
+        }
+    }
+
+    pub(crate) fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub(crate) fn end(&mut self) {
+        self.cursor = self.buf.len();
+    }
+
+    /// Insert pasted text at the cursor, via [`sanitize_paste`].
+    pub(crate) fn paste(&mut self, text: &str) {
+        let clean = sanitize_paste(text);
+        if clean.is_empty() {
+            return;
+        }
+        self.buf.insert_str(self.cursor, &clean);
+        self.cursor += clean.len();
+    }
+}
+
 /// Generate path completions for the given partial input.
 fn complete_path(partial: &str) -> Vec<String> {
     let path = if partial.is_empty() {
@@ -1160,6 +1233,45 @@ mod tests {
             }
             _ => panic!("modal changed variant"),
         }
+    }
+
+    #[test]
+    fn line_edit_multibyte_ops_keep_the_cursor_on_a_char_boundary() {
+        // Type, arrow through, and backspace multibyte chars — every op must
+        // leave the byte cursor slice-safe or render panics.
+        let mut e = LineEdit::default();
+        e.insert_char('a');
+        e.insert_char('é'); // 2 bytes
+        e.insert_char('b');
+        assert_eq!((e.buf.as_str(), e.cursor), ("aéb", 4));
+        e.left(); // before 'b'
+        e.left(); // before 'é'
+        assert_eq!(e.cursor, 1);
+        assert!(e.buf.is_char_boundary(e.cursor));
+        e.right();
+        assert_eq!(e.cursor, 3, "right steps over the whole codepoint");
+        e.backspace(); // removes 'é'
+        assert_eq!((e.buf.as_str(), e.cursor), ("ab", 1));
+        e.home();
+        assert_eq!(e.cursor, 0);
+        e.end();
+        assert_eq!(e.cursor, 2);
+        e.paste("ç\n"); // sanitized, 2 bytes land at the end
+        assert_eq!((e.buf.as_str(), e.cursor), ("abç", 4));
+        assert!(e.buf.is_char_boundary(e.cursor));
+    }
+
+    #[test]
+    fn line_edit_boundary_ops_are_noops() {
+        let mut e = LineEdit::new("x".into());
+        e.right(); // already at end
+        assert_eq!(e.cursor, 1);
+        e.home();
+        e.left(); // already at start
+        e.backspace(); // nothing before the cursor
+        assert_eq!((e.buf.as_str(), e.cursor), ("x", 0));
+        e.paste("\u{200b}\u{202e}"); // sanitizer strips everything -> noop
+        assert_eq!(e.buf, "x");
     }
 
     #[test]

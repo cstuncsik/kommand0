@@ -9,6 +9,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ### Added
 
+- **Settings page** — press `,` in the tree to open a full-screen editor for the
+  simple `config.json` fields (`claude_args`, `claude_bin`, `shell`, `notify`,
+  `theme`, `status_refresh_secs`, `tree_width_pct`). `j`/`k` select, `Enter`
+  edits (blank = back to default), `Enter` saves the field, `Esc` cancels/closes.
+  Saves rewrite only the edited key — unknown/hand-edited keys in the file are
+  preserved — and theme / tree width / notify apply live; `claude_args`,
+  `claude_bin`, and `shell` apply to the next spawned tab. `keybindings` and
+  `theme_colors` remain file-only. Rebindable as `settings`.
 - **Versioned `state.json`** — the state file now carries a `version` field, stamped
   on every save, with a migration seam on load. Files written by older versions (no
   `version` field) still load unchanged, so a future schema change can migrate an

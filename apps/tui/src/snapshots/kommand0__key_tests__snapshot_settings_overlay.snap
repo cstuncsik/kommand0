@@ -1,0 +1,35 @@
+---
+source: apps/tui/src/main.rs
+assertion_line: 5195
+expression: "render_to_string(&mut app, 100, 30)"
+---
+┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                  │
+│  > claude_args           --model opus                                                            │
+│    claude_bin            (default)                                                               │
+│    shell                 (default)                                                               │
+│    notify                (default)                                                               │
+│    theme                 (default)                                                               │
+│    status_refresh_secs   (default)                                                               │
+│    tree_width_pct        (default)                                                               │
+│                                                                                                  │
+│    keybindings / theme_colors: edit /home/user/.config/kommand0/config.json                      │
+│                                                                                                  │
+│    j/k move · Enter edit · Esc close                                                             │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -23,11 +23,12 @@ portable-pty.workspace = true
 vt100.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde_json.workspace = true
+shell-words.workspace = true
 kommand0-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-serde_json.workspace = true
 insta = "1"
 
 # `cargo binstall kommand0-tui` (use `--git <repo>` until/unless published to

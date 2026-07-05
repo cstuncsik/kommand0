@@ -948,6 +948,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "serde_json",
+ "shell-words",
  "tempfile",
  "tokio",
  "tracing",
