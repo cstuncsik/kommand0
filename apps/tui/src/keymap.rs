@@ -24,6 +24,7 @@ pub(crate) enum Action {
     OpenSession,
     CloseSession,
     ReviewDiff,
+    OpenPrInBrowser,
     Cleanup,
     Filter,
     Palette,
@@ -51,6 +52,7 @@ pub(crate) const ALL_ACTIONS: &[Action] = &[
     Action::OpenSession,
     Action::CloseSession,
     Action::ReviewDiff,
+    Action::OpenPrInBrowser,
     Action::Cleanup,
     Action::Filter,
     Action::Palette,
@@ -80,6 +82,7 @@ impl Action {
             Action::OpenSession => "open",
             Action::CloseSession => "close",
             Action::ReviewDiff => "review-diff",
+            Action::OpenPrInBrowser => "open-pr-web",
             Action::Cleanup => "cleanup",
             Action::Filter => "filter",
             Action::Palette => "palette",
@@ -109,6 +112,7 @@ impl Action {
             Action::OpenSession => "Open embedded claude",
             Action::CloseSession => "Close embedded claude",
             Action::ReviewDiff => "Review changes (PR-style diff)",
+            Action::OpenPrInBrowser => "Open the PR in a browser",
             Action::Cleanup => "Clean up a merged workspace",
             Action::Filter => "Filter workspaces (Esc clears)",
             Action::Palette => "Go to workspace",
@@ -287,6 +291,7 @@ const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("x", Action::CloseSession),
     ("Delete", Action::CloseSession),
     ("v", Action::ReviewDiff),
+    ("p", Action::OpenPrInBrowser),
     ("c", Action::Cleanup),
     ("/", Action::Filter),
     (":", Action::Palette),
@@ -404,6 +409,8 @@ mod tests {
         // < shrinks the tree pane, > widens it.
         assert_eq!(km.resolve(&ev(KeyCode::Char('<'), KeyModifiers::NONE)), Some(Action::ShrinkTree));
         assert_eq!(km.resolve(&ev(KeyCode::Char('>'), KeyModifiers::NONE)), Some(Action::WidenTree));
+        // p opens the selected workspace's PR in the browser.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('p'), KeyModifiers::NONE)), Some(Action::OpenPrInBrowser));
     }
 
     #[test]

@@ -332,6 +332,23 @@ fn folder_prefixes(path: &str) -> Vec<String> {
     out
 }
 
+/// Best-effort: open `url` with the OS browser opener, detached (stdio to null,
+/// child dropped un-waited). Errors are ignored — a missing opener is a no-op,
+/// not a crash. macOS uses `open`; everything else `xdg-open` (the app targets
+/// macOS + Linux).
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 pub(crate) struct App {
     pub(crate) repos: Vec<RepoEntry>,
     pub(crate) workspaces: Vec<Workspace>,
@@ -2743,6 +2760,16 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         app.open_diff(&ws_id);
                     }
                 }
+                Action::OpenPrInBrowser => {
+                    // Open the selected workspace's PR in the browser, if one is
+                    // cached with a URL; otherwise no-op (no PR to open).
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone())
+                        && let Some(url) =
+                            app.pr_status.get(&ws_id).map(|p| p.url.clone()).filter(|u| !u.is_empty())
+                    {
+                        open_url(&url);
+                    }
+                }
                 Action::Cleanup => {
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
                         app.cleanup_workspace_prompt(&ws_id);
@@ -4258,6 +4285,20 @@ mod key_tests {
         assert_eq!(app.diff_title, "ws-one");
         assert!(app.diff_rows.is_empty());
         assert!(app.diff_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_pr_in_browser_is_a_safe_noop_without_a_pr() {
+        // Pressing `p` on a workspace with no cached pr_status must not panic (and
+        // must not open anything). The actual browser spawn isn't unit-testable —
+        // only the no-PR guard is exercised here.
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        assert!(app.selected_workspace().is_some());
+        assert!(app.pr_status.is_empty());
+        assert_eq!(press(&mut app, KeyCode::Char('p')).await, KeyOutcome::Continue);
     }
 
     // --- two-pane diff dialog ---
