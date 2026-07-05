@@ -24,8 +24,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
+    /// On-disk schema version, stamped on every save. A file without it predates
+    /// versioning and loads as v1 (see [`legacy_state_version`]); [`AppState::migrate`]
+    /// brings any older file up to `STATE_VERSION` on load, so an upgrade can evolve
+    /// the shape without bricking an existing `state.json`.
+    #[serde(default = "legacy_state_version")]
+    pub version: u32,
     pub repos: Vec<RepoEntry>,
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
@@ -43,6 +49,29 @@ pub struct AppState {
     /// outlives its session.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub embedded_titles: HashMap<String, HashMap<String, String>>,
+}
+
+/// A `state.json` with no `version` field predates schema versioning; that shape
+/// is schema v1, so a missing value deserializes as 1 — deliberately NOT the
+/// current version, or a genuinely-old file would skip the migrations between
+/// v1 and today.
+fn legacy_state_version() -> u32 {
+    1
+}
+
+impl Default for AppState {
+    // A freshly-created state is at the current schema (unlike a derived Default,
+    // which would leave `version` at 0 and mis-stamp a brand-new file).
+    fn default() -> Self {
+        Self {
+            version: Self::STATE_VERSION,
+            repos: Vec::new(),
+            workspaces: Vec::new(),
+            sessions: Vec::new(),
+            embedded_sessions: HashMap::new(),
+            embedded_titles: HashMap::new(),
+        }
+    }
 }
 
 /// Tolerates the legacy single-string form (`{"w1":"uuid"}`) and an explicit
@@ -82,6 +111,17 @@ where
 impl AppState {
     const STATE_DIR: &str = ".kommand0-dev";
     const STATE_FILE: &str = "state.json";
+    /// Current on-disk schema version. Bump this when the `state.json` shape
+    /// changes in a way that needs a migration, and add the step in [`Self::migrate`].
+    const STATE_VERSION: u32 = 1;
+
+    /// Bring a just-loaded state up to `STATE_VERSION`. A file with no `version`
+    /// loaded as v1 ([`legacy_state_version`]). No migrations exist yet (v1 is
+    /// current), so this only stamps the version; a future schema bump adds
+    /// `while state.version < Self::STATE_VERSION { …transform…; state.version += 1 }`.
+    fn migrate(state: &mut Self) {
+        state.version = Self::STATE_VERSION;
+    }
 
     /// Resolve the state directory.
     ///
@@ -116,7 +156,10 @@ impl AppState {
         }
         let data = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&data).with_context(|| format!("failed to parse {}", path.display()))
+        let mut state: Self = serde_json::from_str(&data)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Self::migrate(&mut state);
+        Ok(state)
     }
 
     /// Like [`Self::load_from`] but never aborts on a corrupt file: it backs the
@@ -129,8 +172,11 @@ impl AppState {
         }
         let data = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        match serde_json::from_str(&data) {
-            Ok(state) => Ok((state, None)),
+        match serde_json::from_str::<Self>(&data) {
+            Ok(mut state) => {
+                Self::migrate(&mut state);
+                Ok((state, None))
+            }
             Err(e) => {
                 // Back up the bad file without clobbering an earlier backup — the
                 // first/original is the most valuable one to keep.
@@ -255,6 +301,7 @@ impl AppState {
         }
 
         AppState {
+            version: Self::STATE_VERSION,
             repos: merge_vec(&self.repos, &baseline.repos, disk.repos, |r| r.id.as_str()),
             workspaces: merge_vec(&self.workspaces, &baseline.workspaces, disk.workspaces, |w| {
                 w.id.as_str()
@@ -1066,6 +1113,36 @@ mod tests {
         .unwrap();
         let loaded = AppState::load_from(tmp.path()).unwrap();
         assert_eq!(loaded.embedded_session_ids("w1"), &["legacy-id".to_string()]);
+    }
+
+    #[test]
+    fn state_without_version_loads_as_current_and_restamps() {
+        // A state.json written before schema versioning has no `version` field —
+        // it must still load (treated as v1) and re-save stamped with the current
+        // schema version, so an upgrade never bricks an existing file.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("state.json"),
+            r#"{"repos":[],"workspaces":[],"sessions":[]}"#,
+        )
+        .unwrap();
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert_eq!(
+            loaded.version,
+            AppState::STATE_VERSION,
+            "a versionless file loads at the current schema"
+        );
+
+        loaded.save_to(tmp.path()).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("state.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["version"], AppState::STATE_VERSION, "save stamps the schema version");
+    }
+
+    #[test]
+    fn fresh_state_carries_the_current_version() {
+        // A brand-new state is at the current schema (not 0 from a derived Default).
+        assert_eq!(AppState::default().version, AppState::STATE_VERSION);
     }
 
     #[test]

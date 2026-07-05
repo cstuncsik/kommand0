@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Versioned `state.json`** — the state file now carries a `version` field, stamped
+  on every save, with a migration seam on load. Files written by older versions (no
+  `version` field) still load unchanged, so a future schema change can migrate an
+  existing state instead of bricking it. Groundwork for a stable 1.0.
+
 ## [0.8.0] - 2026-07-05
 
 ### Added
