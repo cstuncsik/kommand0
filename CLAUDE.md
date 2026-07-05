@@ -22,6 +22,23 @@ git worktree. A `kmd` CLI mirrors the core actions.
   version, rolls the CHANGELOG, tags, builds macOS+Linux, publishes the release,
   updates the Homebrew tap.
 
+## Commits, PRs & versioning
+- **Conventional Commits.** `type(scope): summary` — types: `feat`, `fix`, `docs`,
+  `refactor`, `test`, `perf`, `chore`, `ci`; scope is the crate/area (`tui`, `core`,
+  `cli`, `release`). Flag a breaking change with `!` (`feat(cli)!: …`) or a
+  `BREAKING CHANGE:` footer. End commit messages with the
+  `Co-Authored-By: Claude …` trailer.
+- **PR titles** follow the same convention — a single `type(scope): summary` line
+  for the primary change; the body carries the detail.
+- **Versioning is SemVer, 0.x-aware.** Derive the recommended release bump from the
+  Conventional Commits since the last tag:
+  - `fix` / `docs` / `chore` / `refactor` / `perf` / `test` → **patch**
+  - `feat` → **minor**
+  - a breaking change (`!` / `BREAKING CHANGE:`) → **major** at ≥1.0; while on 0.x,
+    **minor** (0.x minors may break).
+  Recommend that bump when cutting a release; the maintainer confirms and may
+  override.
+
 ## Conventions that bite
 - **Hand-formatted — never run `cargo fmt`.** Match the surrounding 4-space,
   brace-on-same-line style by hand; `cargo fmt` would reflow the whole tree.
