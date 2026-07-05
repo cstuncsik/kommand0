@@ -1,102 +1,77 @@
-## Default working style
+# kommand0 — agent guide
 
-For non-trivial work, use this sequence by default:
+Keyboard-first TUI that orchestrates parallel Claude Code sessions, each in its own
+git worktree. A `kmd` CLI mirrors the core actions.
 
-1. Discuss
-2. Research
-3. Plan
-4. Execute
-5. Verify
+## Layout (Rust workspace · edition 2024 · MSRV 1.88)
+- `crates/core` (`kommand0-core`) — all domain logic: git plumbing (`git.rs`),
+  worktrees, workspace/session/repo state, config. No TUI/CLI deps. Functions that
+  shell out (git/gh) are **panic-free** (return `Option`/empty on failure) and safe
+  to call off the UI thread.
+- `apps/tui` (`kommand0` binary) — the ratatui TUI. Keep it **thin**: presentation
+  + input, not domain logic. Modules: render, pane (embedded PTY via vt100), diff,
+  palette, modal, help, keymap, mouse, buttons, notify, theme.
+- `apps/cli` (`kmd` binary) — the clap CLI over the same core.
 
-Do not jump straight into implementation unless the task is obviously tiny.
+## Commands
+- Build: `cargo build --workspace`
+- **CI gates (must pass):** `cargo clippy --workspace --all-targets -- -D warnings`
+  and `cargo test --workspace`. A `cargo audit` job also runs. There is **no fmt check**.
+- Dev TUI: `cargo run -p kommand0-tui`
+- Release: `gh workflow run release.yml -f level=patch|minor|major` — bumps the
+  version, rolls the CHANGELOG, tags, builds macOS+Linux, publishes the release,
+  updates the Homebrew tap.
 
-## Discuss
+## Conventions that bite
+- **Hand-formatted — never run `cargo fmt`.** Match the surrounding 4-space,
+  brace-on-same-line style by hand; `cargo fmt` would reflow the whole tree.
+- **Never block the render loop.** Anything slow (git status, `gh`, diffs, cleanup)
+  runs on a background thread that sends its result back over an `mpsc` channel to
+  the event loop, gated by an `*_inflight` flag + a drop-guard that always clears it
+  (see `request_branch_status_refresh` / `request_pr_status_refresh`). Branch status
+  refreshes ~2s; PR/CI status ~60s (network).
+- **All `gh` calls go through `git::run_gh`** — non-interactive (prompts/pager off,
+  stdin null), ETXTBSY-retry, 20s timeout. Never invoke `gh` directly.
+- **Overlays** (help, palette, modal, diff) own the screen: they swallow keys AND
+  must appear in the mouse/paste guards in `main.rs` so clicks/paste don't leak to
+  the tree behind them. Global focus is `Focus { Tree, Embedded }` (Tab-switched).
+- **Adding a keybinding = 5 sites in `keymap.rs`**: the `Action` enum, `ALL_ACTIONS`,
+  `name()`, `description()`, `DEFAULT_BINDINGS`. All keys are rebindable via config.
+- **State** (`AppState`) persists to `state.json` atomically, 3-way-merged against
+  concurrent `kmd` writes. Workspaces are git worktrees on `kommand0/<name>` branches;
+  a **fallback workspace has no `worktree_path`** (its `working_dir` is the repo
+  root) — per-workspace git/PR features gate on `worktree_path.is_some()`.
 
-Start by clarifying:
-- the goal
-- constraints
-- what should not change
-- whether the task is tiny, normal, or risky
+## Testing
+- Unit tests inline (`#[cfg(test)] mod tests`). **Core** tests build real temp git
+  repos (`init_repo`). **TUI** tests use `test_app()` + `render_to_string`
+  (`TestBackend`); insta `.snap` files snapshot the main layouts — review diffs
+  cell-by-cell, **never bulk-accept**.
+- `apps/tui/tests/e2e.rs` spawns the real binary in a PTY and asserts the rendered
+  screen (vt100). **Known-flaky under parallel load** — re-run
+  `cargo test -p kommand0-tui -- --test-threads=1` to confirm a real failure.
+- External tools are stubbed via env vars: `KOMMAND0_CLAUDE_BIN` (the `embed-stub`
+  fixture), `KOMMAND0_GH_BIN` (shell-script gh stubs), `KOMMAND0_STATE_DIR`
+  (hermetic state), `KOMMAND0_CONFIG`, `KOMMAND0_SHELL`.
 
-For tiny tasks, keep this brief.
-For larger tasks, restate the intended outcome before proceeding.
+## Gotchas
+- **PR CI builds `refs/pull/N/merge`** (your branch + latest main). Green on the
+  branch but red on the PR is usually a *semantic* merge conflict with an advanced
+  main — merge `main` in, don't chase the cache.
+- ratatui bundles crossterm; the workspace's direct `crossterm` must be the **same
+  version** ratatui pulls, or event types won't unify (`cargo tree -i crossterm`
+  should show one node).
+- Keep the CHANGELOG `[Unreleased]` section current as you land changes (Keep a
+  Changelog format) — the release workflow rolls it into the version automatically.
+  0.x semver: minor bumps may carry breaking changes.
 
-## Research
+## Working style
+Default to **Discuss → Research → Plan → Execute → Verify**, proportionate to size
+(skip the ceremony for tiny obvious edits). Smallest reasonable change; preserve
+structure; ask ≤3 focused questions when ambiguous or risky; get build + clippy +
+tests green before calling it done, and say what you did *not* verify.
 
-Before planning or editing:
-- inspect the relevant files
-- inspect neighboring patterns
-- identify affected modules, commands, tests, and docs
-- note risks, assumptions, and unknowns
-
-Use the researcher subagent when the task is medium or large.
-
-## Plan
-
-Before editing, present:
-- files likely to change
-- step-by-step approach
-- risks
-- validation steps
-
-Keep plans proportionate to task size.
-Do not over-plan tiny fixes.
-
-Use the planner subagent for non-trivial work.
-
-## Clarification rule
-
-Before implementation:
-- ask clarifying questions when the task is ambiguous or risky
-- ask no more than 3 focused questions at once
-- do not ask questions for tiny obvious edits
-- ask for confirmation before broad refactors or architectural changes
-
-## Execute
-
-During implementation:
-- make the smallest reasonable changes
-- preserve existing structure unless a change is clearly justified
-- avoid broad refactors unless explicitly requested
-- keep code readable and practical
-- keep changes aligned with the approved plan
-
-## Verify
-
-After implementation:
-- run relevant tests/checks if available
-- verify behavior manually when needed
-- summarize what changed
-- call out anything not verified
-
-Use the verifier subagent for medium or large changes.
-
-## Subagent usage rules
-
-Use:
-- researcher for exploration, codebase reading, dependency mapping, risk discovery
-- planner for turning findings into a concrete implementation plan
-- verifier for post-change review, validation, and missing-check detection
-
-Do not spawn subagents for trivial single-file edits unless it adds clear value.
-
-## Style preferences
-
-- Prefer straightforward solutions over abstractions
-- Keep the TUI thin
-- Keep shared domain logic in core crates
-- Avoid speculative architecture
-- Preserve good names and clean boundaries
-- When unsure, choose the simpler path
-
-## Output preferences
-
-For normal tasks:
-- brief summary
-- research findings
-- plan
-- implementation summary
-- verification summary
-
-For tiny tasks:
-- keep it compact
+For non-trivial work prefer the `cst:*` agents / skills: `/cst:dev-flow`
+(plan → review → implement → review → PR → watch CI), `/cst:pr-review <n>`,
+`cst:planner`, `cst:implementer`, and the `cst:*-reviewer` lenses. Don't spawn
+subagents for trivial single-file edits.
