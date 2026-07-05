@@ -1,0 +1,19 @@
+CLAUDE.md
+  s_164243679ec02c::t_0f931da588c3a1 25-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9c6910d13bb06671b719c61887038653996294e2",
+  "prompts": {},
+  "sessions": {
+    "s_164243679ec02c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8eb123a-c396-4394-8625-f41817ed3acb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
