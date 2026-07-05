@@ -1,0 +1,21 @@
+crates/core/src/config.rs
+  s_59779618133814::t_74811598d66096 6-8,10,12
+  s_59779618133814::t_60369cc7ecb84a 85-123,125-154
+  s_59779618133814::t_c2e9a02fcad626 196-269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a99ede1033ec383654c3bd160e00dace3c46ba4e",
+  "prompts": {},
+  "sessions": {
+    "s_59779618133814": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23a981a5-889a-4bea-b1a5-2e1debe6cf47",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
