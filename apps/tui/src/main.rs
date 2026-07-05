@@ -12,6 +12,7 @@ mod palette;
 #[allow(dead_code)]
 mod pane;
 mod render;
+mod settings;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
@@ -503,6 +504,11 @@ pub(crate) struct App {
 
     /// User config (claude passthrough + tunables), loaded once at startup.
     pub(crate) config: Config,
+    /// Where the settings page writes config fields back to. Resolved once at
+    /// startup (`Config::effective_path()`); tests point it at a temp file.
+    pub(crate) config_path: std::path::PathBuf,
+    /// The settings page, when open (owns the screen like the other overlays).
+    pub(crate) settings: Option<settings::SettingsState>,
     /// Set when a present `config.json` failed to parse, or a keybinding was
     /// unknown/invalid — surfaced in the tree border so it isn't silently ignored.
     pub(crate) config_warning: Option<String>,
@@ -584,6 +590,8 @@ impl App {
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
             config: Config::default(),
+            config_path: Config::effective_path(),
+            settings: None,
             config_warning: None,
             keymap: keymap::KeyMap::default(),
             theme: theme::Theme::default(),
@@ -733,6 +741,53 @@ impl App {
     /// invariant for every write-path (seed, keys, drag).
     pub(crate) fn set_tree_width_pct(&mut self, pct: u16) {
         self.tree_width_pct = pct.clamp(TREE_WIDTH_MIN, TREE_WIDTH_MAX);
+    }
+
+    /// Persist one settings-page field: validate, write `config.json`, mirror
+    /// into the in-memory config, and re-apply the live knobs. `Err` is the
+    /// user-facing message for the settings error line; on failure neither the
+    /// file nor the in-memory config has changed.
+    fn commit_setting(&mut self, field: settings::Field, raw: &str) -> Result<(), String> {
+        let value = field.parse(raw)?;
+        Config::update_file(&self.config_path, field.key(), value.clone())
+            .map_err(|e| format!("{e:#}"))?;
+        field.store(&mut self.config, value.as_ref());
+        match field {
+            settings::Field::Theme => {
+                self.theme =
+                    theme::Theme::build(self.config.theme.as_deref(), &self.config.theme_colors).0;
+            }
+            settings::Field::TreeWidthPct => {
+                self.set_tree_width_pct(seed_tree_width(self.config.tree_width_pct));
+            }
+            settings::Field::Notify => {
+                self.notify_mode = notify::NotifyMode::parse(self.config.notify.as_deref()).0;
+            }
+            // claude_args/claude_bin/shell apply at the next spawn;
+            // status_refresh_secs is read from config every tick.
+            _ => {}
+        }
+        self.refresh_config_warning();
+        Ok(())
+    }
+
+    /// Recompute the tree-border config warning from the in-memory config, so a
+    /// just-fixed issue stops showing (and remaining ones keep showing). The
+    /// startup-only notices (file parse error, corrupt state) are dropped: a
+    /// successful commit proves the file parses, and both are in the log.
+    fn refresh_config_warning(&mut self) {
+        let (_, key_warnings) = keymap::KeyMap::build(&self.config.keybindings);
+        let (_, theme_warnings) =
+            theme::Theme::build(self.config.theme.as_deref(), &self.config.theme_colors);
+        let (_, notify_warning) = notify::NotifyMode::parse(self.config.notify.as_deref());
+        let mut warnings: Vec<String> = key_warnings;
+        warnings.extend(theme_warnings);
+        warnings.extend(notify_warning);
+        self.config_warning = match warnings.len() {
+            0 => None,
+            1 => Some(warnings.remove(0)),
+            n => Some(format!("{n} config issues — see kommand0.log")),
+        };
     }
 
     pub(crate) fn widen_tree(&mut self) {
@@ -2437,6 +2492,87 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         return Ok(KeyOutcome::Continue);
     }
 
+    // Settings page: full-screen config editor. Browse mode navigates rows;
+    // edit mode types into a LineEdit and commits on Enter. Swallows all keys.
+    if app.settings.is_some() {
+        std::mem::take(&mut app.pending_g); // abandon a half-typed `gg`
+        let editing = app.settings.as_ref().is_some_and(|s| s.edit.is_some());
+        if editing {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(s) = app.settings.as_mut() {
+                        s.edit = None;
+                        s.error = None;
+                    }
+                }
+                KeyCode::Enter => {
+                    // Two-phase: read the pending edit, then commit (needs
+                    // `&mut self`), then write the outcome back into the page.
+                    let pending = app
+                        .settings
+                        .as_ref()
+                        .and_then(|s| s.edit.as_ref().map(|e| (s.field(), e.buf.clone())));
+                    if let Some((field, raw)) = pending {
+                        let result = app.commit_setting(field, &raw);
+                        if let Some(s) = app.settings.as_mut() {
+                            match result {
+                                Ok(()) => {
+                                    s.edit = None;
+                                    s.error = None;
+                                }
+                                // Keep the edit open so the input can be fixed.
+                                Err(e) => s.error = Some(e),
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(edit) = app.settings.as_mut().and_then(|s| s.edit.as_mut()) {
+                        match key.code {
+                            KeyCode::Char(c)
+                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                edit.insert_char(c);
+                            }
+                            KeyCode::Backspace => edit.backspace(),
+                            KeyCode::Left => edit.left(),
+                            KeyCode::Right => edit.right(),
+                            KeyCode::Home => edit.home(),
+                            KeyCode::End => edit.end(),
+                            _ => {} // swallow all other keys
+                        }
+                    }
+                }
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => app.settings = None,
+                // The open binding also closes (`,` by default — respects rebinds).
+                _ if app.keymap.resolve(&key) == Some(keymap::Action::OpenSettings) => {
+                    app.settings = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(s) = app.settings.as_mut() {
+                        s.move_down();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(s) = app.settings.as_mut() {
+                        s.move_up();
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(s) = app.settings.as_mut() {
+                        s.error = None;
+                        s.edit = Some(modal::LineEdit::new(s.field().current(&app.config)));
+                    }
+                }
+                _ => {} // swallow all other keys
+            }
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
     // Review-diff dialog: two panes (file tree + diff), dismissed with v/Esc/q,
     // swallows the rest. Tab switches focus; keys act on the focused pane.
     if app.show_diff {
@@ -2760,6 +2896,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Action::Help => {
                     app.show_help = !app.show_help;
                     app.help_scroll = 0;
+                }
+                Action::OpenSettings => {
+                    app.settings = Some(settings::SettingsState::default());
                 }
                 Action::MoveUp => app.move_up(),
                 Action::MoveDown => app.move_down(),
@@ -3217,6 +3356,12 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         if app.show_diff {
                             // The diff overlay owns input (its key handler swallows
                             // too) — don't leak a paste to the tree/filter behind it.
+                        } else if let Some(s) = app.settings.as_mut() {
+                            // Settings owns the screen (implies Focus::Tree); paste
+                            // only lands in an open field edit, else it's dropped.
+                            if let Some(edit) = s.edit.as_mut() {
+                                edit.paste(&text);
+                            }
                         } else if app.focus == Focus::Embedded && !app.modal.is_active() {
                             // Forward raw to the embedded app as a bracketed paste
                             // (claude enables it, so a multi-line paste stays one
@@ -3244,6 +3389,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         } else if app.show_help
                             || app.modal.is_active()
                             || app.palette.is_some()
+                            || app.settings.is_some()
                         {
                             // An overlay owns the screen — ignore mouse (don't leak
                             // stray clicks to the tree/embedded claude behind it; a
@@ -3502,7 +3648,18 @@ mod key_tests {
             worktree_path: None,
             branch_name: None,
         });
-        App::new(state)
+        let mut app = App::new(state);
+        // Every test that commits a setting writes to `config_path` — give each
+        // App its own file (the KOMMAND0_STATE_DIR above is process-wide, so
+        // the effective_path default would race under parallel tests).
+        static NEXT_CONFIG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT_CONFIG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        app.config_path = std::env::temp_dir().join(format!(
+            "kommand0-tests-{}-config-{n}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&app.config_path); // stale file from a reused pid
+        app
     }
 
     async fn press(app: &mut App, code: KeyCode) -> KeyOutcome {
@@ -4621,6 +4778,195 @@ mod key_tests {
         assert_eq!(app.filter_query, ":", "`:` edits the filter query instead");
     }
 
+    async fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c)).await;
+        }
+    }
+
+    /// Read the JSON the settings page wrote for this test's App.
+    fn written_config(app: &App) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&app.config_path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn comma_opens_settings_and_esc_closes() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char(',')).await;
+        assert!(app.settings.is_some(), "`,` opens the settings page");
+        press(&mut app, KeyCode::Esc).await;
+        assert!(app.settings.is_none(), "Esc closes it");
+        // The open binding closes too (round-trips through the keymap).
+        press(&mut app, KeyCode::Char(',')).await;
+        press(&mut app, KeyCode::Char(',')).await;
+        assert!(app.settings.is_none());
+    }
+
+    #[tokio::test]
+    async fn comma_while_filtering_types_a_comma_not_settings() {
+        let mut app = test_app();
+        app.rebuild_tree();
+        press(&mut app, KeyCode::Char('/')).await; // enter the filter box
+        assert!(app.filter_input);
+        press(&mut app, KeyCode::Char(',')).await;
+        assert!(app.settings.is_none(), "`,` while filtering must not open settings");
+        assert_eq!(app.filter_query, ",", "`,` edits the filter query instead");
+    }
+
+    #[tokio::test]
+    async fn settings_edit_commits_to_file_and_config() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char(',')).await;
+        press(&mut app, KeyCode::Char('j')).await; // claude_args -> claude_bin
+        press(&mut app, KeyCode::Enter).await;
+        type_str(&mut app, "claude-dev").await;
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.config.claude_bin.as_deref(), Some("claude-dev"));
+        assert_eq!(written_config(&app)["claude_bin"], "claude-dev");
+        let s = app.settings.as_ref().unwrap();
+        assert!(s.edit.is_none() && s.error.is_none(), "commit closes the edit");
+    }
+
+    #[tokio::test]
+    async fn settings_esc_cancels_edit_without_writing() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char(',')).await;
+        press(&mut app, KeyCode::Char('j')).await;
+        press(&mut app, KeyCode::Enter).await;
+        type_str(&mut app, "nope").await;
+        press(&mut app, KeyCode::Esc).await;
+        assert!(app.settings.is_some(), "Esc in edit mode only cancels the edit");
+        assert_eq!(app.config.claude_bin, None);
+        assert!(!app.config_path.exists(), "nothing written on cancel");
+    }
+
+    #[tokio::test]
+    async fn settings_blank_commit_removes_the_key() {
+        let mut app = test_app();
+        std::fs::write(&app.config_path, r#"{ "claude_bin": "x", "future_knob": 1 }"#).unwrap();
+        app.config.claude_bin = Some("x".into());
+        press(&mut app, KeyCode::Char(',')).await;
+        press(&mut app, KeyCode::Char('j')).await;
+        press(&mut app, KeyCode::Enter).await; // edit seeded with "x"
+        press(&mut app, KeyCode::Backspace).await; // now blank
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.config.claude_bin, None);
+        let raw = written_config(&app);
+        assert!(raw.get("claude_bin").is_none(), "blank removes the key");
+        assert_eq!(raw["future_knob"], 1, "unknown keys survive");
+    }
+
+    #[tokio::test]
+    async fn settings_commit_write_failure_keeps_config_and_shows_error() {
+        let mut app = test_app();
+        // A directory as the config path: reading it errors (not NotFound), so
+        // the commit must fail cleanly — error shown, memory untouched.
+        app.config_path = std::env::temp_dir();
+        press(&mut app, KeyCode::Char(',')).await;
+        press(&mut app, KeyCode::Char('j')).await;
+        press(&mut app, KeyCode::Enter).await;
+        type_str(&mut app, "claude-dev").await;
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.config.claude_bin, None, "failed write must not touch memory");
+        let s = app.settings.as_ref().unwrap();
+        assert!(s.error.is_some(), "error surfaces on the page");
+        assert!(s.edit.is_some(), "edit stays open to fix/retry");
+    }
+
+    #[tokio::test]
+    async fn settings_invalid_number_keeps_edit_open_with_error() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char(',')).await;
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('j')).await; // -> status_refresh_secs
+        }
+        press(&mut app, KeyCode::Enter).await;
+        type_str(&mut app, "fast").await;
+        press(&mut app, KeyCode::Enter).await;
+        let s = app.settings.as_ref().unwrap();
+        assert!(s.error.is_some());
+        assert!(s.edit.is_some());
+        assert!(!app.config_path.exists(), "invalid input writes nothing");
+        // Fixing the value clears the error and commits.
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Backspace).await; // clear "fast"
+        }
+        type_str(&mut app, "5").await;
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.config.status_refresh_secs, Some(5));
+        assert_eq!(written_config(&app)["status_refresh_secs"], 5);
+        assert!(app.settings.as_ref().unwrap().error.is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_tree_width_commit_applies_and_clamps() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char(',')).await;
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Char('j')).await; // -> tree_width_pct (last row)
+        }
+        press(&mut app, KeyCode::Enter).await;
+        type_str(&mut app, "45").await;
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.tree_width_pct, 45, "applies live");
+        // Out-of-range input is clamped before it's written.
+        press(&mut app, KeyCode::Enter).await; // re-edit, seeded "45"
+        press(&mut app, KeyCode::Backspace).await;
+        press(&mut app, KeyCode::Backspace).await;
+        type_str(&mut app, "999").await;
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(written_config(&app)["tree_width_pct"], 60, "file holds the clamped value");
+        assert_eq!(app.tree_width_pct, TREE_WIDTH_MAX);
+    }
+
+    #[tokio::test]
+    async fn settings_claude_args_respect_quotes_and_roundtrip() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char(',')).await; // claude_args is the first row
+        press(&mut app, KeyCode::Enter).await;
+        type_str(&mut app, r#"--append-system-prompt "be terse""#).await;
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(
+            app.config.claude_args,
+            vec!["--append-system-prompt".to_string(), "be terse".to_string()],
+            "quoted arg stays one argv element"
+        );
+        // Reopen the seeded edit and commit unchanged: still exactly 2 args
+        // (current() re-quotes, so open->Enter must not corrupt the value).
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(
+            written_config(&app)["claude_args"],
+            serde_json::json!(["--append-system-prompt", "be terse"])
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_theme_commit_applies_live_and_keeps_overrides() {
+        let mut app = test_app();
+        // A hand-edited role override must survive a theme change from the page.
+        app.config.theme_colors.insert("accent".into(), "#ff8800".into());
+        press(&mut app, KeyCode::Char(',')).await;
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('j')).await; // -> theme
+        }
+        press(&mut app, KeyCode::Enter).await;
+        type_str(&mut app, "high-contrast").await;
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.config.theme.as_deref(), Some("high-contrast"));
+        assert_eq!(written_config(&app)["theme"], "high-contrast");
+        assert_eq!(
+            app.theme.error,
+            ratatui::style::Color::LightRed,
+            "high-contrast base actually applied live (default is Red)"
+        );
+        assert_eq!(
+            app.theme.accent,
+            theme::parse_color("#ff8800").unwrap(),
+            "theme_colors override survives the live re-apply"
+        );
+    }
+
     #[tokio::test]
     async fn palette_jumps_to_an_archived_workspace() {
         let mut app = test_app();
@@ -4835,6 +5181,17 @@ mod key_tests {
         app.rebuild_tree();
         let candidates = app.palette_candidates();
         app.palette = Some(palette::Palette::new(candidates));
+        insta::assert_snapshot!(render_to_string(&mut app, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn snapshot_settings_overlay() {
+        let mut app = test_app();
+        // The page renders config_path in the footer — pin it so the snapshot
+        // doesn't churn on the per-test temp path (render-only, never written).
+        app.config_path = "/home/user/.config/kommand0/config.json".into();
+        app.config.claude_args = vec!["--model".into(), "opus".into()];
+        app.settings = Some(settings::SettingsState::default());
         insta::assert_snapshot!(render_to_string(&mut app, 100, 30));
     }
 

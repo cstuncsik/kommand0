@@ -36,6 +36,7 @@ pub(crate) enum Action {
     Delete,
     ForceDelete,
     Help,
+    OpenSettings,
     Quit,
 }
 
@@ -64,6 +65,7 @@ pub(crate) const ALL_ACTIONS: &[Action] = &[
     Action::Delete,
     Action::ForceDelete,
     Action::Help,
+    Action::OpenSettings,
     Action::Quit,
 ];
 
@@ -94,6 +96,7 @@ impl Action {
             Action::Delete => "delete",
             Action::ForceDelete => "force-delete",
             Action::Help => "help",
+            Action::OpenSettings => "settings",
             Action::Quit => "quit",
         }
     }
@@ -124,6 +127,7 @@ impl Action {
             Action::Delete => "Delete selected",
             Action::ForceDelete => "Force delete",
             Action::Help => "Help",
+            Action::OpenSettings => "Settings",
             Action::Quit => "Quit",
         }
     }
@@ -303,6 +307,7 @@ const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("d", Action::Delete),
     ("D", Action::ForceDelete),
     ("?", Action::Help),
+    (",", Action::OpenSettings),
     ("q", Action::Quit),
 ];
 
@@ -395,6 +400,7 @@ mod tests {
         assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
         assert_eq!(km.resolve(&ev(KeyCode::Char('/'), KeyModifiers::NONE)), Some(Action::Filter));
         assert_eq!(km.resolve(&ev(KeyCode::Char(':'), KeyModifiers::NONE)), Some(Action::Palette));
+        assert_eq!(km.resolve(&ev(KeyCode::Char(','), KeyModifiers::NONE)), Some(Action::OpenSettings));
         assert_eq!(km.resolve(&ev(KeyCode::Enter, KeyModifiers::NONE)), Some(Action::ActivateSelection));
         // Enter, step-in, and open-session are three distinct actions
         // (Enter activates; l/Right steps into a repo; e/r/R open a session).
