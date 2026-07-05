@@ -40,8 +40,29 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
-fn contains(area: Rect, col: u16, row: u16) -> bool {
+pub(crate) fn contains(area: Rect, col: u16, row: u16) -> bool {
     col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
+}
+
+/// Route a mouse event while the review-diff overlay owns the screen: a click
+/// selects/toggles a file row or focuses the diff pane; the wheel scrolls the
+/// pane under the cursor. Any click/scroll is consumed here — it never leaks to
+/// the tree/pane behind the overlay.
+pub(crate) fn handle_diff_mouse(app: &mut App, mouse: MouseEvent) {
+    // An overlay opening mid-drag must not strand the divider grab.
+    app.dragging_divider = false;
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.diff_handle_click(mouse.column, mouse.row);
+        }
+        MouseEventKind::ScrollUp => {
+            app.diff_handle_scroll(mouse.column, mouse.row, true);
+        }
+        MouseEventKind::ScrollDown => {
+            app.diff_handle_scroll(mouse.column, mouse.row, false);
+        }
+        _ => {}
+    }
 }
 
 /// Returns whether the click was consumed (hit a button region or the tree

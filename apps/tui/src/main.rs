@@ -337,16 +337,29 @@ fn folder_prefixes(path: &str) -> Vec<String> {
 /// not a crash. macOS uses `open`; everything else `xdg-open` (the app targets
 /// macOS + Linux).
 fn open_url(url: &str) {
+    // Only hand https URLs to the OS opener — closes the scheme/flag edge (e.g. a
+    // `-`-leading or `file://`/`javascript:` url) even though the caller's url is
+    // gh-sourced.
+    if !url.starts_with("https://") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     let opener = "open";
     #[cfg(not(target_os = "macos"))]
     let opener = "xdg-open";
-    let _ = std::process::Command::new(opener)
+    if let Ok(mut child) = std::process::Command::new(opener)
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        // Reap it off-thread so each `p` press doesn't leave a zombie; detached
+        // and best-effort (we don't care about the opener's exit).
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 pub(crate) struct App {
@@ -370,6 +383,10 @@ pub(crate) struct App {
     /// collapsible file tree (left) + the selected file's diff (right).
     pub(crate) show_diff: bool,
     pub(crate) diff_title: String,
+    /// What the left pane shows when there are no file rows — distinguishes a
+    /// fallback workspace (no branch), a non-repo/uncomputable diff, and a
+    /// genuinely-empty diff. Set in `open_diff`; empty when rows render.
+    pub(crate) diff_note: String,
     /// The per-file diff sections (from `diff_files_vs_default_branch`).
     pub(crate) diff_files: Vec<kommand0_core::FileDiff>,
     /// The flattened, visible file tree — rebuilt on expand/collapse.
@@ -517,6 +534,7 @@ impl App {
             help_scroll: 0,
             show_diff: false,
             diff_title: String::new(),
+            diff_note: String::new(),
             diff_files: Vec::new(),
             diff_rows: Vec::new(),
             diff_expanded: HashSet::new(),
@@ -1877,19 +1895,38 @@ impl App {
         self.diff_selected = 0;
         self.diff_list_scroll = 0;
         self.diff_scroll = 0;
+        self.diff_note.clear();
+        // The overlay and the tree share `pending_g`; a half-typed `gg` in the
+        // tree must not complete as the overlay's jump-to-first (and vice-versa).
+        self.pending_g = false;
         // Own-branch workspaces only: a fallback workspace's `working_dir` is the
         // shared repo root, not a branch to review (mirrors branch_status, which
         // gates on `worktree_path`).
         let Some(worktree) = ws.worktree_path.clone() else {
             self.diff_title = ws.name.clone();
             self.diff_rows.clear();
+            self.diff_note = "This workspace has no branch to review.".to_string();
             return;
         };
         self.diff_title = match &ws.branch_name {
             Some(b) => format!("{} ({b})", ws.name),
             None => ws.name.clone(),
         };
-        self.diff_files = kommand0_core::diff_files_vs_default_branch(&worktree).unwrap_or_default();
+        // Distinguish "couldn't compute" (not a repo / base unresolved → None)
+        // from a genuinely-empty diff (Some(empty)); both leave no rows, but the
+        // note the left pane shows differs.
+        self.diff_files = match kommand0_core::diff_files_vs_default_branch(&worktree) {
+            Some(files) => files,
+            None => {
+                self.diff_rows.clear();
+                self.diff_note = "Couldn't compute a diff — not a git repo.".to_string();
+                return;
+            }
+        };
+        if self.diff_files.is_empty() {
+            self.diff_note =
+                "No committed changes on this branch vs the default branch.".to_string();
+        }
         // Default to every folder expanded, then flatten to the visible rows and
         // land the selection on the first File row (so the right pane shows a diff).
         for path in self.diff_files.iter().map(|f| f.path.clone()).collect::<Vec<_>>() {
@@ -1968,6 +2005,8 @@ impl App {
     }
 
     fn diff_toggle_focus(&mut self) {
+        // Switching panes abandons any half-typed `gg` (shared with the tree).
+        self.pending_g = false;
         self.diff_focus = match self.diff_focus {
             DiffFocus::Files => DiffFocus::Diff,
             DiffFocus::Diff => DiffFocus::Files,
@@ -2045,11 +2084,9 @@ impl App {
     /// list selects/toggles a row; a click in the diff body focuses that pane.
     /// Returns whether the click landed on the dialog.
     fn diff_handle_click(&mut self, col: u16, row: u16) -> bool {
-        let in_area = |a: ratatui::layout::Rect| {
-            col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height
-        };
-        if in_area(self.diff_list_area) {
-            let clicked = (row - self.diff_list_area.y) as usize + self.diff_list_scroll as usize;
+        if mouse::contains(self.diff_list_area, col, row) {
+            let clicked =
+                row.saturating_sub(self.diff_list_area.y) as usize + self.diff_list_scroll as usize;
             if clicked < self.diff_rows.len() {
                 self.diff_selected = clicked;
                 self.diff_focus = DiffFocus::Files;
@@ -2066,7 +2103,7 @@ impl App {
             }
             return true;
         }
-        if in_area(self.diff_body_area) {
+        if mouse::contains(self.diff_body_area, col, row) {
             self.diff_focus = DiffFocus::Diff;
             return true;
         }
@@ -2076,10 +2113,7 @@ impl App {
     /// Handle a scroll-wheel event inside the diff dialog: over the body it scrolls
     /// the diff, over the list it moves the selection. Returns whether it landed.
     fn diff_handle_scroll(&mut self, col: u16, row: u16, up: bool) -> bool {
-        let in_area = |a: ratatui::layout::Rect| {
-            col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height
-        };
-        if in_area(self.diff_body_area) {
+        if mouse::contains(self.diff_body_area, col, row) {
             self.diff_scroll = if up {
                 self.diff_scroll.saturating_sub(1)
             } else {
@@ -2087,7 +2121,7 @@ impl App {
             };
             return true;
         }
-        if in_area(self.diff_list_area) {
+        if mouse::contains(self.diff_list_area, col, row) {
             self.diff_select_move(if up { -1 } else { 1 });
             return true;
         }
@@ -2408,7 +2442,13 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     if app.show_diff {
         let g_was_pending = std::mem::take(&mut app.pending_g);
         match key.code {
-            KeyCode::Char('v') | KeyCode::Char('q') | KeyCode::Esc => app.show_diff = false,
+            // Closing abandons any half-typed `gg` so it can't complete in the
+            // tree (the flag is shared). (`mem::take` above already cleared it;
+            // stated explicitly so the invariant survives that line changing.)
+            KeyCode::Char('v') | KeyCode::Char('q') | KeyCode::Esc => {
+                app.show_diff = false;
+                app.pending_g = false;
+            }
             KeyCode::Tab => app.diff_toggle_focus(),
             _ if app.diff_focus == DiffFocus::Files => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => app.diff_select_move(1),
@@ -3200,24 +3240,7 @@ async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                     }
                     Event::Mouse(mouse_event) => {
                         if app.show_diff {
-                            // The diff dialog owns the mouse: a click selects/toggles
-                            // a file row or focuses the diff pane; the wheel scrolls
-                            // the pane under the cursor. Any click/scroll is consumed
-                            // here (never leaks to the tree/pane behind it).
-                            app.dragging_divider = false;
-                            use ratatui::crossterm::event::{MouseButton, MouseEventKind};
-                            match mouse_event.kind {
-                                MouseEventKind::Down(MouseButton::Left) => {
-                                    app.diff_handle_click(mouse_event.column, mouse_event.row);
-                                }
-                                MouseEventKind::ScrollUp => {
-                                    app.diff_handle_scroll(mouse_event.column, mouse_event.row, true);
-                                }
-                                MouseEventKind::ScrollDown => {
-                                    app.diff_handle_scroll(mouse_event.column, mouse_event.row, false);
-                                }
-                                _ => {}
-                            }
+                            mouse::handle_diff_mouse(&mut app, mouse_event);
                         } else if app.show_help
                             || app.modal.is_active()
                             || app.palette.is_some()
@@ -4251,17 +4274,36 @@ mod key_tests {
     }
 
     #[test]
-    fn diff_overlay_renders_no_changes_note_for_an_empty_diff() {
+    fn diff_overlay_renders_the_diff_note_for_an_empty_diff() {
         let mut app = test_app();
         app.show_diff = true;
         app.diff_title = "ws-one".into();
-        // No files → empty rows → the right pane shows the "no changes" note.
+        // No files → empty rows → the left pane shows `diff_note` (set here as
+        // open_diff would for a genuinely-empty diff).
         app.diff_files.clear();
         app.rebuild_diff_rows();
+        app.diff_note = "No committed changes on this branch vs the default branch.".into();
         let text = render_to_string(&mut app, 100, 30);
         assert!(
             text.contains("No committed changes"),
-            "an empty diff renders the note, not a blank dialog:\n{text}"
+            "an empty diff renders diff_note, not a blank dialog:\n{text}"
+        );
+    }
+
+    #[test]
+    fn open_diff_on_a_fallback_workspace_notes_no_branch_and_renders_it() {
+        // A fallback workspace (no worktree_path) has no branch to review: the
+        // note distinguishes it from an empty diff / a non-repo, and it renders.
+        let mut app = test_app();
+        app.workspaces = app.state.workspaces.clone();
+        // test_app's w1 already has worktree_path = None (a fallback workspace).
+        app.open_diff("w1");
+        assert!(app.diff_rows.is_empty());
+        assert_eq!(app.diff_note, "This workspace has no branch to review.");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(
+            text.contains("branch to review"),
+            "the no-branch note renders in the dialog:\n{text}"
         );
     }
 
@@ -4401,6 +4443,21 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn diff_pending_g_is_reset_on_tab_and_on_close() {
+        // The overlay and the tree share `pending_g`; toggling focus or closing
+        // must clear it so a half-typed `gg` can't complete across the boundary.
+        let mut app = diff_app(&["a.txt"]);
+        app.pending_g = true;
+        press(&mut app, KeyCode::Tab).await;
+        assert!(!app.pending_g, "Tab clears a pending g");
+
+        app.pending_g = true;
+        press(&mut app, KeyCode::Esc).await; // close
+        assert!(!app.show_diff);
+        assert!(!app.pending_g, "closing clears a pending g");
+    }
+
+    #[tokio::test]
     async fn diff_jk_move_the_file_selection_in_files_focus() {
         let mut app = diff_app(&["a.txt", "b.txt", "c.txt"]);
         assert_eq!(app.diff_selected, 0);
@@ -4482,6 +4539,51 @@ mod key_tests {
         assert_eq!(app.diff_selected, 1);
         assert!(!app.diff_expanded.contains("src"), "clicking a folder toggles it collapsed");
         assert_eq!(row_labels(&app), vec!["F:README.md", "D:src"]);
+    }
+
+    #[test]
+    fn diff_click_on_a_file_row_selects_it_without_toggling_the_folder() {
+        let mut app = diff_app(&["src/main.rs", "README.md"]);
+        let _ = render_to_string(&mut app, 100, 30);
+        // Rows: [F:README.md (0), D:src (1), F:src/main.rs (2)].
+        assert_eq!(row_labels(&app), vec!["F:README.md", "D:src", "F:src/main.rs"]);
+        let la = app.diff_list_area;
+        app.diff_scroll = 7; // as if scrolled into another file's diff
+        // Click viewport row 2 (scroll 0) → the FILE src/main.rs.
+        let clicked = app.diff_handle_click(la.x + 1, la.y + 2);
+        assert!(clicked, "a click in the list area is consumed");
+        assert_eq!(app.diff_selected, 2, "lands on the file row");
+        assert_eq!(app.diff_focus, DiffFocus::Files);
+        assert!(app.diff_expanded.contains("src"), "a file click must NOT toggle the folder");
+        assert_eq!(row_labels(&app), vec!["F:README.md", "D:src", "F:src/main.rs"], "rows unchanged");
+        assert_eq!(app.diff_scroll, 0, "selecting a file resets the diff scroll");
+    }
+
+    #[test]
+    fn diff_click_maps_through_a_non_zero_list_scroll() {
+        // Every other click test has scroll 0; this pins the `(row - y) + scroll`
+        // hit-test math with the list scrolled. 40 files, a short pane, so the
+        // list must scroll to keep the selection in view.
+        let paths: Vec<String> = (0..40).map(|i| format!("f{i:02}.txt")).collect();
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let mut app = diff_app(&refs);
+        // Jump to the last file so the render scrolls the list down, then render
+        // to commit `diff_list_scroll`.
+        app.diff_selected = app.diff_rows.len() - 1;
+        let _ = render_to_string(&mut app, 100, 12);
+        let scroll = app.diff_list_scroll;
+        assert!(scroll > 0, "the list scrolled to keep the selection in view");
+        let la = app.diff_list_area;
+        // Click the top visible viewport row → index == scroll (not 0).
+        let clicked = app.diff_handle_click(la.x + 1, la.y);
+        assert!(clicked, "a click in the list area is consumed");
+        assert_eq!(
+            app.diff_selected, scroll as usize,
+            "the top visible row maps to `scroll`, not row 0"
+        );
+        // Sanity: the selected row is the file the scroll offset points at.
+        let want = format!("F:f{:02}.txt", scroll);
+        assert_eq!(row_labels(&app)[app.diff_selected], want);
     }
 
     #[test]

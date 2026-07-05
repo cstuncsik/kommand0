@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use super::theme::Theme;
@@ -123,10 +123,13 @@ pub fn render_diff_overlay(frame: &mut ratatui::Frame, app: &mut App) {
     app.diff_list_area = list_inner;
 
     if app.diff_rows.is_empty() {
+        // `diff_note` distinguishes no-branch / not-a-repo / empty-diff (set in
+        // open_diff). Wrap so a full sentence isn't clipped in the narrow pane.
         let note = Paragraph::new(Line::styled(
-            "  No changes",
+            format!("  {}", app.diff_note),
             Style::default().fg(th.muted),
-        ));
+        ))
+        .wrap(Wrap { trim: true });
         frame.render_widget(note, list_inner);
     } else {
         // Keep the selection in view: scroll so it sits within the visible window.
@@ -203,10 +206,9 @@ pub fn render_diff_overlay(frame: &mut ratatui::Frame, app: &mut App) {
             "  Select a file to see its diff.",
             Style::default().fg(th.muted),
         )],
-        None => vec![Line::styled(
-            "  No committed changes on this branch vs the default branch.",
-            Style::default().fg(th.muted),
-        )],
+        // No rows at all: the left pane already carries the distinct explanation
+        // (diff_note) — keep the right pane empty rather than repeat/conflate it.
+        None => Vec::new(),
     };
 
     // Clamp the diff scroll so the last line stays at the bottom edge (exact: no
