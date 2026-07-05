@@ -5,6 +5,18 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Two-pane diff dialog** — the review-diff view (`v`) is now GitHub-style: a
+  collapsible file tree on the left, the selected file's diff on the right
+  (`git diff <default>...HEAD`, coloured by add / remove / hunk). `Tab` switches
+  focus; in the file pane `j`/`k` move and `Enter`/`l`/`h` expand/collapse
+  folders; in the diff pane `j`/`k`, `PgUp`/`PgDn`, `g`/`G` scroll; click or
+  select a file. `Esc`/`v`/`q` close.
+- **Open PR in a browser** — press `p` on a workspace to open its GitHub PR
+  (from the cached PR/CI status) in your default browser. Rebindable as
+  `open-pr-web`.
+
 ## [0.7.1] - 2026-07-04
 
 ### Added

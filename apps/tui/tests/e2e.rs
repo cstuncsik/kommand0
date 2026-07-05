@@ -390,12 +390,14 @@ fn review_diff_overlay_opens_and_closes() {
     tui.wait_for("demo-ws");
     tui.send("j");
     tui.send("v"); // review the selected workspace's diff
-    // The seeded workspace has no worktree/branch, so the overlay says so —
-    // which proves the key opened it and open_diff ran.
-    tui.wait_for("no branch to review");
+    // The two-pane dialog opens with a titled border and (for this
+    // worktree-less workspace) an empty tree → the right pane's "no changes"
+    // note — which proves the key opened it and open_diff ran.
+    tui.wait_for("Review —");
+    tui.wait_for("No committed changes");
 
     tui.send_esc(); // Esc closes
-    tui.wait_gone("no branch to review");
+    tui.wait_gone("Review —");
 
     tui.send("q");
     tui.wait_exit();

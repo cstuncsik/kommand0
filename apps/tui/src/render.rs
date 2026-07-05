@@ -131,15 +131,9 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         help::render_help_overlay(frame, app.focus, &mut app.help_scroll, &tree_rows, app.theme);
     }
 
-    // Review-diff overlay (PR-style diff of the selected workspace).
+    // Review-diff dialog (two-pane PR-style diff of the selected workspace).
     if app.show_diff {
-        diff::render_diff_overlay(
-            frame,
-            &app.diff_title,
-            &app.diff_text,
-            &mut app.diff_scroll,
-            app.theme,
-        );
+        diff::render_diff_overlay(frame, app);
     }
 
     // Modal overlay on top of everything
