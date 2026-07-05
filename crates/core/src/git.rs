@@ -105,15 +105,26 @@ fn default_branch_ref(working_dir: &str) -> Option<String> {
     None
 }
 
-/// The `git diff <default>...HEAD` for a worktree — the "PR-style" diff of every
-/// change the current branch has committed since it diverged from the default
-/// branch (the `A...B` form excludes the working tree, matching what a PR shows).
+/// One file's section of a PR-style diff (see [`diff_files_vs_default_branch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    /// The new path (the `b/` side; a delete uses its `a/` side — see
+    /// [`file_diff_path`]).
+    pub path: String,
+    /// That file's diff section, verbatim (from its `diff --git` line to the next).
+    pub text: String,
+}
+
+/// The `git diff <default>...HEAD` for a worktree, split per file — the "PR-style"
+/// diff of every change the current branch has committed since it diverged from
+/// the default branch (the `A...B` form excludes the working tree, matching what a
+/// PR shows).
 ///
-/// `Some("")` means no difference (HEAD is the default branch, or nothing is
+/// `Some(vec![])` means no difference (HEAD is the default branch, or nothing is
 /// committed ahead of it). `None` means the directory isn't a git repo or the
 /// default branch couldn't be resolved. Panic-free, meant to run off the UI
 /// thread like [`branch_status`].
-pub fn diff_vs_default_branch(working_dir: &str) -> Option<String> {
+pub fn diff_files_vs_default_branch(working_dir: &str) -> Option<Vec<FileDiff>> {
     let base = default_branch_ref(working_dir)?;
     // `--no-ext-diff` avoids slow user-configured external diff drivers on the UI
     // thread; `--no-color` keeps ANSI codes out of the captured text regardless of
@@ -132,19 +143,98 @@ pub fn diff_vs_default_branch(working_dir: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut files = split_file_diffs(&text);
     // Bound the retained/rendered diff so a pathological worktree can't pin an
     // unbounded string in memory (the overlay separately caps rendered lines).
+    // Cap on whole sections — never a truncated `diff --git` fragment — by
+    // dropping the sections that overflow the budget, keeping the total ~1 MiB.
     const MAX_BYTES: usize = 1 << 20; // 1 MiB
-    if text.len() > MAX_BYTES {
-        let mut end = MAX_BYTES;
-        while !text.is_char_boundary(end) {
-            end -= 1;
+    let mut used = 0usize;
+    // Always keep the first section, even if it alone exceeds the budget — a
+    // single huge file should still render (line-capped) rather than vanish.
+    let keep = files
+        .iter()
+        .take_while(|f| {
+            let first = used == 0;
+            used += f.text.len();
+            first || used <= MAX_BYTES
+        })
+        .count();
+    if keep < files.len() {
+        files.truncate(keep);
+        // Note the drop on the last kept section (not a phantom file row) so the
+        // overlay surfaces it without inventing an empty-path entry.
+        if let Some(last) = files.last_mut() {
+            last.text
+                .push_str("\n… diff truncated (over 1 MiB) — use a shell tab for the full diff\n");
         }
-        text.truncate(end);
-        text.push_str("\n… diff truncated (over 1 MiB) — use a shell tab for the full diff\n");
     }
-    Some(text)
+    Some(files)
+}
+
+/// Split a raw multi-file diff into per-file [`FileDiff`] sections on
+/// `"diff --git "` boundaries, deriving each section's path with
+/// [`file_diff_path`]. Anything before the first header (usually nothing) is
+/// dropped.
+fn split_file_diffs(text: &str) -> Vec<FileDiff> {
+    let mut files: Vec<FileDiff> = Vec::new();
+    for raw in text.split_inclusive('\n') {
+        if raw.starts_with("diff --git ") {
+            // Path is filled in once the whole section is collected (from its
+            // `+++ b/` line — see file_diff_path); the header alone can't be
+            // split reliably when the path contains a space.
+            files.push(FileDiff { path: String::new(), text: raw.to_string() });
+        } else if let Some(cur) = files.last_mut() {
+            cur.text.push_str(raw);
+        }
+    }
+    for f in &mut files {
+        f.path = file_diff_path(&f.text);
+    }
+    files
+}
+
+/// The new-side path of one `diff --git` section. Prefers the unambiguous
+/// `+++ b/<path>` line (a single token from `+++ ` to end-of-line, so a path
+/// with spaces is fine); for a delete (`+++ /dev/null`) uses the `--- a/<path>`
+/// line instead. Falls back to the `diff --git … b/…` split (then the whole
+/// header line) only when neither `+++`/`---` line is present — a git-quoted or
+/// special-char path stays on that fallback, which is acceptable. Never panics.
+fn file_diff_path(section: &str) -> String {
+    let mut plus: Option<&str> = None;
+    let mut minus: Option<&str> = None;
+    for line in section.lines() {
+        // Git appends a literal tab to a `+++`/`---` path that contains spaces
+        // (its own ambiguity guard); trim it off the token.
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            plus = Some(rest.trim_end());
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            minus = Some(rest.trim_end());
+        }
+        if line.starts_with("@@") {
+            break; // headers are done once the first hunk starts
+        }
+    }
+    // A present `+++` that isn't /dev/null gives the new path; a delete's
+    // /dev/null `+++` defers to the `---` (old) path.
+    if let Some(p) = plus
+        && p != "/dev/null"
+    {
+        return p.strip_prefix("b/").unwrap_or(p).to_string();
+    }
+    if let Some(m) = minus
+        && m != "/dev/null"
+    {
+        return m.strip_prefix("a/").unwrap_or(m).to_string();
+    }
+    // No usable +++/--- (mode-only change, binary with none): fall back to the
+    // header's " b/" split, then the whole header line. Never panics.
+    let header = section.lines().next().unwrap_or("");
+    header
+        .split_once(" b/")
+        .map(|(_, b)| b.trim_end().to_string())
+        .unwrap_or_else(|| header.trim_end().to_string())
 }
 
 /// The `gh` binary to invoke (overridable via `KOMMAND0_GH_BIN`, mirroring the
@@ -605,26 +695,40 @@ mod tests {
         }
     }
 
-    // --- diff_vs_default_branch ---
+    // --- diff_files_vs_default_branch ---
 
     #[test]
-    fn diff_shows_committed_branch_changes() {
+    fn diff_splits_committed_changes_into_per_file_sections() {
+        // Two files in different dirs, changed on a branch → two FileDiffs with
+        // the right (b/-side) paths and each file's own +/- content.
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path()); // main + a.txt "hello"
         git(tmp.path(), &["switch", "-c", "feature"]);
         std::fs::write(tmp.path().join("a.txt"), "hello world").unwrap();
-        git(tmp.path(), &["commit", "-am", "edit"]);
-        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
-        assert!(d.contains("a.txt"), "names the changed file: {d}");
-        assert!(d.contains("+hello world"), "shows the added line: {d}");
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-m", "edit"]);
+
+        let files = diff_files_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(files.len(), 2, "one section per changed file: {files:?}");
+        let by_path: std::collections::HashMap<&str, &str> =
+            files.iter().map(|f| (f.path.as_str(), f.text.as_str())).collect();
+        assert!(by_path.contains_key("a.txt"), "parsed the top-level path: {files:?}");
+        assert!(by_path.contains_key("src/lib.rs"), "parsed the nested path: {files:?}");
+        assert!(by_path["a.txt"].contains("+hello world"), "a.txt shows its added line");
+        assert!(by_path["a.txt"].starts_with("diff --git "), "section starts at its header");
+        assert!(by_path["src/lib.rs"].contains("+fn main() {}"), "src/lib.rs shows its content");
+        // Each section is self-contained (a file's text doesn't leak the other's).
+        assert!(!by_path["a.txt"].contains("fn main"), "sections don't bleed into each other");
     }
 
     #[test]
     fn diff_is_empty_on_the_default_branch() {
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path()); // HEAD == main
-        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
-        assert!(d.is_empty(), "HEAD is the default branch → no diff: {d:?}");
+        let files = diff_files_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert!(files.is_empty(), "HEAD is the default branch → no diff: {files:?}");
     }
 
     #[test]
@@ -634,14 +738,14 @@ mod tests {
         git(tmp.path(), &["switch", "-c", "feature"]);
         // Working-tree change only — never committed.
         std::fs::write(tmp.path().join("a.txt"), "dirty").unwrap();
-        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
-        assert!(d.is_empty(), "committed-only diff excludes the working tree: {d:?}");
+        let files = diff_files_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert!(files.is_empty(), "committed-only diff excludes the working tree: {files:?}");
     }
 
     #[test]
     fn diff_is_none_outside_a_repo() {
         let tmp = TempDir::new().unwrap();
-        assert!(diff_vs_default_branch(tmp.path().to_str().unwrap()).is_none());
+        assert!(diff_files_vs_default_branch(tmp.path().to_str().unwrap()).is_none());
     }
 
     #[test]
@@ -662,11 +766,12 @@ mod tests {
         git(tmp.path(), &["commit", "-m", "add main"]);
         git(tmp.path(), &["switch", "feature"]);
 
-        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
-        assert!(d.contains("feat.txt"), "shows the branch's own change: {d}");
+        let files = diff_files_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"feat.txt"), "shows the branch's own change: {paths:?}");
         assert!(
-            !d.contains("main.txt"),
-            "three-dot must not show the default branch's later commits: {d}"
+            !paths.contains(&"main.txt"),
+            "three-dot must not show the default branch's later commits: {paths:?}"
         );
     }
 
@@ -685,8 +790,109 @@ mod tests {
         std::fs::write(tmp.path().join("a.txt"), "hello world").unwrap();
         git(tmp.path(), &["commit", "-am", "edit"]);
 
-        let d = diff_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
-        assert!(d.contains("+hello world"), "based against master: {d}");
+        let files = diff_files_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.txt");
+        assert!(files[0].text.contains("+hello world"), "based against master: {files:?}");
+    }
+
+    #[test]
+    fn diff_path_of_a_rename_into_a_subdir_is_the_new_side() {
+        // A committed rename into a subdir: the path must be the new (`b/`) side,
+        // taken from `+++ b/...`, not the old location.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path()); // main + a.txt
+        git(tmp.path(), &["switch", "-c", "feature"]);
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::rename(tmp.path().join("a.txt"), tmp.path().join("sub/moved.txt")).unwrap();
+        git(tmp.path(), &["add", "-A"]);
+        git(tmp.path(), &["commit", "-m", "rename into sub"]);
+
+        let files = diff_files_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"sub/moved.txt"), "path is the new b/ side: {paths:?}");
+    }
+
+    #[test]
+    fn diff_path_of_a_delete_is_the_deleted_file_not_dev_null() {
+        // A committed delete: `+++ /dev/null` must fall through to the `--- a/...`
+        // (old) path — never "/dev/null".
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path()); // main + a.txt
+        git(tmp.path(), &["switch", "-c", "feature"]);
+        std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
+        git(tmp.path(), &["commit", "-am", "delete a.txt"]);
+
+        let files = diff_files_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.txt", "delete keeps the deleted path: {files:?}");
+    }
+
+    #[test]
+    fn diff_path_with_a_space_in_a_directory_name() {
+        // A dir name with a space makes the `diff --git a/… b/…` header ambiguous
+        // (`a b/` matches the wrong `" b/"`); deriving from `+++ b/` gets it right.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        git(tmp.path(), &["switch", "-c", "feature"]);
+        std::fs::create_dir(tmp.path().join("a b")).unwrap();
+        std::fs::write(tmp.path().join("a b/c.txt"), "x\n").unwrap();
+        git(tmp.path(), &["add", "-A"]);
+        git(tmp.path(), &["commit", "-m", "add spaced dir"]);
+
+        let files = diff_files_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"a b/c.txt"), "spaced path parsed from +++ b/: {paths:?}");
+    }
+
+    #[test]
+    fn file_diff_path_derivation_rules() {
+        // +++ b/ wins (add/modify).
+        assert_eq!(
+            file_diff_path("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@\n"),
+            "x"
+        );
+        // Delete: +++ /dev/null falls back to --- a/ (the old path).
+        assert_eq!(
+            file_diff_path("diff --git a/gone b/gone\n--- a/gone\n+++ /dev/null\n@@\n"),
+            "gone"
+        );
+        // Neither +++/--- present (mode-only): fall back to the header " b/" split.
+        assert_eq!(
+            file_diff_path("diff --git a/m b/m\nold mode 100644\nnew mode 100755\n"),
+            "m"
+        );
+        // A path with a space: the header split is wrong, but +++ b/ is exact.
+        assert_eq!(
+            file_diff_path("diff --git a/a b/c b/a b/c\n--- a/a b/c\n+++ b/a b/c\n@@\n"),
+            "a b/c"
+        );
+    }
+
+    #[test]
+    fn diff_over_the_byte_cap_drops_whole_sections_with_a_note() {
+        // Two big files, together over 1 MiB: the cap must drop a whole section
+        // (never a truncated `diff --git` fragment) and note the drop.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        git(tmp.path(), &["switch", "-c", "feature"]);
+        let big = "x\n".repeat(600 * 1024); // ~1.2 MiB each once diffed
+        std::fs::write(tmp.path().join("big1.txt"), &big).unwrap();
+        std::fs::write(tmp.path().join("big2.txt"), &big).unwrap();
+        git(tmp.path(), &["add", "-A"]);
+        git(tmp.path(), &["commit", "-m", "two big files"]);
+
+        let files = diff_files_vs_default_branch(tmp.path().to_str().unwrap()).unwrap();
+        // Every retained section is a whole diff (starts at its own header).
+        for f in &files {
+            assert!(
+                f.text.starts_with("diff --git "),
+                "no section is a truncated fragment: {:?}",
+                &f.text[..f.text.len().min(40)]
+            );
+        }
+        let joined: String = files.iter().map(|f| f.text.as_str()).collect();
+        assert!(joined.contains("diff truncated"), "the drop is noted: {joined:.80}");
     }
 
     // --- cleanup_merged_workspace ---
