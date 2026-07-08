@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_59779618133814::t_3327640a47ca93 21-24,420-422
+Cargo.toml
+  s_59779618133814::t_3327640a47ca93 6
+Cargo.lock
+  s_59779618133814::t_c6f34aee96c635 909,923,940
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ac5a5d68ff280359e43d38aec1124305546048dc",
+  "prompts": {},
+  "sessions": {
+    "s_59779618133814": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23a981a5-889a-4bea-b1a5-2e1debe6cf47",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
