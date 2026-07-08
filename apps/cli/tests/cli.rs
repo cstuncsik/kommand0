@@ -58,7 +58,7 @@ fn write_stub(path: &Path, body: &str) {
 }
 
 /// A tracked repo (with a bare `origin` so pushes succeed) + a workspace on its
-/// own `kommand0/<name>` branch. Returns the state dir.
+/// own branch (`feat`, named after the workspace). Returns the state dir.
 fn setup(root: &Path) -> std::path::PathBuf {
     let state_dir = root.join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -88,13 +88,18 @@ fn setup(root: &Path) -> std::path::PathBuf {
 
 #[test]
 fn workspace_status_shows_the_branch() {
+    // Uses a suffixed branch (`feat-2`) so the assertion can only match the
+    // BRANCH column — with bare naming, a plain workspace's branch equals its
+    // name and `contains` would pass off the NAME column.
     let tmp = tempfile::tempdir().unwrap();
-    let state = setup(tmp.path());
+    let (state, repo) = repo_with_branch_feat(tmp.path());
+    let create = kmd(&state, &[], &["workspace", "create", "feat", "--repo", &repo]);
+    assert!(create.status.success(), "create: {}", String::from_utf8_lossy(&create.stderr));
     let out = kmd(&state, &[], &["workspace", "status"]);
     assert!(out.status.success());
     let text = stdout(&out);
     assert!(text.contains("BRANCH"), "has a header: {text}");
-    assert!(text.contains("kommand0/feat"), "shows the workspace branch: {text}");
+    assert!(text.contains("feat-2"), "shows the workspace's (suffixed) branch: {text}");
 }
 
 #[test]
@@ -122,7 +127,7 @@ fn workspace_create_from_an_existing_branch() {
     );
     assert!(out.status.success(), "create --branch: {}", String::from_utf8_lossy(&out.stderr));
 
-    // The workspace adopted feat/login (not a fresh kommand0/ branch).
+    // The workspace adopted feat/login (no fresh fork).
     let status = kmd(&state_dir, &[], &["workspace", "status"]);
     assert!(stdout(&status).contains("feat/login"), "shows the adopted branch: {}", stdout(&status));
 
@@ -163,7 +168,7 @@ fn repo_with_branch_feat(root: &Path) -> (std::path::PathBuf, String) {
 #[test]
 fn workspace_create_over_existing_branch_forks_and_notes_when_non_interactive() {
     // A spawned `kmd` has no TTY, so `workspace create feat` (no --branch) hits the
-    // non-interactive path: fork `kommand0/feat` (do NOT adopt `feat`) + stderr note.
+    // non-interactive path: fork a suffixed branch (do NOT adopt `feat`) + stderr note.
     let tmp = tempfile::tempdir().unwrap();
     let (state, repo) = repo_with_branch_feat(tmp.path());
 
@@ -175,51 +180,53 @@ fn workspace_create_over_existing_branch_forks_and_notes_when_non_interactive() 
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Forked, not adopted: the branch is `kommand0/feat`, not `feat`.
+    // Forked, not adopted: bare `feat` exists, so the fork is exactly `feat-2`.
     let status = stdout(&kmd(&state, &[], &["workspace", "status", "feat"]));
     assert!(
-        status.contains("kommand0/feat") && !status.contains("kommand0/feat-"),
-        "forked exactly kommand0/feat (not adopted 'feat' or a suffixed variant): {status}"
+        status.contains("feat-2") && !status.contains("feat-2-") && !status.contains("feat-3"),
+        "forked exactly feat-2 (not adopted 'feat' or a further-suffixed variant): {status}"
     );
 }
 
 #[test]
-fn workspace_create_with_fork_forks_silently() {
-    // --fork skips detection entirely: fork `kommand0/feat`, no note.
+fn workspace_create_with_fork_notes_the_suffixed_branch() {
+    // --fork skips DETECTION (no checkout offer), not uniqueness: with `feat`
+    // taken the fork lands on `feat-2`, and the note names it — otherwise the
+    // user never learns the actual branch name.
     let tmp = tempfile::tempdir().unwrap();
     let (state, repo) = repo_with_branch_feat(tmp.path());
 
     let out = kmd(&state, &[], &["workspace", "create", "feat", "--repo", &repo, "--fork"]);
     assert!(out.status.success(), "create --fork: {}", String::from_utf8_lossy(&out.stderr));
     assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("branch 'feat' exists"),
-        "--fork silences the note: {}",
+        String::from_utf8_lossy(&out.stderr).contains("forked feat-2"),
+        "--fork notes the branch it actually created: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
     let status = stdout(&kmd(&state, &[], &["workspace", "status", "feat"]));
     assert!(
-        status.contains("kommand0/feat") && !status.contains("kommand0/feat-"),
-        "forked exactly kommand0/feat (not adopted 'feat' or a suffixed variant): {status}"
+        status.contains("feat-2") && !status.contains("feat-2-") && !status.contains("feat-3"),
+        "forked exactly feat-2 (not adopted 'feat' or a further-suffixed variant): {status}"
     );
 }
 
 #[test]
 fn non_interactive_note_names_the_actual_forked_branch() {
-    // When `kommand0/feat` already exists, the fork is suffixed to `kommand0/feat-2`;
-    // the note must name the branch actually created (read from `ws.branch_name`),
-    // not a hardcoded `kommand0/feat`.
+    // With `feat` AND `feat-2` taken, the fork suffixes to `feat-3`; the note
+    // must name the branch actually created (read from `ws.branch_name`), not
+    // a hardcoded first-suffix guess.
     let tmp = tempfile::tempdir().unwrap();
     let (state, repo) = repo_with_branch_feat(tmp.path());
-    // Occupy the default fork name so `unique_branch_name` has to suffix.
-    run_git(std::path::Path::new(&repo), &["branch", "kommand0/feat"]);
+    // Occupy the first fork candidate so `unique_branch_name` has to go further.
+    run_git(std::path::Path::new(&repo), &["branch", "feat-2"]);
 
     let out = kmd(&state, &[], &["workspace", "create", "feat", "--repo", &repo]);
     assert!(out.status.success(), "create feat: {}", String::from_utf8_lossy(&out.stderr));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("forked kommand0/feat-2"),
-        "note names the real (suffixed) fork branch, not the hardcoded default: {err}"
+        err.contains("forked feat-3"),
+        "note names the real (suffixed) fork branch, not the first guess: {err}"
     );
 }
 
@@ -231,7 +238,7 @@ fn workspace_create_over_existing_branch_and_workspace_errors_without_a_note() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, repo) = repo_with_branch_feat(tmp.path());
 
-    // First create takes the name `feat` (forks kommand0/feat).
+    // First create takes the name `feat` (forks the suffixed feat-2).
     let first = kmd(&state, &[], &["workspace", "create", "feat", "--repo", &repo]);
     assert!(first.status.success(), "first create: {}", String::from_utf8_lossy(&first.stderr));
 
@@ -240,7 +247,7 @@ fn workspace_create_over_existing_branch_and_workspace_errors_without_a_note() {
     assert!(!dup.status.success(), "duplicate name should fail");
     let err = String::from_utf8_lossy(&dup.stderr);
     assert!(err.contains("already exists"), "canonical error: {err}");
-    assert!(!err.contains("forked kommand0/feat"), "no misleading fork note: {err}");
+    assert!(!err.contains("forked"), "no misleading fork note: {err}");
 }
 
 #[test]
@@ -248,10 +255,11 @@ fn cleanup_removes_a_merged_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
     let gh = tmp.path().join("gh");
-    // gh runs from the repo dir; report the branch's tip as the merged commit.
+    // gh runs from the repo dir; answer the `pr list --head <branch>` lookup by
+    // reporting the branch's tip as the merged commit.
     write_stub(
         &gh,
-        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then oid=$(git rev-parse \"refs/heads/$3\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
+        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
     );
     let out = kmd(
         &state,

@@ -68,8 +68,8 @@ enum WorkspaceAction {
         /// Skip git worktree creation (use repo root as working directory)
         #[arg(long)]
         no_worktree: bool,
-        /// Force a new `kommand0/<name>` branch even if a branch `<name>` exists
-        /// (skip the existing-branch checkout prompt)
+        /// Force forking a new branch even if a branch `<name>` exists (the fork
+        /// gets a `-2`/`-3` suffix then; skips the existing-branch checkout prompt)
         #[arg(long, conflicts_with_all = ["branch", "no_worktree"])]
         fork: bool,
     },
@@ -274,7 +274,7 @@ fn main() -> anyhow::Result<()> {
                                 ),
                             _ => false,
                         };
-                        if !offer {
+                        let ws = if !offer {
                             state.create_workspace(name.as_deref(), &repo)?
                         } else {
                             let n = name.as_deref().expect("offer implies Some(name)");
@@ -289,18 +289,24 @@ fn main() -> anyhow::Result<()> {
                                     state.create_workspace(Some(n), &repo)?
                                 }
                             } else {
-                                let ws = state.create_workspace(Some(n), &repo)?;
-                                // Report the branch actually created — `unique_branch_name`
-                                // may suffix it (`kommand0/{n}-2`), and a worktree fallback
-                                // leaves `branch_name` None (nothing forked → no note).
-                                if let Some(b) = &ws.branch_name {
-                                    eprintln!(
-                                        "note: branch '{n}' exists; forked {b} (use --branch {n} to check it out)"
-                                    );
-                                }
-                                ws
+                                state.create_workspace(Some(n), &repo)?
                             }
+                        };
+                        // Report the branch actually created whenever it isn't the
+                        // requested name — `unique_branch_name` suffixes on collision
+                        // (`{name}-2`), which `--fork` and the non-interactive
+                        // fallthrough would otherwise do silently. Scoped to this
+                        // fresh-branch arm: an adopted `--branch` workspace differs
+                        // legitimately, and a worktree fallback has no branch.
+                        if let Some(b) = &ws.branch_name
+                            && *b != ws.name
+                        {
+                            eprintln!(
+                                "note: branch '{}' exists; forked {b} (use --branch {} to check it out)",
+                                ws.name, ws.name
+                            );
                         }
+                        ws
                     }
                 };
                 let repo_name = state

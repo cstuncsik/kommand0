@@ -10,8 +10,10 @@ pub struct Workspace {
     pub created_at: u64,
     #[serde(default)]
     pub worktree_path: Option<String>,
-    /// The git branch the worktree was created on (`kommand0/<name>`), captured
-    /// at creation. `None` for fallback workspaces with no own worktree/branch.
+    /// The git branch the worktree was created on (named after the workspace,
+    /// suffixed `-2`/`-3`… on collision; adopted branches keep their name; pre-
+    /// existing workspaces may carry a legacy `kommand0/<name>`), captured at
+    /// creation. `None` for fallback workspaces with no own worktree/branch.
     #[serde(default)]
     pub branch_name: Option<String>,
 }
@@ -79,8 +81,9 @@ mod tests {
     fn create_workspace_rejects_unsafe_names() {
         let tmp = TempDir::new().unwrap();
         let (mut state, _) = make_state_with_repo(&tmp);
-        // Names that would escape the worktrees dir or trip git arg parsing.
-        for bad in ["", "   ", ".", "..", "../escape", "a/b", "a\\b", "-rf"] {
+        // Names that would escape the worktrees dir, trip git arg parsing, or
+        // that git refuses as bare branch names (HEAD, @).
+        for bad in ["", "   ", ".", "..", "../escape", "a/b", "a\\b", "-rf", "HEAD", "@"] {
             let err = state
                 .create_workspace_with_base(Some(bad), "myapp", tmp.path())
                 .unwrap_err();

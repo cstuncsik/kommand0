@@ -99,11 +99,13 @@ kmd session list [--workspace <name>]
 kmd session clear <workspace>
 ```
 
-`workspace create <name>` (without `--branch`) detects an existing branch: if a
-branch matching `<name>` already exists (local or `origin`), on a terminal it
-prompts to check it out instead of forking a new `kommand0/<name>` branch;
-non-interactively (piped/CI) it forks as before and notes it on stderr. Pass
-`--fork` to force a new branch, or `--branch <name>` to check one out explicitly.
+`workspace create <name>` forks a branch named `<name>` (suffixed `<name>-2`,
+`-3`, … when that branch already exists). Without `--branch` it detects an
+existing branch first: if a branch matching `<name>` already exists (local or
+`origin`), on a terminal it prompts to check it out instead of forking;
+non-interactively (piped/CI) it forks the suffixed branch and notes the actual
+name on stderr. Pass `--fork` to force a new branch, or `--branch <name>` to
+check one out explicitly.
 
 > Replace `kmd` with `cargo run -p kommand0-cli --` during development.
 

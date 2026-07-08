@@ -55,7 +55,9 @@ git worktree. A `kmd` CLI mirrors the core actions.
 - **Adding a keybinding = 5 sites in `keymap.rs`**: the `Action` enum, `ALL_ACTIONS`,
   `name()`, `description()`, `DEFAULT_BINDINGS`. All keys are rebindable via config.
 - **State** (`AppState`) persists to `state.json` atomically, 3-way-merged against
-  concurrent `kmd` writes. Workspaces are git worktrees on `kommand0/<name>` branches;
+  concurrent `kmd` writes. Workspaces are git worktrees on per-workspace branches
+  named after the workspace (suffixed `-2`… on collision; pre-0.11 workspaces may
+  carry a legacy `kommand0/<name>` branch — still fully supported);
   a **fallback workspace has no `worktree_path`** (its `working_dir` is the repo
   root) — per-workspace git/PR features gate on `worktree_path.is_some()`.
 
