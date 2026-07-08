@@ -909,9 +909,10 @@ fn run_git(cwd: &std::path::Path, args: &[&str]) {
 
 #[test]
 fn c_cleans_up_a_merged_workspace() {
-    // A real repo + worktree on a kommand0/ branch; `gh` (stubbed) reports the
-    // PR merged, so confirming cleanup removes the worktree + branch and drops
-    // the workspace from the tree.
+    // A real repo + worktree on a LEGACY `kommand0/`-prefixed branch (regression
+    // guard: workspaces created before the prefix was dropped must keep cleaning
+    // up); `gh` (stubbed) reports the PR merged, so confirming cleanup removes
+    // the worktree + branch and drops the workspace from the tree.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let repo = root.join("repo");

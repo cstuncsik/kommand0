@@ -3815,7 +3815,7 @@ mod key_tests {
         app.workspaces = vec![
             mk_ws("w1", "auth-refactor", "r1", None),
             mk_ws("w2", "docs", "r1", None),
-            mk_ws("w3", "misc", "r1", Some("kommand0/billing")),
+            mk_ws("w3", "misc", "r1", Some("billing")),
             mk_ws("w4", "ui", "r2", None),
         ];
         app.expanded.insert("r1".to_string());
@@ -4051,8 +4051,8 @@ mod key_tests {
         let ws = app.workspaces.iter().find(|w| w.name == "fresh").expect("workspace created");
         assert_eq!(
             ws.branch_name.as_deref(),
-            Some("kommand0/fresh"),
-            "forked a fresh kommand0/ branch (not a worktree fallback to the repo root)"
+            Some("fresh"),
+            "forked a fresh branch named after the workspace (not a repo-root fallback)"
         );
     }
 
@@ -4096,7 +4096,7 @@ mod key_tests {
         let mut app = test_app();
         let _repo = add_real_repo(&mut app, "feat");
         // The branch-exists prompt is open for the real local `feat`; Enter checks
-        // it out (the bare branch, NOT a fresh kommand0/feat).
+        // it out (the existing branch, NOT a fresh suffixed fork).
         app.modal = modal::ModalState::ConfirmBranchCheckout {
             repo_id: "real".into(),
             repo_name: "real".into(),
@@ -4109,8 +4109,44 @@ mod key_tests {
         assert_eq!(
             ws.branch_name.as_deref(),
             Some("feat"),
-            "checked out the existing bare branch, not kommand0/feat"
+            "checked out the existing branch, not a suffixed fork"
         );
+    }
+
+    #[tokio::test]
+    async fn checkout_choice_fork_on_free_name_creates_the_suffixed_branch() {
+        let mut app = test_app();
+        // Unique workspace name: worktrees land in the shared per-process state
+        // dir (`worktrees/<name>`), so reusing "feat" would race the checkout
+        // test's worktree under parallel runs.
+        let _repo = add_real_repo(&mut app, "forkme");
+        // The prompt is open because local `forkme` exists; `f` forks — the
+        // fork must land on the suffixed branch, never shadow the existing one.
+        app.modal = modal::ModalState::ConfirmBranchCheckout {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            name: "forkme".into(),
+        };
+        press(&mut app, KeyCode::Char('f')).await;
+
+        assert!(matches!(app.modal, modal::ModalState::None), "the choice closes the modal");
+        let ws = app.workspaces.iter().find(|w| w.name == "forkme").expect("workspace created");
+        assert_eq!(ws.branch_name.as_deref(), Some("forkme-2"), "forked the suffixed branch");
+    }
+
+    #[tokio::test]
+    async fn confirm_branch_checkout_copy_does_not_name_the_fork() {
+        // The fork's final name (suffixing) isn't known at render time, so the
+        // modal must offer "fork a new branch" generically — naming one would lie.
+        let mut app = test_app();
+        app.modal = modal::ModalState::ConfirmBranchCheckout {
+            repo_id: "r1".into(),
+            repo_name: "alpha".into(),
+            name: "feat".into(),
+        };
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("fork a new branch"), "generic fork wording: {text}");
+        assert!(!text.contains("fork kommand0/"), "never names a branch it can't know");
     }
 
     #[tokio::test]
@@ -5617,16 +5653,18 @@ mod key_tests {
     async fn branch_status_shows_in_detail_and_tree() {
         let mut app = test_app();
         // Give w1 an own worktree/branch so the status surfaces (test_app's
-        // default workspace has no worktree_path).
+        // default workspace has no worktree_path). The branch value must be
+        // DISTINCT from the workspace name ("ws-one" renders in the tree row,
+        // so asserting on it would prove nothing about the detail pane).
         app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
-        app.workspaces[0].branch_name = Some("kommand0/ws-one".into());
+        app.workspaces[0].branch_name = Some("billing-work".into());
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
         app.select_workspace_row("w1");
         app.branch_status.insert(
             "w1".to_string(),
             kommand0_core::BranchStatus {
-                branch: Some("kommand0/ws-one".into()),
+                branch: Some("billing-work".into()),
                 ahead: 2,
                 behind: 1,
                 dirty: true,
@@ -5640,7 +5678,7 @@ mod key_tests {
 
         // Detail pane.
         assert!(text.contains("Branch:"), "detail shows a Branch line:\n{text}");
-        assert!(text.contains("kommand0/ws-one"), "detail shows the branch name");
+        assert!(text.contains("billing-work"), "detail shows the branch name");
         assert!(text.contains("↑2 ↓1"), "detail shows ahead/behind");
         assert!(text.contains("uncommitted changes"), "detail shows dirty state");
         // Tree row segment (compact, no spaces): " ↑2↓1*".
@@ -5651,7 +5689,7 @@ mod key_tests {
     async fn pr_status_shows_in_detail_and_tree() {
         let mut app = test_app();
         app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
-        app.workspaces[0].branch_name = Some("kommand0/ws-one".into());
+        app.workspaces[0].branch_name = Some("ws-one".into());
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
         app.select_workspace_row("w1");
@@ -5687,7 +5725,7 @@ mod key_tests {
         // Own-branch workspace: `c` opens the confirmation modal.
         let mut app = test_app();
         app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
-        app.workspaces[0].branch_name = Some("kommand0/ws-one".into());
+        app.workspaces[0].branch_name = Some("ws-one".into());
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
         app.select_workspace_row("w1");
@@ -5710,7 +5748,7 @@ mod key_tests {
     async fn cleanup_affordance_and_states_render() {
         let mut app = test_app();
         app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
-        app.workspaces[0].branch_name = Some("kommand0/ws-one".into());
+        app.workspaces[0].branch_name = Some("ws-one".into());
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
         app.select_workspace_row("w1");

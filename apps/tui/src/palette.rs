@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn matches_against_branch_and_repo_too() {
-        let cands = vec![cand("w1", "misc", "myrepo", Some("kommand0/billing"))];
+        let cands = vec![cand("w1", "misc", "myrepo", Some("billing"))];
         let mut p = Palette::new(cands);
         for ch in "billing".chars() {
             p.push_char(ch);

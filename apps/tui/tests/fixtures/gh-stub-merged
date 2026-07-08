@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Fake `gh` for the cleanup e2e (selected via KOMMAND0_GH_BIN): reports the
-# branch's PR as MERGED with the worktree's current HEAD as the merged commit,
-# so cleanup_merged_workspace's "no commits beyond the PR" guard passes. Runs
-# with cwd = the worktree, so `git rev-parse HEAD` is the branch tip.
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  oid=$(git rev-parse HEAD 2>/dev/null)
+# Fake `gh` for the cleanup e2e (selected via KOMMAND0_GH_BIN): answers the
+# `pr list --head <branch>` lookup by reporting that branch's PR as MERGED with
+# the branch tip as the merged commit, so cleanup_merged_workspace's "no commits
+# beyond the PR" guard passes. Runs with cwd = the repo.
+if [ "$1" = "pr" ] && [ "$2" = "list" ] && [ "$3" = "--head" ]; then
+  oid=$(git rev-parse "refs/heads/$4" 2>/dev/null)
   printf 'MERGED\n%s\n' "$oid"
   exit 0
 fi

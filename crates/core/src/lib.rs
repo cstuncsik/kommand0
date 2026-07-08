@@ -584,20 +584,24 @@ impl AppState {
     }
 
     /// Validate a would-be workspace name: it becomes a path segment under
-    /// `worktrees/` and a branch suffix, so reject anything that could escape the
-    /// dir or trip git's arg parsing (empty/whitespace, `.`/`..`, a path
-    /// separator, or a leading dash), and reject a name already in use.
+    /// `worktrees/` and the branch name itself, so reject anything that could
+    /// escape the dir or trip git's arg parsing (empty/whitespace, `.`/`..`, a
+    /// path separator, a leading dash), the two names git refuses as bare
+    /// branches (`HEAD`, `@` — `git worktree add -b` would fail and silently
+    /// fall back to the repo root), and a name already in use.
     pub fn validate_new_workspace_name(&self, name: &str) -> anyhow::Result<()> {
         if name.trim().is_empty()
             || name == "."
             || name == ".."
+            || name == "HEAD"
+            || name == "@"
             || name.contains('/')
             || name.contains('\\')
             || name.starts_with('-')
         {
             bail!(
                 "invalid workspace name {name:?}: must not be empty, '.'/'..', \
-                 contain a path separator, or start with '-'"
+                 'HEAD', '@', contain a path separator, or start with '-'"
             );
         }
         if self.workspaces.iter().any(|w| w.name == name) {
@@ -634,7 +638,7 @@ impl AppState {
             .as_secs();
 
         // Create a git worktree: on an existing branch if one was requested, else
-        // on a fresh `kommand0/<name>` branch.
+        // on a fresh branch named after the workspace.
         let (working_dir, worktree_path, branch_name) = if !use_worktree {
             (repo.path.clone(), None, None)
         } else if let Some(branch_ref) = from_branch {
@@ -1003,7 +1007,7 @@ mod tests {
         assert_eq!(
             ws.branch_name.as_deref(),
             Some("feat/login"),
-            "adopts the existing branch (so cleanup, which only deletes kommand0/, won't remove it)"
+            "adopts the existing branch as-is (no fork)"
         );
         assert!(ws.worktree_path.is_some());
 

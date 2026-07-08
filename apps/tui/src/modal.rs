@@ -76,7 +76,7 @@ pub(crate) enum ModalState {
         unpushed: bool,
     },
     /// A branch named `name` already exists (local or origin); offer to check it
-    /// out instead of forking a fresh `kommand0/<name>`.
+    /// out instead of forking a fresh branch (which would be suffixed `-2`, …).
     ConfirmBranchCheckout {
         repo_id: String,
         repo_name: String,
@@ -108,7 +108,7 @@ pub(crate) enum ModalResult {
     /// Cleanup confirmed for a workspace id.
     ConfirmCleanup(String),
     /// Choice from the branch-exists prompt: check out the existing branch when
-    /// `checkout`, else fork a fresh `kommand0/<name>`.
+    /// `checkout`, else fork a fresh (suffixed) branch.
     BranchCheckoutChoice { repo_id: String, name: String, checkout: bool },
 }
 
@@ -1071,7 +1071,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                     Span::styled("Enter", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
                     Span::raw(" check it out   "),
                     Span::styled("f", Style::default().fg(th.accent)),
-                    Span::raw(format!(" fork kommand0/{name}   ")),
+                    Span::raw(" fork a new branch   ".to_string()),
                     Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(" cancel"),
                 ])),

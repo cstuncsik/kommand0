@@ -5,6 +5,19 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Workspace branches drop the `kommand0/` prefix** — a new workspace forks a
+  branch named exactly after the workspace (`demo`, suffixed `demo-2`, `-3`, …
+  on collision with any local or origin branch), so remote refs read
+  `origin/demo` instead of the remote-lookalike `origin/kommand0/demo`.
+  Existing prefixed branches keep working unchanged (status, PRs, cleanup).
+  Cleanup's ownership gate is relaxed accordingly: it now refuses only the
+  repo's default branch and malformed names — its merged-PR, clean-worktree,
+  and tip-equality guards are unchanged — which deliberately means an adopted
+  (non-kommand0) branch **can** now be cleaned up once its PR merges. Deletion
+  remains local-only; the remote branch is never touched.
+
 ## [0.10.0] - 2026-07-05
 
 ## [0.9.0] - 2026-07-05

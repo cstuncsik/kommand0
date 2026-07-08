@@ -21,17 +21,6 @@ fn is_git_repo(repo_path: &str) -> bool {
     Path::new(repo_path).join(".git").exists()
 }
 
-/// Check if a git branch exists.
-fn branch_exists(repo_path: &str, branch: &str) -> bool {
-    Command::new("git")
-        .args(["-C", repo_path, "rev-parse", "--verify", branch])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 /// Whether a fully-qualified ref (e.g. `refs/heads/foo`, `refs/remotes/origin/foo`)
 /// exists in the repo. Uses `show-ref --verify` (exact ref lookup), not
 /// `rev-parse` (which applies revision syntax, so e.g. `main^{commit}` would
@@ -47,9 +36,13 @@ fn verify_ref(repo_path: &str, full_ref: &str) -> bool {
 }
 
 /// True if a branch named exactly `name` exists locally (`refs/heads/<name>`) or
-/// on origin (`refs/remotes/origin/<name>`). Checks the BARE name — a
-/// `kommand0/<name>` branch does NOT count — using `git show-ref --verify`
-/// (exact ref lookup), so revision syntax like `main^{commit}` never matches.
+/// on origin (`refs/remotes/origin/<name>`). Exact-name lookup — a legacy
+/// `kommand0/<name>` branch does NOT count — via `git show-ref --verify`, so
+/// revision syntax like `main^{commit}` never matches. Both the "branch exists →
+/// checkout or fork?" offer and [`unique_branch_name`] use THIS check, so
+/// detection and minting agree on what "exists" means (an origin-only branch
+/// must suffix the fork, or we'd mint a bare local branch shadowing a divergent
+/// `origin/<name>`).
 pub fn branch_exists_bare(repo_path: &str, name: &str) -> bool {
     // "HEAD" is never a branch: `refs/remotes/origin/HEAD` is a symbolic pointer
     // to the default branch, so treat it as no match rather than a false positive.
@@ -87,15 +80,16 @@ fn prepare_worktree_dir(
     Ok(worktree_path)
 }
 
-/// Find a unique branch name by appending -2, -3, etc.
+/// Find a unique branch name by appending -2, -3, etc. Uniqueness is checked
+/// against local AND origin refs (`branch_exists_bare`), so a fork after the
+/// checkout offer always suffixes rather than shadowing the existing branch.
 fn unique_branch_name(repo_path: &str, base: &str) -> String {
-    let candidate = format!("kommand0/{base}");
-    if !branch_exists(repo_path, &candidate) {
-        return candidate;
+    if !branch_exists_bare(repo_path, base) {
+        return base.to_string();
     }
     for i in 2..100 {
-        let name = format!("kommand0/{base}-{i}");
-        if !branch_exists(repo_path, &name) {
+        let name = format!("{base}-{i}");
+        if !branch_exists_bare(repo_path, &name) {
             return name;
         }
     }
@@ -104,13 +98,14 @@ fn unique_branch_name(repo_path: &str, base: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    format!("kommand0/{base}-{ts}")
+    format!("{base}-{ts}")
 }
 
 /// Create a git worktree for a workspace.
 ///
 /// The worktree is placed at `<base_dir>/worktrees/<workspace_name>`.
-/// A new branch `kommand0/<workspace_name>` is created.
+/// A new branch named after the workspace is created (suffixed `-2`, `-3`, …
+/// when a branch of that name already exists locally or on origin).
 ///
 /// Returns `WorktreeResult::Fallback` if the repo is not a git repo or
 /// if worktree creation fails for any reason.
@@ -343,8 +338,8 @@ fn copy_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Create a worktree that checks out an EXISTING branch instead of forking a new
-/// `kommand0/<name>` one. `branch_ref` may be a local branch (`feat/x`), a
+/// Create a worktree that checks out an EXISTING branch instead of forking a
+/// new one. `branch_ref` may be a local branch (`feat/x`), a
 /// remote-tracking ref (`origin/feat/x`), or a bare name that exists under
 /// `origin/`. For a remote-only ref a local tracking branch is created; for a
 /// local branch it's checked out directly (git refuses if it's already checked
@@ -489,7 +484,7 @@ mod tests {
                 branch_name,
             } => {
                 assert!(Path::new(&worktree_path).exists());
-                assert!(branch_name.starts_with("kommand0/"));
+                assert_eq!(branch_name, "my-feature", "branch is named after the workspace");
 
                 // Remove it
                 remove_worktree(
@@ -539,16 +534,33 @@ mod tests {
         );
         match result2 {
             WorktreeResult::Created { branch_name, .. } => {
-                // Should get a suffixed branch name
-                assert!(
-                    branch_name == "kommand0/feature-2" || branch_name.starts_with("kommand0/feature-"),
-                    "expected suffixed branch, got: {branch_name}"
-                );
+                assert_eq!(branch_name, "feature-2", "second workspace gets a suffixed branch");
             }
             WorktreeResult::Fallback { reason } => {
                 panic!("expected Created, got Fallback: {reason}");
             }
         }
+    }
+
+    #[test]
+    fn unique_branch_name_suffixes_on_origin_only_branch() {
+        // Pins the detection/minting agreement: the checkout offer fires on an
+        // origin-only branch (branch_exists_bare checks origin refs), so the
+        // fork must suffix too — a bare local `feat` would silently shadow a
+        // divergent `origin/feat`.
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+        let op = origin.path().to_str().unwrap();
+        Command::new("git").args(["-C", op, "branch", "feat"]).output().unwrap();
+        let work = TempDir::new().unwrap();
+        let clone = work.path().join("repo");
+        Command::new("git").args(["clone", op, clone.to_str().unwrap()]).output().unwrap();
+        let cp = clone.to_str().unwrap();
+        // The clone has origin/feat but no local feat.
+        assert!(!verify_ref(cp, "refs/heads/feat"));
+
+        assert_eq!(unique_branch_name(cp, "feat"), "feat-2");
+        assert_eq!(unique_branch_name(cp, "other"), "other", "non-colliding name stays bare");
     }
 
     #[test]
@@ -562,7 +574,7 @@ mod tests {
         match create_worktree_from_branch(rp, "ws", base.path(), "feat") {
             WorktreeResult::Created { worktree_path, branch_name } => {
                 assert!(Path::new(&worktree_path).exists());
-                assert_eq!(branch_name, "feat", "existing branch checked out as-is (no kommand0/ prefix)");
+                assert_eq!(branch_name, "feat", "existing branch checked out as-is (no fork)");
                 let head = Command::new("git")
                     .args(["-C", &worktree_path, "rev-parse", "--abbrev-ref", "HEAD"])
                     .output()
@@ -609,8 +621,9 @@ mod tests {
 
     #[test]
     fn branch_exists_bare_ignores_kommand0_prefixed_branch() {
-        // A `kommand0/<name>` branch must NOT make the BARE name match — otherwise
-        // every forked workspace would trigger the checkout offer on re-add.
+        // Legacy-coexistence guard: a pre-existing `kommand0/<name>` branch (from
+        // versions that prefixed forks) must NOT make the BARE name match — the
+        // two names are distinct branches and must not collide in detection.
         let repo = TempDir::new().unwrap();
         init_git_repo(repo.path());
         let rp = repo.path().to_str().unwrap();
