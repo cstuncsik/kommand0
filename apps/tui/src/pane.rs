@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use kommand0_core::PROFILE_ENV;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -81,11 +82,16 @@ impl Pane {
         cmd.env_remove("CLAUDECODE");
         cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
         // Hand a non-default profile down so a nested `kmd`/`kommand0` inside
-        // this session targets the same profile. `None` sets nothing: the
-        // default profile needs no marker, and an env-mode parent already
-        // isolates children via the inherited KOMMAND0_STATE_DIR.
+        // this session targets the same profile. `None` must REMOVE any
+        // inherited value (the CLAUDECODE pattern above): a default-profile
+        // TUI launched inside a profiled session — or under a shell-exported
+        // KOMMAND0_PROFILE — must not leak the ancestor's profile to its
+        // children. An env-mode parent still isolates children via the
+        // inherited KOMMAND0_STATE_DIR either way.
         if let Some(p) = profile {
-            cmd.env("KOMMAND0_PROFILE", p);
+            cmd.env(PROFILE_ENV, p);
+        } else {
+            cmd.env_remove(PROFILE_ENV);
         }
 
         let child = pair.slave.spawn_command(cmd).context("spawn in pty failed")?;

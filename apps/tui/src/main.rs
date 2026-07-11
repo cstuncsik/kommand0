@@ -377,8 +377,11 @@ pub(crate) struct App {
 
     pub(crate) focus: Focus,
 
-    /// The `--profile` name shown in the tree title; `None` for the default
-    /// profile (label hidden).
+    /// The effective non-default profile. Not just cosmetic: shown in the
+    /// tree title AND exported to pane children as `KOMMAND0_PROFILE` (via
+    /// `spawn_pane_cmd`) so a nested `kmd`/`kommand0` targets the same
+    /// profile. `None` for the default profile — label hidden, and the var
+    /// is REMOVED from children.
     pub(crate) profile_label: Option<String>,
 
     // UX state

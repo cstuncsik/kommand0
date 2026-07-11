@@ -113,6 +113,13 @@ where
 /// for a pre-profiles layout, and what the TUI hides in its tree title).
 pub const DEFAULT_PROFILE: &str = "default";
 
+/// The env var a profiled TUI exports to its embedded sessions so a nested
+/// `kmd`/`kommand0` targets the same profile. Read by
+/// [`AppState::init_profile`] (an explicit `--profile` beats it;
+/// `KOMMAND0_STATE_DIR` silently wins). One const for the read and write
+/// sites so they can never drift.
+pub const PROFILE_ENV: &str = "KOMMAND0_PROFILE";
+
 /// The profile for this process, recorded once at startup via
 /// [`AppState::init_profile`] (absent = [`DEFAULT_PROFILE`]). Process-global
 /// on purpose: [`AppState::state_dir`] has no-arg call sites throughout the
@@ -243,7 +250,7 @@ impl AppState {
     pub fn init_profile(flag: Option<&str>) -> Result<String, String> {
         // var_os + lossy (not var().ok()): a non-UTF8 value must reach
         // validation and fail loudly, not silently count as unset.
-        let env_profile = std::env::var_os("KOMMAND0_PROFILE")
+        let env_profile = std::env::var_os(PROFILE_ENV)
             .filter(|v| !v.is_empty())
             .map(|v| v.to_string_lossy().into_owned());
         let resolved =
@@ -356,6 +363,16 @@ impl AppState {
                 // still migrates.
                 if e.kind() == std::io::ErrorKind::NotFound && !from.exists() && to.exists() {
                     continue;
+                }
+                // A failed copy (the symlink path) can leave a PARTIAL
+                // destination the empty-only rollback can't remove — drop it,
+                // or the guard would mask the intact legacy link on every
+                // later run. Deliberately after the race check: a concurrent
+                // winner's file must never be deleted. (Untested: a
+                // deterministic mid-copy failure can't be staged without
+                // device tricks — same accepted class as the rollback lines.)
+                if is_link {
+                    let _ = fs::remove_file(&to);
                 }
                 return rollback(anyhow::anyhow!(
                     "failed to migrate {} into {} ({e}); move it there by hand and retry",
