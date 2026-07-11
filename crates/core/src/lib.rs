@@ -391,14 +391,22 @@ impl AppState {
     /// `git worktree repair` each moved worktree so the repos' gitdir links
     /// follow. Returns `(rewritten, warnings)`: how many worktree/session
     /// paths were rewritten, and any repairs that failed (rerunnable by hand
-    /// — the rename and state rewrite are already complete and correct).
-    /// Legacy-root worktrees/sessions (outside the profile dir) are left
-    /// alone. `KOMMAND0_STATE_DIR` plays no part here: this manipulates the
-    /// profiles tree directly and never resolves the ambient state dir.
+    /// — the rename and state rewrite are already complete and correct). A
+    /// failure after the dir move (corrupt state.json, save error) moves the
+    /// dir back, so an `Err` leaves the original profile intact. Legacy-root
+    /// worktrees/sessions (outside the profile dir) are left alone. Errors
+    /// when `KOMMAND0_STATE_DIR` is set (non-empty): that override targets
+    /// one exact directory — there is no profiles tree to rename in.
     /// Renaming `default` is allowed — the next plain run just starts a
     /// fresh default. Renaming a profile while any kommand0/kmd instance is
     /// running on it is unsupported (nothing locks the directory).
     pub fn rename_profile(old: &str, new: &str) -> anyhow::Result<(usize, Vec<String>)> {
+        if Self::state_dir_override().is_some() {
+            bail!(
+                "profile rename is unavailable when KOMMAND0_STATE_DIR is set; \
+                 it targets one exact directory, not a profiles tree"
+            );
+        }
         Self::rename_profile_at(&Self::base_dir(), old, new)
     }
 
@@ -454,37 +462,58 @@ impl AppState {
             None
         };
 
-        let mut state = Self::load_from(&dst)?;
-        let mut rewritten = 0usize;
-        let mut warnings: Vec<String> = Vec::new();
-        let mut repairs: Vec<(String, String)> = Vec::new(); // (repo path, new worktree path)
-        for ws in &mut state.workspaces {
-            if let Some(wt) = &ws.worktree_path
-                && let Some(new_wt) = rewrite(wt)
-            {
-                match state.repos.iter().find(|r| r.id == ws.repo_id) {
-                    Some(repo) => repairs.push((repo.path.clone(), new_wt.clone())),
-                    None => warnings.push(format!(
-                        "no repo found for workspace '{}'; run `git worktree repair {new_wt}` in it by hand",
-                        ws.name
-                    )),
+        // The load→rewrite→save phase can still fail (corrupt state.json,
+        // save error). Nothing besides the dir move has happened yet, so on
+        // failure move the dir back — an `Err` then leaves the exact original.
+        type Rewritten = (usize, Vec<String>, Vec<(String, String)>);
+        let result = (|| -> anyhow::Result<Rewritten> {
+            let mut state = Self::load_from(&dst)?;
+            let mut rewritten = 0usize;
+            let mut warnings: Vec<String> = Vec::new();
+            let mut repairs: Vec<(String, String)> = Vec::new(); // (repo path, new worktree path)
+            for ws in &mut state.workspaces {
+                if let Some(wt) = &ws.worktree_path
+                    && let Some(new_wt) = rewrite(wt)
+                {
+                    match state.repos.iter().find(|r| r.id == ws.repo_id) {
+                        Some(repo) => repairs.push((repo.path.clone(), new_wt.clone())),
+                        None => warnings.push(format!(
+                            "no repo found for workspace '{}'; run `git worktree repair {new_wt}` in it by hand",
+                            ws.name
+                        )),
+                    }
+                    ws.worktree_path = Some(new_wt);
+                    rewritten += 1;
                 }
-                ws.worktree_path = Some(new_wt);
-                rewritten += 1;
+                // A worktree-backed workspace's working_dir IS its worktree
+                // path — it must follow, or sessions would spawn in the dead
+                // directory.
+                if let Some(new_dir) = rewrite(&ws.working_dir) {
+                    ws.working_dir = new_dir;
+                }
             }
-            // A worktree-backed workspace's working_dir IS its worktree path —
-            // it must follow, or sessions would spawn in the dead directory.
-            if let Some(new_dir) = rewrite(&ws.working_dir) {
-                ws.working_dir = new_dir;
+            for session in &mut state.sessions {
+                if let Some(new_log) = rewrite(&session.log_file) {
+                    session.log_file = new_log;
+                    rewritten += 1;
+                }
             }
-        }
-        for session in &mut state.sessions {
-            if let Some(new_log) = rewrite(&session.log_file) {
-                session.log_file = new_log;
-                rewritten += 1;
+            state.save_to(&dst)?;
+            Ok((rewritten, warnings, repairs))
+        })();
+        let (rewritten, mut warnings, repairs) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                return match fs::rename(&dst, &src) {
+                    Ok(()) => Err(e),
+                    Err(undo) => Err(e.context(format!(
+                        "undoing the rename also failed ({undo}); move {} back to {} by hand",
+                        dst.display(),
+                        src.display()
+                    ))),
+                };
             }
-        }
-        state.save_to(&dst)?;
+        };
 
         // Best-effort git-side fix-up: repair each moved worktree from its
         // repo's root so `.git/worktrees/<n>/gitdir` (and the worktree's
@@ -2008,6 +2037,32 @@ mod tests {
             worktree_path: Some(legacy_wt.clone()),
             branch_name: None,
         });
+        // A sibling profile that shares the name as a PREFIX (`work2`) must
+        // never be rewritten — pins the path-boundary guard in the matcher.
+        let boundary_wt =
+            tmp.path().join("profiles").join("work2").join("worktrees").join("other").to_string_lossy().into_owned();
+        state.workspaces.push(Workspace {
+            id: "boundary".into(),
+            name: "boundary-ws".into(),
+            repo_id: repo.id.clone(),
+            working_dir: boundary_wt.clone(),
+            active: true,
+            created_at: 0,
+            worktree_path: Some(boundary_wt.clone()),
+            branch_name: None,
+        });
+        // A fallback workspace (no worktree; working_dir = the repo root)
+        // passes through untouched and uncounted.
+        state.workspaces.push(Workspace {
+            id: "fallback".into(),
+            name: "fallback-ws".into(),
+            repo_id: repo.id.clone(),
+            working_dir: repo.path.clone(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+            branch_name: None,
+        });
         state.save_to(&profile).unwrap();
 
         let (rewritten, warnings) =
@@ -2029,6 +2084,16 @@ mod tests {
             Some(legacy_wt.as_str()),
             "legacy-root path untouched"
         );
+        let boundary = renamed.workspaces.iter().find(|w| w.name == "boundary-ws").unwrap();
+        assert_eq!(
+            boundary.worktree_path.as_deref(),
+            Some(boundary_wt.as_str()),
+            "prefix-sharing profile work2 untouched (path-boundary guard)"
+        );
+        assert_eq!(boundary.working_dir, boundary_wt, "work2 working_dir untouched");
+        let fallback = renamed.workspaces.iter().find(|w| w.name == "fallback-ws").unwrap();
+        assert_eq!(fallback.worktree_path, None, "fallback stays worktree-less");
+        assert_eq!(fallback.working_dir, repo.path, "fallback working_dir (repo root) untouched");
         let log = &renamed.sessions[0].log_file;
         assert!(log.contains("/profiles/personal/sessions/"), "session log rewritten: {log}");
 
@@ -2069,5 +2134,75 @@ mod tests {
         // None of the failed attempts moved anything.
         assert!(tmp.path().join("profiles").join("a").is_dir());
         assert!(tmp.path().join("profiles").join("b").is_dir());
+    }
+
+    #[test]
+    fn rename_profile_corrupt_state_rolls_back() {
+        // A failure after the dir move (here: unparseable state.json) must
+        // move the dir back — an Err leaves the original profile intact.
+        let tmp = TempDir::new().unwrap();
+        let work = tmp.path().join("profiles").join("work");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("state.json"), "{ not json").unwrap();
+
+        let err = AppState::rename_profile_at(tmp.path(), "work", "personal").unwrap_err();
+        assert!(err.to_string().contains("failed to parse"), "load error surfaces: {err}");
+        assert!(work.is_dir(), "dir moved back to profiles/work");
+        assert!(!tmp.path().join("profiles").join("personal").exists(), "dst gone");
+        assert!(work.join("state.json").exists(), "garbage file back where it started");
+    }
+
+    #[test]
+    fn rename_profile_reports_repair_warnings_but_completes() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join("profiles").join("work");
+        let wt = |name: &str| {
+            profile.join("worktrees").join(name).to_string_lossy().into_owned()
+        };
+        let mut state = AppState::default();
+        // A repo whose path doesn't exist: `git -C` fails → repair warning.
+        state.repos.push(RepoEntry {
+            id: "gone".into(),
+            name: "gone".into(),
+            path: tmp.path().join("no-such-repo").to_string_lossy().into_owned(),
+        });
+        state.workspaces.push(Workspace {
+            id: "w1".into(),
+            name: "broken-repo-ws".into(),
+            repo_id: "gone".into(),
+            working_dir: wt("a"),
+            active: true,
+            created_at: 0,
+            worktree_path: Some(wt("a")),
+            branch_name: None,
+        });
+        // A workspace with an orphan repo_id: the no-repo warning.
+        state.workspaces.push(Workspace {
+            id: "w2".into(),
+            name: "orphan-ws".into(),
+            repo_id: "orphan".into(),
+            working_dir: wt("b"),
+            active: true,
+            created_at: 0,
+            worktree_path: Some(wt("b")),
+            branch_name: None,
+        });
+        state.save_to(&profile).unwrap();
+
+        let (rewritten, warnings) =
+            AppState::rename_profile_at(tmp.path(), "work", "personal").unwrap();
+        assert_eq!(rewritten, 2, "both worktree paths rewritten despite warnings");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("no repo found")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("couldn't repair")), "{warnings:?}");
+        let renamed =
+            AppState::load_from(&tmp.path().join("profiles").join("personal")).unwrap();
+        assert!(
+            renamed.workspaces.iter().all(|w| {
+                w.worktree_path.as_deref().unwrap().contains("/profiles/personal/")
+            }),
+            "rename + rewrite completed: {:?}",
+            renamed.workspaces
+        );
     }
 }

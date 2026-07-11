@@ -604,3 +604,84 @@ fn profile_rename_moves_state_and_rejects_occupied_target() {
         String::from_utf8_lossy(&dup.stderr)
     );
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_rename_rewrites_worktree_and_session_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("a.txt"), "1").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "init"]);
+
+    let add =
+        kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "add", repo.to_str().unwrap()]);
+    assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+    let create = kmd_at(
+        tmp.path(),
+        &[],
+        &["--profile", "work", "workspace", "create", "feat", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(create.status.success(), "create: {}", String::from_utf8_lossy(&create.stderr));
+
+    // Seed a session row whose log path is the relative form
+    // create_session_with_base stores when the base (the debug state dir) is
+    // relative — pinning the base-verbatim rewrite arm alongside the
+    // cwd-absolutized worktree arm.
+    let state_path =
+        tmp.path().join(".kommand0-dev").join("profiles").join("work").join("state.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let ws_id = v["workspaces"][0]["id"].as_str().unwrap().to_string();
+    v["sessions"] = serde_json::json!([{
+        "id": "s1", "workspace_id": ws_id, "claude_session_id": null, "pid": null,
+        "status": "Stopped", "created_at": 0, "ended_at": null,
+        "log_file": ".kommand0-dev/profiles/work/sessions/s1.log"
+    }]);
+    std::fs::write(&state_path, v.to_string()).unwrap();
+
+    let out = kmd_at(tmp.path(), &[], &["profile", "rename", "work", "personal"]);
+    assert!(out.status.success(), "rename: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stdout(&out).contains("2 worktree/session path(s) rewritten"),
+        "count wired through to the summary: {}",
+        stdout(&out)
+    );
+
+    // The repo's gitdir link follows (repair ran)…
+    let list =
+        Command::new("git").args(["worktree", "list"]).current_dir(&repo).output().unwrap();
+    let list = String::from_utf8_lossy(&list.stdout).to_string();
+    assert!(list.contains("profiles/personal/worktrees/feat"), "gitdir repaired: {list}");
+
+    // …and the profile's state carries both rewritten paths.
+    let new_state = std::fs::read_to_string(
+        tmp.path().join(".kommand0-dev").join("profiles").join("personal").join("state.json"),
+    )
+    .unwrap();
+    assert!(
+        new_state.contains("profiles/personal/worktrees/feat"),
+        "worktree path rewritten: {new_state}"
+    );
+    assert!(
+        new_state.contains(".kommand0-dev/profiles/personal/sessions/s1.log"),
+        "relative session log rewritten: {new_state}"
+    );
+    assert!(!new_state.contains("profiles/work/"), "no old-path residue: {new_state}");
+}
+
+#[test]
+fn profile_rename_unavailable_with_state_dir_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = kmd(tmp.path(), &[], &["profile", "rename", "a", "b"]);
+    assert!(!out.status.success(), "env-mode rename must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unavailable when KOMMAND0_STATE_DIR"),
+        "clear error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
