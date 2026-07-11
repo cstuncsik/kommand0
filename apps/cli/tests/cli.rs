@@ -566,3 +566,41 @@ fn migration_respects_a_config_env_override_end_to_end() {
     );
     assert!(!base2.join("config.json").exists());
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_rename_moves_state_and_rejects_occupied_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("proj-ren");
+    std::fs::create_dir_all(&repo).unwrap();
+    let add =
+        kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "add", repo.to_str().unwrap()]);
+    assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+
+    let out = kmd_at(tmp.path(), &[], &["profile", "rename", "work", "personal"]);
+    assert!(out.status.success(), "rename: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("Renamed profile"), "summary printed: {}", stdout(&out));
+
+    let personal = stdout(&kmd_at(tmp.path(), &[], &["--profile", "personal", "repo", "list"]));
+    assert!(personal.contains("proj-ren"), "state followed the rename: {personal}");
+    assert!(
+        !tmp.path().join(".kommand0-dev").join("profiles").join("work").exists(),
+        "old dir gone"
+    );
+    let work = stdout(&kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "list"]));
+    assert!(!work.contains("proj-ren"), "old profile name is fresh: {work}");
+
+    // Renaming onto an existing profile is refused.
+    let other = tmp.path().join("proj-other");
+    std::fs::create_dir_all(&other).unwrap();
+    let add =
+        kmd_at(tmp.path(), &[], &["--profile", "other", "repo", "add", other.to_str().unwrap()]);
+    assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+    let dup = kmd_at(tmp.path(), &[], &["profile", "rename", "personal", "other"]);
+    assert!(!dup.status.success(), "occupied target must fail");
+    assert!(
+        String::from_utf8_lossy(&dup.stderr).contains("already exists"),
+        "clear error: {}",
+        String::from_utf8_lossy(&dup.stderr)
+    );
+}
