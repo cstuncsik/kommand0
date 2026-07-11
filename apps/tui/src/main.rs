@@ -377,6 +377,10 @@ pub(crate) struct App {
 
     pub(crate) focus: Focus,
 
+    /// The `--profile` name shown in the tree title; `None` for the default
+    /// profile (label hidden).
+    pub(crate) profile_label: Option<String>,
+
     // UX state
     pub(crate) show_help: bool,
     pub(crate) help_scroll: u16,
@@ -536,6 +540,7 @@ impl App {
             tree_items: Vec::new(),
             selected_index: 0,
             focus: Focus::Tree,
+            profile_label: None,
             show_help: false,
             help_scroll: 0,
             show_diff: false,
@@ -3113,13 +3118,37 @@ fn cli_short_circuit(args: &[String]) -> Option<String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return Some(format!(
             "kommand0 {} — keyboard-first orchestrator for parallel Claude Code sessions\n\n\
-             Usage: kommand0              launch the TUI\n\
-             \x20      kommand0 --version  print version\n\n\
+             Usage: kommand0                    launch the TUI\n\
+             \x20      kommand0 --profile <name>   run an isolated profile (own state, config, log, worktrees)\n\
+             \x20      kommand0 --version          print version\n\n\
              Manage repos/workspaces from the CLI with `kmd` (see the README).",
             env!("CARGO_PKG_VERSION")
         ));
     }
     None
+}
+
+/// First `--profile <name>` / `--profile=<name>` anywhere in the args (later
+/// duplicates are ignored — first wins; `kmd`/clap errors on duplicates
+/// instead, a deliberate divergence). The space form takes the next arg
+/// verbatim. `Err(message)` on a missing or empty value.
+fn parse_profile_arg(args: &[String]) -> Result<Option<String>, String> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--profile" {
+            return match it.next() {
+                Some(v) => Ok(Some(v.clone())),
+                None => Err("--profile requires a value".to_string()),
+            };
+        }
+        if let Some(v) = arg.strip_prefix("--profile=") {
+            if v.is_empty() {
+                return Err("--profile requires a value".to_string());
+            }
+            return Ok(Some(v.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// Keyboard-enhancement flags requested when the terminal supports the Kitty
@@ -3137,11 +3166,34 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Answer `--version`/`--help` before entering the alt-screen, where stdout
-    // would be swallowed.
+    // would be swallowed. (Kept first so `kommand0 --profile --help` prints
+    // help and exits rather than treating `--help` as a profile name.)
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(msg) = cli_short_circuit(&args) {
         println!("{msg}");
         return Ok(());
+    }
+    // Profile errors (bad value, KOMMAND0_STATE_DIR conflict) exit here, while
+    // stderr still reaches the terminal — the alt-screen starts below.
+    let profile = match parse_profile_arg(&args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kommand0: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(p) = &profile
+        && let Err(e) = AppState::set_profile(p)
+    {
+        eprintln!("kommand0: {e}");
+        std::process::exit(1);
+    }
+    // Must run BEFORE init_logging(): that create_dir_all's the state dir,
+    // which would create profiles/… first and trip the migration guard —
+    // reordering this after init_logging silently orphans pre-profiles state.
+    if let Err(e) = AppState::migrate_legacy_profiles() {
+        eprintln!("kommand0: {e}");
+        std::process::exit(1);
     }
     init_logging();
     tracing::info!("kommand0 started");
@@ -3177,7 +3229,7 @@ async fn main() -> anyhow::Result<()> {
             crossterm::event::PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
-    let result = run(&mut terminal).await;
+    let result = run(&mut terminal, profile).await;
     if supports_enhanced_keys {
         let _ = crossterm::execute!(
             std::io::stdout(),
@@ -3190,11 +3242,14 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
+async fn run(terminal: &mut DefaultTerminal, profile: Option<String>) -> anyhow::Result<()> {
     // A corrupt state.json degrades to default (backed up) + a warning, rather
     // than aborting startup.
     let (state, state_warning) = AppState::load_checked()?;
     let mut app = App::new(state);
+    // Surface the profile in the tree title — hidden for the default profile,
+    // so `--profile default` looks exactly like no flag.
+    app.profile_label = profile.filter(|p| p != "default");
     // Load user config now (App::new keeps a hermetic default for tests). A
     // present-but-invalid file (or a bad keybinding) surfaces a warning in the
     // tree border, with full detail in the log.
@@ -4796,10 +4851,41 @@ mod key_tests {
         );
         assert!(cli_short_circuit(&["-V".to_string()]).is_some());
         assert!(cli_short_circuit(&["--help".to_string()]).unwrap().contains("Usage"));
+        assert!(
+            cli_short_circuit(&["--help".to_string()]).unwrap().contains("--profile"),
+            "help documents --profile"
+        );
         assert!(cli_short_circuit(&[]).is_none(), "no args launches the TUI");
         assert!(
             cli_short_circuit(&["anything-else".to_string()]).is_none(),
             "unknown args just launch the TUI"
+        );
+    }
+
+    #[test]
+    fn parse_profile_arg_table() {
+        let args = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_profile_arg(&args(&[])), Ok(None), "absent");
+        assert_eq!(parse_profile_arg(&args(&["--profile", "work"])), Ok(Some("work".into())));
+        assert_eq!(parse_profile_arg(&args(&["--profile=work"])), Ok(Some("work".into())));
+        assert!(parse_profile_arg(&args(&["--profile"])).is_err(), "missing value");
+        assert!(parse_profile_arg(&args(&["--profile="])).is_err(), "empty equals value");
+        // Any position: the whole vector is scanned.
+        assert_eq!(
+            parse_profile_arg(&args(&["--other", "x", "--profile", "late"])),
+            Ok(Some("late".into()))
+        );
+        // The space form takes the next arg verbatim — unreachable for --help
+        // in main(), where cli_short_circuit runs first and wins.
+        assert_eq!(
+            parse_profile_arg(&args(&["--profile", "--help"])),
+            Ok(Some("--help".into()))
+        );
+        // Duplicate flag: first wins (kmd/clap errors instead — deliberate
+        // divergence).
+        assert_eq!(
+            parse_profile_arg(&args(&["--profile", "a", "--profile", "b"])),
+            Ok(Some("a".into()))
         );
     }
 
@@ -5189,6 +5275,14 @@ mod key_tests {
             "tree should list repo alpha:\n{text}"
         );
         assert!(text.contains("beta"), "tree should list repo beta:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn tree_title_shows_a_non_default_profile() {
+        let mut app = test_app();
+        app.profile_label = Some("work".into());
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Repos · work"), "tree title carries the profile:\n{text}");
     }
 
     // Golden full-screen snapshots of key layouts (geometry/position/borders that

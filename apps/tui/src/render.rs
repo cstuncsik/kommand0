@@ -235,10 +235,13 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 
 fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let th = app.theme;
-    // Tree title doubles as the `/` filter box when filtering.
+    // Tree title doubles as the `/` filter box when filtering (which then
+    // transiently replaces a profile label).
     let title = if app.filter_input || !app.filter_query.is_empty() {
         let cursor = if app.filter_input { "\u{2588}" } else { "" };
         format!(" Repos · /{}{} ", app.filter_query, cursor)
+    } else if let Some(p) = &app.profile_label {
+        format!(" Repos · {p} ")
     } else {
         " Repos ".to_string()
     };
