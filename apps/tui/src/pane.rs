@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use kommand0_core::PROFILE_ENV;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -48,12 +49,13 @@ impl Pane {
     /// Spawn `program` (with `args`) in a fresh PTY of `rows`×`cols`, running in
     /// `cwd`, and start pumping its output into a vt100 emulator.
     pub fn spawn(program: &str, args: &[&str], cwd: &Path, rows: u16, cols: u16) -> Result<Pane> {
-        Self::spawn_with_wake(program, args, cwd, rows, cols, None)
+        Self::spawn_with_wake(program, args, cwd, rows, cols, None, None)
     }
 
     /// Like [`Pane::spawn`], but `wake` is invoked (off the UI thread) after each
     /// chunk of child output, so an event loop can schedule a coalesced repaint
-    /// instead of polling — keystroke echo stays responsive.
+    /// instead of polling — keystroke echo stays responsive. A `profile` is
+    /// exported to the child as `KOMMAND0_PROFILE` (see the spawn body).
     pub fn spawn_with_wake(
         program: &str,
         args: &[&str],
@@ -61,6 +63,7 @@ impl Pane {
         rows: u16,
         cols: u16,
         wake: Option<Box<dyn Fn() + Send>>,
+        profile: Option<&str>,
     ) -> Result<Pane> {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -78,6 +81,18 @@ impl Pane {
         // launched from kommand0-run-under-claude must start a real session).
         cmd.env_remove("CLAUDECODE");
         cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+        // Hand a non-default profile down so a nested `kmd`/`kommand0` inside
+        // this session targets the same profile. `None` must REMOVE any
+        // inherited value (the CLAUDECODE pattern above): a default-profile
+        // TUI launched inside a profiled session — or under a shell-exported
+        // KOMMAND0_PROFILE — must not leak the ancestor's profile to its
+        // children. An env-mode parent still isolates children via the
+        // inherited KOMMAND0_STATE_DIR either way.
+        if let Some(p) = profile {
+            cmd.env(PROFILE_ENV, p);
+        } else {
+            cmd.env_remove(PROFILE_ENV);
+        }
 
         let child = pair.slave.spawn_command(cmd).context("spawn in pty failed")?;
         drop(pair.slave); // close our handle to the slave so EOF propagates on exit

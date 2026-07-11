@@ -34,8 +34,10 @@ struct Tui {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     master: Box<dyn portable_pty::MasterPty + Send>, // kept for resize()
-    // Kept alive for the duration of the test: state dir + fake-claude cwd
-    _state_dir: tempfile::TempDir,
+    /// The isolated state dir, doubling as the child's cwd (in the
+    /// legacy-layout variant it's the cwd root CONTAINING `.kommand0-dev`,
+    /// not the state dir itself). Kept alive for the duration of the test.
+    state_dir: tempfile::TempDir,
 }
 
 impl Tui {
@@ -47,9 +49,34 @@ impl Tui {
 
     /// Like [`Tui::launch`] but sets additional environment variables.
     fn launch_with(state_json: Option<String>, extra_env: &[(&str, &str)]) -> Self {
+        Self::launch_impl(state_json, extra_env, &[], false)
+    }
+
+    /// Like [`Tui::launch`] but WITHOUT `KOMMAND0_STATE_DIR` (the (debug)
+    /// binary resolves its base dir to `<cwd>/.kommand0-dev`, and the optional
+    /// state seeds a legacy pre-profiles layout at that root) and with CLI
+    /// `args` — for the migration/profile tests.
+    #[cfg(debug_assertions)]
+    fn launch_legacy_layout(state_json: Option<String>, args: &[&str]) -> Self {
+        Self::launch_impl(state_json, &[], args, true)
+    }
+
+    fn launch_impl(
+        state_json: Option<String>,
+        extra_env: &[(&str, &str)],
+        args: &[&str],
+        legacy_layout: bool,
+    ) -> Self {
         let state_dir = tempfile::tempdir().unwrap();
+        let seed_root = if legacy_layout {
+            let base = state_dir.path().join(".kommand0-dev");
+            std::fs::create_dir_all(&base).unwrap();
+            base
+        } else {
+            state_dir.path().to_path_buf()
+        };
         if let Some(json) = state_json {
-            std::fs::write(state_dir.path().join("state.json"), json).unwrap();
+            std::fs::write(seed_root.join("state.json"), json).unwrap();
         }
 
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -72,12 +99,22 @@ impl Tui {
             .unwrap();
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_kommand0"));
+        for a in args {
+            cmd.arg(a);
+        }
         // Don't let a developer's exported env leak into tests; each test sets
         // exactly what it needs via extra_env below.
         cmd.env_remove("KOMMAND0_CONFIG");
         cmd.env_remove("KOMMAND0_CLAUDE_BIN");
         cmd.env_remove("KOMMAND0_GH_BIN");
-        cmd.env("KOMMAND0_STATE_DIR", state_dir.path());
+        cmd.env_remove("KOMMAND0_PROFILE");
+        if legacy_layout {
+            // No exact-dir override: state resolves relative to the cwd set
+            // below (debug base `.kommand0-dev`), where the layout is seeded.
+            cmd.env_remove("KOMMAND0_STATE_DIR");
+        } else {
+            cmd.env("KOMMAND0_STATE_DIR", state_dir.path());
+        }
         cmd.env("PATH", path_env);
         cmd.env("TERM", "xterm-256color");
         for (k, v) in extra_env {
@@ -115,7 +152,7 @@ impl Tui {
             child,
             killer,
             master,
-            _state_dir: state_dir,
+            state_dir,
         }
     }
 
@@ -160,14 +197,14 @@ impl Tui {
 
     /// Read the persisted state.json (after the app has written it).
     fn read_state(&self) -> serde_json::Value {
-        let raw = std::fs::read_to_string(self._state_dir.path().join("state.json"))
+        let raw = std::fs::read_to_string(self.state_dir.path().join("state.json"))
             .unwrap_or_else(|_| "{}".to_string());
         serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null)
     }
 
     /// Contents of the app's log file (empty if not written).
     fn log_contents(&self) -> String {
-        std::fs::read_to_string(self._state_dir.path().join("kommand0.log")).unwrap_or_default()
+        std::fs::read_to_string(self.state_dir.path().join("kommand0.log")).unwrap_or_default()
     }
 
     fn send(&mut self, bytes: &str) {
@@ -1166,6 +1203,81 @@ fn reopen_resumes_stored_session() {
     tui.wait_for("11111111"); // the stored session id
 
     tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn profile_flag_with_state_dir_env_fails_before_the_alt_screen() {
+    // The env conflict exits before ratatui::init, so a plain (non-PTY) spawn
+    // captures the message on stderr and the terminal is never touched.
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_kommand0"))
+        .args(["--profile", "x"])
+        .env("KOMMAND0_STATE_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "env + --profile must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot be combined"), "conflict message on stderr: {err}");
+    assert!(out.stdout.is_empty(), "terminal never entered the alt-screen");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn legacy_state_migrates_before_logging_and_renders_the_tree() {
+    // Pins the load-bearing main() ordering: migrate_legacy_profiles() must run
+    // BEFORE init_logging() — init_logging create_dir_all's the state dir, which
+    // would create profiles/… first, trip the migration guard, and silently
+    // orphan the legacy state. If that ordering ever regresses, the tree renders
+    // empty instead of the seeded repo and this times out. Debug-gated: a
+    // release binary ignores the cwd and would migrate the REAL data dir.
+    let repo_dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(repo_dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_legacy_layout(Some(state), &[]);
+
+    tui.wait_for("demo"); // the migrated (not orphaned) state feeds the tree
+    let base = tui.state_dir.path().join(".kommand0-dev");
+    assert!(
+        base.join("profiles").join("default").join("state.json").exists(),
+        "legacy state.json moved under profiles/default/"
+    );
+    assert!(!base.join("state.json").exists(), "legacy root left clean");
+
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_flag_shows_the_label_and_state_lands_in_the_profile_dir() {
+    // Pins the init_profile → tree-title wiring end to end: launched with
+    // --profile work (no KOMMAND0_STATE_DIR), the title reads `Repos · work`
+    // and a save writes state under profiles/work/. Debug-gated like the
+    // other cwd-relative-base tests.
+    let mut tui = Tui::launch_legacy_layout(None, &["--profile", "work"]);
+    tui.wait_for("Repos · work");
+
+    // Add a repo so the profile's state file actually gets written.
+    let repo = tui.state_dir.path().join("proj-tui");
+    std::fs::create_dir_all(&repo).unwrap();
+    tui.send("a");
+    tui.wait_for("Add Repository");
+    tui.send(repo.to_str().unwrap());
+    tui.send("\r");
+    tui.wait_for("proj-tui");
+
+    assert!(
+        tui.state_dir
+            .path()
+            .join(".kommand0-dev")
+            .join("profiles")
+            .join("work")
+            .join("state.json")
+            .exists(),
+        "state landed under profiles/work/"
+    );
+
     tui.send("q");
     tui.wait_exit();
 }

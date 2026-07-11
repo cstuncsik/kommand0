@@ -10,6 +10,9 @@ use kommand0_core::{
 #[derive(Parser)]
 #[command(name = "kmd", version, about = "Keyboard-first local orchestrator for parallel coding sessions")]
 struct Cli {
+    /// Run against an isolated profile (own state, config, log, sessions, worktrees)
+    #[arg(long, global = true, value_name = "NAME")]
+    profile: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -193,6 +196,12 @@ fn main() -> anyhow::Result<()> {
         .try_init();
 
     let cli = Cli::parse();
+
+    // Resolve + record the profile (--profile, else an inherited
+    // KOMMAND0_PROFILE; an invalid name / env conflict aborts) before any
+    // state, config, or log access resolves a directory.
+    AppState::init_profile(cli.profile.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+    AppState::migrate_legacy_profiles()?;
 
     match cli.command {
         Commands::Repo { action } => match action {

@@ -189,9 +189,11 @@ This runs three layers:
 
 The state directory is resolved in this order:
 
-1. `KOMMAND0_STATE_DIR` environment variable, if set
-2. Debug builds: `.kommand0-dev/` relative to the current directory
-3. Release builds: the platform data directory (`~/Library/Application Support/kommand0` on macOS, `~/.local/share/kommand0` on Linux)
+1. `KOMMAND0_STATE_DIR` environment variable, if set — an exact directory, no profile layer (and it can't be combined with `--profile`)
+2. Debug builds: `.kommand0-dev/profiles/<profile>` relative to the current directory
+3. Release builds: `profiles/<profile>` under the platform data directory (`~/Library/Application Support/kommand0` on macOS, `~/.local/share/kommand0` on Linux)
+
+`<profile>` is the `--profile <name>` value — both binaries take the flag (`kommand0 --profile work`, `kmd --profile work repo list`) — and defaults to `default`. Each profile is a fully isolated instance with its own `state.json`, `config.json`, `kommand0.log`, `sessions/`, and `worktrees/`; the TUI shows a non-default profile in the tree title. For a non-default profile the TUI also exports `KOMMAND0_PROFILE` into its embedded sessions, so a nested `kmd` (or `kommand0`) targets the same profile; an explicit `--profile` beats the variable, and `KOMMAND0_STATE_DIR` still wins silently over it. On first run, a pre-profiles layout (`state.json`/`config.json` at the data-dir root) migrates into `profiles/default/` automatically; existing worktrees and session logs stay where they are and keep working.
 
 `state.json` (repos, workspaces, sessions) lives at the root of that directory; session logs are written as JSON lines files in its `sessions/` subdirectory. The app's own diagnostics (warnings/errors that can't go to the terminal while the TUI is running) are appended to `kommand0.log` there. It's append-only and not rotated — safe to delete anytime.
 

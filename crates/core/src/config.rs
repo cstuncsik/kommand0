@@ -51,7 +51,8 @@ pub struct Config {
 }
 
 impl Config {
-    const FILE: &str = "config.json";
+    /// The config filename — also what the legacy-profiles migration moves.
+    pub(crate) const FILE: &str = "config.json";
 
     /// Read a config file, returning a warning if a present file fails to parse
     /// (a missing/unreadable file is a silent default). Any parse error discards
@@ -85,13 +86,20 @@ impl Config {
         Self::read(&Self::effective_path())
     }
 
+    /// `KOMMAND0_CONFIG` when set and non-empty — the global config-path
+    /// override (a set-but-empty value counts as unset, matching the other
+    /// `KOMMAND0_*` overrides). Shared by [`Self::effective_path`] and the
+    /// legacy-profiles migration so the two can never disagree.
+    pub(crate) fn path_override() -> Option<PathBuf> {
+        std::env::var_os("KOMMAND0_CONFIG")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+    }
+
     /// The path [`Self::load_checked`] reads (and the settings page writes):
     /// `KOMMAND0_CONFIG` if set and non-empty, else `config.json` in the state dir.
     pub fn effective_path() -> PathBuf {
-        match std::env::var_os("KOMMAND0_CONFIG").filter(|p| !p.is_empty()) {
-            Some(path) => PathBuf::from(path),
-            None => AppState::state_dir().join(Self::FILE),
-        }
+        Self::path_override().unwrap_or_else(|| AppState::state_dir().join(Self::FILE))
     }
 
     /// Set (`Some`) or remove (`None`) one top-level key in the config file at
