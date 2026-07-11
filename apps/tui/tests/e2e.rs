@@ -103,6 +103,7 @@ impl Tui {
         cmd.env_remove("KOMMAND0_CONFIG");
         cmd.env_remove("KOMMAND0_CLAUDE_BIN");
         cmd.env_remove("KOMMAND0_GH_BIN");
+        cmd.env_remove("KOMMAND0_PROFILE");
         if legacy_layout {
             // No exact-dir override: state resolves relative to the cwd set
             // below (debug base `.kommand0-dev`), where the layout is seeded.

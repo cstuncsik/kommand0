@@ -997,7 +997,15 @@ impl App {
         let inner = pane_content_rect(self.right_pane_area);
         let rows = if inner.height > 0 { inner.height } else { 24 };
         let cols = if inner.width > 0 { inner.width } else { 80 };
-        pane::Pane::spawn_with_wake(bin, args, std::path::Path::new(ws_dir), rows, cols, wake)
+        pane::Pane::spawn_with_wake(
+            bin,
+            args,
+            std::path::Path::new(ws_dir),
+            rows,
+            cols,
+            wake,
+            self.profile_label.as_deref(),
+        )
     }
 
     /// Spawn a shell pane (`$SHELL`, or the configured `shell`) in `ws_dir`.
@@ -3182,12 +3190,15 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
-    if let Some(p) = &profile
-        && let Err(e) = AppState::set_profile(p)
-    {
-        eprintln!("kommand0: {e}");
-        std::process::exit(1);
-    }
+    // --profile, else an inherited KOMMAND0_PROFILE (a profiled parent TUI
+    // exports it to embedded sessions) — the effective name drives the label.
+    let profile = match AppState::init_profile(profile.as_deref()) {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("kommand0: {e}");
+            std::process::exit(1);
+        }
+    };
     // Must run BEFORE init_logging(): that create_dir_all's the state dir,
     // which would create profiles/… first and trip the migration guard —
     // reordering this after init_logging silently orphans pre-profiles state.
@@ -3242,14 +3253,14 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run(terminal: &mut DefaultTerminal, profile: Option<String>) -> anyhow::Result<()> {
+async fn run(terminal: &mut DefaultTerminal, profile: String) -> anyhow::Result<()> {
     // A corrupt state.json degrades to default (backed up) + a warning, rather
     // than aborting startup.
     let (state, state_warning) = AppState::load_checked()?;
     let mut app = App::new(state);
-    // Surface the profile in the tree title — hidden for the default profile,
-    // so `--profile default` looks exactly like no flag.
-    app.profile_label = profile.filter(|p| p != DEFAULT_PROFILE);
+    // Surface the (effective) profile in the tree title — hidden for the
+    // default profile, so `--profile default` looks exactly like no flag.
+    app.profile_label = (profile != DEFAULT_PROFILE).then_some(profile);
     // Load user config now (App::new keeps a hermetic default for tests). A
     // present-but-invalid file (or a bad keybinding) surfaces a warning in the
     // tree border, with full detail in the log.

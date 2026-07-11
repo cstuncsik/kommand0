@@ -18,27 +18,32 @@ fn run_git(cwd: &Path, args: &[&str]) {
 /// Run `kmd <args>` with `KOMMAND0_STATE_DIR` (and optional extra env) set.
 fn kmd(state_dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kmd"));
-    cmd.args(args).env("KOMMAND0_STATE_DIR", state_dir);
+    cmd.args(args)
+        .env("KOMMAND0_STATE_DIR", state_dir)
+        // Belt + braces: the exact-dir override already ignores it, but tests
+        // must not depend on the developer's shell exporting a profile.
+        .env_remove("KOMMAND0_PROFILE");
     for (k, v) in env {
         cmd.env(k, v);
     }
     cmd.output().unwrap()
 }
 
-/// Run `kmd <args>` from `cwd` with NO inherited kommand0 env — both
-/// `KOMMAND0_STATE_DIR` and `KOMMAND0_CONFIG` removed (`env` adds back what a
-/// test needs). A debug binary then resolves its base dir to
-/// `<cwd>/.kommand0-dev`, so a per-test tempdir cwd isolates it (parallel-safe:
-/// cwd is per-child). Tests using this are `#[cfg(debug_assertions)]`-gated —
-/// under `cargo test --release` the binary would resolve the developer's REAL
-/// data dir instead.
+/// Run `kmd <args>` from `cwd` with NO inherited kommand0 env —
+/// `KOMMAND0_STATE_DIR`, `KOMMAND0_CONFIG`, and `KOMMAND0_PROFILE` removed
+/// (`env` adds back what a test needs). A debug binary then resolves its base
+/// dir to `<cwd>/.kommand0-dev`, so a per-test tempdir cwd isolates it
+/// (parallel-safe: cwd is per-child). Tests using this are
+/// `#[cfg(debug_assertions)]`-gated — under `cargo test --release` the binary
+/// would resolve the developer's REAL data dir instead.
 #[cfg(debug_assertions)]
 fn kmd_at(cwd: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kmd"));
     cmd.args(args)
         .current_dir(cwd)
         .env_remove("KOMMAND0_STATE_DIR")
-        .env_remove("KOMMAND0_CONFIG");
+        .env_remove("KOMMAND0_CONFIG")
+        .env_remove("KOMMAND0_PROFILE");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -474,4 +479,47 @@ fn migration_is_skipped_when_state_dir_env_is_set() {
     assert!(out.status.success(), "list: {}", String::from_utf8_lossy(&out.stderr));
     assert!(base.join("state.json").exists(), "legacy file untouched");
     assert!(!base.join("profiles").exists(), "no profiles/ dir created under the legacy base");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_env_var_selects_the_profile_and_the_flag_beats_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("proj-env");
+    std::fs::create_dir_all(&repo).unwrap();
+    let dev = tmp.path().join(".kommand0-dev");
+
+    // KOMMAND0_PROFILE alone (as a profiled TUI exports it to its embedded
+    // sessions) targets that profile.
+    let add = kmd_at(
+        tmp.path(),
+        &[("KOMMAND0_PROFILE", "work")],
+        &["repo", "add", repo.to_str().unwrap()],
+    );
+    assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+    assert!(
+        dev.join("profiles").join("work").join("state.json").exists(),
+        "state landed under profiles/work/"
+    );
+    let plain = kmd_at(tmp.path(), &[], &["repo", "list"]);
+    assert!(plain.status.success());
+    assert!(
+        !stdout(&plain).contains("proj-env"),
+        "isolated from the default profile: {}",
+        stdout(&plain)
+    );
+
+    // An explicit --profile beats the inherited variable.
+    let other = kmd_at(
+        tmp.path(),
+        &[("KOMMAND0_PROFILE", "work")],
+        &["--profile", "other", "repo", "add", repo.to_str().unwrap()],
+    );
+    assert!(other.status.success(), "add w/ flag: {}", String::from_utf8_lossy(&other.stderr));
+    assert!(
+        dev.join("profiles").join("other").join("state.json").exists(),
+        "flag wins: state landed under profiles/other/"
+    );
+    let work = stdout(&kmd_at(tmp.path(), &[("KOMMAND0_PROFILE", "work")], &["repo", "list"]));
+    assert!(work.contains("proj-env"), "work profile keeps its own repo: {work}");
 }

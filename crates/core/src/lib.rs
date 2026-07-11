@@ -113,9 +113,9 @@ where
 /// for a pre-profiles layout, and what the TUI hides in its tree title).
 pub const DEFAULT_PROFILE: &str = "default";
 
-/// The `--profile` value for this process, recorded once at startup via
-/// [`AppState::set_profile`] (absent = [`DEFAULT_PROFILE`]). Process-global on
-/// purpose: [`AppState::state_dir`] has no-arg call sites throughout the
+/// The profile for this process, recorded once at startup via
+/// [`AppState::init_profile`] (absent = [`DEFAULT_PROFILE`]). Process-global
+/// on purpose: [`AppState::state_dir`] has no-arg call sites throughout the
 /// crates, and "which dir" is already ambient state (the env override is read
 /// the same way).
 static PROFILE: OnceLock<String> = OnceLock::new();
@@ -137,7 +137,7 @@ impl AppState {
 
     /// `KOMMAND0_STATE_DIR` when set and non-empty — the exact-dir escape
     /// hatch (no `profiles/` suffix). A set-but-empty value counts as unset;
-    /// every consumer ([`Self::state_dir`], [`Self::set_profile`],
+    /// every consumer ([`Self::state_dir`], [`Self::init_profile`],
     /// [`Self::migrate_legacy_profiles`]) shares this predicate so they can
     /// never disagree on that edge.
     fn state_dir_override() -> Option<PathBuf> {
@@ -164,8 +164,8 @@ impl AppState {
     ///
     /// Priority: `KOMMAND0_STATE_DIR` env var (an exact directory — no
     /// profile suffix), then `<base>/profiles/<profile>`, where `<base>` is
-    /// [`Self::base_dir`] and `<profile>` is the `--profile` value recorded
-    /// via [`Self::set_profile`] (`default` when the flag was omitted).
+    /// [`Self::base_dir`] and `<profile>` is the profile recorded via
+    /// [`Self::init_profile`] (`default` when nothing selected one).
     pub fn state_dir() -> PathBuf {
         if let Some(dir) = Self::state_dir_override() {
             return dir; // exact dir, unchanged — the env escape hatch
@@ -194,25 +194,66 @@ impl AppState {
         Ok(())
     }
 
-    /// Validate and record the `--profile` value for this process. Errors on
-    /// an invalid name, or when `KOMMAND0_STATE_DIR` is also set (the env var
-    /// targets one exact directory — combining it with a profile is
-    /// ambiguous). Call once at startup, before any state/config/log access
-    /// and before spawning threads.
-    pub fn set_profile(name: &str) -> Result<(), String> {
-        if Self::state_dir_override().is_some() {
-            return Err(
-                "--profile cannot be combined with KOMMAND0_STATE_DIR; unset the variable or drop the flag"
-                    .to_string(),
-            );
+    /// Decide the profile from its three inputs — pure, so the precedence
+    /// table is unit-testable without touching process env or the OnceLock.
+    ///
+    /// - an explicit `--profile` flag + `KOMMAND0_STATE_DIR` is an error (the
+    ///   env var targets one exact directory — combining them is ambiguous);
+    /// - `KOMMAND0_STATE_DIR` alone wins SILENTLY over `KOMMAND0_PROFILE`
+    ///   (the exact-dir contract: children spawned by an env-mode parent
+    ///   stay hermetic even with a stale profile var in their env);
+    /// - else the flag beats `KOMMAND0_PROFILE`; whichever is used must be a
+    ///   valid name.
+    fn resolve_profile(
+        flag: Option<&str>,
+        env_profile: Option<&str>,
+        state_dir_overridden: bool,
+    ) -> Result<Option<String>, String> {
+        if state_dir_overridden {
+            if flag.is_some() {
+                return Err(
+                    "--profile cannot be combined with KOMMAND0_STATE_DIR; unset the variable or drop the flag"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
         }
-        Self::validate_profile_name(name)?;
-        // A second call is unreachable by construction (both binaries set the
-        // profile exactly once, pre-thread-spawn) — assert that in debug;
-        // in release the first value simply stays.
-        let set = PROFILE.set(name.to_string());
-        debug_assert!(set.is_ok(), "set_profile called more than once");
-        Ok(())
+        match flag.or(env_profile) {
+            Some(name) => {
+                Self::validate_profile_name(name)?;
+                Ok(Some(name.to_string()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve and record this process's profile: the `--profile` flag, else
+    /// the `KOMMAND0_PROFILE` env var (set by a profiled TUI for its embedded
+    /// sessions, so a nested `kmd`/`kommand0` targets the same profile —
+    /// same non-empty semantics as the other overrides; an invalid value is
+    /// a loud startup error, not a silent default). Returns the EFFECTIVE
+    /// name ([`DEFAULT_PROFILE`] when nothing selected one) for the caller's
+    /// label logic. Call once at startup, before any state/config/log access
+    /// and before spawning threads.
+    pub fn init_profile(flag: Option<&str>) -> Result<String, String> {
+        // var_os + lossy (not var().ok()): a non-UTF8 value must reach
+        // validation and fail loudly, not silently count as unset.
+        let env_profile = std::env::var_os("KOMMAND0_PROFILE")
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string_lossy().into_owned());
+        let resolved =
+            Self::resolve_profile(flag, env_profile.as_deref(), Self::state_dir_override().is_some())?;
+        match resolved {
+            Some(name) => {
+                // A second call is unreachable by construction (both binaries
+                // init the profile exactly once, pre-thread-spawn) — assert
+                // that in debug; in release the first value simply stays.
+                let set = PROFILE.set(name.clone());
+                debug_assert!(set.is_ok(), "init_profile called more than once");
+                Ok(name)
+            }
+            None => Ok(DEFAULT_PROFILE.to_string()),
+        }
     }
 
     /// One-time migration of the pre-profiles layout: when `<base>/profiles/`
@@ -1577,10 +1618,29 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // NOTE: no test in this module ever calls `set_profile` — the TUI test
+    // NOTE: no test in this module ever calls `init_profile` — the TUI test
     // harness sets KOMMAND0_STATE_DIR process-wide, and PROFILE is a
-    // process-global OnceLock; the set_profile/state_dir glue is covered by
-    // the process-level CLI and e2e tests instead.
+    // process-global OnceLock; the init_profile/state_dir glue is covered by
+    // the process-level CLI and e2e tests instead. `resolve_profile` is pure,
+    // so its precedence table lives here.
+
+    #[test]
+    fn resolve_profile_precedence_table() {
+        let ok = |s: &str| Ok(Some(s.to_string()));
+        // Flag wins over env; env used when no flag; nothing → None.
+        assert_eq!(AppState::resolve_profile(Some("flag"), Some("env"), false), ok("flag"));
+        assert_eq!(AppState::resolve_profile(None, Some("env"), false), ok("env"));
+        assert_eq!(AppState::resolve_profile(None, None, false), Ok(None));
+        // The exact-dir override wins SILENTLY over the env profile (children
+        // of an env-mode parent stay hermetic even with a stale profile var)…
+        assert_eq!(AppState::resolve_profile(None, Some("env"), true), Ok(None));
+        // …but an explicit flag against it is a loud conflict.
+        let err = AppState::resolve_profile(Some("flag"), None, true).unwrap_err();
+        assert!(err.contains("cannot be combined"), "{err}");
+        // Whichever source is used must be a valid name.
+        assert!(AppState::resolve_profile(Some("../evil"), None, false).is_err());
+        assert!(AppState::resolve_profile(None, Some("../evil"), false).is_err());
+    }
 
     #[test]
     fn validate_profile_name_accepts_and_rejects() {

@@ -197,11 +197,10 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // Record the profile (and surface an invalid name / env conflict) before
-    // any state, config, or log access resolves a directory.
-    if let Some(p) = &cli.profile {
-        AppState::set_profile(p).map_err(|e| anyhow::anyhow!(e))?;
-    }
+    // Resolve + record the profile (--profile, else an inherited
+    // KOMMAND0_PROFILE; an invalid name / env conflict aborts) before any
+    // state, config, or log access resolves a directory.
+    AppState::init_profile(cli.profile.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
     AppState::migrate_legacy_profiles()?;
 
     match cli.command {
