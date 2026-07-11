@@ -32,6 +32,7 @@ fn kmd(state_dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
 /// cwd is per-child). Tests using this are `#[cfg(debug_assertions)]`-gated —
 /// under `cargo test --release` the binary would resolve the developer's REAL
 /// data dir instead.
+#[cfg(debug_assertions)]
 fn kmd_at(cwd: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kmd"));
     cmd.args(args)
@@ -381,7 +382,13 @@ fn profile_flag_isolates_state_and_default_equals_no_flag() {
     // Visible under the same profile, absent from the (default) profile.
     let work = stdout(&kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "list"]));
     assert!(work.contains("proj-alpha"), "work profile sees the repo: {work}");
-    let plain = stdout(&kmd_at(tmp.path(), &[], &["repo", "list"]));
+    let plain_out = kmd_at(tmp.path(), &[], &["repo", "list"]);
+    assert!(
+        plain_out.status.success(),
+        "plain list: {}",
+        String::from_utf8_lossy(&plain_out.stderr)
+    );
+    let plain = stdout(&plain_out);
     assert!(!plain.contains("proj-alpha"), "default profile doesn't: {plain}");
     assert!(
         tmp.path().join(".kommand0-dev").join("profiles").join("work").join("state.json").exists(),

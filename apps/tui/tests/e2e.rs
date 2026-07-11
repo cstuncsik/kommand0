@@ -34,8 +34,10 @@ struct Tui {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     master: Box<dyn portable_pty::MasterPty + Send>, // kept for resize()
-    // Kept alive for the duration of the test: state dir + fake-claude cwd
-    _state_dir: tempfile::TempDir,
+    /// The isolated state dir, doubling as the child's cwd (in the
+    /// legacy-layout variant it's the cwd root CONTAINING `.kommand0-dev`,
+    /// not the state dir itself). Kept alive for the duration of the test.
+    state_dir: tempfile::TempDir,
 }
 
 impl Tui {
@@ -53,7 +55,7 @@ impl Tui {
     /// Like [`Tui::launch`] but WITHOUT `KOMMAND0_STATE_DIR`: the (debug)
     /// binary resolves its base dir to `<cwd>/.kommand0-dev`, and the optional
     /// state seeds a legacy pre-profiles layout at that root — for the
-    /// migration test. `_state_dir` is then the cwd tempdir, not the state dir.
+    /// migration test.
     #[cfg(debug_assertions)]
     fn launch_legacy_layout(state_json: Option<String>) -> Self {
         Self::launch_impl(state_json, &[], true)
@@ -145,7 +147,7 @@ impl Tui {
             child,
             killer,
             master,
-            _state_dir: state_dir,
+            state_dir,
         }
     }
 
@@ -190,14 +192,14 @@ impl Tui {
 
     /// Read the persisted state.json (after the app has written it).
     fn read_state(&self) -> serde_json::Value {
-        let raw = std::fs::read_to_string(self._state_dir.path().join("state.json"))
+        let raw = std::fs::read_to_string(self.state_dir.path().join("state.json"))
             .unwrap_or_else(|_| "{}".to_string());
         serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null)
     }
 
     /// Contents of the app's log file (empty if not written).
     fn log_contents(&self) -> String {
-        std::fs::read_to_string(self._state_dir.path().join("kommand0.log")).unwrap_or_default()
+        std::fs::read_to_string(self.state_dir.path().join("kommand0.log")).unwrap_or_default()
     }
 
     fn send(&mut self, bytes: &str) {
@@ -1213,6 +1215,7 @@ fn profile_flag_with_state_dir_env_fails_before_the_alt_screen() {
     assert!(!out.status.success(), "env + --profile must fail");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("cannot be combined"), "conflict message on stderr: {err}");
+    assert!(out.stdout.is_empty(), "terminal never entered the alt-screen");
 }
 
 #[cfg(debug_assertions)]
@@ -1229,7 +1232,7 @@ fn legacy_state_migrates_before_logging_and_renders_the_tree() {
     let mut tui = Tui::launch_legacy_layout(Some(state));
 
     tui.wait_for("demo"); // the migrated (not orphaned) state feeds the tree
-    let base = tui._state_dir.path().join(".kommand0-dev");
+    let base = tui.state_dir.path().join(".kommand0-dev");
     assert!(
         base.join("profiles").join("default").join("state.json").exists(),
         "legacy state.json moved under profiles/default/"

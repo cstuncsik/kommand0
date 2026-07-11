@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyEvent, KeyEventKind};
-use kommand0_core::{AppState, Config, RepoEntry, SessionStatus, Workspace};
+use kommand0_core::{AppState, Config, DEFAULT_PROFILE, RepoEntry, SessionStatus, Workspace};
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent},
@@ -3249,7 +3249,7 @@ async fn run(terminal: &mut DefaultTerminal, profile: Option<String>) -> anyhow:
     let mut app = App::new(state);
     // Surface the profile in the tree title — hidden for the default profile,
     // so `--profile default` looks exactly like no flag.
-    app.profile_label = profile.filter(|p| p != "default");
+    app.profile_label = profile.filter(|p| p != DEFAULT_PROFILE);
     // Load user config now (App::new keeps a hermetic default for tests). A
     // present-but-invalid file (or a bad keybinding) surfaces a warning in the
     // tree border, with full detail in the log.
@@ -4870,6 +4870,9 @@ mod key_tests {
         assert_eq!(parse_profile_arg(&args(&["--profile=work"])), Ok(Some("work".into())));
         assert!(parse_profile_arg(&args(&["--profile"])).is_err(), "missing value");
         assert!(parse_profile_arg(&args(&["--profile="])).is_err(), "empty equals value");
+        // …but the space form takes even an empty next arg verbatim —
+        // validation rejects it downstream (mirror of the `--profile=` row).
+        assert_eq!(parse_profile_arg(&args(&["--profile", ""])), Ok(Some(String::new())));
         // Any position: the whole vector is scanned.
         assert_eq!(
             parse_profile_arg(&args(&["--other", "x", "--profile", "late"])),
