@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-11
+
 ### Added
 
 - **Profiles** — `kommand0 --profile <name>` / `kmd --profile <name> …` run fully
@@ -436,7 +438,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/cstuncsik/kommand0/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/cstuncsik/kommand0/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/cstuncsik/kommand0/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/cstuncsik/kommand0/compare/v0.8.0...v0.9.0
