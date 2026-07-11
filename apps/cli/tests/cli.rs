@@ -25,6 +25,25 @@ fn kmd(state_dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     cmd.output().unwrap()
 }
 
+/// Run `kmd <args>` from `cwd` with NO inherited kommand0 env — both
+/// `KOMMAND0_STATE_DIR` and `KOMMAND0_CONFIG` removed (`env` adds back what a
+/// test needs). A debug binary then resolves its base dir to
+/// `<cwd>/.kommand0-dev`, so a per-test tempdir cwd isolates it (parallel-safe:
+/// cwd is per-child). Tests using this are `#[cfg(debug_assertions)]`-gated —
+/// under `cargo test --release` the binary would resolve the developer's REAL
+/// data dir instead.
+fn kmd_at(cwd: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kmd"));
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_remove("KOMMAND0_STATE_DIR")
+        .env_remove("KOMMAND0_CONFIG");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
@@ -346,4 +365,106 @@ fn session_start_owns_its_group_and_stop_kills_it() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(gone, "stop killed the child (pid {pid} still alive)");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_flag_isolates_state_and_default_equals_no_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("proj-alpha");
+    std::fs::create_dir_all(&repo).unwrap();
+    let repo_str = repo.to_str().unwrap();
+
+    let add = kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "add", repo_str]);
+    assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+
+    // Visible under the same profile, absent from the (default) profile.
+    let work = stdout(&kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "list"]));
+    assert!(work.contains("proj-alpha"), "work profile sees the repo: {work}");
+    let plain = stdout(&kmd_at(tmp.path(), &[], &["repo", "list"]));
+    assert!(!plain.contains("proj-alpha"), "default profile doesn't: {plain}");
+    assert!(
+        tmp.path().join(".kommand0-dev").join("profiles").join("work").join("state.json").exists(),
+        "state landed under profiles/work/"
+    );
+
+    // `--profile default` is exactly the no-flag profile.
+    let beta = tmp.path().join("proj-beta");
+    std::fs::create_dir_all(&beta).unwrap();
+    let add = kmd_at(tmp.path(), &[], &["repo", "add", beta.to_str().unwrap()]);
+    assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+    let dflt = stdout(&kmd_at(tmp.path(), &[], &["--profile", "default", "repo", "list"]));
+    assert!(dflt.contains("proj-beta"), "--profile default == no flag: {dflt}");
+}
+
+#[test]
+fn profile_flag_conflicts_with_state_dir_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = kmd(tmp.path(), &[], &["--profile", "work", "repo", "list"]);
+    assert!(!out.status.success(), "env + --profile must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be combined"),
+        "clear conflict error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_flag_rejects_an_invalid_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = kmd_at(tmp.path(), &[], &["--profile", "../evil", "repo", "list"]);
+    assert!(!out.status.success(), "traversal name must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid profile name"),
+        "clear validation error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn legacy_state_migrates_into_the_default_profile_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join(".kommand0-dev");
+    std::fs::create_dir_all(&base).unwrap();
+    let json = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "legacy-repo", "path": "/tmp" }],
+        "workspaces": [],
+        "sessions": []
+    });
+    std::fs::write(base.join("state.json"), json.to_string()).unwrap();
+
+    let out = kmd_at(tmp.path(), &[], &["repo", "list"]);
+    assert!(out.status.success(), "list: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("legacy-repo"), "migrated state visible: {}", stdout(&out));
+    let migrated = base.join("profiles").join("default").join("state.json");
+    assert!(migrated.exists(), "state.json moved under profiles/default/");
+    assert!(!base.join("state.json").exists(), "root left clean");
+
+    // Idempotent at the binary level: a second run changes nothing.
+    let again = kmd_at(tmp.path(), &[], &["repo", "list"]);
+    assert!(again.status.success());
+    assert!(stdout(&again).contains("legacy-repo"), "still listed: {}", stdout(&again));
+    assert!(migrated.exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn migration_is_skipped_when_state_dir_env_is_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join(".kommand0-dev");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("state.json"), "{}").unwrap();
+    let other = tmp.path().join("other-state");
+    std::fs::create_dir_all(&other).unwrap();
+
+    let out = kmd_at(
+        tmp.path(),
+        &[("KOMMAND0_STATE_DIR", other.to_str().unwrap())],
+        &["repo", "list"],
+    );
+    assert!(out.status.success(), "list: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(base.join("state.json").exists(), "legacy file untouched");
+    assert!(!base.join("profiles").exists(), "no profiles/ dir created under the legacy base");
 }
