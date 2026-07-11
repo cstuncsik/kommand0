@@ -19,6 +19,7 @@ pub use workspace::Workspace;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
@@ -108,6 +109,12 @@ where
         .collect())
 }
 
+/// The `--profile` value for this process, recorded once at startup via
+/// [`AppState::set_profile`] (absent = `default`). Process-global on purpose:
+/// [`AppState::state_dir`] has no-arg call sites throughout the crates, and
+/// "which dir" is already ambient state (the env override is read the same way).
+static PROFILE: OnceLock<String> = OnceLock::new();
+
 impl AppState {
     const STATE_DIR: &str = ".kommand0-dev";
     const STATE_FILE: &str = "state.json";
@@ -123,18 +130,22 @@ impl AppState {
         state.version = Self::STATE_VERSION;
     }
 
-    /// Resolve the state directory.
-    ///
-    /// Priority: `KOMMAND0_STATE_DIR` env var, then `.kommand0-dev/` relative
-    /// to the current directory in debug builds, then the platform data dir in
-    /// release builds (`~/Library/Application Support/kommand0` on macOS,
+    /// `KOMMAND0_STATE_DIR` when set and non-empty — the exact-dir escape
+    /// hatch (no `profiles/` suffix). A set-but-empty value counts as unset;
+    /// every consumer ([`Self::state_dir`], [`Self::set_profile`],
+    /// [`Self::migrate_legacy_profiles`]) shares this predicate so they can
+    /// never disagree on that edge.
+    fn state_dir_override() -> Option<PathBuf> {
+        std::env::var_os("KOMMAND0_STATE_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// The profile-independent data root: `.kommand0-dev/` relative to the
+    /// current directory in debug builds, else the platform data dir
+    /// (`~/Library/Application Support/kommand0` on macOS,
     /// `~/.local/share/kommand0` on Linux).
-    pub fn state_dir() -> PathBuf {
-        if let Some(dir) = std::env::var_os("KOMMAND0_STATE_DIR")
-            && !dir.is_empty()
-        {
-            return PathBuf::from(dir);
-        }
+    fn base_dir() -> PathBuf {
         if cfg!(debug_assertions) {
             PathBuf::from(Self::STATE_DIR)
         } else {
@@ -142,6 +153,137 @@ impl AppState {
                 .map(|d| d.join("kommand0"))
                 .unwrap_or_else(|| PathBuf::from(Self::STATE_DIR))
         }
+    }
+
+    /// Resolve the state directory.
+    ///
+    /// Priority: `KOMMAND0_STATE_DIR` env var (an exact directory — no
+    /// profile suffix), then `<base>/profiles/<profile>`, where `<base>` is
+    /// [`Self::base_dir`] and `<profile>` is the `--profile` value recorded
+    /// via [`Self::set_profile`] (`default` when the flag was omitted).
+    pub fn state_dir() -> PathBuf {
+        if let Some(dir) = Self::state_dir_override() {
+            return dir; // exact dir, unchanged — the env escape hatch
+        }
+        let profile = PROFILE.get().map(String::as_str).unwrap_or("default");
+        Self::base_dir().join("profiles").join(profile)
+    }
+
+    /// Validate a would-be profile name: it becomes a path segment under
+    /// `profiles/`, so allow only `[A-Za-z0-9._-]+` and at most 64 bytes;
+    /// reject `""`, `"."` (would alias the profiles root itself), and `".."`.
+    pub fn validate_profile_name(name: &str) -> Result<(), String> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.len() > 64
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
+        {
+            // The name failed validation, so it may carry control/escape
+            // bytes — never echo it raw into a terminal.
+            return Err(format!(
+                "invalid profile name '{}': allowed characters are letters, digits, '.', '_', '-'",
+                name.escape_debug()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate and record the `--profile` value for this process. Errors on
+    /// an invalid name, or when `KOMMAND0_STATE_DIR` is also set (the env var
+    /// targets one exact directory — combining it with a profile is
+    /// ambiguous). Call once at startup, before any state/config/log access
+    /// and before spawning threads.
+    pub fn set_profile(name: &str) -> Result<(), String> {
+        if Self::state_dir_override().is_some() {
+            return Err(
+                "--profile cannot be combined with KOMMAND0_STATE_DIR; unset the variable or drop the flag"
+                    .to_string(),
+            );
+        }
+        Self::validate_profile_name(name)?;
+        // A second call is unreachable by construction (both binaries set the
+        // profile exactly once, pre-thread-spawn) — assert that in debug;
+        // in release the first value simply stays.
+        let set = PROFILE.set(name.to_string());
+        debug_assert!(set.is_ok(), "set_profile called more than once");
+        Ok(())
+    }
+
+    /// One-time migration of the pre-profiles layout: when `<base>/profiles/`
+    /// doesn't exist yet and a legacy `state.json` / `config.json` sits at the
+    /// `<base>` root, move them into `<base>/profiles/default/`. Legacy
+    /// `worktrees/`, `sessions/`, and `kommand0.log` stay at the old root —
+    /// state stores worktree and session-log paths absolute, so they keep
+    /// resolving. A no-op when `KOMMAND0_STATE_DIR` is set (non-empty): the
+    /// env var targets an exact directory outside the profiles layout. On
+    /// `Err` the caller must abort startup — proceeding with fresh state would
+    /// mask the legacy file (and, after the first save, permanently orphan it).
+    pub fn migrate_legacy_profiles() -> anyhow::Result<()> {
+        if Self::state_dir_override().is_some() {
+            return Ok(());
+        }
+        Self::migrate_legacy_profiles_at(&Self::base_dir())
+    }
+
+    /// [`Self::migrate_legacy_profiles`] against an explicit base dir (the
+    /// test seam).
+    fn migrate_legacy_profiles_at(base: &Path) -> anyhow::Result<()> {
+        let profiles = base.join("profiles");
+        // Idempotence guard: an existing profiles/ dir — even an empty one —
+        // means the layout is already current. `exists()` stats through
+        // symlinks deliberately: a dangling link counts as absent, so a failed
+        // migration below stays retriable instead of being masked.
+        if profiles.exists() {
+            return Ok(());
+        }
+        // The legacy filenames are frozen — this migrates the pre-profiles
+        // layout only. state.json moves first: if the move fails partway, the
+        // orphan is at worst config.json (defaults; recoverable).
+        let legacy: Vec<&str> = [Self::STATE_FILE, "config.json"]
+            .into_iter()
+            .filter(|f| base.join(f).exists())
+            .collect();
+        if legacy.is_empty() {
+            // Fresh install: create nothing (the first save / log open creates
+            // the profile dir lazily).
+            return Ok(());
+        }
+        let default_dir = profiles.join("default");
+        // On failure, best-effort remove the dirs we may have just created.
+        // `remove_dir` is rmdir(2) — empty-only, never recursive — so it's a
+        // no-op once any file has landed; it exists to prevent an empty
+        // profiles/ husk that would trip the guard above on every later run
+        // and silently mask the legacy files.
+        let rollback = |err: anyhow::Error| -> anyhow::Result<()> {
+            let _ = fs::remove_dir(&default_dir);
+            let _ = fs::remove_dir(&profiles);
+            Err(err)
+        };
+        if let Err(e) = fs::create_dir_all(&default_dir) {
+            return rollback(anyhow::anyhow!(
+                "failed to migrate {} into {} ({e}); move it there by hand and retry",
+                base.join(legacy[0]).display(),
+                default_dir.display()
+            ));
+        }
+        for file in legacy {
+            let from = base.join(file);
+            let to = default_dir.join(file);
+            if let Err(e) = fs::rename(&from, &to) {
+                // Lost race: a concurrent process won this exact migration
+                // between our guard and the rename.
+                if e.kind() == std::io::ErrorKind::NotFound && !from.exists() && to.exists() {
+                    return Ok(());
+                }
+                return rollback(anyhow::anyhow!(
+                    "failed to migrate {} into {} ({e}); move it there by hand and retry",
+                    from.display(),
+                    default_dir.display()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Load state from the given base directory. Returns default if no state file
@@ -1409,5 +1551,128 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = run_git_status(tmp.path().to_str().unwrap());
         assert!(result.is_err());
+    }
+
+    // NOTE: no test in this module ever calls `set_profile` — the TUI test
+    // harness sets KOMMAND0_STATE_DIR process-wide, and PROFILE is a
+    // process-global OnceLock; the set_profile/state_dir glue is covered by
+    // the process-level CLI and e2e tests instead.
+
+    #[test]
+    fn validate_profile_name_accepts_and_rejects() {
+        let max_len = "a".repeat(64);
+        for ok in ["work", "a.B-2_x", max_len.as_str()] {
+            assert!(AppState::validate_profile_name(ok).is_ok(), "{ok:?} should be valid");
+        }
+        let too_long = "a".repeat(65);
+        for bad in ["", ".", "..", "a/b", "a b", "café", too_long.as_str()] {
+            let err = AppState::validate_profile_name(bad).unwrap_err();
+            assert!(err.contains("invalid profile name"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn migrate_legacy_moves_state_and_config_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("state.json"), "{}").unwrap();
+        fs::write(tmp.path().join("config.json"), "{}").unwrap();
+        AppState::migrate_legacy_profiles_at(tmp.path()).unwrap();
+        let dir = tmp.path().join("profiles").join("default");
+        assert!(dir.join("state.json").exists(), "state.json migrated");
+        assert!(dir.join("config.json").exists(), "config.json migrated");
+        assert!(!tmp.path().join("state.json").exists(), "root left clean");
+        assert!(!tmp.path().join("config.json").exists(), "root left clean");
+        // Second call: profiles/ exists, so the guard makes it a no-op.
+        AppState::migrate_legacy_profiles_at(tmp.path()).unwrap();
+        assert!(dir.join("state.json").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_state_only() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("state.json"), "{}").unwrap();
+        AppState::migrate_legacy_profiles_at(tmp.path()).unwrap();
+        assert!(tmp.path().join("profiles").join("default").join("state.json").exists());
+        assert!(!tmp.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_config_only_still_migrates() {
+        // A user who only ever changed settings has config.json but no
+        // state.json — those settings must not be orphaned at the old root.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("config.json"), "{}").unwrap();
+        AppState::migrate_legacy_profiles_at(tmp.path()).unwrap();
+        assert!(tmp.path().join("profiles").join("default").join("config.json").exists());
+        assert!(!tmp.path().join("config.json").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_noop_when_profiles_dir_exists() {
+        // An existing profiles/ dir — even empty — means the migration already
+        // ran (or a save beat us to it): never move anything then.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("state.json"), "{}").unwrap();
+        fs::create_dir_all(tmp.path().join("profiles")).unwrap();
+        AppState::migrate_legacy_profiles_at(tmp.path()).unwrap();
+        assert!(tmp.path().join("state.json").exists(), "legacy file untouched");
+        assert!(!tmp.path().join("profiles").join("default").exists(), "nothing moved");
+    }
+
+    #[test]
+    fn migrate_legacy_fresh_dir_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        AppState::migrate_legacy_profiles_at(tmp.path()).unwrap();
+        assert!(
+            !tmp.path().join("profiles").exists(),
+            "a fresh install stays side-effect-free (first save creates the dir)"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_preserves_content_and_leaves_worktrees_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        state.repos.push(RepoEntry {
+            id: "r1".to_string(),
+            name: "my-repo".to_string(),
+            path: "/tmp/my-repo".to_string(),
+        });
+        state.save_to(tmp.path()).unwrap();
+        fs::create_dir_all(tmp.path().join("worktrees").join("ws")).unwrap();
+
+        AppState::migrate_legacy_profiles_at(tmp.path()).unwrap();
+
+        let migrated =
+            AppState::load_from(&tmp.path().join("profiles").join("default")).unwrap();
+        assert_eq!(migrated.repos.len(), 1);
+        assert_eq!(migrated.repos[0].name, "my-repo", "content survives the move");
+        assert!(
+            tmp.path().join("worktrees").join("ws").is_dir(),
+            "worktrees stay at the old root (state stores absolute paths)"
+        );
+        assert!(!tmp.path().join("profiles").join("default").join("worktrees").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_legacy_failure_leaves_no_masking_husk_and_stays_retriable() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("state.json"), "{}").unwrap();
+        // A dangling symlink at base/profiles: `exists()` follows the link
+        // (stat), so the idempotence guard passes, and create_dir_all then
+        // fails deterministically.
+        std::os::unix::fs::symlink("missing", tmp.path().join("profiles")).unwrap();
+
+        let err = AppState::migrate_legacy_profiles_at(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("failed to migrate"), "got: {err}");
+        assert!(tmp.path().join("state.json").exists(), "legacy file untouched");
+        assert!(
+            !tmp.path().join("profiles").exists(),
+            "no masking husk left behind (a dangling link still counts as absent)"
+        );
+        // Retriable: a second run errors again rather than silently masking
+        // the legacy file behind the guard.
+        assert!(AppState::migrate_legacy_profiles_at(tmp.path()).is_err());
     }
 }
