@@ -10,7 +10,7 @@ use kommand0_core::{
 #[derive(Parser)]
 #[command(name = "kmd", version, about = "Keyboard-first local orchestrator for parallel coding sessions")]
 struct Cli {
-    /// Run against an isolated profile (own state, config, log, worktrees)
+    /// Run against an isolated profile (own state, config, log, sessions, worktrees)
     #[arg(long, global = true, value_name = "NAME")]
     profile: Option<String>,
     #[command(subcommand)]

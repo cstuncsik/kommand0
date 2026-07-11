@@ -9,8 +9,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 - **Profiles** — `kommand0 --profile <name>` / `kmd --profile <name> …` run fully
   isolated instances: each profile keeps its own `state.json`, `config.json`,
-  `kommand0.log`, and `worktrees/` under `<data dir>/profiles/<name>`. Omitting
-  the flag uses the `default` profile. On first run a legacy `state.json`/
+  `kommand0.log`, `sessions/`, and `worktrees/` under `<data dir>/profiles/<name>`.
+  Omitting the flag uses the `default` profile. On first run a legacy `state.json`/
   `config.json` at the data-dir root moves into `profiles/default/` automatically
   (existing worktrees and session logs stay in place and keep working).
   Embedded sessions inherit the profile via `KOMMAND0_PROFILE`, so a `kmd` run
@@ -18,7 +18,9 @@ All notable changes to kommand0 are documented here. The format is based on
   still wins). `KOMMAND0_STATE_DIR` still targets an exact directory and cannot
   be combined with `--profile`. Caveat: don't run a pre-profiles binary and
   this version concurrently across the migration — the old binary writes the
-  old root location again (split-brain).
+  old root location again (split-brain). Two new binaries racing the very
+  first migration can transiently see fresh state until the files land; the
+  worst case is the documented abort-and-retry, not data loss.
 
 ## [0.11.0] - 2026-07-08
 

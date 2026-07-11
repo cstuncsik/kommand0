@@ -3127,7 +3127,7 @@ fn cli_short_circuit(args: &[String]) -> Option<String> {
         return Some(format!(
             "kommand0 {} — keyboard-first orchestrator for parallel Claude Code sessions\n\n\
              Usage: kommand0                    launch the TUI\n\
-             \x20      kommand0 --profile <name>   run an isolated profile (own state, config, log, worktrees)\n\
+             \x20      kommand0 --profile <name>   run an isolated profile (own state, config, log, sessions, worktrees)\n\
              \x20      kommand0 --version          print version\n\n\
              Manage repos/workspaces from the CLI with `kmd` (see the README).",
             env!("CARGO_PKG_VERSION")
@@ -3171,6 +3171,13 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
     Flags::DISAMBIGUATE_ESCAPE_CODES | Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES | Flags::REPORT_ALTERNATE_KEYS
 }
 
+/// Print a startup error and exit. Only for failures before the alt-screen
+/// starts — stderr still reaches the terminal there.
+fn die(msg: &str) -> ! {
+    eprintln!("kommand0: {msg}");
+    std::process::exit(1);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Answer `--version`/`--help` before entering the alt-screen, where stdout
@@ -3185,26 +3192,19 @@ async fn main() -> anyhow::Result<()> {
     // stderr still reaches the terminal — the alt-screen starts below.
     let profile = match parse_profile_arg(&args) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("kommand0: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => die(&e),
     };
     // --profile, else an inherited KOMMAND0_PROFILE (a profiled parent TUI
     // exports it to embedded sessions) — the effective name drives the label.
     let profile = match AppState::init_profile(profile.as_deref()) {
         Ok(name) => name,
-        Err(e) => {
-            eprintln!("kommand0: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => die(&e),
     };
     // Must run BEFORE init_logging(): that create_dir_all's the state dir,
     // which would create profiles/… first and trip the migration guard —
     // reordering this after init_logging silently orphans pre-profiles state.
     if let Err(e) = AppState::migrate_legacy_profiles() {
-        eprintln!("kommand0: {e}");
-        std::process::exit(1);
+        die(&e.to_string());
     }
     init_logging();
     tracing::info!("kommand0 started");
@@ -4890,7 +4890,8 @@ mod key_tests {
             Ok(Some("late".into()))
         );
         // The space form takes the next arg verbatim — unreachable for --help
-        // in main(), where cli_short_circuit runs first and wins.
+        // in main() (cli_short_circuit runs first and wins), and validation
+        // rejects any leading-'-' name downstream anyway.
         assert_eq!(
             parse_profile_arg(&args(&["--profile", "--help"])),
             Ok(Some("--help".into()))

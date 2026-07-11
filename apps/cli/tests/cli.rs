@@ -387,6 +387,9 @@ fn profile_flag_isolates_state_and_default_equals_no_flag() {
     // Visible under the same profile, absent from the (default) profile.
     let work = stdout(&kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "list"]));
     assert!(work.contains("proj-alpha"), "work profile sees the repo: {work}");
+    // The global flag also parses AFTER the subcommand.
+    let after = stdout(&kmd_at(tmp.path(), &[], &["repo", "list", "--profile", "work"]));
+    assert!(after.contains("proj-alpha"), "flag after the subcommand: {after}");
     let plain_out = kmd_at(tmp.path(), &[], &["repo", "list"]);
     assert!(
         plain_out.status.success(),
@@ -522,4 +525,44 @@ fn profile_env_var_selects_the_profile_and_the_flag_beats_it() {
     );
     let work = stdout(&kmd_at(tmp.path(), &[("KOMMAND0_PROFILE", "work")], &["repo", "list"]));
     assert!(work.contains("proj-env"), "work profile keeps its own repo: {work}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn migration_respects_a_config_env_override_end_to_end() {
+    // Pins the env wire into migrate_legacy_profiles: with KOMMAND0_CONFIG
+    // set, state migrates but config.json stays at the legacy root.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join(".kommand0-dev");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("state.json"), r#"{"repos":[]}"#).unwrap();
+    std::fs::write(base.join("config.json"), "{}").unwrap();
+    let other_cfg = tmp.path().join("other-config.json");
+    std::fs::write(&other_cfg, "{}").unwrap();
+
+    let out = kmd_at(
+        tmp.path(),
+        &[("KOMMAND0_CONFIG", other_cfg.to_str().unwrap())],
+        &["repo", "list"],
+    );
+    assert!(out.status.success(), "list: {}", String::from_utf8_lossy(&out.stderr));
+    let dflt = base.join("profiles").join("default");
+    assert!(dflt.join("state.json").exists(), "state migrated");
+    assert!(base.join("config.json").exists(), "config.json stays at the root");
+    assert!(!dflt.join("config.json").exists());
+
+    // Without the override (fresh layout): both migrate.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let base2 = tmp2.path().join(".kommand0-dev");
+    std::fs::create_dir_all(&base2).unwrap();
+    std::fs::write(base2.join("state.json"), r#"{"repos":[]}"#).unwrap();
+    std::fs::write(base2.join("config.json"), "{}").unwrap();
+    let out = kmd_at(tmp2.path(), &[], &["repo", "list"]);
+    assert!(out.status.success(), "list: {}", String::from_utf8_lossy(&out.stderr));
+    let dflt2 = base2.join("profiles").join("default");
+    assert!(
+        dflt2.join("state.json").exists() && dflt2.join("config.json").exists(),
+        "both migrated without the override"
+    );
+    assert!(!base2.join("config.json").exists());
 }

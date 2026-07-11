@@ -121,7 +121,9 @@ pub const DEFAULT_PROFILE: &str = "default";
 static PROFILE: OnceLock<String> = OnceLock::new();
 
 impl AppState {
-    const STATE_DIR: &str = ".kommand0-dev";
+    /// The profile-independent dev-build data root (also the release fallback
+    /// when the platform data dir can't be resolved).
+    const DEV_BASE_DIR: &str = ".kommand0-dev";
     const STATE_FILE: &str = "state.json";
     /// Current on-disk schema version. Bump this when the `state.json` shape
     /// changes in a way that needs a migration, and add the step in [`Self::migrate`].
@@ -152,11 +154,11 @@ impl AppState {
     /// `~/.local/share/kommand0` on Linux).
     fn base_dir() -> PathBuf {
         if cfg!(debug_assertions) {
-            PathBuf::from(Self::STATE_DIR)
+            PathBuf::from(Self::DEV_BASE_DIR)
         } else {
             dirs::data_dir()
                 .map(|d| d.join("kommand0"))
-                .unwrap_or_else(|| PathBuf::from(Self::STATE_DIR))
+                .unwrap_or_else(|| PathBuf::from(Self::DEV_BASE_DIR))
         }
     }
 
@@ -176,18 +178,21 @@ impl AppState {
 
     /// Validate a would-be profile name: it becomes a path segment under
     /// `profiles/`, so allow only `[A-Za-z0-9._-]+` and at most 64 bytes;
-    /// reject `""`, `"."` (would alias the profiles root itself), and `".."`.
-    pub fn validate_profile_name(name: &str) -> Result<(), String> {
+    /// reject `""`, `"."` (would alias the profiles root itself), `".."`, and
+    /// a leading `-` (an arg-parsing foot-gun — `--profile --resume` must not
+    /// mint a profile; mirrors `validate_new_workspace_name`).
+    fn validate_profile_name(name: &str) -> Result<(), String> {
         if name.is_empty()
             || name == "."
             || name == ".."
             || name.len() > 64
+            || name.starts_with('-')
             || !name.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
         {
             // The name failed validation, so it may carry control/escape
             // bytes — never echo it raw into a terminal.
             return Err(format!(
-                "invalid profile name '{}': allowed characters are letters, digits, '.', '_', '-'",
+                "invalid profile name '{}': use 1-64 characters from letters, digits, '.', '_', '-' (not '.', '..', or leading '-')",
                 name.escape_debug()
             ));
         }
@@ -260,9 +265,10 @@ impl AppState {
     /// doesn't exist yet and a legacy `state.json` / `config.json` sits at the
     /// `<base>` root, move them into `<base>/profiles/default/`. Legacy
     /// `worktrees/`, `sessions/`, and `kommand0.log` stay at the old root —
-    /// state stores worktree and session-log paths absolute, so they keep
-    /// resolving. A no-op when `KOMMAND0_STATE_DIR` is set (non-empty): the
-    /// env var targets an exact directory outside the profiles layout. When
+    /// state stores worktree and session-log paths that are absolute in
+    /// release builds (and unchanged either way), so they keep resolving. A
+    /// no-op when `KOMMAND0_STATE_DIR` is set (non-empty): the env var
+    /// targets an exact directory outside the profiles layout. When
     /// `KOMMAND0_CONFIG` is set (non-empty), config.json also stays at the
     /// root (the override may point at that very file). On `Err` the caller
     /// must abort startup — proceeding with fresh state would mask the legacy
@@ -271,12 +277,11 @@ impl AppState {
         if Self::state_dir_override().is_some() {
             return Ok(());
         }
-        // An active KOMMAND0_CONFIG (same non-empty semantics as the state-dir
-        // override) freezes config.json: the override may point AT the legacy
-        // root file — moving it would silently break the user's settings —
-        // and when it points elsewhere the root config.json is unused anyway.
-        let config_overridden =
-            std::env::var_os("KOMMAND0_CONFIG").is_some_and(|v| !v.is_empty());
+        // An active KOMMAND0_CONFIG freezes config.json: the override may
+        // point AT the legacy root file — moving it would silently break the
+        // user's settings — and when it points elsewhere the root config.json
+        // is unused anyway.
+        let config_overridden = Config::path_override().is_some();
         Self::migrate_legacy_profiles_at(&Self::base_dir(), config_overridden)
     }
 
@@ -292,15 +297,13 @@ impl AppState {
         if profiles.exists() {
             return Ok(());
         }
-        // The legacy filenames are frozen — this migrates the pre-profiles
-        // layout only. state.json moves first: if the move fails partway, the
-        // orphan is at worst config.json (defaults; recoverable). With
-        // KOMMAND0_CONFIG active, config.json stays at the root (see the
-        // wrapper above).
+        // state.json moves first: if the move fails partway, the orphan is at
+        // worst config.json (defaults; recoverable). With KOMMAND0_CONFIG
+        // active, config.json stays at the root (see the wrapper above).
         let candidates: &[&str] = if config_overridden {
             &[Self::STATE_FILE]
         } else {
-            &[Self::STATE_FILE, "config.json"]
+            &[Self::STATE_FILE, Config::FILE]
         };
         let legacy: Vec<&str> = candidates
             .iter()
@@ -333,7 +336,20 @@ impl AppState {
         for file in legacy {
             let from = base.join(file);
             let to = default_dir.join(file);
-            if let Err(e) = fs::rename(&from, &to) {
+            // A symlinked legacy file is materialized — copy through the link
+            // (follows it), then drop the link — because a relative link would
+            // dangle when moved a level deeper. Regular files keep the atomic
+            // same-filesystem rename.
+            let is_link = from
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            let moved = if is_link {
+                fs::copy(&from, &to).and_then(|_| fs::remove_file(&from))
+            } else {
+                fs::rename(&from, &to)
+            };
+            if let Err(e) = moved {
                 // Lost race: a concurrent process won this file's move between
                 // our guard and the rename — keep going so any remaining
                 // legacy file (e.g. config.json after state.json's race loss)
@@ -1649,7 +1665,7 @@ mod tests {
             assert!(AppState::validate_profile_name(ok).is_ok(), "{ok:?} should be valid");
         }
         let too_long = "a".repeat(65);
-        for bad in ["", ".", "..", "a/b", "a b", "café", too_long.as_str()] {
+        for bad in ["", ".", "..", "a/b", "a b", "-x", "café", too_long.as_str()] {
             let err = AppState::validate_profile_name(bad).unwrap_err();
             assert!(err.contains("invalid profile name"), "{bad:?}: {err}");
         }
@@ -1786,5 +1802,35 @@ mod tests {
         std::os::unix::fs::symlink("missing", tmp.path().join("profiles")).unwrap();
         let err = AppState::migrate_legacy_profiles_at(tmp.path(), false).unwrap_err();
         assert!(err.to_string().contains("config.json"), "file-keyed message: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_legacy_materializes_a_symlinked_config() {
+        // A RELATIVE symlink would dangle when moved a level deeper into
+        // profiles/default/ — the migration copies through the link instead
+        // and drops the link.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("dotfiles-config.json"), r#"{"claude_bin":"x"}"#).unwrap();
+        std::os::unix::fs::symlink("dotfiles-config.json", tmp.path().join("config.json"))
+            .unwrap();
+
+        AppState::migrate_legacy_profiles_at(tmp.path(), false).unwrap();
+
+        let migrated = tmp.path().join("profiles").join("default").join("config.json");
+        assert!(
+            !fs::symlink_metadata(&migrated).unwrap().file_type().is_symlink(),
+            "materialized as a regular file"
+        );
+        assert_eq!(
+            fs::read_to_string(&migrated).unwrap(),
+            r#"{"claude_bin":"x"}"#,
+            "contents came through the link"
+        );
+        assert!(
+            fs::symlink_metadata(tmp.path().join("config.json")).is_err(),
+            "the link is gone from the root"
+        );
+        assert!(tmp.path().join("dotfiles-config.json").exists(), "link target untouched");
     }
 }
