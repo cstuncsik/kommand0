@@ -5,6 +5,17 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`kmd profile rename` now migrates Claude Code's session stores** — Claude
+  keys its per-directory transcripts by a slug of the working directory
+  (`~/.claude/projects/<slug>/<uuid>.jsonl`, honoring `CLAUDE_CONFIG_DIR`), so
+  renaming a profile moved every worktree out from under its store and every
+  embedded session resumed as a fresh conversation. The rename now moves each
+  affected store dir along (best-effort, like the git worktree repair:
+  collisions, overlong hashed store names, and failed moves become warnings
+  naming the manual fix).
+
 ## [0.13.0] - 2026-07-12
 
 ### Added
