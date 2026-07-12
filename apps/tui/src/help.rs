@@ -18,6 +18,14 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
         keys: "(typing)",
         description: "Goes to the embedded claude",
     },
+    // Kept short: an overlay row that wraps would break the scroll clamp
+    // (it counts logical lines). tmux detail lives in the README + the
+    // startup hint: Shift+Enter needs the kitty protocol, which tmux
+    // never passes through.
+    KeyBinding {
+        keys: "[Alt+Enter]",
+        description: "Newline (tmux: Shift+Enter = Enter)",
+    },
     KeyBinding {
         keys: "[Ctrl+A] then [c]",
         description: "New session tab",

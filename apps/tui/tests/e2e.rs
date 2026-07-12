@@ -846,7 +846,7 @@ fn stale_resume_auto_heals_to_a_fresh_session() {
     tui.wait_for("demo-ws");
     tui.send("j");
     tui.send("e"); // open -> resume the gone session (stub stays alive on the error)
-    tui.wait_for("started a fresh one"); // detected, healed in place with a new session
+    tui.wait_for("not found in Claude's store"); // detected, healed in place with a new session
     tui.wait_for("1 live"); // still embedded — the slot now holds the fresh session
 
     tui.send("\x01");

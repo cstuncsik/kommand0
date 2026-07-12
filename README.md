@@ -167,6 +167,10 @@ cargo run -p kommand0-tui   # from a checkout
 | `?` | Tree | Toggle help overlay |
 | `q` | Tree | Quit |
 
+## Terminals & tmux
+
+Shift+Enter (a newline in an embedded session, without submitting) needs a terminal that speaks the kitty keyboard protocol. tmux does not pass that protocol through — regardless of its `extended-keys` settings — so under tmux Shift+Enter is byte-identical to Enter and submits. Use `Alt+Enter` instead: it works everywhere (as does Claude's own `\` + Enter). kommand0 shows a one-time hint at startup when it detects this situation.
+
 ## Test
 
 ```sh

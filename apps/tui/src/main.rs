@@ -1073,6 +1073,12 @@ impl App {
     /// numbering are preserved). Returns `false` if the fresh spawn itself failed
     /// (the caller then drops the tab). `now` stamps the new tab.
     fn heal_resume(&mut self, ws_id: &str, gone_id: &str, ws_dir: &str, now: Instant) -> bool {
+        // Surface the miss loudly (log here, banner below): healing silently
+        // would convert a recoverable store mismatch (e.g. a worktree moved
+        // out from under claude's cwd-keyed store) into a forgotten id.
+        tracing::warn!(
+            "resume miss: session {gone_id} not found in Claude's store for {ws_dir}; starting fresh"
+        );
         // Carry the user's tab title to the replacement (capture before the
         // remove, which now also forgets the title). The tab's *purpose* is still
         // meaningful even though its conversation is gone.
@@ -1101,7 +1107,12 @@ impl App {
                 }
                 self.embed_error = Some((
                     ws_id.to_string(),
-                    "The previous Claude session was gone — started a fresh one.".to_string(),
+                    format!(
+                        "session {} not found in Claude's store for this directory — started \
+                         fresh (the old transcript keeps its uuid filename under \
+                         ~/.claude/projects/)",
+                        gone_id.get(..8).unwrap_or(gone_id)
+                    ),
                 ));
                 true
             }
@@ -3243,7 +3254,12 @@ async fn main() -> anyhow::Result<()> {
             crossterm::event::PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
-    let result = run(&mut terminal, profile).await;
+    // tmux never passes the kitty keyboard protocol through (verified on
+    // 3.7b: it ignores the push and never answers the query, regardless of
+    // its extended-keys settings), so Shift+Enter arrives byte-identical to
+    // Enter there — hint once at startup that Alt+Enter is the newline.
+    let tmux_newline_hint = std::env::var_os("TMUX").is_some() && !supports_enhanced_keys;
+    let result = run(&mut terminal, profile, tmux_newline_hint).await;
     if supports_enhanced_keys {
         let _ = crossterm::execute!(
             std::io::stdout(),
@@ -3256,7 +3272,11 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run(terminal: &mut DefaultTerminal, profile: String) -> anyhow::Result<()> {
+async fn run(
+    terminal: &mut DefaultTerminal,
+    profile: String,
+    tmux_newline_hint: bool,
+) -> anyhow::Result<()> {
     // A corrupt state.json degrades to default (backed up) + a warning, rather
     // than aborting startup.
     let (state, state_warning) = AppState::load_checked()?;
@@ -3283,6 +3303,14 @@ async fn run(terminal: &mut DefaultTerminal, profile: String) -> anyhow::Result<
     warnings.extend(notify_warning);
     for w in &warnings {
         tracing::warn!("config: {w}");
+    }
+    // Not a config problem, but the tree border + log is the only passive
+    // startup notify surface there is.
+    if tmux_newline_hint {
+        let hint = "tmux: Shift+Enter is indistinguishable from Enter here — \
+                    use Alt+Enter for a newline in embedded sessions";
+        tracing::info!("{hint}");
+        warnings.push(hint.to_string());
     }
     app.config_warning = match warnings.len() {
         0 => None,
@@ -6216,6 +6244,15 @@ mod key_tests {
         assert!(
             text.contains("Move down"),
             "help should list bindings from the keymap:\n{text}"
+        );
+        // The embedded section sits below the fold at 30 rows — render taller
+        // to bring it into the popup.
+        let mut tall = Terminal::new(TestBackend::new(100, 80)).unwrap();
+        tall.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&tall);
+        assert!(
+            text.contains("Alt+Enter"),
+            "help should document the newline chord for embedded sessions:\n{text}"
         );
     }
 }
