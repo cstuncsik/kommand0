@@ -34,6 +34,23 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Manage profiles
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// Rename a profile directory, rewriting workspace/session paths and
+    /// repairing git worktree links
+    Rename {
+        /// Current profile name
+        old: String,
+        /// New profile name
+        new: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -612,6 +629,17 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     println!("No session found for workspace: {workspace}");
                 }
+            }
+        },
+        Commands::Profile { action } => match action {
+            ProfileAction::Rename { old, new } => {
+                let (rewritten, warnings) = AppState::rename_profile(&old, &new)?;
+                for w in &warnings {
+                    eprintln!("warning: {w}");
+                }
+                println!(
+                    "Renamed profile: {old} → {new} ({rewritten} worktree/session path(s) rewritten)"
+                );
             }
         },
     }

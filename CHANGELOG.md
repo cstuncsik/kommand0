@@ -5,6 +5,17 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`kmd profile rename <old> <new>`** — renames a profile directory and keeps
+  it working: worktree and session-log paths stored in the profile's
+  `state.json` are rewritten to the new location, and each moved worktree's
+  git link is repaired (`git worktree repair`; a failed repair is reported as
+  a warning to rerun by hand). Worktrees still at the pre-profiles data-dir
+  root are left alone. Renaming `default` is allowed — the next plain run
+  starts a fresh default profile. Caveat: don't rename a profile while a
+  kommand0/kmd instance is running on it (nothing locks the directory).
+
 ## [0.12.0] - 2026-07-11
 
 ### Added
