@@ -644,13 +644,43 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     }]);
     std::fs::write(&state_path, v.to_string()).unwrap();
 
-    let out = kmd_at(tmp.path(), &[], &["profile", "rename", "work", "personal"]);
+    // Seed a Claude project store for the worktree under a REDIRECTED config
+    // dir (never the real ~/.claude). The store dir name is claude's cwd
+    // slug; the binary's stored worktree path is cwd-absolutized against the
+    // child's canonical cwd, so compute the slug from the canonical path.
+    let claude_slug = |path: &str| -> String {
+        path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+    };
+    let canon = tmp.path().canonicalize().unwrap();
+    let old_wt = canon.join(".kommand0-dev/profiles/work/worktrees/feat");
+    let claude_dir = tmp.path().join("claude-config");
+    let projects = claude_dir.join("projects");
+    let old_store = projects.join(claude_slug(&old_wt.to_string_lossy()));
+    std::fs::create_dir_all(&old_store).unwrap();
+    std::fs::write(old_store.join("abc.jsonl"), "{}").unwrap();
+
+    let out = kmd_at(
+        tmp.path(),
+        &[("CLAUDE_CONFIG_DIR", claude_dir.to_str().unwrap())],
+        &["profile", "rename", "work", "personal"],
+    );
     assert!(out.status.success(), "rename: {}", String::from_utf8_lossy(&out.stderr));
     assert!(
         stdout(&out).contains("2 worktree/session path(s) rewritten"),
         "count wired through to the summary: {}",
         stdout(&out)
     );
+    assert!(
+        stdout(&out).contains("1 Claude project dir(s) migrated"),
+        "claude migration in the summary: {}",
+        stdout(&out)
+    );
+
+    // The Claude session store followed the worktree.
+    let new_wt = canon.join(".kommand0-dev/profiles/personal/worktrees/feat");
+    let new_store = projects.join(claude_slug(&new_wt.to_string_lossy()));
+    assert!(new_store.join("abc.jsonl").exists(), "store migrated with its transcript");
+    assert!(!old_store.exists(), "old store dir gone");
 
     // The repo's gitdir link follows (repair ran)…
     let list =

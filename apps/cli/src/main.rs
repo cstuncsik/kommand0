@@ -633,12 +633,17 @@ fn main() -> anyhow::Result<()> {
         },
         Commands::Profile { action } => match action {
             ProfileAction::Rename { old, new } => {
-                let (rewritten, warnings) = AppState::rename_profile(&old, &new)?;
+                let (rewritten, migrated, warnings) = AppState::rename_profile(&old, &new)?;
                 for w in &warnings {
                     eprintln!("warning: {w}");
                 }
+                let claude_note = if migrated > 0 {
+                    format!(", {migrated} Claude project dir(s) migrated")
+                } else {
+                    String::new()
+                };
                 println!(
-                    "Renamed profile: {old} → {new} ({rewritten} worktree/session path(s) rewritten)"
+                    "Renamed profile: {old} → {new} ({rewritten} worktree/session path(s) rewritten{claude_note})"
                 );
             }
         },

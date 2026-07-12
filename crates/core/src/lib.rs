@@ -387,31 +387,69 @@ impl AppState {
     /// Rename profile `old` to `new`: move `<base>/profiles/<old>` to
     /// `<base>/profiles/<new>`, rewrite the profile's own stored paths
     /// (workspace `worktree_path`/`working_dir` and session `log_file`
-    /// prefixes under the old dir) in its state.json, and best-effort
-    /// `git worktree repair` each moved worktree so the repos' gitdir links
-    /// follow. Returns `(rewritten, warnings)`: how many worktree/session
-    /// paths were rewritten, and any repairs that failed (rerunnable by hand
-    /// — the rename and state rewrite are already complete and correct). A
-    /// failure after the dir move (corrupt state.json, save error) moves the
-    /// dir back, so an `Err` leaves the original profile intact. Legacy-root
-    /// worktrees/sessions (outside the profile dir) are left alone. Errors
-    /// when `KOMMAND0_STATE_DIR` is set (non-empty): that override targets
-    /// one exact directory — there is no profiles tree to rename in.
-    /// Renaming `default` is allowed — the next plain run just starts a
-    /// fresh default. Renaming a profile while any kommand0/kmd instance is
-    /// running on it is unsupported (nothing locks the directory).
-    pub fn rename_profile(old: &str, new: &str) -> anyhow::Result<(usize, Vec<String>)> {
+    /// prefixes under the old dir) in its state.json, and best-effort follow
+    /// up with `git worktree repair` for each moved worktree (the repos'
+    /// gitdir links) and a move of each moved dir's Claude Code project store
+    /// (`~/.claude/projects/<slug>` — claude keys sessions by cwd, so
+    /// `--resume` would otherwise miss). Returns `(rewritten, migrated,
+    /// warnings)`: how many worktree/session paths were rewritten, how many
+    /// Claude project dirs moved, and any best-effort steps that failed
+    /// (rerunnable by hand — the rename and state rewrite are already
+    /// complete and correct). A failure after the dir move (corrupt
+    /// state.json, save error) moves the dir back, so an `Err` leaves the
+    /// original profile intact. Legacy-root worktrees/sessions (outside the
+    /// profile dir) are left alone. Errors when `KOMMAND0_STATE_DIR` is set
+    /// (non-empty): that override targets one exact directory — there is no
+    /// profiles tree to rename in. Renaming `default` is allowed — the next
+    /// plain run just starts a fresh default. Renaming a profile while any
+    /// kommand0/kmd instance is running on it is unsupported (nothing locks
+    /// the directory).
+    pub fn rename_profile(old: &str, new: &str) -> anyhow::Result<(usize, usize, Vec<String>)> {
         if Self::state_dir_override().is_some() {
             bail!(
                 "profile rename is unavailable when KOMMAND0_STATE_DIR is set; \
                  it targets one exact directory, not a profiles tree"
             );
         }
-        Self::rename_profile_at(&Self::base_dir(), old, new)
+        // Claude Code's per-directory session store lives under
+        // `$CLAUDE_CONFIG_DIR` (set and non-empty) else `~/.claude`, in
+        // `projects/` — threaded into the seam so tests never touch env/home.
+        let claude_projects = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
+            .map(|d| d.join("projects"))
+            .unwrap_or_default();
+        Self::rename_profile_at(&Self::base_dir(), old, new, &claude_projects)
     }
 
-    /// [`Self::rename_profile`] against an explicit base dir (the test seam).
-    fn rename_profile_at(base: &Path, old: &str, new: &str) -> anyhow::Result<(usize, Vec<String>)> {
+    /// Claude Code's project-store dir name for a working directory: the
+    /// path string with every non-ASCII-alphanumeric char replaced by `-`
+    /// (the rule extracted from the claude binary:
+    /// `path.replace(/[^a-zA-Z0-9]/g, "-")`). JS regexes operate per UTF-16
+    /// code unit, so a BMP char becomes one dash and an astral-plane char
+    /// (e.g. an emoji in a workspace name) becomes two.
+    fn claude_project_slug(path: &Path) -> String {
+        path.to_string_lossy()
+            .chars()
+            .flat_map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    std::iter::repeat_n(c, 1)
+                } else {
+                    std::iter::repeat_n('-', c.len_utf16())
+                }
+            })
+            .collect()
+    }
+
+    /// [`Self::rename_profile`] against an explicit base dir and Claude
+    /// projects root (the test seam).
+    fn rename_profile_at(
+        base: &Path,
+        old: &str,
+        new: &str,
+        claude_projects: &Path,
+    ) -> anyhow::Result<(usize, usize, Vec<String>)> {
         Self::validate_profile_name(old).map_err(|e| anyhow::anyhow!(e))?;
         Self::validate_profile_name(new).map_err(|e| anyhow::anyhow!(e))?;
         if old == new {
@@ -431,7 +469,7 @@ impl AppState {
 
         // Fresh/empty profile: the rename alone is complete.
         if !dst.join(Self::STATE_FILE).exists() {
-            return Ok((0, Vec::new()));
+            return Ok((0, 0, Vec::new()));
         }
 
         // Rewrite stored paths under the old profile dir. Two prefix forms
@@ -465,12 +503,13 @@ impl AppState {
         // The load→rewrite→save phase can still fail (corrupt state.json,
         // save error). Nothing besides the dir move has happened yet, so on
         // failure move the dir back — an `Err` then leaves the exact original.
-        type Rewritten = (usize, Vec<String>, Vec<(String, String)>);
+        type Rewritten = (usize, Vec<String>, Vec<(String, String)>, Vec<(String, String)>);
         let result = (|| -> anyhow::Result<Rewritten> {
             let mut state = Self::load_from(&dst)?;
             let mut rewritten = 0usize;
             let mut warnings: Vec<String> = Vec::new();
             let mut repairs: Vec<(String, String)> = Vec::new(); // (repo path, new worktree path)
+            let mut dir_moves: Vec<(String, String)> = Vec::new(); // workspace dirs (old, new)
             for ws in &mut state.workspaces {
                 if let Some(wt) = &ws.worktree_path
                     && let Some(new_wt) = rewrite(wt)
@@ -482,6 +521,7 @@ impl AppState {
                             ws.name
                         )),
                     }
+                    dir_moves.push((wt.clone(), new_wt.clone()));
                     ws.worktree_path = Some(new_wt);
                     rewritten += 1;
                 }
@@ -489,6 +529,7 @@ impl AppState {
                 // path — it must follow, or sessions would spawn in the dead
                 // directory.
                 if let Some(new_dir) = rewrite(&ws.working_dir) {
+                    dir_moves.push((ws.working_dir.clone(), new_dir.clone()));
                     ws.working_dir = new_dir;
                 }
             }
@@ -499,9 +540,9 @@ impl AppState {
                 }
             }
             state.save_to(&dst)?;
-            Ok((rewritten, warnings, repairs))
+            Ok((rewritten, warnings, repairs, dir_moves))
         })();
-        let (rewritten, mut warnings, repairs) = match result {
+        let (rewritten, mut warnings, repairs, mut dir_moves) = match result {
             Ok(v) => v,
             Err(e) => {
                 return match fs::rename(&dst, &src) {
@@ -534,7 +575,53 @@ impl AppState {
                 )),
             }
         }
-        Ok((rewritten, warnings))
+
+        // Claude Code keys its session store by a slug of each session's cwd
+        // (`<projects>/<slug>/<uuid>.jsonl`) — move the store dirs of moved
+        // workspace dirs along, or every `--resume` in the renamed profile
+        // misses and starts fresh. Same best-effort tier as the repair above;
+        // silently a no-op on machines without a claude store.
+        let mut migrated = 0usize;
+        if claude_projects.exists() {
+            dir_moves.sort();
+            dir_moves.dedup(); // worktree_path and working_dir are usually the same dir
+            for (old_dir, new_dir) in dir_moves {
+                let old_slug = Self::claude_project_slug(Path::new(&old_dir));
+                let new_slug = Self::claude_project_slug(Path::new(&new_dir));
+                if old_slug.len() > 200 || new_slug.len() > 200 {
+                    // claude truncates + hashes long slugs — we can't
+                    // replicate the hash, so leave the store and name the fix.
+                    warnings.push(format!(
+                        "couldn't migrate Claude sessions for {new_dir}: the store dir name \
+                         exceeds 200 chars (claude hashes those); move it by hand under {}",
+                        claude_projects.display()
+                    ));
+                    continue;
+                }
+                let old_store = claude_projects.join(&old_slug);
+                if !old_store.exists() {
+                    continue; // no claude sessions for that dir
+                }
+                let new_store = claude_projects.join(&new_slug);
+                if new_store.exists() {
+                    warnings.push(format!(
+                        "couldn't migrate Claude sessions: {} already exists (left {} in place)",
+                        new_store.display(),
+                        old_store.display()
+                    ));
+                    continue;
+                }
+                match fs::rename(&old_store, &new_store) {
+                    Ok(()) => migrated += 1,
+                    Err(e) => warnings.push(format!(
+                        "couldn't migrate Claude sessions {} to {} ({e}); move it by hand",
+                        old_store.display(),
+                        new_store.display()
+                    )),
+                }
+            }
+        }
+        Ok((rewritten, migrated, warnings))
     }
 
     /// Load state from the given base directory. Returns default if no state file
@@ -2065,10 +2152,15 @@ mod tests {
         });
         state.save_to(&profile).unwrap();
 
-        let (rewritten, warnings) =
-            AppState::rename_profile_at(tmp.path(), "work", "personal").unwrap();
+        // An absent Claude projects root is a silent no-op (machine without
+        // claude) — nothing created, no warnings.
+        let no_claude = tmp.path().join("no-claude-store");
+        let (rewritten, migrated, warnings) =
+            AppState::rename_profile_at(tmp.path(), "work", "personal", &no_claude).unwrap();
         assert_eq!(rewritten, 2, "one worktree path + one session log");
+        assert_eq!(migrated, 0, "no claude store to migrate");
         assert!(warnings.is_empty(), "repair should succeed: {warnings:?}");
+        assert!(!no_claude.exists(), "absent projects root stays absent");
         assert!(!tmp.path().join("profiles").join("work").exists(), "old dir gone");
         let personal = tmp.path().join("profiles").join("personal");
         assert!(personal.is_dir(), "new dir present");
@@ -2110,9 +2202,10 @@ mod tests {
         // No state.json in the profile: the dir rename alone is complete.
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("profiles").join("scratch")).unwrap();
-        let (rewritten, warnings) =
-            AppState::rename_profile_at(tmp.path(), "scratch", "kept").unwrap();
-        assert_eq!(rewritten, 0);
+        let (rewritten, migrated, warnings) =
+            AppState::rename_profile_at(tmp.path(), "scratch", "kept", &tmp.path().join("nc"))
+                .unwrap();
+        assert_eq!((rewritten, migrated), (0, 0));
         assert!(warnings.is_empty());
         assert!(tmp.path().join("profiles").join("kept").is_dir());
         assert!(!tmp.path().join("profiles").join("scratch").exists());
@@ -2124,7 +2217,9 @@ mod tests {
         fs::create_dir_all(tmp.path().join("profiles").join("a")).unwrap();
         fs::create_dir_all(tmp.path().join("profiles").join("b")).unwrap();
         let err = |old: &str, new: &str| {
-            AppState::rename_profile_at(tmp.path(), old, new).unwrap_err().to_string()
+            AppState::rename_profile_at(tmp.path(), old, new, &tmp.path().join("nc"))
+                .unwrap_err()
+                .to_string()
         };
         assert!(err("missing", "x").contains("not found"), "missing src");
         assert!(err("a", "b").contains("already exists"), "occupied dst");
@@ -2145,7 +2240,9 @@ mod tests {
         fs::create_dir_all(&work).unwrap();
         fs::write(work.join("state.json"), "{ not json").unwrap();
 
-        let err = AppState::rename_profile_at(tmp.path(), "work", "personal").unwrap_err();
+        let err =
+            AppState::rename_profile_at(tmp.path(), "work", "personal", &tmp.path().join("nc"))
+                .unwrap_err();
         assert!(err.to_string().contains("failed to parse"), "load error surfaces: {err}");
         assert!(work.is_dir(), "dir moved back to profiles/work");
         assert!(!tmp.path().join("profiles").join("personal").exists(), "dst gone");
@@ -2189,8 +2286,9 @@ mod tests {
         });
         state.save_to(&profile).unwrap();
 
-        let (rewritten, warnings) =
-            AppState::rename_profile_at(tmp.path(), "work", "personal").unwrap();
+        let (rewritten, _migrated, warnings) =
+            AppState::rename_profile_at(tmp.path(), "work", "personal", &tmp.path().join("nc"))
+                .unwrap();
         assert_eq!(rewritten, 2, "both worktree paths rewritten despite warnings");
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("no repo found")), "{warnings:?}");
@@ -2203,6 +2301,135 @@ mod tests {
             }),
             "rename + rewrite completed: {:?}",
             renamed.workspaces
+        );
+    }
+
+    /// The claude store slug rule (`path.replace(/[^a-zA-Z0-9]/g, "-")` — a
+    /// JS regex, so one dash per UTF-16 code unit). The rule itself is
+    /// pinned independently by the literal rows in
+    /// `claude_project_slug_matches_claude_utf16_rule`.
+    fn expected_claude_slug(path: &str) -> String {
+        path.chars()
+            .flat_map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    std::iter::repeat_n(c, 1)
+                } else {
+                    std::iter::repeat_n('-', c.len_utf16())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claude_project_slug_matches_claude_utf16_rule() {
+        let slug = |s: &str| AppState::claude_project_slug(Path::new(s));
+        assert_eq!(slug("/tmp/my-repo"), "-tmp-my-repo");
+        // Per UTF-16 code unit, like claude's JS regex: a BMP char is one
+        // dash, an astral-plane char (two units — legal in workspace names)
+        // is two. One-dash emoji slugs would silently miss claude's dir.
+        assert_eq!(slug("aéb"), "a-b");
+        assert_eq!(slug("a🚀b"), "a--b");
+    }
+
+    /// One profile with a worktree-backed workspace (orphan repo, so the only
+    /// expected warning is the no-repo one) — for the claude-store tests.
+    fn profile_with_worktree_ws(tmp: &TempDir) -> String {
+        let profile = tmp.path().join("profiles").join("work");
+        let old_wt = profile.join("worktrees").join("feat").to_string_lossy().into_owned();
+        let mut state = AppState::default();
+        state.workspaces.push(Workspace {
+            id: "w1".into(),
+            name: "feat".into(),
+            repo_id: "orphan".into(),
+            working_dir: old_wt.clone(),
+            active: true,
+            created_at: 0,
+            worktree_path: Some(old_wt.clone()),
+            branch_name: None,
+        });
+        state.save_to(&profile).unwrap();
+        old_wt
+    }
+
+    #[test]
+    fn rename_profile_migrates_the_claude_project_store() {
+        let tmp = TempDir::new().unwrap();
+        let old_wt = profile_with_worktree_ws(&tmp);
+        let projects = tmp.path().join("claude").join("projects");
+        let old_slug = expected_claude_slug(&old_wt);
+        fs::create_dir_all(projects.join(&old_slug)).unwrap();
+        fs::write(projects.join(&old_slug).join("abc.jsonl"), "{}").unwrap();
+
+        let (rewritten, migrated, warnings) =
+            AppState::rename_profile_at(tmp.path(), "work", "personal", &projects).unwrap();
+        assert_eq!((rewritten, migrated), (1, 1));
+        let new_slug = expected_claude_slug(&old_wt.replace("/work/", "/personal/"));
+        assert!(
+            projects.join(&new_slug).join("abc.jsonl").exists(),
+            "the store dir followed the worktree (transcript intact)"
+        );
+        assert!(!projects.join(&old_slug).exists(), "old store dir gone");
+        // worktree_path and working_dir were the same dir — deduped, so no
+        // second (colliding) move was attempted; only the orphan-repo warning.
+        assert!(
+            warnings.iter().all(|w| w.contains("no repo found")),
+            "no claude warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn rename_profile_claude_store_collision_warns_and_touches_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let old_wt = profile_with_worktree_ws(&tmp);
+        let projects = tmp.path().join("claude").join("projects");
+        let old_slug = expected_claude_slug(&old_wt);
+        let new_slug = expected_claude_slug(&old_wt.replace("/work/", "/personal/"));
+        fs::create_dir_all(projects.join(&old_slug)).unwrap();
+        fs::write(projects.join(&old_slug).join("old.jsonl"), "{}").unwrap();
+        fs::create_dir_all(projects.join(&new_slug)).unwrap();
+        fs::write(projects.join(&new_slug).join("taken.jsonl"), "{}").unwrap();
+
+        let (_, migrated, warnings) =
+            AppState::rename_profile_at(tmp.path(), "work", "personal", &projects).unwrap();
+        assert_eq!(migrated, 0);
+        assert!(
+            warnings.iter().any(|w| w.contains("already exists")),
+            "collision warned: {warnings:?}"
+        );
+        assert!(projects.join(&old_slug).join("old.jsonl").exists(), "source untouched");
+        assert!(projects.join(&new_slug).join("taken.jsonl").exists(), "target untouched");
+    }
+
+    #[test]
+    fn rename_profile_skips_overlong_claude_slugs_with_a_warning() {
+        // claude truncates + hashes store names past ~200 chars — we can't
+        // replicate the hash, so the migration must skip and say so.
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join("profiles").join("work");
+        let long_name = "a".repeat(200);
+        let long_wt =
+            profile.join("worktrees").join(&long_name).to_string_lossy().into_owned();
+        let mut state = AppState::default();
+        state.workspaces.push(Workspace {
+            id: "w1".into(),
+            name: "long".into(),
+            repo_id: "orphan".into(),
+            working_dir: long_wt.clone(),
+            active: true,
+            created_at: 0,
+            worktree_path: Some(long_wt),
+            branch_name: None,
+        });
+        state.save_to(&profile).unwrap();
+        let projects = tmp.path().join("claude").join("projects");
+        fs::create_dir_all(&projects).unwrap();
+
+        let (_, migrated, warnings) =
+            AppState::rename_profile_at(tmp.path(), "work", "personal", &projects).unwrap();
+        assert_eq!(migrated, 0);
+        assert!(
+            warnings.iter().any(|w| w.contains("exceeds 200 chars")),
+            "overlong slug warned: {warnings:?}"
         );
     }
 }

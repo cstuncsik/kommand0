@@ -5,6 +5,27 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`kmd profile rename` now migrates Claude Code's session stores** — Claude
+  keys its per-directory transcripts by a slug of the working directory
+  (`~/.claude/projects/<slug>/<uuid>.jsonl`, honoring `CLAUDE_CONFIG_DIR`), so
+  renaming a profile moved every worktree out from under its store and every
+  embedded session resumed as a fresh conversation. The rename now moves each
+  affected store dir along (best-effort, like the git worktree repair:
+  collisions, overlong hashed store names, and failed moves become warnings
+  naming the manual fix).
+- **A missed `--resume` is no longer silent** — when Claude's store has no
+  session for the stored id (e.g. a moved directory), the auto-heal still
+  starts a fresh tab but now names the lost session id in the banner and the
+  log, and notes that the old transcript keeps its uuid filename under
+  `~/.claude/projects/`.
+- **tmux newline hint** — under tmux the kitty keyboard protocol never passes
+  through, making Shift+Enter indistinguishable from Enter in embedded
+  sessions; kommand0 now shows a one-time startup hint pointing at
+  `Alt+Enter` (which works everywhere), and the help overlay + README
+  document it.
+
 ## [0.13.0] - 2026-07-12
 
 ### Added

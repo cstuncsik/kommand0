@@ -18,6 +18,12 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
         keys: "(typing)",
         description: "Goes to the embedded claude",
     },
+    // Kept to one unwrapped line (see the scroll-clamp note below); the tmux
+    // detail lives in the README and the startup hint.
+    KeyBinding {
+        keys: "[Alt+Enter]",
+        description: "Newline (tmux: Shift+Enter = Enter)",
+    },
     KeyBinding {
         keys: "[Ctrl+A] then [c]",
         description: "New session tab",
@@ -147,7 +153,10 @@ pub fn render_help_overlay(
         Style::default().fg(th.muted),
     ));
 
-    // Clamp scroll so the last line stays at the bottom edge
+    // Clamp scroll so the last line stays at the bottom edge. This counts
+    // LOGICAL lines while the Paragraph below wraps: a row that wraps makes
+    // the tail unreachable — keep rows to one line (or count wrapped lines
+    // here).
     let inner_height = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(inner_height) as u16;
     *scroll = (*scroll).min(max_scroll);

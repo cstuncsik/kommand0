@@ -167,6 +167,10 @@ cargo run -p kommand0-tui   # from a checkout
 | `?` | Tree | Toggle help overlay |
 | `q` | Tree | Quit |
 
+## Terminals & tmux
+
+Shift+Enter (a newline in an embedded session, without submitting) needs a terminal that speaks the kitty keyboard protocol. tmux does not pass that protocol through — regardless of its `extended-keys` settings — so under tmux Shift+Enter is byte-identical to Enter and submits. Use `Alt+Enter` instead: it works everywhere (as does Claude's own `\` + Enter). kommand0 shows a one-time hint at startup when it detects this situation.
+
 ## Test
 
 ```sh
@@ -193,7 +197,7 @@ The state directory is resolved in this order:
 2. Debug builds: `.kommand0-dev/profiles/<profile>` relative to the current directory
 3. Release builds: `profiles/<profile>` under the platform data directory (`~/Library/Application Support/kommand0` on macOS, `~/.local/share/kommand0` on Linux)
 
-`<profile>` is the `--profile <name>` value — both binaries take the flag (`kommand0 --profile work`, `kmd --profile work repo list`) — and defaults to `default`. Each profile is a fully isolated instance with its own `state.json`, `config.json`, `kommand0.log`, `sessions/`, and `worktrees/`; the TUI shows a non-default profile in the tree title. For a non-default profile the TUI also exports `KOMMAND0_PROFILE` into its embedded sessions, so a nested `kmd` (or `kommand0`) targets the same profile; an explicit `--profile` beats the variable, and `KOMMAND0_STATE_DIR` still wins silently over it. On first run, a pre-profiles layout (`state.json`/`config.json` at the data-dir root) migrates into `profiles/default/` automatically; existing worktrees and session logs stay where they are and keep working. Rename a profile with `kmd profile rename <old> <new>` — it rewrites the profile's stored worktree/session paths and repairs the git worktree links; don't run it while an instance is using that profile.
+`<profile>` is the `--profile <name>` value — both binaries take the flag (`kommand0 --profile work`, `kmd --profile work repo list`) — and defaults to `default`. Each profile is a fully isolated instance with its own `state.json`, `config.json`, `kommand0.log`, `sessions/`, and `worktrees/`; the TUI shows a non-default profile in the tree title. For a non-default profile the TUI also exports `KOMMAND0_PROFILE` into its embedded sessions, so a nested `kmd` (or `kommand0`) targets the same profile; an explicit `--profile` beats the variable, and `KOMMAND0_STATE_DIR` still wins silently over it. On first run, a pre-profiles layout (`state.json`/`config.json` at the data-dir root) migrates into `profiles/default/` automatically; existing worktrees and session logs stay where they are and keep working. Rename a profile with `kmd profile rename <old> <new>` — it rewrites the profile's stored worktree/session paths, repairs the git worktree links, and moves each worktree's Claude Code session store (`~/.claude/projects/<cwd-slug>`, honoring `CLAUDE_CONFIG_DIR`) so embedded sessions keep resuming; don't run it while an instance is using that profile.
 
 `state.json` (repos, workspaces, sessions) lives at the root of that directory; session logs are written as JSON lines files in its `sessions/` subdirectory. The app's own diagnostics (warnings/errors that can't go to the terminal while the TUI is running) are appended to `kommand0.log` there. It's append-only and not rotated — safe to delete anytime.
 
