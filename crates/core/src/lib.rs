@@ -426,11 +426,19 @@ impl AppState {
     /// Claude Code's project-store dir name for a working directory: the
     /// path string with every non-ASCII-alphanumeric char replaced by `-`
     /// (the rule extracted from the claude binary:
-    /// `path.replace(/[^a-zA-Z0-9]/g, "-")`).
+    /// `path.replace(/[^a-zA-Z0-9]/g, "-")`). JS regexes operate per UTF-16
+    /// code unit, so a BMP char becomes one dash and an astral-plane char
+    /// (e.g. an emoji in a workspace name) becomes two.
     fn claude_project_slug(path: &Path) -> String {
         path.to_string_lossy()
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .flat_map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    std::iter::repeat_n(c, 1)
+                } else {
+                    std::iter::repeat_n('-', c.len_utf16())
+                }
+            })
             .collect()
     }
 
@@ -2296,10 +2304,31 @@ mod tests {
         );
     }
 
-    /// The claude store slug rule, restated independently of the production
-    /// helper (it IS the spec: `path.replace(/[^a-zA-Z0-9]/g, "-")`).
+    /// The claude store slug rule (`path.replace(/[^a-zA-Z0-9]/g, "-")` — a
+    /// JS regex, so one dash per UTF-16 code unit). The rule itself is
+    /// pinned independently by the literal rows in
+    /// `claude_project_slug_matches_claude_utf16_rule`.
     fn expected_claude_slug(path: &str) -> String {
-        path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+        path.chars()
+            .flat_map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    std::iter::repeat_n(c, 1)
+                } else {
+                    std::iter::repeat_n('-', c.len_utf16())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claude_project_slug_matches_claude_utf16_rule() {
+        let slug = |s: &str| AppState::claude_project_slug(Path::new(s));
+        assert_eq!(slug("/tmp/my-repo"), "-tmp-my-repo");
+        // Per UTF-16 code unit, like claude's JS regex: a BMP char is one
+        // dash, an astral-plane char (two units — legal in workspace names)
+        // is two. One-dash emoji slugs would silently miss claude's dir.
+        assert_eq!(slug("aéb"), "a-b");
+        assert_eq!(slug("a🚀b"), "a--b");
     }
 
     /// One profile with a worktree-backed workspace (orphan repo, so the only
