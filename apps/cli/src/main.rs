@@ -43,8 +43,8 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ProfileAction {
-    /// Rename a profile directory, rewriting workspace/session paths and
-    /// repairing git worktree links
+    /// Rename a profile directory, rewriting workspace/session paths,
+    /// repairing git worktree links, and migrating Claude Code session stores
     Rename {
         /// Current profile name
         old: String,

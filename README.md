@@ -83,7 +83,7 @@ kmd repo list
 kmd repo delete <name-or-path> [--force]
 
 # Workspaces
-kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--fork]
+kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--fork] [--no-worktree]
 kmd workspace list [--all] [--repo <name>]
 kmd workspace show <name>
 kmd workspace status [<name>]          # git branch / ahead-behind / dirty
@@ -97,6 +97,9 @@ kmd session start <workspace>
 kmd session stop <workspace>
 kmd session list [--workspace <name>]
 kmd session clear <workspace>
+
+# Profiles (every kmd command also takes the global --profile <name> flag)
+kmd profile rename <old> <new>
 ```
 
 `workspace create <name>` forks a branch named `<name>` (suffixed `<name>-2`,
@@ -105,7 +108,9 @@ existing branch first: if a branch matching `<name>` already exists (local or
 `origin`), on a terminal it prompts to check it out instead of forking;
 non-interactively (piped/CI) it forks the suffixed branch and notes the actual
 name on stderr. Pass `--fork` to force a new branch, or `--branch <name>` to
-check one out explicitly.
+check one out explicitly. `--no-worktree` skips the worktree entirely and uses
+the repo root as the working directory (can't be combined with `--branch` or
+`--fork`).
 
 > Replace `kmd` with `cargo run -p kommand0-cli --` during development.
 
@@ -146,8 +151,9 @@ cargo run -p kommand0-tui   # from a checkout
 | `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it — clean up, archive/activate, new session, or jump to a session tab |
 | `n` / `N` | Tree | Jump to + open the next / previous workspace that needs you (cycles the "N waiting") |
 | `A` | Tree | Archive / activate the selected workspace |
-| `Enter` / `e` / `r` / `R` | Tree | Open the embedded Claude pane for the workspace |
-| `x` | Tree | Close the embedded Claude pane |
+| `Enter` | Tree | Activate the selection: open the workspace / expand the repo |
+| `e` / `r` / `R` | Tree | Open the embedded Claude pane for the workspace |
+| `x` / `Delete` | Tree | Close the embedded Claude pane |
 | `v` | Tree | Review the workspace's diff (two-pane: file tree + selected file's diff; `Tab` switches focus) |
 | `p` | Tree | Open the workspace's PR in a browser |
 | `c` | Tree | Clean up the selected merged workspace (worktree + branch) |
@@ -159,6 +165,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `Ctrl+A` then `s` | Embedded | New shell tab (`$SHELL` / `shell` config; ephemeral) |
 | `Ctrl+A` then `[` / `]` | Embedded | Previous / next tab |
 | `Ctrl+A` then `1`–`9` | Embedded | Jump to tab N |
+| `Ctrl+A` then `r` | Embedded | Rename the active tab |
 | `Ctrl+A` then `x` | Embedded | Close the active tab |
 | `Ctrl+A` then `t` | Embedded | Back to tree (also `Tab` / `Esc`) |
 | `Ctrl+A` then `q` | Embedded | Quit kommand0 |
@@ -256,5 +263,6 @@ One button, from the **Actions → Release → Run workflow** menu: pick a bump
 (`patch`/`minor`/`major`) or type an explicit version. The workflow runs the
 test gate, bumps the workspace version, rolls `[Unreleased]` into a dated
 section in `CHANGELOG.md` (via `scripts/cut-release.sh`), commits + tags on
-`main`, then builds and publishes the universal macOS binary. Pushing a `v*`
-tag by hand also builds + publishes (skipping the bump).
+`main`, then builds the universal macOS and Linux x86_64 binaries, publishes
+the release, and updates the Homebrew tap. Pushing a `v*` tag by hand also
+builds + publishes (skipping the bump).
