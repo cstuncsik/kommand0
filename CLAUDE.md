@@ -10,7 +10,7 @@ git worktree. A `kmd` CLI mirrors the core actions.
   to call off the UI thread.
 - `apps/tui` (`kommand0` binary) — the ratatui TUI. Keep it **thin**: presentation
   + input, not domain logic. Modules: render, pane (embedded PTY via vt100), diff,
-  palette, modal, help, keymap, mouse, buttons, notify, theme.
+  palette, modal, help, keymap, mouse, buttons, notify, settings, theme.
 - `apps/cli` (`kmd` binary) — the clap CLI over the same core.
 
 ## Commands
@@ -55,7 +55,11 @@ git worktree. A `kmd` CLI mirrors the core actions.
 - **Adding a keybinding = 5 sites in `keymap.rs`**: the `Action` enum, `ALL_ACTIONS`,
   `name()`, `description()`, `DEFAULT_BINDINGS`. All keys are rebindable via config.
 - **State** (`AppState`) persists to `state.json` atomically, 3-way-merged against
-  concurrent `kmd` writes. Workspaces are git worktrees on per-workspace branches
+  concurrent `kmd` writes. It lives per-profile at `<base>/profiles/<name>/`
+  (selected by `--profile` or an inherited `KOMMAND0_PROFILE`; `KOMMAND0_STATE_DIR`
+  is the exact-dir escape hatch), and a one-time legacy migration moves a root
+  `state.json`/`config.json` into `profiles/default/` — it MUST run before anything
+  creates the state dir. Workspaces are git worktrees on per-workspace branches
   named after the workspace (suffixed `-2`… on collision; pre-0.11 workspaces may
   carry a legacy `kommand0/<name>` branch — still fully supported);
   a **fallback workspace has no `worktree_path`** (its `working_dir` is the repo
@@ -71,7 +75,12 @@ git worktree. A `kmd` CLI mirrors the core actions.
   `cargo test -p kommand0-tui -- --test-threads=1` to confirm a real failure.
 - External tools are stubbed via env vars: `KOMMAND0_CLAUDE_BIN` (the `embed-stub`
   fixture), `KOMMAND0_GH_BIN` (shell-script gh stubs), `KOMMAND0_STATE_DIR`
-  (hermetic state), `KOMMAND0_CONFIG`, `KOMMAND0_SHELL`.
+  (hermetic state), `KOMMAND0_CONFIG`, `KOMMAND0_PROFILE` (the e2e harness strips
+  it for hermeticity), `KOMMAND0_SHELL`. The harness also strips `TMUX`
+  (deterministic keyboard setup).
+- Never call `init_profile` in unit tests — the profile is a process-global
+  `OnceLock`; precedence is unit-tested via the pure `resolve_profile`, the glue
+  via CLI/e2e tests.
 
 ## Gotchas
 - **PR CI builds `refs/pull/N/merge`** (your branch + latest main). Green on the
@@ -80,6 +89,11 @@ git worktree. A `kmd` CLI mirrors the core actions.
 - ratatui bundles crossterm; the workspace's direct `crossterm` must be the **same
   version** ratatui pulls, or event types won't unify (`cargo tree -i crossterm`
   should show one node).
+- **Profile migration runs before `init_logging`** — `init_logging`
+  `create_dir_all`s the state dir; an existing `profiles/` dir trips the
+  migration's idempotence guard and silently orphans pre-profiles state.
+- Help-overlay rows must stay ONE unwrapped line — the overlay's scroll clamp
+  counts logical lines, so a wrapping row makes the tail unreachable.
 - Keep the CHANGELOG `[Unreleased]` section current as you land changes (Keep a
   Changelog format) — the release workflow rolls it into the version automatically.
   0.x semver: minor bumps may carry breaking changes.

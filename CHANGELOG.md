@@ -5,6 +5,16 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Docs drift (v0.12–v0.14)** — README documents the profiles CLI
+  (`kmd profile rename`, the global `--profile` flag), `--no-worktree`,
+  the tab-rename and `Delete` keybindings, the actual `Enter` vs `e`/`r`/`R`
+  split, and the full release output (macOS universal + Linux x86_64 +
+  Homebrew tap); the help overlay gains the shell-tab row; `kmd profile
+  rename --help` mentions the Claude session-store migration; the agent
+  guide catches up on profiles, migration ordering, and test hermeticity.
+
 ## [0.14.0] - 2026-07-13
 
 ### Added

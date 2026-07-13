@@ -29,6 +29,10 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
         description: "New session tab",
     },
     KeyBinding {
+        keys: "[Ctrl+A] then [s]",
+        description: "New shell tab (ephemeral)",
+    },
+    KeyBinding {
         keys: "[Ctrl+A] then [ / ]",
         description: "Previous / next tab",
     },
