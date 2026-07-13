@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-07-13
+
 ### Fixed
 
 - **Docs drift (v0.12–v0.14)** — README documents the profiles CLI
@@ -497,7 +499,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/cstuncsik/kommand0/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/cstuncsik/kommand0/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/cstuncsik/kommand0/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/cstuncsik/kommand0/compare/v0.12.0...v0.13.0
