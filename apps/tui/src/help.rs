@@ -22,7 +22,7 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
     // detail lives in the README and the startup hint.
     KeyBinding {
         keys: "[Alt+Enter]",
-        description: "Newline (tmux: Shift+Enter = Enter)",
+        description: "Newline (when Shift+Enter submits)",
     },
     KeyBinding {
         keys: "[Ctrl+A] then [c]",
