@@ -5,6 +5,17 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Shift+Enter under tmux** — kommand0 now requests xterm's modifyOtherKeys
+  (mode 1) when running inside a tmux configured with `set -s extended-keys on`
+  and `set -s extended-keys-format csi-u`, so Shift+Enter inserts a newline in
+  embedded sessions instead of submitting (tmux then delivers it as
+  `CSI 13;2u`; ordinary keys keep their classic encodings, and the request is
+  reset on every exit path). With tmux's default options (`off`/`xterm`) the
+  startup hint now names that exact two-line config; `Alt+Enter` remains the
+  zero-config fallback.
+
 ## [0.13.1] - 2026-07-12
 
 ### Fixed

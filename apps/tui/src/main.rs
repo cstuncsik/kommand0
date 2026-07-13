@@ -3185,6 +3185,53 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
     Flags::DISAMBIGUATE_ESCAPE_CODES | Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES | Flags::REPORT_ALTERNATE_KEYS
 }
 
+/// modifyOtherKeys mode 1 request / reset (`CSI >4;1m` / `CSI >4;0m`) — the
+/// fallback for tmux, which never passes the kitty protocol through but,
+/// with `extended-keys on` + `extended-keys-format csi-u`, delivers
+/// Shift+Enter to a requesting pane app as `CSI 13;2u` (which crossterm
+/// parses as Shift+Enter). Probed on tmux 3.7b: mode 1 suffices and leaves
+/// ordinary keys (Ctrl+C, Tab, Ctrl+arrows, plain Enter) on their classic
+/// encodings — mode 2 would rewrite far more keys for no extra gain here.
+/// Both the explicit `>4;0m` and bare `>4m` reset there; the explicit form
+/// is used.
+const MODIFY_OTHER_KEYS_REQUEST: &str = "\x1b[>4;1m";
+const MODIFY_OTHER_KEYS_RESET: &str = "\x1b[>4;0m";
+
+/// One tmux server option (`tmux show -sv <name>`), raw stdout. Panic-free
+/// and bounded (~2s, the run_gh timeout shape) so a wedged tmux server can't
+/// hang startup. `None` when tmux is missing, errors (an older tmux without
+/// the option), times out, or prints nothing.
+fn tmux_option(name: &str) -> Option<String> {
+    let child = std::process::Command::new("tmux")
+        .args(["show", "-sv", name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = rx.recv_timeout(Duration::from_secs(2)).ok()?.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Whether tmux will deliver modifyOtherKeys in the CSI u form crossterm
+/// parses: `extended-keys` on/always AND `extended-keys-format` csi-u.
+/// Takes raw `tmux show -sv` output (a trailing newline is fine). tmux 3.7
+/// defaults are off/xterm — BOTH options must be configured — and an older
+/// tmux where the query fails (`None`) counts as not delivering: with the
+/// xterm format tmux answers `CSI 27;2;13~`, which crossterm cannot parse.
+fn tmux_delivers_csi_u(extended_keys: Option<&str>, format: Option<&str>) -> bool {
+    matches!(extended_keys.map(str::trim), Some("on") | Some("always"))
+        && format.map(str::trim) == Some("csi-u")
+}
+
 /// Print a startup error and exit. Only for failures before the alt-screen
 /// starts — stderr still reaches the terminal there.
 fn die(msg: &str) -> ! {
@@ -3226,6 +3273,22 @@ async fn main() -> anyhow::Result<()> {
     // DISAMBIGUATE_ESCAPE_CODES lets terminals report Shift+Enter distinctly from Enter
     let supports_enhanced_keys =
         crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    // tmux swallows the kitty protocol (the probe above returns false there),
+    // but when its extended-keys options are set it delivers modified keys in
+    // the CSI u form to a pane app that requests modifyOtherKeys — probe the
+    // options now (cheap, read-only `tmux show`); the request itself is
+    // written after the rest of the terminal setup, and reset in every
+    // teardown path (normal exit + the panic hook).
+    let tmux = std::env::var_os("TMUX").is_some();
+    let tmux_extended_keys = tmux
+        && !supports_enhanced_keys
+        && tmux_delivers_csi_u(
+            tmux_option("extended-keys").as_deref(),
+            tmux_option("extended-keys-format").as_deref(),
+        );
+    // The hint only fires when tmux is NOT configured for CSI u delivery —
+    // when it is, Shift+Enter just works and there is nothing to hint.
+    let tmux_newline_hint = tmux && !supports_enhanced_keys && !tmux_extended_keys;
     // Panic safety net: we've entered raw mode + the alt-screen. `ratatui::init`
     // already installed a hook that restores the terminal on panic, but it does
     // NOT pop the keyboard-enhancement flags or disable mouse/bracketed-paste.
@@ -3241,6 +3304,9 @@ async fn main() -> anyhow::Result<()> {
             if supports_enhanced_keys {
                 let _ = crossterm::execute!(out, crossterm::event::PopKeyboardEnhancementFlags);
             }
+            if tmux_extended_keys {
+                let _ = crossterm::execute!(out, crossterm::style::Print(MODIFY_OTHER_KEYS_RESET));
+            }
             let _ = crossterm::execute!(out, crossterm::event::DisableBracketedPaste);
             let _ = crossterm::execute!(out, crossterm::event::DisableMouseCapture);
             prev_hook(info);
@@ -3254,16 +3320,25 @@ async fn main() -> anyhow::Result<()> {
             crossterm::event::PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
-    // tmux never passes the kitty keyboard protocol through (verified on
-    // 3.7b: it ignores the push and never answers the query, regardless of
-    // its extended-keys settings), so Shift+Enter arrives byte-identical to
-    // Enter there — hint once at startup that Alt+Enter is the newline.
-    let tmux_newline_hint = std::env::var_os("TMUX").is_some() && !supports_enhanced_keys;
+    if tmux_extended_keys {
+        // Shift+Enter then arrives as `CSI 13;2u` → crossterm parses
+        // Shift+Enter → the pane's existing mapping sends \n.
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::style::Print(MODIFY_OTHER_KEYS_REQUEST)
+        );
+    }
     let result = run(&mut terminal, profile, tmux_newline_hint).await;
     if supports_enhanced_keys {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
+    if tmux_extended_keys {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::style::Print(MODIFY_OTHER_KEYS_RESET)
         );
     }
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
@@ -3307,8 +3382,9 @@ async fn run(
     // Not a config problem, but the tree border + log is the only passive
     // startup notify surface there is.
     if tmux_newline_hint {
-        let hint = "tmux: Shift+Enter is indistinguishable from Enter here — \
-                    use Alt+Enter for a newline in embedded sessions";
+        let hint = "tmux: for Shift+Enter newlines add 'set -s extended-keys on' and \
+                    'set -s extended-keys-format csi-u' to tmux.conf, then restart tmux — \
+                    or use Alt+Enter";
         tracing::info!("{hint}");
         warnings.push(hint.to_string());
     }
@@ -4902,6 +4978,20 @@ mod key_tests {
             cli_short_circuit(&["anything-else".to_string()]).is_none(),
             "unknown args just launch the TUI"
         );
+    }
+
+    #[test]
+    fn tmux_delivers_csi_u_option_table() {
+        // Raw `tmux show -sv` captures carry a trailing newline.
+        assert!(tmux_delivers_csi_u(Some("on\n"), Some("csi-u\n")));
+        assert!(tmux_delivers_csi_u(Some("always\n"), Some("csi-u\n")));
+        // tmux 3.7 defaults (off/xterm): both must be configured.
+        assert!(!tmux_delivers_csi_u(Some("off\n"), Some("csi-u\n")));
+        assert!(!tmux_delivers_csi_u(Some("on\n"), Some("xterm\n")));
+        // An older tmux without the options (query fails) → not delivering.
+        assert!(!tmux_delivers_csi_u(None, Some("csi-u\n")));
+        assert!(!tmux_delivers_csi_u(Some("on\n"), None));
+        assert!(!tmux_delivers_csi_u(None, None));
     }
 
     #[test]

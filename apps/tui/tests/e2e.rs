@@ -108,6 +108,10 @@ impl Tui {
         cmd.env_remove("KOMMAND0_CLAUDE_BIN");
         cmd.env_remove("KOMMAND0_GH_BIN");
         cmd.env_remove("KOMMAND0_PROFILE");
+        // Deterministic keyboard setup whether or not the test run itself
+        // happens inside tmux (the binary would otherwise probe the real
+        // tmux server's extended-keys options — read-only, but env-dependent).
+        cmd.env_remove("TMUX");
         if legacy_layout {
             // No exact-dir override: state resolves relative to the cwd set
             // below (debug base `.kommand0-dev`), where the layout is seeded.

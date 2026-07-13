@@ -169,7 +169,14 @@ cargo run -p kommand0-tui   # from a checkout
 
 ## Terminals & tmux
 
-Shift+Enter (a newline in an embedded session, without submitting) needs a terminal that speaks the kitty keyboard protocol. tmux does not pass that protocol through — regardless of its `extended-keys` settings — so under tmux Shift+Enter is byte-identical to Enter and submits. Use `Alt+Enter` instead: it works everywhere (as does Claude's own `\` + Enter). kommand0 shows a one-time hint at startup when it detects this situation.
+Shift+Enter (a newline in an embedded session, without submitting) needs a terminal that reports modified keys distinctly. Outside tmux, kommand0 uses the kitty keyboard protocol. tmux never passes that protocol through, but it can deliver the same keys via xterm's modifyOtherKeys — kommand0 requests it automatically when tmux is configured for CSI u delivery. Add these two lines to `tmux.conf` and restart tmux:
+
+```
+set -s extended-keys on
+set -s extended-keys-format csi-u
+```
+
+Without them (tmux defaults are `off`/`xterm`), Shift+Enter stays byte-identical to Enter under tmux and submits; kommand0 then shows a one-time startup hint with exactly this config. `Alt+Enter` remains the zero-config newline everywhere (as does Claude's own `\` + Enter).
 
 ## Test
 
