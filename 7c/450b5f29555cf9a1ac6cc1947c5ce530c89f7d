@@ -1,0 +1,23 @@
+apps/tui/src/render.rs
+  s_bb42836d1aac55::t_b304d4ecde9e88 217-223
+CHANGELOG.md
+  s_bb42836d1aac55::t_e949d0ce9098be 8-13
+apps/tui/src/main.rs
+  s_bb42836d1aac55::t_0126acd9abd872 5424-5439
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "7c450b5f29555cf9a1ac6cc1947c5ce530c89f7d",
+  "prompts": {},
+  "sessions": {
+    "s_bb42836d1aac55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ad9c91b-df57-44fe-9a0a-1428bbc26db4",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}
