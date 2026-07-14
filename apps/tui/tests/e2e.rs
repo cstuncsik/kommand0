@@ -604,7 +604,7 @@ fn clicking_panes_switches_focus() {
     tui.send("j");
     tui.send("e");
     tui.wait_for("EMBED-STUB-READY");
-    tui.wait_for("Ctrl+A t tree"); // embedded footer → focus is on claude
+    tui.wait_for("Ctrl+] tree"); // embedded footer → focus is on claude
 
     // Left-click (press+release) in empty tree space, well below the few rows.
     tui.send("\x1b[<0;5;20M");
@@ -614,7 +614,7 @@ fn clicking_panes_switches_focus() {
     // Click back inside the content pane → focus returns to the embedded session.
     tui.send("\x1b[<0;60;12M");
     tui.send("\x1b[<0;60;12m");
-    tui.wait_for("Ctrl+A t tree"); // embedded footer again → focus back on claude
+    tui.wait_for("Ctrl+] tree"); // embedded footer again → focus back on claude
 
     tui.send("\x1d"); // Ctrl+] leaves
     tui.send("q");

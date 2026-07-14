@@ -259,6 +259,10 @@ pub(crate) struct SessionTab {
 pub(crate) struct WorkspaceSessions {
     pub(crate) tabs: Vec<SessionTab>,
     pub(crate) active: usize,
+    /// The previously active tab's id — `Ctrl+A l` (tmux prefix-l) jumps back
+    /// to it. By id, not index: indices shift on close, and a closed tab's id
+    /// simply stops resolving, so the chord degrades to a no-op.
+    last_active: Option<String>,
 }
 
 impl WorkspaceSessions {
@@ -268,23 +272,43 @@ impl WorkspaceSessions {
     pub(crate) fn active_tab(&self) -> Option<&SessionTab> {
         self.tabs.get(self.active)
     }
+    /// Every deliberate tab switch routes through here so the tab we left is
+    /// remembered for `Ctrl+A l`. (The reap path assigns `active` directly:
+    /// re-clamping onto the same logical tab is not a switch.)
+    fn switch_to(&mut self, idx: usize) {
+        if idx != self.active
+            && let Some(prev) = self.tabs.get(self.active)
+        {
+            self.last_active = Some(prev.id.clone());
+        }
+        self.active = idx;
+    }
+    /// Switch to the previously active tab; silently a no-op when there is
+    /// none (fresh pane) or it no longer exists (closed).
+    fn select_last_active(&mut self) {
+        if let Some(id) = self.last_active.clone()
+            && let Some(idx) = self.tabs.iter().position(|t| t.id == id)
+        {
+            self.switch_to(idx); // records the outgoing tab: A <-> B toggles
+        }
+    }
     fn push(&mut self, tab: SessionTab) {
         self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
+        self.switch_to(self.tabs.len() - 1);
     }
     fn next(&mut self) {
         if !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
+            self.switch_to((self.active + 1) % self.tabs.len());
         }
     }
     fn prev(&mut self) {
         if !self.tabs.is_empty() {
-            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+            self.switch_to((self.active + self.tabs.len() - 1) % self.tabs.len());
         }
     }
     fn select(&mut self, idx: usize) {
         if idx < self.tabs.len() {
-            self.active = idx;
+            self.switch_to(idx);
         }
     }
     /// Remove the tab at `idx` (order-preserving), re-clamping `active`. Returns
@@ -886,6 +910,25 @@ impl App {
         }
     }
 
+    /// Move the selection to the nearest repo header before/after the current
+    /// row, skipping workspace rows (vim `{`/`}` style: clamps at the
+    /// outermost repo, no wrap). Operates on the rendered `tree_items`, so it
+    /// respects an active filter.
+    pub(crate) fn jump_repo(&mut self, forward: bool) {
+        let target = if forward {
+            (self.selected_index + 1..self.tree_items.len())
+                .find(|&i| matches!(self.tree_items[i], TreeNode::Repo { .. }))
+        } else {
+            (0..self.selected_index)
+                .rev()
+                .find(|&i| matches!(self.tree_items[i], TreeNode::Repo { .. }))
+        };
+        if let Some(i) = target {
+            self.selected_index = i;
+            self.update_active_session();
+        }
+    }
+
     /// Persist state, logging (not silently dropping) any failure — a save error
     /// is otherwise invisible while the TUI owns the terminal.
     pub(crate) fn save_state(&self) {
@@ -955,7 +998,7 @@ impl App {
             let Some(sessions) = self.embedded.get_mut(&ws_id) else {
                 return;
             };
-            sessions.active = 0; // focus the first tab on open
+            sessions.switch_to(0); // focus the first tab on open
         } else {
             self.embed_error = None;
         }
@@ -2462,6 +2505,13 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     }
                     return Ok(KeyOutcome::Continue);
                 }
+                KeyCode::Char('l') if !ctrl => {
+                    // Last-active tab (tmux prefix-l); no-op with no history.
+                    if let Some(s) = app.selected_sessions_mut() {
+                        s.select_last_active();
+                    }
+                    return Ok(KeyOutcome::Continue);
+                }
                 KeyCode::Char('a') if ctrl => {
                     app.forward_to_embedded(key); // literal Ctrl+A to claude
                     return Ok(KeyOutcome::Continue);
@@ -2932,6 +2982,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Action::CollapseOrParent => app.tree_collapse_or_parent(),
                 Action::StepInto => app.tree_expand_or_enter(),
                 Action::SelectLast => app.tree_select_last(),
+                Action::PrevRepo => app.jump_repo(false),
+                Action::NextRepo => app.jump_repo(true),
                 Action::WidenTree => app.widen_tree(),
                 Action::ShrinkTree => app.shrink_tree(),
                 Action::OpenSession => app.toggle_embedded(),
@@ -4433,6 +4485,7 @@ mod key_tests {
             WorkspaceSessions {
                 tabs: vec![tab("s1", &["-c", "sleep 30"]), tab("s2", &["-c", "sleep 30"])],
                 active: 0,
+                last_active: None,
             },
         );
 
@@ -4475,7 +4528,7 @@ mod key_tests {
             let tab_id = format!("{ws}-s");
             app.embedded.insert(
                 ws.to_string(),
-                WorkspaceSessions { tabs: vec![tab(&tab_id, &["-c", "sleep 30"])], active: 0 },
+                WorkspaceSessions { tabs: vec![tab(&tab_id, &["-c", "sleep 30"])], active: 0, last_active: None },
             );
             app.attention.insert(tab_id);
         }
@@ -4521,7 +4574,7 @@ mod key_tests {
         let claude = tab("claude-1", &["-c", "sleep 30"]); // stays alive
         let mut shell = tab("shell-1", &["-c", "exit 0"]); // exits immediately
         shell.kind = TabKind::Shell;
-        let mut s = WorkspaceSessions { tabs: vec![claude, shell], active: 1 };
+        let mut s = WorkspaceSessions { tabs: vec![claude, shell], active: 1, last_active: None };
         wait_exit(&mut s.tabs[1].pane);
         app.embedded.insert("w1".to_string(), s);
 
@@ -5421,6 +5474,32 @@ mod key_tests {
         assert!(text.contains("Repos · work"), "tree title carries the profile:\n{text}");
     }
 
+    #[test]
+    fn jump_repo_moves_between_repo_headers_and_clamps() {
+        let mut app = test_app(); // repos alpha (r1, ws-one under it) and beta (r2)
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        // tree: [Repo r1, Workspace w1, Repo r2]
+        app.selected_index = 1; // the workspace row
+        app.jump_repo(true);
+        assert_eq!(app.selected_index, 2, "}} skips the workspace row to the next repo");
+        app.jump_repo(true);
+        assert_eq!(app.selected_index, 2, "clamps at the last repo (no wrap)");
+        app.jump_repo(false);
+        assert_eq!(app.selected_index, 0, "{{ jumps back over the workspace row");
+        app.jump_repo(false);
+        assert_eq!(app.selected_index, 0, "clamps at the first repo");
+
+        // Under an active filter the jumps operate on the filtered rows.
+        app.filter_query = "beta".to_string();
+        app.rebuild_tree();
+        app.selected_index = 0; // only [Repo r2] remains
+        app.jump_repo(true);
+        assert_eq!(app.selected_index, 0, "single filtered repo: nowhere to jump");
+        app.jump_repo(false);
+        assert_eq!(app.selected_index, 0);
+    }
+
     #[tokio::test]
     async fn status_line_shows_the_armed_ctrl_a_prefix() {
         let mut app = test_app();
@@ -5434,7 +5513,7 @@ mod key_tests {
         app.embedded_prefix = false;
         let text = render_to_string(&mut app, 100, 30);
         assert!(!text.contains("Ctrl+A …"), "indicator gone when disarmed:\n{text}");
-        assert!(text.contains("Ctrl+A t tree"), "resting hint back:\n{text}");
+        assert!(text.contains("Ctrl+] tree"), "resting hint back:\n{text}");
     }
 
     // Golden full-screen snapshots of key layouts (geometry/position/borders that
@@ -5750,6 +5829,7 @@ mod key_tests {
             WorkspaceSessions {
                 tabs: vec![tab("s1", &["-c", "sleep 30"])],
                 active: 0,
+                last_active: None,
             },
         );
         app.attention.insert("s1".to_string());
@@ -5778,6 +5858,7 @@ mod key_tests {
             WorkspaceSessions {
                 tabs: vec![tab("a", &["-c", "sleep 30"]), tab("b", &["-c", "sleep 30"])],
                 active: 0, // viewing tab "a"
+                last_active: None,
             },
         );
         app.attention.insert("b".to_string()); // sibling tab "b" came back
@@ -5826,6 +5907,7 @@ mod key_tests {
             WorkspaceSessions {
                 tabs: vec![tab("s1", &["-c", "sleep 30"])],
                 active: 0,
+                last_active: None,
             },
         );
         app.attention.insert("s1".to_string());
@@ -5848,6 +5930,7 @@ mod key_tests {
             WorkspaceSessions {
                 tabs: vec![tab("a", &["-c", "sleep 30"]), tab("b", &["-c", "sleep 30"])],
                 active: 0,
+                last_active: None,
             },
         );
         app.embedded.insert(
@@ -5855,6 +5938,7 @@ mod key_tests {
             WorkspaceSessions {
                 tabs: vec![tab("c", &["-c", "sleep 30"])],
                 active: 0,
+                last_active: None,
             },
         );
         // Every pane starts at the tab() helper's 24x80.
@@ -5877,6 +5961,7 @@ mod key_tests {
             WorkspaceSessions {
                 tabs: vec![tab("a", &["-c", "sleep 30"]), tab("b", &["-c", "sleep 30"])],
                 active: 0, // "a" is visible; "b" is a background tab
+                last_active: None,
             },
         );
         app.focus = Focus::Embedded;
@@ -6050,6 +6135,7 @@ mod key_tests {
             WorkspaceSessions {
                 tabs: vec![tab("a", &["-c", "sleep 30"])],
                 active: 0,
+                last_active: None,
             },
         );
 
@@ -6156,6 +6242,7 @@ mod key_tests {
                 tab("c", &["-c", "sleep 30"]),
             ],
             active: 0,
+            last_active: None,
         };
         s.next();
         assert_eq!(s.active, 1);
@@ -6184,6 +6271,34 @@ mod key_tests {
     }
 
     #[test]
+    fn last_active_tab_chord_toggles_and_degrades() {
+        let mut s = WorkspaceSessions {
+            tabs: vec![
+                tab("a", &["-c", "sleep 30"]),
+                tab("b", &["-c", "sleep 30"]),
+                tab("c", &["-c", "sleep 30"]),
+            ],
+            active: 0,
+            last_active: None,
+        };
+        // Fresh pane: no history — no-op.
+        s.select_last_active();
+        assert_eq!(s.active, 0);
+        // a -> b, then last-active returns to a, and again toggles back to b.
+        s.select(1);
+        s.select_last_active();
+        assert_eq!(s.tabs[s.active].id, "a", "returns to the tab we left");
+        s.select_last_active();
+        assert_eq!(s.tabs[s.active].id, "b", "toggles a <-> b");
+        // Close the remembered tab: the dangling id degrades to a no-op.
+        s.select(2); // now on c; last_active = b
+        let b_idx = s.tabs.iter().position(|t| t.id == "b").unwrap();
+        assert!(!s.remove_tab(b_idx));
+        s.select_last_active();
+        assert_eq!(s.tabs[s.active].id, "c", "closed last-active tab: no-op");
+    }
+
+    #[test]
     fn reap_drops_exited_tab_and_keeps_active_by_identity() {
         let mut app = test_app(); // has workspace "w1"
         let mut s = WorkspaceSessions {
@@ -6193,6 +6308,7 @@ mod key_tests {
                 tab("c", &["-c", "sleep 30"]),
             ],
             active: 2, // active on "c"
+            last_active: None,
         };
         s.tabs[0].pane.kill(); // a non-active tab exits
         wait_exit(&mut s.tabs[0].pane);
@@ -6216,6 +6332,7 @@ mod key_tests {
         let s = WorkspaceSessions {
             tabs: vec![tab("a", &["-c", "sleep 30"])],
             active: 0,
+            last_active: None,
         };
         app.embedded.insert("w1".to_string(), s);
         app.focus = Focus::Embedded;
@@ -6263,6 +6380,7 @@ mod key_tests {
                 tab("b", &["-c", "sleep 30"]),
             ],
             active: 0,
+            last_active: None,
         };
         s.tabs[1].was_resume = true;
         wait_exit(&mut s.tabs[0].pane);
@@ -6294,6 +6412,7 @@ mod key_tests {
             WorkspaceSessions {
                 tabs: vec![tab("sess-1", &["-c", "sleep 30"])],
                 active: 0,
+                last_active: None,
             },
         );
         app.focus = Focus::Embedded;

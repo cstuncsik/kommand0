@@ -18,6 +18,8 @@ pub(crate) enum Action {
     CollapseOrParent,
     StepInto,
     SelectLast,
+    PrevRepo,
+    NextRepo,
     WidenTree,
     ShrinkTree,
     ActivateSelection,
@@ -47,6 +49,8 @@ pub(crate) const ALL_ACTIONS: &[Action] = &[
     Action::CollapseOrParent,
     Action::StepInto,
     Action::SelectLast,
+    Action::PrevRepo,
+    Action::NextRepo,
     Action::WidenTree,
     Action::ShrinkTree,
     Action::ActivateSelection,
@@ -78,6 +82,8 @@ impl Action {
             Action::CollapseOrParent => "collapse",
             Action::StepInto => "expand",
             Action::SelectLast => "last",
+            Action::PrevRepo => "prev-repo",
+            Action::NextRepo => "next-repo",
             Action::WidenTree => "widen-tree",
             Action::ShrinkTree => "shrink-tree",
             Action::ActivateSelection => "activate",
@@ -109,6 +115,8 @@ impl Action {
             Action::CollapseOrParent => "Collapse repo / jump to parent",
             Action::StepInto => "Expand repo / step in",
             Action::SelectLast => "Last item (gg = first)",
+            Action::PrevRepo => "Jump to the previous repo",
+            Action::NextRepo => "Jump to the next repo",
             Action::WidenTree => "Widen tree pane",
             Action::ShrinkTree => "Shrink tree pane",
             Action::ActivateSelection => "Open workspace / expand repo",
@@ -286,6 +294,8 @@ const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("Right", Action::StepInto),
     ("l", Action::StepInto),
     ("G", Action::SelectLast),
+    ("{", Action::PrevRepo),
+    ("}", Action::NextRepo),
     (">", Action::WidenTree),
     ("<", Action::ShrinkTree),
     ("Enter", Action::ActivateSelection),
@@ -412,6 +422,9 @@ mod tests {
         // SHIFT is carried by the char case, not a modifier).
         assert_eq!(km.resolve(&ev(KeyCode::Char('n'), KeyModifiers::NONE)), Some(Action::NextWaiting));
         assert_eq!(km.resolve(&ev(KeyCode::Char('N'), KeyModifiers::SHIFT)), Some(Action::PrevWaiting));
+        // { / } jump between repo headers.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('{'), KeyModifiers::NONE)), Some(Action::PrevRepo));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('}'), KeyModifiers::NONE)), Some(Action::NextRepo));
         // < shrinks the tree pane, > widens it.
         assert_eq!(km.resolve(&ev(KeyCode::Char('<'), KeyModifiers::NONE)), Some(Action::ShrinkTree));
         assert_eq!(km.resolve(&ev(KeyCode::Char('>'), KeyModifiers::NONE)), Some(Action::WidenTree));
