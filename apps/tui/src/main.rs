@@ -5421,6 +5421,22 @@ mod key_tests {
         assert!(text.contains("Repos · work"), "tree title carries the profile:\n{text}");
     }
 
+    #[tokio::test]
+    async fn status_line_shows_the_armed_ctrl_a_prefix() {
+        let mut app = test_app();
+        app.focus = Focus::Embedded;
+        app.embedded_prefix = true;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Ctrl+A …"), "armed indicator shown:\n{text}");
+
+        // Disarmed (the very next key clears the prefix): back to the
+        // resting hint, no armed marker.
+        app.embedded_prefix = false;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(!text.contains("Ctrl+A …"), "indicator gone when disarmed:\n{text}");
+        assert!(text.contains("Ctrl+A t tree"), "resting hint back:\n{text}");
+    }
+
     // Golden full-screen snapshots of key layouts (geometry/position/borders that
     // the substring `contains` checks above can't catch). A repo is kept selected
     // so the detail pane never renders a workspace's local-timezone timestamp,

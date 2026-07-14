@@ -214,6 +214,13 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 
     let hints = match app.focus {
         Focus::Tree => "Enter open · a repo · w ws · ? help · q quit",
+        // While the Ctrl+A prefix is armed (it clears on the very next key —
+        // handle_key resets it first thing), show the armed state and what
+        // the prefix accepts instead of the resting hint. Pure render: no
+        // state lives here.
+        Focus::Embedded if app.embedded_prefix => {
+            "Ctrl+A … t tree · c new · s shell · r rename · x close · [ ] tabs · 1-9 jump"
+        }
         Focus::Embedded => "Ctrl+A t tree · Ctrl+A q quit",
     };
 
