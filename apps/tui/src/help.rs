@@ -41,6 +41,10 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
         description: "Jump to tab N",
     },
     KeyBinding {
+        keys: "[Ctrl+A] then [l]",
+        description: "Jump to the last-active tab",
+    },
+    KeyBinding {
         keys: "[Ctrl+A] then [r]",
         description: "Rename the active tab",
     },

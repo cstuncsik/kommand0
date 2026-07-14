@@ -125,7 +125,7 @@ cargo run -p kommand0-tui   # from a checkout
 
 - **Two-pane layout**: Tree (repos/workspaces) on the left; the embedded Claude pane or workspace details on the right
 - **Embedded Claude**: opening a workspace launches a real interactive `claude` in a pseudo-terminal, composited into the right pane — full fidelity (its own input box, slash commands, `/model`, colours), not a reimplemented chat UI
-- **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9). Open a new **Claude** tab with `Ctrl+A c` (or the `[+]` tab), or a **shell** tab with `Ctrl+A s` — a `$SHELL` session in the worktree, for running anything (codex, lazygit, or `tmux`/`zellij` for splits inside the pane). Shell tabs are marked `$` and are ephemeral; Claude tabs persist their session and resume on reopen
+- **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9), and `Ctrl+A l` toggles back to the last-active tab (tmux-style). Open a new **Claude** tab with `Ctrl+A c` (or the `[+]` tab), or a **shell** tab with `Ctrl+A s` — a `$SHELL` session in the worktree, for running anything (codex, lazygit, or `tmux`/`zellij` for splits inside the pane). Shell tabs are marked `$` and are ephemeral; Claude tabs persist their session and resume on reopen
 - **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items and scroll the tree; inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead. With the Branch field blank, if the workspace **name** matches an existing branch (local or `origin`), a prompt offers to check it out instead of forking
@@ -146,6 +146,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `j` / `k` / `Up` / `Down` | Tree | Navigate workspaces |
 | `h` / `l` / `Left` / `Right` | Tree | Collapse repo (or jump to parent) / expand repo |
 | `gg` / `G` | Tree | Jump to first / last item |
+| `{` / `}` | Tree | Jump to the previous / next repo header (skips workspace rows) |
 | `<` / `>` | Tree | Shrink / widen the tree pane (5% steps, 15–60%; this session only — set `tree_width_pct` for a persistent default) |
 | `/` | Tree | Filter workspaces by name/branch (`Esc` clears) |
 | `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it — clean up, archive/activate, new session, or jump to a session tab |
@@ -165,6 +166,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `Ctrl+A` then `s` | Embedded | New shell tab (`$SHELL` / `shell` config; ephemeral) |
 | `Ctrl+A` then `[` / `]` | Embedded | Previous / next tab |
 | `Ctrl+A` then `1`–`9` | Embedded | Jump to tab N |
+| `Ctrl+A` then `l` | Embedded | Jump to the last-active tab |
 | `Ctrl+A` then `r` | Embedded | Rename the active tab |
 | `Ctrl+A` then `x` | Embedded | Close the active tab |
 | `Ctrl+A` then `t` | Embedded | Back to tree (also `Tab` / `Esc`) |

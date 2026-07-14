@@ -7,6 +7,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ### Added
 
+- **`{` / `}` repo jumps in the tree** — move straight to the previous / next
+  repo header, skipping workspace rows (vim-style, clamped at the outermost
+  repo; works on the filtered view too). Rebindable as `prev-repo` /
+  `next-repo`.
+- **`Ctrl+A l` — last-active tab** — the tmux-style prefix chord toggles back
+  to the previously active session tab of the workspace (a closed tab simply
+  no-ops). The resting embedded hint now also names `Ctrl+]` as the fast way
+  back to the tree.
 - **Armed `Ctrl+A` indicator** — while the tmux-style prefix is waiting for
   its second key, the status line shows `Ctrl+A …` plus the accepted keys
   instead of the resting hint; it disappears on the next keypress.
