@@ -5,6 +5,12 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Armed `Ctrl+A` indicator** — while the tmux-style prefix is waiting for
+  its second key, the status line shows `Ctrl+A …` plus the accepted keys
+  instead of the resting hint; it disappears on the next keypress.
+
 ## [0.14.1] - 2026-07-13
 
 ### Fixed
