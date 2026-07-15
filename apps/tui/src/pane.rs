@@ -9,7 +9,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -41,8 +41,38 @@ pub struct Pane {
     /// Bumped on every chunk of child output; lets callers cheaply detect that a
     /// pane produced output since they last looked (poll-based activity signal).
     output_seq: Arc<AtomicU64>,
+    /// Whether the child opted into focus reporting (`CSI ?1004h`). Set by the
+    /// reader thread's byte scan (vt100 0.16 doesn't track this mode), read on
+    /// the UI thread by [`Pane::sync_focus`].
+    focus_reporting: Arc<AtomicBool>,
+    /// The focus state last SENT to the child (`CSI I`/`CSI O`) — edge trigger
+    /// for [`Pane::sync_focus`]. `None` until the first report after opt-in.
+    focus_sent: Option<bool>,
     rows: u16,
     cols: u16,
+}
+
+/// Detect the focus-reporting DECSET (`CSI ? 1004 h` / `l`) in a child's raw
+/// output stream. `tail` carries the last few bytes of the previous chunk so
+/// a sequence straddling a read boundary still matches. Returns the LAST
+/// occurrence's state in this chunk, `None` when the chunk doesn't touch the
+/// mode.
+fn scan_focus_reporting(tail: &mut Vec<u8>, chunk: &[u8]) -> Option<bool> {
+    const ON: &[u8] = b"\x1b[?1004h";
+    const OFF: &[u8] = b"\x1b[?1004l";
+    let mut data = std::mem::take(tail);
+    data.extend_from_slice(chunk);
+    let mut latest = None;
+    for w in data.windows(ON.len()) {
+        if w == ON {
+            latest = Some(true);
+        } else if w == OFF {
+            latest = Some(false);
+        }
+    }
+    let keep = data.len().min(ON.len() - 1);
+    *tail = data.split_off(data.len() - keep);
+    latest
 }
 
 impl Pane {
@@ -105,16 +135,22 @@ impl Pane {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let output_seq = Arc::new(AtomicU64::new(0));
+        let focus_reporting = Arc::new(AtomicBool::new(false));
         let parser_t = parser.clone();
         let seq_t = output_seq.clone();
+        let focus_t = focus_reporting.clone();
         let handle = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut focus_tail: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF: child exited / pty closed
                     Ok(n) => {
                         if let Ok(mut p) = parser_t.lock() {
                             p.process(&buf[..n]);
+                        }
+                        if let Some(on) = scan_focus_reporting(&mut focus_tail, &buf[..n]) {
+                            focus_t.store(on, Ordering::Relaxed);
                         }
                         seq_t.fetch_add(1, Ordering::Relaxed);
                         if let Some(w) = &wake {
@@ -137,6 +173,8 @@ impl Pane {
             _master: pair.master,
             reader: Some(handle),
             output_seq,
+            focus_reporting,
+            focus_sent: None,
             rows,
             cols,
         })
@@ -166,6 +204,35 @@ impl Pane {
         self.writer.write_all(bytes).context("pty write failed")?;
         self.writer.flush().context("pty flush failed")?;
         Ok(())
+    }
+
+    /// Send the synthesized focus state (`CSI I` / `CSI O`) to the child —
+    /// edge-triggered, so callers can invoke this every frame. A no-op until
+    /// the child opts into focus reporting (`CSI ?1004h`); the first report
+    /// after opt-in carries the CURRENT state, like a real terminal enabling
+    /// mode 1004 (and opting back out resets that memory, so a later re-opt-in
+    /// gets a fresh report).
+    pub fn sync_focus(&mut self, focused: bool) {
+        if !self.focus_reporting.load(Ordering::Relaxed) {
+            self.focus_sent = None;
+            return;
+        }
+        if self.focus_sent != Some(focused) {
+            let _ = self.send(if focused { b"\x1b[I" } else { b"\x1b[O" });
+            self.focus_sent = Some(focused);
+        }
+    }
+
+    /// Test hook: flip the opt-in flag as the reader thread's scan would.
+    #[cfg(test)]
+    pub(crate) fn set_focus_reporting(&self, on: bool) {
+        self.focus_reporting.store(on, Ordering::Relaxed);
+    }
+
+    /// Test hook: the focus state last sent to the child.
+    #[cfg(test)]
+    pub(crate) fn focus_sent(&self) -> Option<bool> {
+        self.focus_sent
     }
 
     /// Encode a key event and forward it to the child. Returns `Ok(false)` if the
@@ -588,6 +655,49 @@ mod tests {
 
     fn tmp() -> std::path::PathBuf {
         std::env::temp_dir()
+    }
+
+    #[test]
+    fn scan_focus_reporting_detects_opt_in_out_and_straddled_sequences() {
+        let mut tail = Vec::new();
+        assert_eq!(scan_focus_reporting(&mut tail, b"hello world"), None);
+        assert_eq!(scan_focus_reporting(&mut tail, b"x\x1b[?1004hy"), Some(true));
+        assert_eq!(scan_focus_reporting(&mut tail, b"\x1b[?1004l"), Some(false));
+        // Both in one chunk: the LAST occurrence wins.
+        assert_eq!(scan_focus_reporting(&mut tail, b"\x1b[?1004h..\x1b[?1004l"), Some(false));
+        // A sequence split across two reads still matches (the tail carry).
+        let mut tail = Vec::new();
+        assert_eq!(scan_focus_reporting(&mut tail, b"out\x1b[?10"), None);
+        assert_eq!(scan_focus_reporting(&mut tail, b"04h more"), Some(true));
+        // Split at every boundary, for good measure.
+        let seq = b"\x1b[?1004h";
+        for cut in 1..seq.len() {
+            let mut tail = Vec::new();
+            assert_eq!(scan_focus_reporting(&mut tail, &seq[..cut]), None, "cut {cut}");
+            assert_eq!(scan_focus_reporting(&mut tail, &seq[cut..]), Some(true), "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn sync_focus_gates_on_opt_in_and_reports_current_state_first() {
+        let mut p = Pane::spawn("sh", &["-c", "sleep 30"], &tmp(), 24, 80).unwrap();
+        // Not opted in: nothing is ever sent.
+        p.sync_focus(true);
+        assert_eq!(p.focus_sent(), None, "no report before the child opts in");
+        // Opt in (as the reader's scan would): the first sync reports the
+        // CURRENT state, focused or not.
+        p.set_focus_reporting(true);
+        p.sync_focus(false);
+        assert_eq!(p.focus_sent(), Some(false), "initial state reported on opt-in");
+        p.sync_focus(true);
+        assert_eq!(p.focus_sent(), Some(true), "edge to focused");
+        // Opting out clears the memory, so a re-opt-in reports fresh.
+        p.set_focus_reporting(false);
+        p.sync_focus(true);
+        assert_eq!(p.focus_sent(), None, "opt-out resets the sent state");
+        p.set_focus_reporting(true);
+        p.sync_focus(true);
+        assert_eq!(p.focus_sent(), Some(true), "re-opt-in reports again");
     }
 
     fn sgr(kind: MouseEventKind, mods: KeyModifiers, col: u16, row: u16) -> Option<String> {

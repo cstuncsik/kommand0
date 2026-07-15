@@ -1285,3 +1285,29 @@ fn profile_flag_shows_the_label_and_state_lands_in_the_profile_dir() {
     tui.send("q");
     tui.wait_exit();
 }
+
+#[test]
+fn embedded_focus_reports_follow_pane_focus() {
+    // The stub opts into focus reporting (CSI ?1004h); kommand0 synthesizes
+    // CSI I / CSI O on composite-focus edges. The stub echoes its input with
+    // ESC rendered as '^', so the reports are visible as `^[I` / `^[O`.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub-focus")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open the embedded pane (focus -> Embedded)
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for("^[I"); // opted in + active tab of the focused pane -> focus-in
+
+    // Leaving for the tree is a focus-out edge for the child.
+    tui.send("\x01"); // Ctrl+A
+    tui.send("t");
+    tui.wait_for("^[O");
+
+    tui.send("q");
+    tui.wait_exit();
+}
