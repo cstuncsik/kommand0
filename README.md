@@ -187,6 +187,8 @@ set -s extended-keys-format csi-u
 
 Without them (tmux defaults are `off`/`xterm`), Shift+Enter stays byte-identical to Enter under tmux and submits; kommand0 then shows a one-time startup hint with exactly this config. `Alt+Enter` remains the zero-config newline everywhere (as does Claude's own `\` + Enter).
 
+kommand0 also synthesizes terminal **focus events** for embedded sessions: a child that opts into focus reporting (mode 1004 — Claude does) receives `CSI I`/`CSI O` as it becomes or stops being the active tab of the focused pane, so it always knows whether you're actually looking at it. This per-tab synthesis works even when the outer terminal never reports focus; to also propagate real window focus through tmux, add `set -g focus-events on` to `tmux.conf`.
+
 ## Test
 
 ```sh

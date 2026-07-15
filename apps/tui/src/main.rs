@@ -498,6 +498,11 @@ pub(crate) struct App {
     /// True when the embedded-pane prefix (Ctrl+A) was pressed and the next key
     /// is a kommand0 command rather than forwarded to claude.
     pub(crate) embedded_prefix: bool,
+    /// Whether kommand0's own terminal window has focus (crossterm
+    /// `FocusGained`/`FocusLost`, mode 1004). One dimension of the composite
+    /// focus synthesized for embedded children in [`App::sync_focus_states`].
+    /// Defaults to true — a terminal that never reports simply keeps it there.
+    pub(crate) terminal_focused: bool,
     /// Last embedded-pane spawn failure as `(workspace_id, message)`, surfaced
     /// in that workspace's detail pane only.
     pub(crate) embed_error: Option<(String, String)>,
@@ -609,6 +614,7 @@ impl App {
             embedded_wake: None,
             right_pane_area: ratatui::layout::Rect::default(),
             embedded_prefix: false,
+            terminal_focused: true,
             embed_error: None,
             branch_status: HashMap::new(),
             status_inflight: false,
@@ -1170,6 +1176,28 @@ impl App {
     fn active_pane_mut(&mut self) -> Option<&mut pane::Pane> {
         let ws_id = self.selected_workspace()?.id.clone();
         self.embedded.get_mut(&ws_id)?.active_pane_mut()
+    }
+
+    /// Synthesize terminal focus for embedded children. A child is "focused"
+    /// iff kommand0's own terminal has focus AND the embedded pane owns input
+    /// AND it is the active tab of the selected workspace. Recompute-and-diff
+    /// over every live tab, edge-triggered per pane (`Pane::sync_focus`), so
+    /// calling this once per frame covers every transition — terminal
+    /// focus, Tree<->Embedded switches, tab switches, workspace moves — with
+    /// no per-site wiring. Overlays (help/palette/modal/diff) deliberately do
+    /// NOT count as unfocus; wiring overlay state in here is the upgrade path
+    /// if that ever matters.
+    fn sync_focus_states(&mut self) {
+        let focused_ws = (self.terminal_focused && self.focus == Focus::Embedded)
+            .then(|| self.selected_workspace().map(|w| w.id.clone()))
+            .flatten();
+        for (ws_id, sessions) in self.embedded.iter_mut() {
+            let active = sessions.active;
+            for (idx, tab) in sessions.tabs.iter_mut().enumerate() {
+                let focused = focused_ws.as_deref() == Some(ws_id.as_str()) && idx == active;
+                tab.pane.sync_focus(focused);
+            }
+        }
     }
 
     /// How many of a workspace's session tabs are currently active (a Claude tab
@@ -3359,6 +3387,7 @@ async fn main() -> anyhow::Result<()> {
             if tmux_extended_keys {
                 let _ = crossterm::execute!(out, crossterm::style::Print(MODIFY_OTHER_KEYS_RESET));
             }
+            let _ = crossterm::execute!(out, crossterm::event::DisableFocusChange);
             let _ = crossterm::execute!(out, crossterm::event::DisableBracketedPaste);
             let _ = crossterm::execute!(out, crossterm::event::DisableMouseCapture);
             prev_hook(info);
@@ -3366,6 +3395,9 @@ async fn main() -> anyhow::Result<()> {
     }
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    // Focus reporting (mode 1004): FocusGained/FocusLost feed the composite
+    // focus synthesized for embedded children (App::sync_focus_states).
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
     if supports_enhanced_keys {
         let _ = crossterm::execute!(
             std::io::stdout(),
@@ -3393,6 +3425,7 @@ async fn main() -> anyhow::Result<()> {
             crossterm::style::Print(MODIFY_OTHER_KEYS_RESET)
         );
     }
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
@@ -3508,6 +3541,10 @@ async fn run(
         // Seed the viewed session before drawing so a just-opened/just-switched
         // tab is never momentarily flagged "needs you" before the next tick.
         app.mark_active_viewed();
+        // Edge-triggered focus synthesis for embedded children, once per frame
+        // — covers every transition (terminal focus, Tree<->Embedded, tab and
+        // workspace switches, a child opting in mid-run) without per-site wiring.
+        app.sync_focus_states();
         terminal.draw(|frame| render::ui(frame, &mut app))?;
 
         tokio::select! {
@@ -3567,6 +3604,12 @@ async fn run(
                         // blocking thread above because crossterm's async
                         // EventStream wedges on a rapid resize burst.)
                     }
+                    // Terminal focus (mode 1004, enabled at startup). Handled
+                    // here at the top level on purpose: these aren't keys, so
+                    // no overlay/focus guard may swallow them — the composite
+                    // focus for embedded children must always track reality.
+                    Event::FocusGained => app.terminal_focused = true,
+                    Event::FocusLost => app.terminal_focused = false,
                     Event::Paste(text) => {
                         // Bracketed paste arrives as one event (not Char keys).
                         // Route it with the SAME precedence handle_key uses: the
@@ -6268,6 +6311,45 @@ mod key_tests {
         assert_eq!(s.active, 0);
         // Close the final tab -> empty.
         assert!(s.remove_tab(0));
+    }
+
+    #[test]
+    fn sync_focus_states_composite_targets_the_active_tab_only() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        let s = WorkspaceSessions {
+            tabs: vec![tab("a", &["-c", "sleep 30"]), tab("b", &["-c", "sleep 30"])],
+            active: 0,
+            last_active: None,
+        };
+        s.tabs[0].pane.set_focus_reporting(true);
+        s.tabs[1].pane.set_focus_reporting(true);
+        app.embedded.insert("w1".to_string(), s);
+
+        // Embedded + terminal focused: only the active tab is "focused".
+        app.focus = Focus::Embedded;
+        app.terminal_focused = true;
+        app.sync_focus_states();
+        let s = &app.embedded["w1"];
+        assert_eq!(s.tabs[0].pane.focus_sent(), Some(true), "active tab gets focus-in");
+        assert_eq!(s.tabs[1].pane.focus_sent(), Some(false), "background tab gets focus-out");
+
+        // Back to the tree: the active tab loses focus too.
+        app.focus = Focus::Tree;
+        app.sync_focus_states();
+        assert_eq!(app.embedded["w1"].tabs[0].pane.focus_sent(), Some(false));
+
+        // Terminal blur while embedded stays unfocused; regaining the
+        // terminal restores the active tab.
+        app.focus = Focus::Embedded;
+        app.terminal_focused = false;
+        app.sync_focus_states();
+        assert_eq!(app.embedded["w1"].tabs[0].pane.focus_sent(), Some(false));
+        app.terminal_focused = true;
+        app.sync_focus_states();
+        assert_eq!(app.embedded["w1"].tabs[0].pane.focus_sent(), Some(true));
     }
 
     #[test]

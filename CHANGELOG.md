@@ -5,6 +5,18 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Focus events for embedded sessions** — a child that opts into terminal
+  focus reporting (mode 1004, as Claude does) now receives synthesized
+  `CSI I`/`CSI O` on real focus edges: the composite of the terminal
+  window's own focus (kommand0 enables mode 1004 upstream), whether the
+  embedded pane owns input, and whether the tab is the active one of the
+  selected workspace. Edge-triggered per tab, so switching tabs or bouncing
+  to the tree and back informs each session exactly once. The per-tab
+  synthesis works under tmux even without `focus-events`; add
+  `set -g focus-events on` to also propagate the window dimension.
+
 ## [0.15.0] - 2026-07-14
 
 ### Added

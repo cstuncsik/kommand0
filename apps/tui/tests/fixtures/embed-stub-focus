@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# embed-stub that opts into focus reporting (DECSET 1004), for the
+# focus-forwarding e2e: kommand0's synthesized CSI I / CSI O arrive on stdin
+# and are echoed with ESC rendered as '^' (so `^[I` / `^[O` show on screen).
+stty -echo 2>/dev/null              # raw-ish like a real TUI: we echo, not the tty
+printf '\033[?1049h\033[2J\033[H'   # alt-screen + clear
+printf '\033[?1004h'                # opt into focus reporting (mode 1004)
+printf 'EMBED-STUB-READY\r\n> '
+while IFS= read -r -n1 ch; do
+  if [ "$ch" = $'\033' ]; then printf '^'; else printf '%s' "$ch"; fi
+done
