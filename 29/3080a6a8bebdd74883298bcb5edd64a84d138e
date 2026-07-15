@@ -1,0 +1,48 @@
+apps/tui/src/main.rs
+  s_bb42836d1aac55::t_e878e11c212df6 3398-3400
+  s_bb42836d1aac55::t_dc3d461508504d 3607-3612
+  s_bb42836d1aac55::t_b9770898c198c5 3390
+  s_bb42836d1aac55::t_20808aeee6701d 6317-6354
+  s_bb42836d1aac55::t_33427cd6878520 501-505,617
+  s_bb42836d1aac55::t_ae4e5c109be38c 1181-1202
+  s_bb42836d1aac55::t_c9b398c6555a05 3544-3547
+  s_bb42836d1aac55::t_b5584064b7d16c 3428
+  s_d1466ac3f69073::t_dcf226b5c3851e 6316
+CHANGELOG.md
+  s_bb42836d1aac55::t_be1ffdeddede40 8-19
+apps/tui/tests/e2e.rs
+  s_bb42836d1aac55::t_9768740a66ba14 1288-1313
+README.md
+  s_bb42836d1aac55::t_ee922de2fa3a80 190-191
+apps/tui/src/pane.rs
+  s_bb42836d1aac55::t_f0f8d992c6b1d3 209-237
+  s_bb42836d1aac55::t_23cb2255b5e0e7 44-50,55-75
+  s_bb42836d1aac55::t_f4e6e9f52a4f42 660-702
+  s_d1466ac3f69073::t_3e9eb5ae8c13f1 12,76-77,138,141,144,152-154,176-177
+apps/tui/tests/fixtures/embed-stub-focus
+  s_bb42836d1aac55::t_8fd64e0b00c4ac 1-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "293080a6a8bebdd74883298bcb5edd64a84d138e",
+  "prompts": {},
+  "sessions": {
+    "s_bb42836d1aac55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ad9c91b-df57-44fe-9a0a-1428bbc26db4",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    },
+    "s_d1466ac3f69073": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f3d4a1b9-1bee-4192-a447-664f94d5d3f6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
