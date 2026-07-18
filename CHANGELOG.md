@@ -5,12 +5,17 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- **Docs: copying text from embedded panes** — the README's Terminals & tmux
-  section now explains why native drag-to-select is suppressed (kommand0 and
-  tmux both capture the mouse) and that Shift+drag bypasses the capture for
-  the terminal's native selection.
+- **Drag-to-select in embedded panes** — dragging over a pane whose program
+  hasn't enabled mouse reporting (a shell tab at rest, logs, build output)
+  now selects the dragged cells tmux-style: content-aware reading-order
+  selection over the live grid (never tree text or borders), a reversed
+  highlight while dragging, and an OSC 52 clipboard copy on release (native
+  in Ghostty/kitty/iTerm2/WezTerm; tmux's default `set-clipboard` passes it
+  through). A program that has enabled mouse reporting (claude's UI,
+  `lazygit`, …) keeps receiving every mouse event exactly as before —
+  Shift+drag remains the raw-screen bypass for those.
 
 ## [0.16.0] - 2026-07-15
 

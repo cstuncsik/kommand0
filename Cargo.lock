@@ -940,6 +940,7 @@ name = "kommand0-tui"
 version = "0.16.0"
 dependencies = [
  "anyhow",
+ "base64",
  "crossterm",
  "futures",
  "insta",

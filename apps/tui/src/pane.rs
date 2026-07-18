@@ -276,6 +276,17 @@ impl Pane {
         }
     }
 
+    /// Whether the child has enabled ANY mouse reporting mode. Drives the
+    /// selection arbitration (tmux rule): a mouse-mode child keeps receiving
+    /// every mouse event exactly as today; only a mouse-less child's pane is
+    /// drag-selectable.
+    pub fn wants_mouse(&self) -> bool {
+        self.parser
+            .lock()
+            .map(|p| p.screen().mouse_protocol_mode() != MouseProtocolMode::None)
+            .unwrap_or(false)
+    }
+
     /// Monotonic counter of output chunks received; compare against a previous
     /// value to tell whether the child produced output in the interim.
     pub fn output_seq(&self) -> u64 {
@@ -317,6 +328,26 @@ impl Pane {
             .unwrap_or_default()
     }
 
+    /// Text of the inclusive selection between two pane-local `(row, col)`
+    /// cells (already normalized to reading order). The range is clamped
+    /// against the CURRENT grid first: a resize mid-drag can leave stored
+    /// cells past the new size, and vt100's `contents_between` does a bare
+    /// `cols - start_col` subtraction (a debug-build panic otherwise).
+    pub fn selection_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        let Ok(parser) = self.parser.lock() else {
+            return String::new();
+        };
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        if rows == 0 || cols == 0 {
+            return String::new();
+        }
+        let start = (start.0.min(rows - 1), start.1.min(cols - 1));
+        let end = (end.0.min(rows - 1), end.1.min(cols - 1));
+        // end col is exclusive in vt100; +1 makes our inclusive head count.
+        screen.contents_between(start.0, start.1, end.0, end.1.saturating_add(1))
+    }
+
     /// Screen-relative cursor position, or `None` when hidden.
     pub fn cursor(&self) -> Option<(u16, u16)> {
         let p = self.parser.lock().ok()?;
@@ -331,7 +362,9 @@ impl Pane {
 
     /// Composite the emulated screen into `area` of `buf`. The visible cursor is
     /// drawn as a reversed cell. Clamped to both the screen and `buf` bounds.
-    pub fn blit(&self, buf: &mut Buffer, area: Rect) {
+    /// `selection` is a normalized inclusive pane-local `(row, col)` range
+    /// (reading order) rendered reversed, like a terminal's own highlight.
+    pub fn blit(&self, buf: &mut Buffer, area: Rect, selection: Option<((u16, u16), (u16, u16))>) {
         let Ok(parser) = self.parser.lock() else {
             return;
         };
@@ -378,8 +411,12 @@ impl Pane {
                 if cell.underline() {
                     style = style.add_modifier(Modifier::UNDERLINED);
                 }
-                // XOR so the cursor stays visible on an already-inverse cell.
-                if cell.inverse() ^ (cursor == Some((row, col))) {
+                // Tuple lexicographic order IS reading order for (row, col).
+                let selected =
+                    selection.is_some_and(|(s, e)| (row, col) >= s && (row, col) <= e);
+                // XOR so the cursor stays visible on an already-inverse cell
+                // (and a cursor inside a selection reads as a single-cell hole).
+                if cell.inverse() ^ (cursor == Some((row, col))) ^ selected {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
                 let contents = cell.contents();
@@ -589,6 +626,27 @@ pub fn encode_mouse(
         // single-byte form, decline — the caller treats this as "nothing sent".
         MouseProtocolEncoding::Utf8 => None,
     }
+}
+
+/// OSC 52 clipboard-copy sequence for `text` (clipboard `c`) — the terminal
+/// does the actual copying. Raw input is clamped to 64 KiB at a char boundary
+/// first: most terminals cap the whole OSC sequence around ~100 KB, and a
+/// selection that big isn't a copy-paste use case — truncate rather than
+/// chunk (chunked OSC 52 is the upgrade path if anyone ever asks).
+pub fn encode_osc52_copy(text: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    const OSC52_MAX_RAW: usize = 64 * 1024;
+    // `floor_char_boundary` is unstable on MSRV 1.88 — walk back by hand.
+    let mut cut = text.len().min(OSC52_MAX_RAW);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = b"\x1b]52;c;".to_vec();
+    out.extend_from_slice(
+        base64::engine::general_purpose::STANDARD.encode(&text[..cut]).as_bytes(),
+    );
+    out.push(0x07);
+    out
 }
 
 /// Encode a crossterm key event into the bytes a terminal would send to the
@@ -993,7 +1051,7 @@ mod tests {
         let pane = Pane::spawn("sh", &["-c", "printf HELLO"], &tmp(), 5, 20).unwrap();
         assert!(wait_until(&pane, "HELLO"));
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
-        pane.blit(&mut buf, Rect::new(0, 0, 20, 5));
+        pane.blit(&mut buf, Rect::new(0, 0, 20, 5), None);
         let row0: String = (0..5).map(|x| buf[(x, 0)].symbol()).collect();
         assert_eq!(row0, "HELLO");
         // Plain text emits no SGR 2, so it must not be dimmed — proves the dim
@@ -1016,7 +1074,7 @@ mod tests {
         assert!(wait_until(&pane, "SECOND"), "screen:\n{}", pane.screen_contents());
         assert!(!pane.screen_contents().contains("FIRST"));
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
-        pane.blit(&mut buf, Rect::new(0, 0, 20, 5));
+        pane.blit(&mut buf, Rect::new(0, 0, 20, 5), None);
         let row0: String = (0..6).map(|x| buf[(x, 0)].symbol()).collect();
         assert_eq!(row0, "SECOND");
     }
@@ -1027,7 +1085,7 @@ mod tests {
         assert!(wait_until(&pane, "XY"));
         // Buffer larger than the pane area; render into an offset sub-rect.
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 10));
-        pane.blit(&mut buf, Rect::new(5, 2, 10, 3));
+        pane.blit(&mut buf, Rect::new(5, 2, 10, 3), None);
         assert_eq!(buf[(5, 2)].symbol(), "X");
         assert_eq!(buf[(6, 2)].symbol(), "Y");
         // Untouched cell stays default.
@@ -1041,10 +1099,93 @@ mod tests {
         let pane = Pane::spawn("sh", &["-c", "printf '\\033[2mD'"], &tmp(), 3, 10).unwrap();
         assert!(wait_until(&pane, "D"));
         let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
-        pane.blit(&mut buf, Rect::new(0, 0, 10, 3));
+        pane.blit(&mut buf, Rect::new(0, 0, 10, 3), None);
         let m = buf[(0, 0)].style().add_modifier;
         assert!(m.contains(Modifier::DIM));
         assert!(!m.contains(Modifier::BOLD)); // DIM must not be conflated with BOLD (SGR 1 vs 2)
+    }
+
+    #[test]
+    fn wants_mouse_tracks_child_mode() {
+        let plain = Pane::spawn("sh", &["-c", "printf P; sleep 30"], &tmp(), 3, 10).unwrap();
+        assert!(wait_until(&plain, "P"));
+        assert!(!plain.wants_mouse(), "plain sh never enables mouse reporting");
+        let mousey =
+            Pane::spawn("sh", &["-c", "printf '\\033[?1000hM'; sleep 30"], &tmp(), 3, 10)
+                .unwrap();
+        assert!(wait_until(&mousey, "M"));
+        assert!(mousey.wants_mouse(), "?1000h child holds mouse mode");
+    }
+
+    #[test]
+    fn selection_text_trims_and_joins_rows() {
+        let pane =
+            Pane::spawn("sh", &["-c", "printf 'AB CD\\r\\nEF'"], &tmp(), 5, 20).unwrap();
+        assert!(wait_until(&pane, "EF"));
+        // Single row, inclusive head.
+        assert_eq!(pane.selection_text((1, 0), (1, 1)), "EF");
+        // Multi-row: first row runs to its (trimmed) end, rows join with \n.
+        assert_eq!(pane.selection_text((0, 3), (1, 1)), "CD\nEF");
+        // Inverted range extracts nothing.
+        assert_eq!(pane.selection_text((1, 1), (0, 3)), "");
+        // Cells past the grid clamp instead of panicking (resize mid-drag):
+        // the range runs to the last grid row (empty rows join as newlines).
+        assert_eq!(pane.selection_text((1, 0), (400, 400)), "EF\n\n\n");
+    }
+
+    #[test]
+    fn blit_reverses_selected_cells() {
+        let pane = Pane::spawn("sh", &["-c", "printf HELLO"], &tmp(), 5, 20).unwrap();
+        assert!(wait_until(&pane, "HELLO"));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
+        pane.blit(&mut buf, Rect::new(0, 0, 20, 5), Some(((0, 1), (0, 3))));
+        for x in [1, 2, 3] {
+            assert!(
+                buf[(x, 0)].style().add_modifier.contains(Modifier::REVERSED),
+                "cell {x} inside the selection is reversed"
+            );
+        }
+        for x in [0, 4] {
+            assert!(
+                !buf[(x, 0)].style().add_modifier.contains(Modifier::REVERSED),
+                "cell {x} outside the selection is untouched"
+            );
+        }
+
+        // A two-row selection fills in READING ORDER: a first-row cell PAST
+        // the head column is still inside (tuple order compares row first).
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
+        pane.blit(&mut buf, Rect::new(0, 0, 20, 5), Some(((0, 1), (1, 2))));
+        assert!(
+            buf[(4, 0)].style().add_modifier.contains(Modifier::REVERSED),
+            "row 0 col 4 (past the head column) is inside the reading-order fill"
+        );
+        assert!(
+            buf[(2, 1)].style().add_modifier.contains(Modifier::REVERSED),
+            "row 1 up to the head column is inside"
+        );
+        assert!(
+            !buf[(0, 0)].style().add_modifier.contains(Modifier::REVERSED),
+            "row 0 before the anchor column stays outside"
+        );
+        assert!(
+            !buf[(3, 1)].style().add_modifier.contains(Modifier::REVERSED),
+            "row 1 past the head column stays outside"
+        );
+    }
+
+    #[test]
+    fn encode_osc52_copy_emits_exact_sequence() {
+        assert_eq!(encode_osc52_copy("hello"), b"\x1b]52;c;aGVsbG8=\x07".to_vec());
+        // The 64 KiB clamp cuts at a char boundary: with 3-byte € chars the
+        // limit (65536) lands mid-char and must walk back to 65535 bytes.
+        use base64::Engine as _;
+        let big = "€".repeat(30_000); // 90_000 bytes
+        let out = encode_osc52_copy(&big);
+        let payload = &out[b"\x1b]52;c;".len()..out.len() - 1];
+        let decoded = base64::engine::general_purpose::STANDARD.decode(payload).unwrap();
+        assert_eq!(decoded.len(), 65_535, "cut walked back to the char boundary");
+        assert!(std::str::from_utf8(&decoded).is_ok(), "no split char in the payload");
     }
 
     fn k(code: KeyCode) -> KeyEvent {
