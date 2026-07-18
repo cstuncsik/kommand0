@@ -790,12 +790,15 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         // The active session's pane fills the area below the tab strip. It was
         // already sized to `content` by resize_embedded_panes above.
         let content = super::pane_content_rect(area);
+        // Selection highlight: the clear-sites guarantee `pane_selection` only
+        // ever refers to the pane blitted here (the visible active tab).
+        let sel = app.pane_selection.map(|s| s.range());
         if let Some(p) = app
             .embedded
             .get_mut(ws_id)
             .and_then(|s| s.active_pane_mut())
         {
-            p.blit(frame.buffer_mut(), content);
+            p.blit(frame.buffer_mut(), content, sel);
         }
         return;
     }

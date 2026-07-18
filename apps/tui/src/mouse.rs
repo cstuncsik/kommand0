@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
@@ -177,9 +179,154 @@ pub(crate) fn handle_divider_drag(app: &mut App, mouse: MouseEvent) -> bool {
     }
 }
 
+/// A drag-selection over the visible grid of a mouse-less embedded pane.
+/// Cells are pane-local **(row, col)** — reading order, matching blit's
+/// range compare and vt100's `contents_between` — NOT the `(col, row)` that
+/// `translate_mouse` produces; producers must swap at assignment.
+#[derive(Clone, Copy)]
+pub(crate) struct PaneSelection {
+    /// The Down cell (fixed end).
+    pub anchor: (u16, u16),
+    /// The latest drag cell, inclusive (moving end).
+    pub head: (u16, u16),
+    /// Still receiving Drag events (false after Up or a stray event).
+    pub dragging: bool,
+}
+
+impl PaneSelection {
+    /// The normalized inclusive range in reading order — tuple lexicographic
+    /// min/max, so a backwards or upward drag just swaps ends.
+    pub(crate) fn range(&self) -> ((u16, u16), (u16, u16)) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+}
+
+/// Clamp an absolute mouse position into the pane's content rect and convert
+/// to pane-local **(row, col)** — note the swap from the `(col, row)` the
+/// mouse event carries. A drag that leaves the pane keeps selecting to the
+/// nearest edge.
+fn clamp_to_content(right_pane_area: Rect, col: u16, row: u16) -> (u16, u16) {
+    let inner = super::pane_content_rect(right_pane_area);
+    let col = col.clamp(inner.x, inner.x + inner.width.saturating_sub(1));
+    let row = row.clamp(inner.y, inner.y + inner.height.saturating_sub(1));
+    (row - inner.y, col - inner.x)
+}
+
+/// tmux-rule drag selection for embedded panes (runs before the focus-based
+/// routing split). A Left-Down on the content of a child that has NOT
+/// enabled mouse reporting starts a kommand0 selection — highlight while
+/// dragging, OSC 52 copy to `out` on release; the child receives nothing for
+/// that gesture. A mouse-mode child (claude included) keeps receiving every
+/// event exactly as before. Arbitration is per-gesture at Down: a child
+/// enabling mouse mid-drag doesn't steal the drag. Returns whether the event
+/// was consumed. `out` is the host terminal's stdout in production; tests
+/// capture a `Vec<u8>` (the `notify::ring_bell` pattern).
+pub(crate) fn handle_selection(app: &mut App, mouse: MouseEvent, out: &mut impl Write) -> bool {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Clear-on-mouse-down, unconditional — a lingering highlight dies
+            // on the next press wherever it lands.
+            app.pane_selection = None;
+            // COORDINATE SWAP: translate_mouse returns (col, row); the
+            // selection stores (row, col). Both are (u16, u16) — a
+            // transposition compiles silently, so swap exactly here.
+            if let Some((col, row)) =
+                super::translate_mouse(app.right_pane_area, mouse.column, mouse.row)
+                && app.active_pane_mut().is_some_and(|p| !p.wants_mouse())
+            {
+                app.focus = super::Focus::Embedded;
+                app.embedded_prefix = false;
+                let cell = (row, col);
+                app.pane_selection =
+                    Some(PaneSelection { anchor: cell, head: cell, dragging: true });
+                return true;
+            }
+            false
+        }
+        MouseEventKind::Down(_) => {
+            app.pane_selection = None;
+            false
+        }
+        _ => {
+            // PaneSelection is Copy: work on a copy and write back, so `app`
+            // stays borrowable for the pane/rect lookups below.
+            let Some(mut sel) = app.pane_selection.filter(|s| s.dragging) else {
+                return false;
+            };
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    sel.head = clamp_to_content(app.right_pane_area, mouse.column, mouse.row);
+                    app.pane_selection = Some(sel);
+                    true
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    sel.dragging = false;
+                    let (start, end) = sel.range();
+                    if start == end {
+                        // Plain click: focus already switched at Down; the
+                        // clipboard is untouched and nothing lingers.
+                        app.pane_selection = None;
+                        return true;
+                    }
+                    app.pane_selection = Some(sel); // keep the highlight
+                    let text = app
+                        .active_pane_mut()
+                        .map(|p| p.selection_text(start, end))
+                        .unwrap_or_default();
+                    // Trailing newlines never reach the clipboard: a drag past
+                    // the prompt into empty rows would otherwise paste a
+                    // line-executing \n into a shell. The extractor stays
+                    // faithful — only the payload trims. Trimmed-to-empty (a
+                    // drag over nothing but empty rows) behaves exactly like
+                    // an empty extraction: no copy, the highlight stays until
+                    // the next key/Down.
+                    let text = text.trim_end_matches('\n');
+                    if !text.is_empty() {
+                        let _ = out.write_all(&super::pane::encode_osc52_copy(text));
+                        let _ = out.flush();
+                    }
+                    true
+                }
+                // A stray event mid-drag (wheel, second button, Moved) ends
+                // the grab and routes normally — the divider's convention.
+                // The highlight lingers un-copied until the next key/Down;
+                // self-healing.
+                _ => {
+                    sel.dragging = false;
+                    app.pane_selection = Some(sel);
+                    false
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_range_normalizes_reading_order() {
+        // Backwards drag up-left: head before the anchor in reading order.
+        let sel = PaneSelection { anchor: (5, 10), head: (2, 3), dragging: true };
+        assert_eq!(sel.range(), ((2, 3), (5, 10)));
+        // Same-row backwards drag.
+        let sel = PaneSelection { anchor: (4, 8), head: (4, 2), dragging: true };
+        assert_eq!(sel.range(), ((4, 2), (4, 8)));
+        // Single cell.
+        let sel = PaneSelection { anchor: (3, 3), head: (3, 3), dragging: false };
+        assert_eq!(sel.range(), ((3, 3), (3, 3)));
+    }
+
+    #[test]
+    fn clamp_to_content_clamps_edge_overshoot() {
+        // Right pane at (30,0) 70x30: content x 31..=98, y 2..=28 (border +
+        // 1-row tab strip). Expectations are (row, col) — the swap.
+        let area = Rect::new(30, 0, 70, 30);
+        assert_eq!(clamp_to_content(area, 50, 10), (8, 19), "in-range converts");
+        assert_eq!(clamp_to_content(area, 200, 200), (26, 67), "overshoot clamps to the far edge");
+        assert_eq!(clamp_to_content(area, 0, 0), (0, 0), "undershoot clamps to the origin");
+    }
 
     #[test]
     fn width_pct_at_biases_and_subtracts_origin() {

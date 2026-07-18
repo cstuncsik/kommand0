@@ -473,6 +473,11 @@ pub(crate) struct App {
     /// True while the tree/content border is being dragged to resize the tree
     /// (ephemeral, not persisted — like `mouse_pos`).
     pub(crate) dragging_divider: bool,
+    /// Drag-selection over the active embedded pane (highlight + OSC 52 copy);
+    /// only ever refers to the VISIBLE pane — every route that could change
+    /// which pane renders (keys, mouse Down, overlays, reap, background
+    /// cleanup) clears it.
+    pub(crate) pane_selection: Option<mouse::PaneSelection>,
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
     pub(crate) pending_button_action: Option<buttons::HitAction>,
     pub(crate) modal: modal::ModalState,
@@ -602,6 +607,7 @@ impl App {
             tree_scroll_offset: 0,
             mouse_pos: None,
             dragging_divider: false,
+            pane_selection: None,
             hit_regions: Vec::new(),
             pending_button_action: None,
             modal: modal::ModalState::default(),
@@ -1704,6 +1710,11 @@ impl App {
         for ws_id in &remove_ws {
             self.embedded.remove(ws_id);
         }
+        // Dropped tabs/workspaces shift what renders where — a stale highlight
+        // must not land on the neighbor tab.
+        if !dead.is_empty() || !remove_ws.is_empty() {
+            self.pane_selection = None;
+        }
         if self.focus == Focus::Embedded {
             let gone = self
                 .selected_workspace()
@@ -2467,6 +2478,9 @@ fn handle_filter_paste(app: &mut App, text: &str) {
 /// Handle one key press. Extracted from the main event loop so tests can
 /// drive the app without a real terminal.
 async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> {
+    // Any key dismisses a pane selection highlight (it may be about to change
+    // what the pane shows; the copy already happened on mouse-up).
+    app.pane_selection = None;
     // Embedded pane owns the keyboard: every key forwards to the real claude
     // (incl. Ctrl+C, Tab, q, slash commands). kommand0 commands are reached via a
     // tmux-style prefix (Ctrl+A) so there's always a reliable way out:
@@ -3581,6 +3595,11 @@ async fn run(
                             // re-syncs the active session (a raw clamp skipped
                             // both, stranding focus/selection after cleanup).
                             app.clamp_selection();
+                            // Rows shifted under selected_index — a DIFFERENT
+                            // workspace's pane can now be the visible one (the
+                            // one pane-switch route with no key and no Down),
+                            // so a highlight (or live drag) must not carry over.
+                            app.pane_selection = None;
                         }
                     }
                     Err(msg) => {
@@ -3665,8 +3684,18 @@ async fn run(
                             // palette, which captures keys after the modal block).
                             // An overlay opening mid-drag must not strand the flag.
                             app.dragging_divider = false;
+                            app.pane_selection = None;
                         } else if mouse::handle_divider_drag(&mut app, mouse_event) {
                             // A tree/content border drag — consumed; don't route on.
+                        } else if mouse::handle_selection(
+                            &mut app,
+                            mouse_event,
+                            &mut std::io::stdout(),
+                        ) {
+                            // A drag-selection gesture over a mouse-less embedded
+                            // pane (before the focus split on purpose: a Down from
+                            // the tree both focuses and anchors). OSC 52 copy
+                            // happens on release, inside handle_selection.
                         } else if app.focus == Focus::Embedded {
                             app.handle_embedded_mouse(mouse_event);
                         } else {
@@ -6378,6 +6407,144 @@ mod key_tests {
         assert!(!s.remove_tab(b_idx));
         s.select_last_active();
         assert_eq!(s.tabs[s.active].id, "c", "closed last-active tab: no-op");
+    }
+
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+    fn m(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    /// App with workspace w1 selected and one embedded tab running `cmd`;
+    /// right pane at (30,0) 70x30 → content cells start at screen (31, 2).
+    fn app_with_pane(cmd: &str) -> App {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.right_pane_area = ratatui::layout::Rect::new(30, 0, 70, 30);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", cmd])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        app
+    }
+
+    #[test]
+    fn pane_drag_selects_and_copies_for_non_mouse_child() {
+        let mut app = app_with_pane("printf 'HELLO WORLD'; sleep 30");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.embedded["w1"].tabs[0].pane.screen_contents().contains("HELLO") {
+            assert!(Instant::now() < deadline, "stub never printed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        // Down at screen (31, 2) = pane cell (row 0, col 0) — the (col, row)
+        // → (row, col) swap; expectations written in (row, col).
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Down(MouseButton::Left), 31, 2),
+            &mut out
+        ));
+        assert_eq!(app.focus, Focus::Embedded, "down focuses the pane");
+        let sel = app.pane_selection.expect("anchored");
+        assert_eq!(sel.anchor, (0, 0), "(row, col) convention");
+        assert!(sel.dragging);
+        // Drag to screen (35, 2) = cell (0, 4): inclusive head over "HELLO".
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Drag(MouseButton::Left), 35, 2),
+            &mut out
+        ));
+        assert_eq!(app.pane_selection.unwrap().head, (0, 4));
+        assert!(out.is_empty(), "no copy before release");
+        // Up: OSC 52 copy of exactly the dragged cells.
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Up(MouseButton::Left), 35, 2),
+            &mut out
+        ));
+        assert_eq!(out, pane::encode_osc52_copy("HELLO"), "copied the dragged text");
+        let sel = app.pane_selection.expect("highlight persists after Up");
+        assert!(!sel.dragging);
+
+        // A drag ending on empty rows below the text: the extraction carries
+        // trailing \n per empty row, but the clipboard payload is trimmed
+        // (pasting into a shell would otherwise execute the line).
+        let mut out: Vec<u8> = Vec::new();
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Down(MouseButton::Left), 31, 2),
+            &mut out
+        ));
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Drag(MouseButton::Left), 35, 4),
+            &mut out
+        ));
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Up(MouseButton::Left), 35, 4),
+            &mut out
+        ));
+        assert_eq!(
+            out,
+            pane::encode_osc52_copy("HELLO WORLD"),
+            "trailing empty rows trimmed from the payload"
+        );
+    }
+
+    #[test]
+    fn pane_drag_forwards_untouched_for_mouse_mode_child() {
+        let mut app = app_with_pane("printf '\\033[?1002hM'; sleep 30");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.embedded["w1"].tabs[0].pane.wants_mouse() {
+            assert!(Instant::now() < deadline, "child never enabled mouse mode");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        assert!(
+            !mouse::handle_selection(
+                &mut app,
+                m(MouseEventKind::Down(MouseButton::Left), 31, 2),
+                &mut out
+            ),
+            "mouse-mode child: not consumed — routes/forwards exactly as today"
+        );
+        assert!(app.pane_selection.is_none());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn click_without_drag_copies_nothing() {
+        let mut app = app_with_pane("printf X; sleep 30");
+        let mut out: Vec<u8> = Vec::new();
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Down(MouseButton::Left), 31, 2),
+            &mut out
+        ));
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Up(MouseButton::Left), 31, 2),
+            &mut out
+        ));
+        assert!(out.is_empty(), "plain click never touches the clipboard");
+        assert!(app.pane_selection.is_none(), "no lingering highlight");
+        assert_eq!(app.focus, Focus::Embedded, "click-to-focus preserved");
+    }
+
+    #[tokio::test]
+    async fn key_clears_pane_selection() {
+        let mut app = test_app();
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (0, 3), dragging: false });
+        press(&mut app, KeyCode::Char('j')).await;
+        assert!(app.pane_selection.is_none(), "any key dismisses the highlight");
     }
 
     #[test]

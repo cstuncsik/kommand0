@@ -16,15 +16,21 @@ const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
 /// vt100 0.16 moved the audible-bell counter off `Screen` onto the `Callbacks`
-/// trait; this counts BEL for `bell_count()`/`wait_for_bell()`.
+/// trait; this counts BEL for `bell_count()`/`wait_for_bell()` and captures
+/// OSC 52 clipboard writes (base64 payloads, as vt100 delivers them) for
+/// `wait_for_clipboard()`.
 #[derive(Default)]
 struct BellCounter {
     count: usize,
+    clipboard: Vec<String>,
 }
 
 impl vt100::Callbacks for BellCounter {
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.count += 1;
+    }
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        self.clipboard.push(String::from_utf8_lossy(data).into_owned());
     }
 }
 
@@ -271,6 +277,26 @@ impl Tui {
             if Instant::now() > deadline {
                 panic!(
                     "timed out waiting for the terminal bell; screen:\n{}",
+                    self.screen()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Wait until the app has written an OSC 52 clipboard copy; returns the
+    /// base64 payload (as vt100 delivers it).
+    fn wait_for_clipboard(&self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(data) =
+                self.parser.lock().unwrap().callbacks().clipboard.first().cloned()
+            {
+                return data;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "timed out waiting for an OSC 52 copy; screen:\n{}",
                     self.screen()
                 );
             }
@@ -1308,6 +1334,35 @@ fn embedded_focus_reports_follow_pane_focus() {
     tui.send("t");
     tui.wait_for("^[O");
 
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn drag_select_copies_via_osc52() {
+    // A child WITHOUT mouse reporting (embed-stub-plain): a drag over its pane
+    // becomes a kommand0 selection, and the release writes the text to the
+    // host terminal as OSC 52 — captured by the harness' vt100 callback.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub-plain")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e"); // open the embedded pane
+    tui.wait_for("EMBED-STUB-READY");
+
+    // Drag across "EMBED" on the READY row: pane content starts at screen
+    // (col 32, row 3) 1-based; the READY line is the pane's second row.
+    tui.send("\x1b[<0;32;4M"); // press  (pane cell row 1, col 0)
+    tui.send("\x1b[<32;36;4M"); // drag  (button 0 + motion bit, col 36)
+    tui.send("\x1b[<0;36;4m"); // release
+
+    assert_eq!(tui.wait_for_clipboard(), "RU1CRUQ=", "base64 of the dragged \"EMBED\"");
+
+    tui.send("\x01"); // Ctrl+A (the drag focused the pane)
     tui.send("q");
     tui.wait_exit();
 }
