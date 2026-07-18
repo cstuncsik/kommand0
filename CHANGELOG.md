@@ -17,13 +17,6 @@ All notable changes to kommand0 are documented here. The format is based on
   `lazygit`, …) keeps receiving every mouse event exactly as before —
   Shift+drag remains the raw-screen bypass for those.
 
-### Fixed
-
-- **Docs: copying text from embedded panes** — the README's Terminals & tmux
-  section now explains why native drag-to-select is suppressed (kommand0 and
-  tmux both capture the mouse) and that Shift+drag bypasses the capture for
-  the terminal's native selection.
-
 ## [0.16.0] - 2026-07-15
 
 ### Added

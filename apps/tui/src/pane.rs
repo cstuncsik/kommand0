@@ -630,9 +630,9 @@ pub fn encode_mouse(
 
 /// OSC 52 clipboard-copy sequence for `text` (clipboard `c`) — the terminal
 /// does the actual copying. Raw input is clamped to 64 KiB at a char boundary
-/// first. ponytail: most terminals cap the whole OSC sequence around ~100 KB,
-/// and a selection that big isn't a copy-paste use case — truncate rather
-/// than chunk (chunked OSC 52 is the upgrade path if anyone ever asks).
+/// first: most terminals cap the whole OSC sequence around ~100 KB, and a
+/// selection that big isn't a copy-paste use case — truncate rather than
+/// chunk (chunked OSC 52 is the upgrade path if anyone ever asks).
 pub fn encode_osc52_copy(text: &str) -> Vec<u8> {
     use base64::Engine as _;
     const OSC52_MAX_RAW: usize = 64 * 1024;
@@ -1151,6 +1151,27 @@ mod tests {
                 "cell {x} outside the selection is untouched"
             );
         }
+
+        // A two-row selection fills in READING ORDER: a first-row cell PAST
+        // the head column is still inside (tuple order compares row first).
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
+        pane.blit(&mut buf, Rect::new(0, 0, 20, 5), Some(((0, 1), (1, 2))));
+        assert!(
+            buf[(4, 0)].style().add_modifier.contains(Modifier::REVERSED),
+            "row 0 col 4 (past the head column) is inside the reading-order fill"
+        );
+        assert!(
+            buf[(2, 1)].style().add_modifier.contains(Modifier::REVERSED),
+            "row 1 up to the head column is inside"
+        );
+        assert!(
+            !buf[(0, 0)].style().add_modifier.contains(Modifier::REVERSED),
+            "row 0 before the anchor column stays outside"
+        );
+        assert!(
+            !buf[(3, 1)].style().add_modifier.contains(Modifier::REVERSED),
+            "row 1 past the head column stays outside"
+        );
     }
 
     #[test]

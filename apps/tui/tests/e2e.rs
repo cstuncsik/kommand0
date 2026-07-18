@@ -15,17 +15,17 @@ use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-/// vt100 0.16 moved the audible-bell counter off `Screen` onto the `Callbacks`
-/// trait; this counts BEL for `bell_count()`/`wait_for_bell()` and captures
-/// OSC 52 clipboard writes (base64 payloads, as vt100 delivers them) for
-/// `wait_for_clipboard()`.
+/// Host-side terminal callbacks (vt100 0.16 routes these off `Screen` onto
+/// the `Callbacks` trait): counts BEL for `bell_count()`/`wait_for_bell()`
+/// and captures OSC 52 clipboard writes (base64 payloads, as vt100 delivers
+/// them) for `wait_for_clipboard()`.
 #[derive(Default)]
-struct BellCounter {
+struct HostCallbacks {
     count: usize,
     clipboard: Vec<String>,
 }
 
-impl vt100::Callbacks for BellCounter {
+impl vt100::Callbacks for HostCallbacks {
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.count += 1;
     }
@@ -35,7 +35,7 @@ impl vt100::Callbacks for BellCounter {
 }
 
 struct Tui {
-    parser: Arc<Mutex<vt100::Parser<BellCounter>>>,
+    parser: Arc<Mutex<vt100::Parser<HostCallbacks>>>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -143,7 +143,7 @@ impl Tui {
             ROWS,
             COLS,
             0,
-            BellCounter::default(),
+            HostCallbacks::default(),
         )));
         let parser_clone = parser.clone();
         std::thread::spawn(move || {
@@ -1361,6 +1361,14 @@ fn drag_select_copies_via_osc52() {
     tui.send("\x1b[<0;36;4m"); // release
 
     assert_eq!(tui.wait_for_clipboard(), "RU1CRUQ=", "base64 of the dragged \"EMBED\"");
+    // The child received NOTHING for the gesture: the stub echoes its input
+    // with ESC rendered as '^', so a forwarded SGR mouse report would show
+    // up as `^[<...` on its screen.
+    assert!(
+        !tui.screen().contains("^[<"),
+        "no mouse bytes were forwarded to the child:\n{}",
+        tui.screen()
+    );
 
     tui.send("\x01"); // Ctrl+A (the drag focused the pane)
     tui.send("q");

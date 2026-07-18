@@ -1184,6 +1184,15 @@ impl App {
         self.embedded.get_mut(&ws_id)?.active_pane_mut()
     }
 
+    /// Focus the embedded pane from a mouse gesture. Clearing the Ctrl+A
+    /// prefix is part of the invariant — a half-typed prefix carried across a
+    /// click would mis-fire on the next keystroke. Both mouse routes
+    /// (click-to-focus and drag-selection) go through here.
+    pub(crate) fn focus_embedded_by_click(&mut self) {
+        self.focus = Focus::Embedded;
+        self.embedded_prefix = false;
+    }
+
     /// Synthesize terminal focus for embedded children. A child is "focused"
     /// iff kommand0's own terminal has focus AND the embedded pane owns input
     /// AND it is the active tab of the selected workspace. Recompute-and-diff
@@ -3599,6 +3608,8 @@ async fn run(
                             // workspace's pane can now be the visible one (the
                             // one pane-switch route with no key and no Down),
                             // so a highlight (or live drag) must not carry over.
+                            // (Inside the select! loop — unit-unreachable;
+                            // review-only coverage.)
                             app.pane_selection = None;
                         }
                     }
@@ -3683,6 +3694,8 @@ async fn run(
                             // leaked click could even open a modal and orphan the
                             // palette, which captures keys after the modal block).
                             // An overlay opening mid-drag must not strand the flag.
+                            // (Inside the select! loop — unit-unreachable;
+                            // review-only coverage.)
                             app.dragging_divider = false;
                             app.pane_selection = None;
                         } else if mouse::handle_divider_drag(&mut app, mouse_event) {
@@ -6438,7 +6451,10 @@ mod key_tests {
     fn pane_drag_selects_and_copies_for_non_mouse_child() {
         let mut app = app_with_pane("printf 'HELLO WORLD'; sleep 30");
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !app.embedded["w1"].tabs[0].pane.screen_contents().contains("HELLO") {
+        // Poll for the END of the line: the later assertions need the whole
+        // of "HELLO WORLD" on screen, and a split PTY chunk could deliver
+        // "HELLO" first.
+        while !app.embedded["w1"].tabs[0].pane.screen_contents().contains("WORLD") {
             assert!(Instant::now() < deadline, "stub never printed");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -6536,6 +6552,112 @@ mod key_tests {
         assert!(out.is_empty(), "plain click never touches the clipboard");
         assert!(app.pane_selection.is_none(), "no lingering highlight");
         assert_eq!(app.focus, Focus::Embedded, "click-to-focus preserved");
+    }
+
+    #[test]
+    fn drag_over_empty_rows_copies_nothing() {
+        // The trim guard is all that prevents emitting `\x1b]52;c;\x07`,
+        // which would CLEAR the user's clipboard.
+        let mut app = app_with_pane("printf 'HELLO WORLD'; sleep 30");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.embedded["w1"].tabs[0].pane.screen_contents().contains("WORLD") {
+            assert!(Instant::now() < deadline, "stub never printed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        // Down at screen (31, 12) = pane cell (row 10, col 0) — an ASYMMETRIC
+        // anchor, so a (col, row) transposition at the Down site cannot pass.
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Down(MouseButton::Left), 31, 12),
+            &mut out
+        ));
+        assert_eq!(app.pane_selection.unwrap().anchor, (10, 0), "asymmetric (row, col) anchor");
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Drag(MouseButton::Left), 35, 14),
+            &mut out
+        ));
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Up(MouseButton::Left), 35, 14),
+            &mut out
+        ));
+        assert!(out.is_empty(), "empty-rows selection trims to nothing: no OSC 52 at all");
+        let sel = app.pane_selection.expect("trimmed-to-empty keeps the highlight");
+        assert!(!sel.dragging);
+    }
+
+    #[test]
+    fn down_outside_pane_clears_lingering_highlight() {
+        let mut app = app_with_pane("printf X; sleep 30");
+        // A Left Down on the tree clears a lingering highlight and routes on.
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (0, 3), dragging: false });
+        let mut out: Vec<u8> = Vec::new();
+        assert!(
+            !mouse::handle_selection(
+                &mut app,
+                m(MouseEventKind::Down(MouseButton::Left), 5, 5),
+                &mut out
+            ),
+            "tree click is not consumed"
+        );
+        assert!(app.pane_selection.is_none(), "clear-on-mouse-down is unconditional");
+        // A non-left Down clears too (and never anchors).
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (0, 3), dragging: false });
+        assert!(!mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Down(MouseButton::Middle), 31, 2),
+            &mut out
+        ));
+        assert!(app.pane_selection.is_none(), "middle-button down clears");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn scroll_mid_drag_ends_grab_and_routes_on() {
+        let mut app = app_with_pane("printf X; sleep 30");
+        let mut out: Vec<u8> = Vec::new();
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Down(MouseButton::Left), 31, 2),
+            &mut out
+        ));
+        assert!(mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Drag(MouseButton::Left), 35, 2),
+            &mut out
+        ));
+        // A stray wheel event ends the grab and is NOT consumed.
+        assert!(!mouse::handle_selection(&mut app, m(MouseEventKind::ScrollUp, 35, 2), &mut out));
+        let sel = app.pane_selection.expect("highlight survives the stray event");
+        assert!(!sel.dragging, "the grab ended");
+        // With the grab gone, a further Drag routes normally (not consumed).
+        assert!(!mouse::handle_selection(
+            &mut app,
+            m(MouseEventKind::Drag(MouseButton::Left), 40, 2),
+            &mut out
+        ));
+        assert!(out.is_empty(), "nothing was ever copied");
+    }
+
+    #[test]
+    fn reap_clears_pane_selection() {
+        let mut app = test_app(); // has workspace "w1"
+        let mut s = WorkspaceSessions {
+            tabs: vec![tab("a", &["-c", "sleep 30"])],
+            active: 0,
+            last_active: None,
+        };
+        s.tabs[0].pane.kill();
+        wait_exit(&mut s.tabs[0].pane);
+        app.embedded.insert("w1".to_string(), s);
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 2), dragging: false });
+        app.reap_embedded(Instant::now());
+        assert!(app.pane_selection.is_none(), "a reaped tab clears the highlight");
     }
 
     #[tokio::test]

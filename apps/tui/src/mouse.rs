@@ -24,8 +24,7 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 && contains(app.right_pane_area, mouse.column, mouse.row)
                 && app.active_pane_mut().is_some()
             {
-                app.focus = super::Focus::Embedded;
-                app.embedded_prefix = false;
+                app.focus_embedded_by_click();
                 app.forward_mouse_to_embedded(mouse);
             }
         }
@@ -51,8 +50,10 @@ pub(crate) fn contains(area: Rect, col: u16, row: u16) -> bool {
 /// pane under the cursor. Any click/scroll is consumed here — it never leaks to
 /// the tree/pane behind the overlay.
 pub(crate) fn handle_diff_mouse(app: &mut App, mouse: MouseEvent) {
-    // An overlay opening mid-drag must not strand the divider grab.
+    // An overlay opening mid-drag must not strand the divider grab or a pane
+    // selection (the sibling overlay branch in main.rs clears both too).
     app.dragging_divider = false;
+    app.pane_selection = None;
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             app.diff_handle_click(mouse.column, mouse.row);
@@ -234,8 +235,7 @@ pub(crate) fn handle_selection(app: &mut App, mouse: MouseEvent, out: &mut impl 
                 super::translate_mouse(app.right_pane_area, mouse.column, mouse.row)
                 && app.active_pane_mut().is_some_and(|p| !p.wants_mouse())
             {
-                app.focus = super::Focus::Embedded;
-                app.embedded_prefix = false;
+                app.focus_embedded_by_click();
                 let cell = (row, col);
                 app.pane_selection =
                     Some(PaneSelection { anchor: cell, head: cell, dragging: true });
