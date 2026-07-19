@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use kommand0_core::PROFILE_ENV;
@@ -48,6 +48,11 @@ pub struct Pane {
     /// The focus state last SENT to the child (`CSI I`/`CSI O`) — edge trigger
     /// for [`Pane::sync_focus`]. `None` until the first report after opt-in.
     focus_sent: Option<bool>,
+    /// Instant of the last bytes written to the child. Every write is direct
+    /// user interaction (keys, scroll, paste, focus reports), so output arriving
+    /// right after is the child redrawing in response; the activity tracker
+    /// uses this to not count it as work.
+    last_input: Option<Instant>,
     rows: u16,
     cols: u16,
 }
@@ -175,6 +180,7 @@ impl Pane {
             output_seq,
             focus_reporting,
             focus_sent: None,
+            last_input: None,
             rows,
             cols,
         })
@@ -201,9 +207,16 @@ impl Pane {
 
     /// Write raw bytes to the child's stdin.
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        self.last_input = Some(Instant::now());
         self.writer.write_all(bytes).context("pty write failed")?;
         self.writer.flush().context("pty flush failed")?;
         Ok(())
+    }
+
+    /// Instant of the last user input written to the child, if any. Output that
+    /// follows within a short grace of this is interaction (a redraw), not work.
+    pub fn last_input_at(&self) -> Option<Instant> {
+        self.last_input
     }
 
     /// Send the synthesized focus state (`CSI I` / `CSI O`) to the child —
@@ -1261,8 +1274,16 @@ mod tests {
     fn send_key_round_trips_into_child() {
         // `cat` echoes stdin to the pty; typed bytes appear on screen.
         let mut pane = Pane::spawn("cat", &[], &tmp(), 5, 20).unwrap();
+        assert!(
+            pane.last_input_at().is_none(),
+            "no input sent yet, nothing to stamp"
+        );
         pane.send_key(k(KeyCode::Char('h'))).unwrap();
         pane.send_key(k(KeyCode::Char('i'))).unwrap();
+        assert!(
+            pane.last_input_at().is_some(),
+            "every write to the child must stamp last_input"
+        );
         assert!(wait_until(&pane, "hi"), "screen:\n{}", pane.screen_contents());
         pane.kill();
     }

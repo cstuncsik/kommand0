@@ -1740,10 +1740,14 @@ impl App {
     /// [`Self::apply_shell_busy`] overrides shell tabs by their PTY foreground
     /// process group. Called every tick.
     fn update_pane_activity(&mut self, now: Instant) {
-        let seqs: Vec<(String, u64)> = self
+        let seqs: Vec<(String, u64, Option<Instant>)> = self
             .embedded
             .values()
-            .flat_map(|s| s.tabs.iter().map(|t| (t.id.clone(), t.pane.output_seq())))
+            .flat_map(|s| {
+                s.tabs
+                    .iter()
+                    .map(|t| (t.id.clone(), t.pane.output_seq(), t.pane.last_input_at()))
+            })
             .collect();
         self.apply_pane_activity(now, &seqs);
         // Shell tabs report activity by their PTY foreground process group (a
@@ -1765,7 +1769,11 @@ impl App {
         // quiet with unseen output. Order matters: clear before latching so the
         // session you're watching is never flagged.
         self.mark_active_viewed();
-        let newly_waiting = self.recompute_attention(now, &seqs);
+        let seq_pairs: Vec<(String, u64)> = seqs
+            .iter()
+            .map(|(id, seq, _)| (id.clone(), *seq))
+            .collect();
+        let newly_waiting = self.recompute_attention(now, &seq_pairs);
         if !newly_waiting.is_empty() {
             self.notify_newly_waiting(&newly_waiting);
         }
@@ -2376,19 +2384,29 @@ impl App {
     }
 
     /// Core of [`Self::update_pane_activity`], split out for testing: given the
-    /// observed `(session_id, output_seq)` for the live panes, arm a session as
-    /// active only after two consecutive ticks of new output (debounce), let it
-    /// decay after `ACTIVE_WINDOW`, and prune sessions no longer present.
-    fn apply_pane_activity(&mut self, now: Instant, seqs: &[(String, u64)]) {
+    /// observed `(session_id, output_seq, last_input_at)` for the live panes,
+    /// arm a session as active only after two consecutive ticks of new output
+    /// (debounce), let it decay after `ACTIVE_WINDOW`, and prune sessions no
+    /// longer present. Output arriving within `INPUT_GRACE` of user input to
+    /// that pane is the child redrawing in response (a scroll wheel tick, a
+    /// keystroke echo), not work: it updates `pane_seen` but neither arms the
+    /// spinner nor stamps `last_output_at` (so a scrolled pager stays idle for
+    /// [`Self::apply_shell_busy`] too).
+    fn apply_pane_activity(&mut self, now: Instant, seqs: &[(String, u64, Option<Instant>)]) {
         // Generous so the spinner rides through Claude's bursty output without
         // flicker; it decays only after a real ~2s pause (feel over accuracy).
         // Kept below ATTENTION_SETTLE so the spinner fades before the "needs you"
         // dot can appear — the two never show at once.
         const ACTIVE_WINDOW: Duration = Duration::from_millis(2000);
-        for (id, seq) in seqs {
+        // Interaction-driven redraws land well inside this; real work keeps
+        // producing past it, so at worst the spinner starts one grace late.
+        const INPUT_GRACE: Duration = Duration::from_millis(500);
+        for (id, seq, input_at) in seqs {
             let had_new = self.pane_seen.get(id) != Some(seq);
             self.pane_seen.insert(id.clone(), *seq);
-            if had_new {
+            let user_caused =
+                input_at.is_some_and(|t| now.saturating_duration_since(t) < INPUT_GRACE);
+            if had_new && !user_caused {
                 // Stamp the last-output time (no debounce) for the settle check.
                 self.last_output_at.insert(id.clone(), now);
                 if self.pane_pending.contains(id) {
@@ -2396,12 +2414,14 @@ impl App {
                 } else {
                     self.pane_pending.insert(id.clone());
                 }
-            } else {
+            } else if !had_new {
                 self.pane_pending.remove(id);
             }
+            // had_new && user_caused: swallowed. Keep any pending arm so a
+            // stray scroll doesn't reset genuinely starting work.
         }
         // Drop bookkeeping for panes no longer present this tick.
-        let live: HashSet<&str> = seqs.iter().map(|(id, _)| id.as_str()).collect();
+        let live: HashSet<&str> = seqs.iter().map(|(id, _, _)| id.as_str()).collect();
         self.pane_seen.retain(|id, _| live.contains(id.as_str()));
         self.pane_pending.retain(|id| live.contains(id.as_str()));
         self.pane_active_until
@@ -5813,14 +5833,14 @@ mod key_tests {
         let t = Instant::now();
 
         // One tick of new output: held pending by the debounce, not yet active.
-        app.apply_pane_activity(t, &[("w1".to_string(), 1)]);
+        app.apply_pane_activity(t, &[("w1".to_string(), 1, None)]);
         assert!(
             !app.waiting_response.contains("w1"),
             "a single output tick must not arm (debounce)"
         );
 
         // A second consecutive tick of new output arms it.
-        app.apply_pane_activity(t, &[("w1".to_string(), 2)]);
+        app.apply_pane_activity(t, &[("w1".to_string(), 2, None)]);
         assert!(
             app.waiting_response.contains("w1"),
             "two consecutive output ticks should mark the pane active"
@@ -5828,14 +5848,14 @@ mod key_tests {
 
         // A gap shorter than the window keeps it active (bridges bursty output
         // so the spinner reads as continuous, not flickering).
-        app.apply_pane_activity(t + Duration::from_millis(800), &[("w1".to_string(), 2)]);
+        app.apply_pane_activity(t + Duration::from_millis(800), &[("w1".to_string(), 2, None)]);
         assert!(
             app.waiting_response.contains("w1"),
             "a sub-window output gap must not drop the spinner"
         );
 
         // No new output past the active window: decays to idle.
-        app.apply_pane_activity(t + Duration::from_millis(2100), &[("w1".to_string(), 2)]);
+        app.apply_pane_activity(t + Duration::from_millis(2100), &[("w1".to_string(), 2, None)]);
         assert!(
             !app.waiting_response.contains("w1"),
             "a stale pane should decay to idle"
@@ -5848,6 +5868,36 @@ mod key_tests {
         assert!(app.pane_pending.is_empty());
         assert!(app.pane_active_until.is_empty());
         assert!(app.last_output_at.is_empty());
+    }
+
+    #[test]
+    fn input_driven_output_does_not_arm_or_stamp() {
+        let mut app = test_app();
+        let t = Instant::now();
+
+        // Output ticks arriving right after user input (scroll-driven redraws)
+        // are swallowed: no spinner, no last-output stamp, however long the
+        // scrolling goes on.
+        for seq in 1..=4 {
+            app.apply_pane_activity(t, &[("w1".to_string(), seq, Some(t))]);
+        }
+        assert!(
+            !app.waiting_response.contains("w1"),
+            "scroll-driven redraws must not arm the spinner"
+        );
+        assert!(
+            !app.last_output_at.contains_key("w1"),
+            "input-driven output must not count for the settle/shell-busy checks"
+        );
+
+        // The same cadence with the input grace lapsed arms normally.
+        let old_input = Some(t - Duration::from_secs(1));
+        app.apply_pane_activity(t, &[("w1".to_string(), 5, old_input)]);
+        app.apply_pane_activity(t, &[("w1".to_string(), 6, old_input)]);
+        assert!(
+            app.waiting_response.contains("w1"),
+            "output past the input grace must arm the spinner"
+        );
     }
 
     #[test]
@@ -5948,7 +5998,7 @@ mod key_tests {
         let t = Instant::now();
 
         // Fresh output isn't attention until it has gone quiet (settled).
-        app.apply_pane_activity(t, &[("s1".to_string(), 1)]);
+        app.apply_pane_activity(t, &[("s1".to_string(), 1, None)]);
         let newly = app.recompute_attention(t, &[("s1".to_string(), 1)]);
         assert!(!app.attention.contains("s1"), "fresh output isn't attention yet");
         assert!(newly.is_empty(), "no rising edge before settle");
@@ -5961,7 +6011,7 @@ mod key_tests {
 
         // Resumed output must NOT clear it (no mid-turn strobe) — only viewing does,
         // and a still-latched session is NOT a rising edge (no repeat notification).
-        app.apply_pane_activity(later, &[("s1".to_string(), 2)]);
+        app.apply_pane_activity(later, &[("s1".to_string(), 2, None)]);
         let newly = app.recompute_attention(later, &[("s1".to_string(), 2)]);
         assert!(
             app.attention.contains("s1"),
@@ -6035,7 +6085,7 @@ mod key_tests {
     fn attention_relatches_after_view_then_new_output() {
         let mut app = test_app(); // focus Tree
         let t = Instant::now();
-        app.apply_pane_activity(t, &[("s1".to_string(), 1)]);
+        app.apply_pane_activity(t, &[("s1".to_string(), 1, None)]);
         app.recompute_attention(t + Duration::from_millis(3000), &[("s1".to_string(), 1)]);
         assert!(app.attention.contains("s1"), "first latch");
 
@@ -6045,7 +6095,7 @@ mod key_tests {
 
         // New output after viewing, still fresh -> not yet.
         let t2 = t + Duration::from_millis(2000);
-        app.apply_pane_activity(t2, &[("s1".to_string(), 2)]);
+        app.apply_pane_activity(t2, &[("s1".to_string(), 2, None)]);
         app.recompute_attention(t2, &[("s1".to_string(), 2)]);
         assert!(!app.attention.contains("s1"), "fresh post-view output isn't attention yet");
 

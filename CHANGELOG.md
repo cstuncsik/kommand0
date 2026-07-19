@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Scrolling no longer fakes "working"**: output a session produces in direct
+  response to user input (scroll-wheel redraws, keystroke echo) no longer
+  lights the activity spinner or the flashing dot, and a scrolled pager no
+  longer counts as a busy shell. Real work at most starts the spinner ~0.5s
+  later.
+
 ### Changed
 
 - **Selected workspace stays highlighted**: the selected tree row keeps its
