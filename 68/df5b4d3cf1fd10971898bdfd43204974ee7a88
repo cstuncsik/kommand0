@@ -1,0 +1,29 @@
+apps/tui/src/main.rs
+  s_ae7c076b7de8d9::t_ac5b5894f8473f 6691
+  s_ae7c076b7de8d9::t_1d5c474d7358e4 6125-6155
+  s_ae7c076b7de8d9::t_89d31536289e9e 1574-1580
+  s_ae7c076b7de8d9::t_b4f48194b97a2c 2397-2399
+  s_ae7c076b7de8d9::t_14c9d617bb27b1 2411-2413,2427-2437
+  s_ae7c076b7de8d9::t_fa0bd775fa62f7 6124,6813-6884
+CHANGELOG.md
+  s_ae7c076b7de8d9::t_dd0c055b8c9312 8-13
+apps/tui/src/mouse.rs
+  s_ae7c076b7de8d9::t_cce6d63a4e80f3 31-32
+  s_ae7c076b7de8d9::t_930f0678f683fc 111-117,119,124-125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "68df5b4d3cf1fd10971898bdfd43204974ee7a88",
+  "prompts": {},
+  "sessions": {
+    "s_ae7c076b7de8d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ece0a7b-8224-41af-8d50-9069346970fa",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}
