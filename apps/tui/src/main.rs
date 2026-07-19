@@ -1184,6 +1184,15 @@ impl App {
         self.embedded.get_mut(&ws_id)?.active_pane_mut()
     }
 
+    /// The visible pane's `output_seq`: the selected workspace's active tab
+    /// (immutable mirror of `active_pane_mut`'s lookup). The event loop's wake
+    /// arm compares it against the last drawn value to tell visible output
+    /// from background-only output, which needs no repaint.
+    fn visible_pane_seq(&self) -> Option<u64> {
+        let ws_id = &self.selected_workspace()?.id;
+        Some(self.embedded.get(ws_id)?.active_tab()?.pane.output_seq())
+    }
+
     /// Focus the embedded pane from a mouse gesture. Clearing the Ctrl+A
     /// prefix is part of the invariant — a half-typed prefix carried across a
     /// click would mis-fire on the next keystroke. Both mouse routes
@@ -3610,20 +3619,61 @@ async fn run(
         tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
     app.cleanup_tx = Some(cleanup_tx);
 
+    // Redraw coalescing for the wake arm: the visible pane's `output_seq` as of
+    // the last draw, when that draw happened, and whether the wake arm proved
+    // the next frame would be identical (background-only output: skip it).
+    let mut last_drawn_seq: Option<u64> = None;
+    let mut last_draw_at = Instant::now();
+    let mut skip_draw = false;
+
     loop {
-        // Seed the viewed session before drawing so a just-opened/just-switched
-        // tab is never momentarily flagged "needs you" before the next tick.
-        app.mark_active_viewed();
-        // Edge-triggered focus synthesis for embedded children, once per frame
-        // — covers every transition (terminal focus, Tree<->Embedded, tab and
-        // workspace switches, a child opting in mid-run) without per-site wiring.
-        app.sync_focus_states();
-        terminal.draw(|frame| render::ui(frame, &mut app))?;
+        if !skip_draw {
+            // Seed the viewed session before drawing so a just-opened/just-switched
+            // tab is never momentarily flagged "needs you" before the next tick.
+            app.mark_active_viewed();
+            // Edge-triggered focus synthesis for embedded children, once per frame:
+            // covers every transition (terminal focus, Tree<->Embedded, tab and
+            // workspace switches, a child opting in mid-run) without per-site wiring.
+            app.sync_focus_states();
+            // Sample BEFORE drawing: a read after could record a seq whose chunk
+            // is not in the frame just drawn, silently skipping that output.
+            let seq = app.visible_pane_seq();
+            terminal.draw(|frame| render::ui(frame, &mut app))?;
+            last_drawn_seq = seq;
+            last_draw_at = Instant::now();
+        }
+        skip_draw = false;
 
         tokio::select! {
             _ = wake_rx.recv() => {
                 // Drain any backlog so we coalesce into a single redraw.
                 while wake_rx.try_recv().is_ok() {}
+                // Invariant: this arm stays mutation-free beyond draining and
+                // pacing. Any state change belongs in an always-draw arm; the
+                // seq-only comparison below relies on visible-pane identity
+                // changes (tab/workspace switches, opens, reaps) flowing
+                // through arms that always repaint.
+                if app.visible_pane_seq() == last_drawn_seq {
+                    // Background-only output: the visible pane's frame would be
+                    // unchanged, so skip the repaint (a resume storm in other
+                    // workspaces must not peg the UI thread).
+                    skip_draw = true;
+                } else {
+                    // Visible-pane output storm: pace repaints to ~66fps. Defer
+                    // rather than drop: dropping would regress keystroke echo to
+                    // the 50ms tick (the input-arm draw resets the clock and the
+                    // echo lands within the cap). Read elapsed() ONCE and subtract
+                    // from that value; a guard and subtraction on two separate
+                    // reads can underflow, and Duration subtraction panics.
+                    const WAKE_REDRAW_CAP: Duration = Duration::from_millis(15);
+                    let e = last_draw_at.elapsed();
+                    if e < WAKE_REDRAW_CAP {
+                        tokio::time::sleep(WAKE_REDRAW_CAP - e).await;
+                        // Pick up chunks that arrived during the pause so they
+                        // land in this draw, not a queued extra wake iteration.
+                        while wake_rx.try_recv().is_ok() {}
+                    }
+                }
             }
             Some(status) = status_rx.recv() => {
                 // A status refresh finished: replace the cache wholesale (drops
@@ -6119,6 +6169,57 @@ mod key_tests {
         // ...once it settles, it re-latches.
         app.recompute_attention(t2 + Duration::from_millis(3000), &[("s1".to_string(), 2)]);
         assert!(app.attention.contains("s1"), "unseen output after a view re-latches");
+    }
+
+    #[test]
+    fn visible_pane_seq_follows_selection_tab_and_workspace() {
+        let mut app = test_app();
+        app.workspaces.push(mk_ws("w2", "docs", "r1", None));
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        assert_eq!(app.visible_pane_seq(), None, "no embedded sessions: no visible pane");
+
+        // w1: tab "a" prints (its seq advances), tab "b" stays silent (seq 0).
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![
+                    tab("a", &["-c", "printf X; sleep 30"]),
+                    tab("b", &["-c", "sleep 30"]),
+                ],
+                active: 0,
+                last_active: None,
+            },
+        );
+        app.embedded.insert(
+            "w2".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("c", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.embedded["w1"].tabs[0].pane.output_seq() == 0 {
+            assert!(Instant::now() < deadline, "pane never produced output");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Stable now: "X" was the only output, sleep produces nothing more.
+        let a_seq = app.embedded["w1"].tabs[0].pane.output_seq();
+        assert_eq!(app.visible_pane_seq(), Some(a_seq), "selected ws: the active tab's seq");
+
+        // Selecting another workspace retargets to ITS active tab while w1's
+        // is still the noisy one: every wrong candidate differs from the
+        // expected value (an always-w1 mutant would return a_seq here).
+        app.select_workspace_row("w2");
+        assert_eq!(app.visible_pane_seq(), Some(0), "tracks the workspace selection");
+        app.select_workspace_row("w1");
+        assert_eq!(app.visible_pane_seq(), Some(a_seq), "and back");
+
+        // A tab switch retargets to the newly active (silent) tab.
+        app.embedded.get_mut("w1").unwrap().active = 1;
+        assert_eq!(app.visible_pane_seq(), Some(0), "tracks the tab switch");
     }
 
     #[test]

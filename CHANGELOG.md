@@ -11,6 +11,13 @@ All notable changes to kommand0 are documented here. The format is based on
   embedded session without moving focus (the tree keeps the keyboard), and the
   output that scroll provokes no longer flags the session as "needs you".
 
+### Fixed
+
+- **Resuming several sessions at once no longer lags or glitches the UI**:
+  output from panes in non-visible workspaces no longer forces a repaint per
+  chunk, and visible-pane redraws are paced at ~66fps (a burst defers the
+  repaint by at most 15ms instead of dropping it).
+
 ## [0.18.2] - 2026-07-19
 
 ### Fixed
