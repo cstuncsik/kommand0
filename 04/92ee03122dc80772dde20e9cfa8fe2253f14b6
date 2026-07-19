@@ -1,0 +1,25 @@
+apps/tui/src/main.rs
+  s_ae7c076b7de8d9::t_ba16fc527448e6 1187-1195
+  s_ae7c076b7de8d9::t_9b5c9a7bbdf239 6195-6197,6202-6205
+  s_ae7c076b7de8d9::t_aac0053e55789c 6157
+  s_ae7c076b7de8d9::t_05df9a75270ec4 6158-6194,6198-6201,6206-6207
+  s_ae7c076b7de8d9::t_2e64922a7ae6df 3605-3611,3613-3628,3634-3659
+CHANGELOG.md
+  s_ae7c076b7de8d9::t_f8044d0441f6de 8-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "0492ee03122dc80772dde20e9cfa8fe2253f14b6",
+  "prompts": {},
+  "sessions": {
+    "s_ae7c076b7de8d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ece0a7b-8224-41af-8d50-9069346970fa",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}
