@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Selected workspace stays highlighted**: the selected tree row keeps its
+  bold highlight color while focus is in the embedded pane, instead of
+  dropping to the muted color (the pane border and TREE/CLAUDE badge already
+  indicate focus).
+
 ## [0.18.0] - 2026-07-19
 
 ### Changed

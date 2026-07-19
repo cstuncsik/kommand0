@@ -384,13 +384,9 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             ("\u{25CB}", th.muted)
                         };
                         let prefix = "  \u{251C}\u{2500} ";
-                        let style = if is_selected && app.focus == Focus::Tree {
+                        let style = if is_selected {
                             Style::default()
                                 .fg(th.selected)
-                                .add_modifier(Modifier::BOLD)
-                        } else if is_selected {
-                            Style::default()
-                                .fg(th.muted)
                                 .add_modifier(Modifier::BOLD)
                         } else if !ws.active {
                             Style::default().fg(th.muted)
