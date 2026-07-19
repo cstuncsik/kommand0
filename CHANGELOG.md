@@ -5,6 +5,12 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Hover-scroll**: the mouse wheel over the content pane scrolls the visible
+  embedded session without moving focus (the tree keeps the keyboard), and the
+  output that scroll provokes no longer flags the session as "needs you".
+
 ## [0.18.2] - 2026-07-19
 
 ### Fixed

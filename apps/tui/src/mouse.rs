@@ -28,11 +28,8 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 app.forward_mouse_to_embedded(mouse);
             }
         }
-        MouseEventKind::ScrollUp => {
-            handle_scroll(app, mouse.column, mouse.row, true);
-        }
-        MouseEventKind::ScrollDown => {
-            handle_scroll(app, mouse.column, mouse.row, false);
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            handle_scroll(app, mouse);
         }
         MouseEventKind::Moved => {
             app.mouse_pos = Some((mouse.column, mouse.row));
@@ -111,16 +108,21 @@ fn handle_click(app: &mut App, col: u16, row: u16) -> bool {
     false
 }
 
-fn handle_scroll(app: &mut App, col: u16, row: u16, up: bool) {
-    let areas = app.pane_areas;
-
-    if contains(areas.tree, col, row) {
+/// Route a wheel tick by the cell under the pointer: the tree navigates rows;
+/// anywhere else is offered to the visible embedded pane (hover-scroll), which
+/// scrolls WITHOUT moving focus. `forward_mouse_to_embedded` carries the
+/// guards (no pane = no-op; borders/tab strip rejected by translate), so no
+/// pre-checks here.
+fn handle_scroll(app: &mut App, mouse: MouseEvent) {
+    if contains(app.pane_areas.tree, mouse.column, mouse.row) {
         // Navigate tree
-        if up {
+        if matches!(mouse.kind, MouseEventKind::ScrollUp) {
             app.move_up();
         } else {
             app.move_down();
         }
+    } else {
+        app.forward_mouse_to_embedded(mouse);
     }
 }
 

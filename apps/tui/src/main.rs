@@ -1571,10 +1571,13 @@ impl App {
         }
     }
 
-    /// Forward a mouse event to the focused embedded pane, translated into the
-    /// pane's inner coordinate space. The pane only acts on it if claude enabled
-    /// mouse reporting. Events outside the pane's inner area are ignored (so a
-    /// click on the border/tree can't strand the pane).
+    /// Forward a mouse event to the visible embedded pane (the selected
+    /// workspace's active tab), translated into the pane's inner coordinate
+    /// space. Reached while the pane is focused AND from tree-focused
+    /// hover-scroll, so it must not assume `Focus::Embedded`. The pane only
+    /// acts on it if claude enabled mouse reporting. Events outside the pane's
+    /// inner area are ignored (so a click on the border/tree can't strand the
+    /// pane).
     ///
     /// Known limitation: a drag/release that leaves the pane is dropped rather
     /// than clamped to the edge, so a selection started inside and released
@@ -2391,7 +2394,9 @@ impl App {
     /// that pane is the child redrawing in response (a scroll wheel tick, a
     /// keystroke echo), not work: it updates `pane_seen` but neither arms the
     /// spinner nor stamps `last_output_at` (so a scrolled pager stays idle for
-    /// [`Self::apply_shell_busy`] too).
+    /// [`Self::apply_shell_busy`] too), and it keeps a fully-seen session's
+    /// `viewed_seq` current so a scroll-provoked redraw can't latch a false
+    /// "needs you" (a genuinely unseen backlog still latches).
     fn apply_pane_activity(&mut self, now: Instant, seqs: &[(String, u64, Option<Instant>)]) {
         // Generous so the spinner rides through Claude's bursty output without
         // flicker; it decays only after a real ~2s pause (feel over accuracy).
@@ -2403,6 +2408,9 @@ impl App {
         const INPUT_GRACE: Duration = Duration::from_millis(500);
         for (id, seq, input_at) in seqs {
             let had_new = self.pane_seen.get(id) != Some(seq);
+            // Captured BEFORE the insert: "fully seen" below must compare
+            // against what the session had produced before THIS chunk.
+            let prev_seen = self.pane_seen.get(id).copied().unwrap_or(0);
             self.pane_seen.insert(id.clone(), *seq);
             let user_caused =
                 input_at.is_some_and(|t| now.saturating_duration_since(t) < INPUT_GRACE);
@@ -2416,9 +2424,18 @@ impl App {
                 }
             } else if !had_new {
                 self.pane_pending.remove(id);
+            } else {
+                // had_new && user_caused: swallowed for the spinner. Keep any
+                // pending arm so a stray scroll doesn't reset genuinely
+                // starting work. A session that was fully seen before this
+                // chunk stays seen: the redraw the user's own input provoked
+                // (hover-scroll runs tree-focused, where mark_active_viewed
+                // never fires) must not latch a false "needs you". A
+                // genuinely-unseen backlog still latches.
+                if self.viewed_seq.get(id).copied().unwrap_or(0) >= prev_seen {
+                    self.viewed_seq.insert(id.clone(), *seq);
+                }
             }
-            // had_new && user_caused: swallowed. Keep any pending arm so a
-            // stray scroll doesn't reset genuinely starting work.
         }
         // Drop bookkeeping for panes no longer present this tick.
         let live: HashSet<&str> = seqs.iter().map(|(id, _, _)| id.as_str()).collect();
@@ -6105,6 +6122,38 @@ mod key_tests {
     }
 
     #[test]
+    fn user_caused_output_keeps_seen_session_seen_but_not_unseen() {
+        // Hover-scroll provokes child redraws while the tree keeps focus, so
+        // mark_active_viewed (Embedded-only) never runs; without the advance
+        // in apply_pane_activity the scrolled session would latch a false
+        // "needs you" 3s later.
+        let mut app = test_app(); // focus Tree
+        let t = Instant::now();
+        // "seen" is fully viewed at seq 1; "unseen" has a backlog (viewed 0 < 5).
+        app.apply_pane_activity(
+            t,
+            &[("seen".to_string(), 1, None), ("unseen".to_string(), 5, None)],
+        );
+        app.viewed_seq.insert("seen".to_string(), 1);
+        // Both bump their seq within INPUT_GRACE of user input (a wheel tick).
+        let t2 = t + Duration::from_millis(100);
+        app.apply_pane_activity(
+            t2,
+            &[("seen".to_string(), 2, Some(t2)), ("unseen".to_string(), 6, Some(t2))],
+        );
+        assert_eq!(app.viewed_seq.get("seen"), Some(&2), "fully-seen session stays seen");
+        assert!(
+            !app.viewed_seq.contains_key("unseen"),
+            "a backlog is never marked seen by a scroll"
+        );
+        // After the settle window, only the backlog latches.
+        let later = t2 + Duration::from_millis(3000);
+        app.recompute_attention(later, &[("seen".to_string(), 2), ("unseen".to_string(), 6)]);
+        assert!(!app.attention.contains("seen"), "no false latch for scroll-provoked output");
+        assert!(app.attention.contains("unseen"), "genuinely unseen output still latches");
+    }
+
+    #[test]
     fn attention_count_shows_in_status_bar() {
         let mut app = test_app();
         app.expanded.insert("r1".to_string());
@@ -6639,11 +6688,7 @@ mod key_tests {
     #[test]
     fn pane_drag_forwards_untouched_for_mouse_mode_child() {
         let mut app = app_with_pane("printf '\\033[?1002hM'; sleep 30");
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !app.embedded["w1"].tabs[0].pane.wants_mouse() {
-            assert!(Instant::now() < deadline, "child never enabled mouse mode");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_wants_mouse(&app);
         let mut out: Vec<u8> = Vec::new();
         assert!(
             !mouse::handle_selection(
@@ -6763,6 +6808,78 @@ mod key_tests {
             &mut out
         ));
         assert!(out.is_empty(), "nothing was ever copied");
+    }
+
+    /// Poll until the child has enabled mouse reporting (the reader thread
+    /// applies the `?100xh` opt-in asynchronously).
+    fn wait_wants_mouse(app: &App) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.embedded["w1"].tabs[0].pane.wants_mouse() {
+            assert!(Instant::now() < deadline, "child never enabled mouse mode");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn scroll_over_content_without_a_session_is_a_noop() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 8);
+        app.right_pane_area = ratatui::layout::Rect::new(30, 0, 70, 30);
+        let before = app.selected_index;
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollDown, 50, 10));
+        assert_eq!(app.focus, Focus::Tree, "no pane: focus stays on the tree");
+        assert_eq!(app.selected_index, before, "tree selection unchanged");
+    }
+
+    #[test]
+    fn scroll_over_content_with_mouseless_child_sends_nothing() {
+        // The forward branch is taken, but send_mouse gates on the child's
+        // mouse mode: a plain sleep never opted in, so nothing is written.
+        let mut app = app_with_pane("sleep 30");
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollDown, 50, 10));
+        assert!(app.embedded["w1"].tabs[0].pane.last_input_at().is_none());
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn hover_scroll_forwards_to_pane_without_focusing() {
+        let mut app = app_with_pane("printf '\\033[?1000h'; sleep 30");
+        wait_wants_mouse(&app);
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 8);
+        let before = app.selected_index;
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollDown, 50, 10));
+        assert!(
+            app.embedded["w1"].tabs[0].pane.last_input_at().is_some(),
+            "the wheel tick reached the child"
+        );
+        assert_eq!(app.focus, Focus::Tree, "hover-scroll must not steal focus");
+        assert_eq!(app.selected_index, before, "tree selection unchanged");
+    }
+
+    #[test]
+    fn scroll_over_tree_navigates_even_with_mousey_pane() {
+        // Tree priority: the wheel over the tree keeps navigating rows even
+        // while a mouse-mode pane is live; nothing leaks to the child.
+        let mut app = app_with_pane("printf '\\033[?1000h'; sleep 30");
+        wait_wants_mouse(&app);
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 8);
+        let before = app.selected_index;
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollUp, 5, 3));
+        assert_ne!(app.selected_index, before, "tree scroll still navigates");
+        assert!(app.embedded["w1"].tabs[0].pane.last_input_at().is_none());
+    }
+
+    #[test]
+    fn scroll_on_pane_border_forwards_nothing() {
+        // (30, 5) is the right pane's left border: translate_mouse rejects it,
+        // so even a mouse-mode child receives nothing.
+        let mut app = app_with_pane("printf '\\033[?1000h'; sleep 30");
+        wait_wants_mouse(&app);
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollUp, 30, 5));
+        assert!(app.embedded["w1"].tabs[0].pane.last_input_at().is_none());
     }
 
     #[test]
