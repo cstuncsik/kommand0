@@ -251,15 +251,15 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                 }
                 KeyCode::Enter => {
                     let name = input.trim().to_string();
-                    if name.is_empty() {
-                        *error = Some("Name cannot be empty".to_string());
+                    let branch = branch.trim().to_string();
+                    // A blank name is fine when a branch is given — core derives
+                    // a path-safe workspace name from the branch.
+                    if name.is_empty() && branch.is_empty() {
+                        *error = Some("Enter a name or a branch".to_string());
                         ModalResult::Consumed
                     } else {
-                        let result = ModalResult::SubmitWorkspace(
-                            repo_id.clone(),
-                            name,
-                            branch.trim().to_string(),
-                        );
+                        let result =
+                            ModalResult::SubmitWorkspace(repo_id.clone(), name, branch);
                         *modal = ModalState::None;
                         result
                     }
@@ -786,7 +786,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
 
             // Name field — the cursor is drawn only on the focused field.
             frame.render_widget(
-                Paragraph::new(Line::styled("Workspace name:", lbl(name_focused))),
+                Paragraph::new(Line::styled("Workspace name (blank = from branch):", lbl(name_focused))),
                 inner[0],
             );
             if name_focused {
@@ -1316,13 +1316,29 @@ mod tests {
     }
 
     #[test]
-    fn add_workspace_empty_name_is_rejected() {
+    fn add_workspace_both_fields_empty_is_rejected() {
         let mut modal = add_workspace_modal();
-        // Type only into the branch field, leaving the name blank.
-        handle_modal_key(&mut modal, key(KeyCode::Tab));
-        handle_modal_key(&mut modal, key(KeyCode::Char('x')));
         assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Enter)), ModalResult::Consumed));
         assert!(matches!(modal, ModalState::AddWorkspace { error: Some(_), .. }), "stays open with an error");
+    }
+
+    #[test]
+    fn add_workspace_blank_name_with_branch_submits() {
+        let mut modal = add_workspace_modal();
+        // Type only into the branch field, leaving the name blank — the
+        // workspace name is derived from the branch downstream.
+        handle_modal_key(&mut modal, key(KeyCode::Tab));
+        for c in "feat/x".chars() {
+            handle_modal_key(&mut modal, key(KeyCode::Char(c)));
+        }
+        match handle_modal_key(&mut modal, key(KeyCode::Enter)) {
+            ModalResult::SubmitWorkspace(_, name, branch) => {
+                assert!(name.is_empty(), "blank name is passed through for derivation");
+                assert_eq!(branch, "feat/x");
+            }
+            _ => panic!("expected SubmitWorkspace"),
+        }
+        assert!(matches!(modal, ModalState::None), "submit closes the modal");
     }
 
     fn confirm_branch_checkout_modal() -> ModalState {

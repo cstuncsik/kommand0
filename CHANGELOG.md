@@ -9,6 +9,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ### Fixed
 
+- **Add Workspace now handles branches with `/` in the name** — typing an
+  existing branch like `user/feature` into the Name field checks it out
+  directly (the workspace gets the path-safe `user-feature` name) instead of
+  failing validation with "must not contain a path separator". The Name field
+  may also be left blank when the Branch field is filled; the workspace name
+  is then derived from the branch the same way.
+
 - **Docs: drag-to-select under tmux needs `set -s set-clipboard on`** — the
   0.17.0 README claimed tmux's default `set-clipboard` passes the OSC 52 copy
   through; the default (`external`) actually drops clipboard requests from
