@@ -1,0 +1,35 @@
+apps/tui/src/pane.rs
+  s_ae7c076b7de8d9::t_81e76e02bef8c2 53
+  s_ae7c076b7de8d9::t_f126d706967b61 1277-1280,1283-1286
+  s_ae7c076b7de8d9::t_c4de2ae3005c71 210,216-219
+  s_ae7c076b7de8d9::t_40bfd699975500 15
+  s_ae7c076b7de8d9::t_9938273dfd1188 51-52,54-55
+  s_ae7c076b7de8d9::t_275a8ad173a864 183
+  s_ae7c076b7de8d9::t_9c868f5d80bc0c 220-221
+apps/tui/src/main.rs
+  s_ae7c076b7de8d9::t_c14e692d9621bf 5874-5902
+  s_ae7c076b7de8d9::t_aa8f30b3d091e7 1743,1746-1750
+  s_ae7c076b7de8d9::t_7a63f3bcdafc42 2387-2395,2401-2404,2407-2409,2417,2420-2421
+  s_ae7c076b7de8d9::t_b9f21aebc9bd38 5836,5843,5851,5858,6001,6014,6088,6098
+  s_ae7c076b7de8d9::t_e63e12f46749e7 1772-1776
+  s_ae7c076b7de8d9::t_7002ea0a3d5502 2424
+  s_ae7c076b7de8d9::t_fc588896eb9b10 5873
+CHANGELOG.md
+  s_ae7c076b7de8d9::t_05b842d7133444 8-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6160d6fcbc98842d3ac801f65a3fb3894068a598",
+  "prompts": {},
+  "sessions": {
+    "s_ae7c076b7de8d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ece0a7b-8224-41af-8d50-9069346970fa",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
