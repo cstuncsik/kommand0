@@ -115,6 +115,13 @@ const RESUME_FAIL_MSG: &str =
 /// scanning so a live session's own output can't false-positive.
 const RESUME_CHECK_WINDOW: Duration = Duration::from_secs(8);
 
+/// The miss scan serializes each resumed pane's full grid under the parser
+/// mutex its reader thread holds during replay, so running it every 50ms tick
+/// stalled the UI thread during multi-resume storms (4 resumes = 80 full-grid
+/// serializations/s). Healing a miss is not latency-sensitive; scan at most
+/// this often within [`RESUME_CHECK_WINDOW`].
+const RESUME_MISS_SCAN_EVERY: Duration = Duration::from_millis(500);
+
 fn claude_args(resume_id: Option<&str>) -> (Vec<String>, Option<String>) {
     match resume_id {
         Some(id) => (vec!["--resume".to_string(), id.to_string()], None),
@@ -461,6 +468,9 @@ pub(crate) struct App {
     /// Per-session instant of the most recent new output (any delta, no
     /// debounce) — used to decide a session has gone quiet ("settled").
     last_output_at: HashMap<String, Instant>,
+    /// Last time [`Self::reap_embedded`] ran the resume-miss screen scan
+    /// (paced by `RESUME_MISS_SCAN_EVERY`; exit reaping stays per-tick).
+    last_resume_scan: Instant,
     /// Sessions that produced unseen output and then went quiet — they "need
     /// you". A latched set: a session stays here until the user views it (or its
     /// pane is gone), so a mid-turn pause that resumes can't strobe it on/off.
@@ -602,6 +612,7 @@ impl App {
             pane_active_until: HashMap::new(),
             viewed_seq: HashMap::new(),
             last_output_at: HashMap::new(),
+            last_resume_scan: Instant::now(),
             attention: HashSet::new(),
             pane_areas: mouse::PaneAreas::default(),
             tree_scroll_offset: 0,
@@ -1655,11 +1666,19 @@ impl App {
         // would re-resume the same gone session).
         let mut exited: Vec<(String, String, bool, Instant, Option<i32>)> = Vec::new();
         let mut resume_missed: Vec<(String, String)> = Vec::new();
+        // The miss scan is paced (see RESUME_MISS_SCAN_EVERY); exit reaping
+        // below stays per-tick.
+        let scan_misses =
+            now.saturating_duration_since(self.last_resume_scan) >= RESUME_MISS_SCAN_EVERY;
+        if scan_misses {
+            self.last_resume_scan = now;
+        }
         for (ws_id, sessions) in self.embedded.iter_mut() {
             for tab in sessions.tabs.iter_mut() {
                 if let Some(code) = tab.pane.try_wait() {
                     exited.push((ws_id.clone(), tab.id.clone(), tab.was_resume, tab.spawned, code));
-                } else if tab.was_resume
+                } else if scan_misses
+                    && tab.was_resume
                     && now.saturating_duration_since(tab.spawned) < RESUME_CHECK_WINDOW
                 {
                     // Require BOTH the marker and this tab's (random uuid) session
@@ -7108,6 +7127,39 @@ mod key_tests {
         assert!(tab_ids.contains(&"b"), "healthy tab kept: {tab_ids:?}");
         assert!(!tab_ids.contains(&"a"), "failed tab gone (healed or dropped): {tab_ids:?}");
         assert!(s.active < s.tabs.len(), "active stays in range");
+    }
+
+    #[test]
+    fn resume_miss_scan_is_paced_not_per_tick() {
+        // The miss scan serializes the pane grid under the reader's parser
+        // mutex, so it must run on the RESUME_MISS_SCAN_EVERY stride, not
+        // every 50ms tick (exit reaping is untouched by the pacing).
+        let mut app = test_app();
+        let mut s = WorkspaceSessions {
+            tabs: vec![tab("a", &["-c", &format!("printf '{RESUME_MISS_MARKER} a'; sleep 30")])],
+            active: 0,
+            last_active: None,
+        };
+        s.tabs[0].was_resume = true;
+        app.embedded.insert("w1".to_string(), s);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.embedded["w1"].tabs[0].pane.screen_contents().contains(RESUME_MISS_MARKER) {
+            assert!(Instant::now() < deadline, "pane never showed the miss marker");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Pin the stride start so the poll above can't eat the window.
+        let t = Instant::now();
+        app.last_resume_scan = t;
+        app.reap_embedded(t);
+        assert!(
+            ids(&app.embedded["w1"]).contains(&"a"),
+            "within the stride the screen is not scanned, the missed tab survives"
+        );
+        // At exactly the stride boundary the scan runs and the miss is
+        // healed (fresh id) or dropped; either way "a" is gone.
+        app.reap_embedded(t + RESUME_MISS_SCAN_EVERY);
+        let gone = app.embedded.get("w1").map(|s| !ids(s).contains(&"a")).unwrap_or(true);
+        assert!(gone, "past the stride the scan heals/drops the missed resume");
     }
 
     #[tokio::test]

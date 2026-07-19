@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Less scroll lag right after resuming workspaces**: the resume-failure
+  screen scan now runs at most twice a second instead of every 50ms tick, so
+  it no longer fights the replaying sessions for their terminal buffers on
+  the UI thread during the first seconds after a resume.
+
 ## [0.19.0] - 2026-07-19
 
 ### Added
