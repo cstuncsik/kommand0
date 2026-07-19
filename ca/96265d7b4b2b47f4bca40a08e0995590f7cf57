@@ -1,0 +1,21 @@
+CHANGELOG.md
+  s_bb42836d1aac55::t_06bbacec4d2e52 8-14
+README.md
+  s_bb42836d1aac55::t_8ee9f9a951aff0 192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ca96265d7b4b2b47f4bca40a08e0995590f7cf57",
+  "prompts": {},
+  "sessions": {
+    "s_bb42836d1aac55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ad9c91b-df57-44fe-9a0a-1428bbc26db4",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
