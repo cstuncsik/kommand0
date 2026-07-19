@@ -1,0 +1,25 @@
+apps/tui/src/main.rs
+  s_ae7c076b7de8d9::t_a97d0b7da1e601 6225
+  s_ae7c076b7de8d9::t_f4dc7cde9d4e05 1583-1589,2406-2408,2420-2422,2436-2446,6226-6256,6792,6914-6984
+  s_ae7c076b7de8d9::t_b26e7e087383ac 6985
+apps/tui/src/mouse.rs
+  s_ae7c076b7de8d9::t_f4dc7cde9d4e05 31-32,111-117,119,124-125
+CHANGELOG.md
+  s_ae7c076b7de8d9::t_5ac748956c056e 8-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "75f0d48ec0416f3f4bba662c1dcd1777e1c26eef",
+  "prompts": {},
+  "sessions": {
+    "s_ae7c076b7de8d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ece0a7b-8224-41af-8d50-9069346970fa",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
