@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Docs: drag-to-select under tmux needs `set -s set-clipboard on`** — the
+  0.17.0 README claimed tmux's default `set-clipboard` passes the OSC 52 copy
+  through; the default (`external`) actually drops clipboard requests from
+  applications inside panes, so the copy silently never landed.
+
 ## [0.17.0] - 2026-07-18
 
 ### Added
