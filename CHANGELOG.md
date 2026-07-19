@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Flashing green dot while producing**: a workspace row's status dot now
+  pulses green in step with the activity spinner while any of its session
+  tabs is producing output.
+- **Smaller merged-PR glyph**: the tree row's merged indicator is now the
+  1-column `●` instead of the oversized `⬤`.
+
 ## [0.17.0] - 2026-07-18
 
 ### Added

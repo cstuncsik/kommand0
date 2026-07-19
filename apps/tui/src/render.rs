@@ -14,11 +14,11 @@ use super::{App, Focus, TreeNode, buttons, diff, help, modal, palette, settings}
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Compact tree-row glyph for a PR: state first (merged/closed short-circuit),
-/// else the CI outcome of an open PR. `⬤` merged · `✕` closed · `✓` passing ·
+/// else the CI outcome of an open PR. `●` merged · `✕` closed · `✓` passing ·
 /// `✗` failing · `◍` pending · `◇` no checks.
 fn pr_glyph(pr: &PrStatus) -> char {
     match pr.state {
-        PrState::Merged => '\u{2B24}', // ⬤
+        PrState::Merged => '\u{25CF}', // ●
         PrState::Closed => '\u{2715}', // ✕
         PrState::Open => match pr.checks {
             PrChecks::Passing => '\u{2713}', // ✓
@@ -367,9 +367,17 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         // output you haven't viewed and went quiet ("needs you").
                         // It can coexist with the right-side activity spinner: the
                         // dot answers "unseen since it last went quiet", the
-                        // spinner "producing right now".
+                        // spinner "producing right now". While producing, the dot
+                        // flashes green in step with the spinner (~500ms phase).
+                        let active_tabs = app.ws_active_tab_count(&ws.id);
                         let (dot, dot_color) = if app.ws_needs_attention(&ws.id) {
                             ("\u{25CF}", th.attention)
+                        } else if active_tabs > 0 {
+                            if (app.spinner_tick / 2).is_multiple_of(2) {
+                                ("\u{25CF}", th.active)
+                            } else {
+                                ("\u{25CB}", th.active)
+                            }
                         } else if ws.active {
                             ("\u{25CF}", th.active)
                         } else {
@@ -392,7 +400,6 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
                         // Build icon cluster from session state
                         let session = app.state.find_session_by_workspace(&ws.id);
-                        let active_tabs = app.ws_active_tab_count(&ws.id);
                         let is_expanded_narrow = app.expanded_icon_rows.contains(&ws.id);
                         let icons = workspace_icon_cluster(
                             th,
@@ -461,9 +468,9 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             pr.map(|p| format!(" #{} ", p.number)).unwrap_or_default();
                         let pr_w_raw = pr
                             .map(|p| {
-                                // Measure the actual glyph — the merged `⬤` is 2 cols
-                                // wide in many terminals, so a fixed +1 would misalign
-                                // the right-anchored icon hit-regions on merged rows.
+                                // Measure the actual glyph — some glyphs render 2 cols
+                                // wide in some terminals, so a fixed +1 could misalign
+                                // the right-anchored icon hit-regions.
                                 UnicodeWidthStr::width(pr_num_seg.as_str())
                                     + UnicodeWidthStr::width(pr_glyph(p).to_string().as_str())
                             })
@@ -1852,7 +1859,7 @@ mod tests {
     #[test]
     fn pr_glyph_reflects_state_then_ci() {
         // State short-circuits: merged/closed ignore the CI field.
-        assert_eq!(pr_glyph(&pr(PrState::Merged, PrChecks::Failing, PrReview::None)), '\u{2B24}');
+        assert_eq!(pr_glyph(&pr(PrState::Merged, PrChecks::Failing, PrReview::None)), '\u{25CF}');
         assert_eq!(pr_glyph(&pr(PrState::Closed, PrChecks::Passing, PrReview::None)), '\u{2715}');
         // Open PRs surface the CI outcome.
         assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Passing, PrReview::None)), '\u{2713}');
