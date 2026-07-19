@@ -12,7 +12,7 @@ expression: "render_to_string(&mut app, 100, 30)"
 │                            ││                                                                    │
 │                            ││                                                                    │
 │                     ┌ Add Workspace to demo ──────────────────────────────┐                      │
-│                     │ Workspace name:                                     │                      │
+│                     │ Workspace name (blank = from branch):               │                      │
 │                     │ review                                              │                      │
 │                     │ Branch (blank = new):                               │                      │
 │                     │ origin/feat/x█                                      │                      │

@@ -2845,16 +2845,29 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 if !branch.is_empty() {
                     // An explicitly-filled Branch field checks out that branch as
                     // today — the detect-and-offer flow is only for a blank one.
+                    // A blank name means derive a path-safe one from the branch.
                     let repo_name = repo.map(|r| r.name).unwrap_or_default();
-                    let result =
-                        app.state.create_workspace_from_branch(Some(&name), &repo_id, &branch);
+                    let result = app.state.create_workspace_from_branch(
+                        (!name.is_empty()).then_some(name.as_str()),
+                        &repo_id,
+                        &branch,
+                    );
                     app.finish_add_workspace(result, repo_id, repo_name, name, branch);
                 } else if let Some(repo) = repo {
+                    // A name with a '/' can only mean an existing branch (workspace
+                    // names ban path separators): check it out directly, the
+                    // workspace name derived by core. A missing branch surfaces
+                    // core's error, with the typed name preserved for a retry.
+                    if name.contains('/') {
+                        let result =
+                            app.state.create_workspace_from_branch(None, &repo_id, &name);
+                        app.finish_add_workspace(result, repo_id, repo.name, name, String::new());
+                    }
                     // Blank branch: offer the checkout only for a valid, unused
                     // name whose bare branch already exists — otherwise fall
                     // through to create, which surfaces core's canonical error
                     // (a duplicate or invalid name never opens the offer).
-                    if app.state.validate_new_workspace_name(&name).is_ok()
+                    else if app.state.validate_new_workspace_name(&name).is_ok()
                         && kommand0_core::worktree::branch_exists_bare(&repo.path, &name)
                     {
                         app.modal = modal::ModalState::ConfirmBranchCheckout {
@@ -4364,6 +4377,65 @@ mod key_tests {
             Some("fresh"),
             "forked a fresh branch named after the workspace (not a repo-root fallback)"
         );
+    }
+
+    #[tokio::test]
+    async fn slash_name_checks_out_the_existing_branch_directly() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "user/slashed");
+        // A '/' name can only be a branch: no offer prompt, straight to checkout
+        // with the path-safe derived workspace name.
+        app.modal = add_workspace_modal_for("real", "user/slashed");
+        press(&mut app, KeyCode::Enter).await;
+
+        assert!(matches!(app.modal, modal::ModalState::None), "no prompt, modal closes");
+        let ws = app.workspaces.iter().find(|w| w.name == "user-slashed").expect("workspace created");
+        assert_eq!(
+            ws.branch_name.as_deref(),
+            Some("user/slashed"),
+            "checked out the existing slash branch, not a fresh fork"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_name_missing_branch_reopens_with_error() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        // A '/' name whose branch doesn't exist must surface the checkout error,
+        // not the invalid-name one, and keep the typed name for a retry.
+        app.modal = add_workspace_modal_for("real", "ghost/nope");
+        press(&mut app, KeyCode::Enter).await;
+
+        match &app.modal {
+            modal::ModalState::AddWorkspace { error: Some(e), input, .. } => {
+                assert!(e.contains("branch not found"), "surfaces the checkout error: {e}");
+                assert_eq!(input, "ghost/nope", "the typed name is preserved for a retry");
+            }
+            _ => panic!("expected AddWorkspace reopened with an error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_branch_blank_name_derives_the_workspace_name() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "team/derive-me");
+        // Branch filled, name blank: the workspace name is derived path-safe
+        // from the branch.
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            input: String::new(),
+            cursor: 0,
+            branch: "team/derive-me".into(),
+            branch_cursor: 14,
+            field: modal::AddWorkspaceField::Branch,
+            error: None,
+        };
+        press(&mut app, KeyCode::Enter).await;
+
+        assert!(matches!(app.modal, modal::ModalState::None), "modal closes");
+        let ws = app.workspaces.iter().find(|w| w.name == "team-derive-me").expect("workspace created");
+        assert_eq!(ws.branch_name.as_deref(), Some("team/derive-me"));
     }
 
     #[tokio::test]
