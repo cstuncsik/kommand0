@@ -867,6 +867,10 @@ impl AppState {
             && let Some(pos) = ids.iter().position(|id| id == old_id)
         {
             // `new_id` is a fresh UUID v4, so no duplicate check is needed.
+            debug_assert!(
+                !ids.iter().any(|id| id == new_id),
+                "replace_embedded_session: new_id {new_id} already present"
+            );
             ids[pos] = new_id.to_string();
         } else {
             self.add_embedded_session(workspace_id, new_id);
