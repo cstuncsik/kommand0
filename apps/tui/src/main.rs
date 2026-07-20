@@ -240,19 +240,20 @@ pub(crate) enum DiffFocus {
     Diff,
 }
 
-/// One Claude session tab within a workspace: a live PTY pane plus the metadata
-/// to persist/resume it and to detect a failed resume.
-/// What a session tab runs. Claude tabs persist + resume across restarts; shell
-/// tabs are ephemeral (a fresh `$SHELL`, gone on quit — nothing to resume).
+/// What a session tab runs. Both kinds persist across restarts: Claude tabs
+/// resume their conversation (`claude --resume`); shell tabs reopen as fresh
+/// shells (a shell's process, unlike a conversation, can't be resumed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TabKind {
     Claude,
     Shell,
 }
 
+/// One session tab within a workspace: a live PTY pane plus the metadata
+/// to persist/resume it and to detect a failed resume.
 pub(crate) struct SessionTab {
-    /// Claude session id (UUID) for a Claude tab, else a generated id — the
-    /// stable key for activity tracking either way.
+    /// Claude session id (UUID) for a Claude tab, else its persisted `shell:`
+    /// sentinel: the stable key for activity tracking either way.
     pub(crate) id: String,
     pub(crate) pane: pane::Pane,
     was_resume: bool,
@@ -952,12 +953,27 @@ impl App {
         }
     }
 
-    /// Persist state, logging (not silently dropping) any failure — a save error
-    /// is otherwise invisible while the TUI owns the terminal.
-    pub(crate) fn save_state(&self) {
+    /// Merge this state over disk and, on success, advance the merge baseline
+    /// to the in-memory state just written (git's fetch-updates-tracking-ref
+    /// model). The baseline must track the last state of OURS known to be on
+    /// disk: left at the startup snapshot, a key first persisted mid-run reads
+    /// as a concurrent add once we delete it (mine=absent, baseline=absent,
+    /// disk=present) and the closed tab resurrects on the next reopen.
+    /// Deliberately NOT the merged result: a concurrent `kmd` add lives on disk
+    /// but not in `self.state`, and baselining it would flip it into "our
+    /// deletion" on the next save.
+    fn persist_state(&mut self) -> anyhow::Result<()> {
         // Merge over the current on-disk state (a `kmd` command may have written
         // it while we were open) rather than blindly overwriting it.
-        if let Err(e) = self.state.merge_save(&self.state_baseline) {
+        self.state.merge_save(&self.state_baseline)?;
+        self.state_baseline = self.state.clone();
+        Ok(())
+    }
+
+    /// Persist state, logging (not silently dropping) any failure: a save error
+    /// is otherwise invisible while the TUI owns the terminal.
+    pub(crate) fn save_state(&mut self) {
+        if let Err(e) = self.persist_state() {
             tracing::warn!("failed to persist state: {e}");
         }
     }
@@ -995,7 +1011,8 @@ impl App {
     /// Enter (spawning if needed) the embedded interactive `claude` pane for the
     /// selected workspace. Experimental PTY-passthrough toggle (Phase 2).
     /// Open the selected workspace's embedded sessions: if it has none live yet,
-    /// resume every persisted session id as a tab (or start a first session when
+    /// restore every persisted entry as a tab (Claude ids resume the session,
+    /// `shell:` sentinels respawn as fresh shells; or start a first session when
     /// none are stored), then focus the first tab.
     fn toggle_embedded(&mut self) {
         let Some(ws) = self.selected_workspace() else {
@@ -1005,16 +1022,20 @@ impl App {
         let ws_name = ws.name.clone();
         let ws_dir = ws.working_dir.clone();
         if !self.embedded.contains_key(&ws_id) {
-            // Cleared up front; spawn_session_tab re-sets it on any failure, so a
-            // partial-resume failure's message survives (a later clear would
-            // swallow it).
+            // Cleared up front; spawn_session_tab / spawn_shell_tab re-set it on
+            // any failure, so a partial-reopen failure's message survives (a
+            // later clear would swallow it).
             self.embed_error = None;
             let persisted: Vec<String> = self.state.embedded_session_ids(&ws_id).to_vec();
             if persisted.is_empty() {
                 self.spawn_session_tab(&ws_id, &ws_dir, &ws_name, None);
             } else {
                 for id in persisted.iter().take(MAX_SESSION_TABS) {
-                    self.spawn_session_tab(&ws_id, &ws_dir, &ws_name, Some(id));
+                    if AppState::is_shell_session_id(id) {
+                        self.spawn_shell_tab(&ws_id, &ws_dir, Some(id));
+                    } else {
+                        self.spawn_session_tab(&ws_id, &ws_dir, &ws_name, Some(id));
+                    }
                 }
             }
             // If every spawn failed, embed_error is set — stay on the tree.
@@ -1099,7 +1120,7 @@ impl App {
                     self.state.add_embedded_session(ws_id, &session_id);
                     // Merge over disk (like save_state) so this doesn't clobber a
                     // concurrent `kmd` write; keep the Result to surface a failure.
-                    if self.state.merge_save(&self.state_baseline).is_err() {
+                    if self.persist_state().is_err() {
                         self.embed_error = Some((
                             ws_id.to_string(),
                             "Couldn't persist this session — it may not resume \
@@ -1134,6 +1155,60 @@ impl App {
         }
     }
 
+    /// Spawn one shell tab for a workspace and append it. `reopen_id` reuses a
+    /// persisted `shell:` sentinel as the tab id; `None` mints + persists a fresh
+    /// one. Returns whether the pane started (on failure `embed_error` is set,
+    /// and a reopened entry is forgotten so the persisted Vec stays aligned).
+    fn spawn_shell_tab(&mut self, ws_id: &str, ws_dir: &str, reopen_id: Option<&str>) -> bool {
+        match self.spawn_shell_pane(ws_dir) {
+            Ok(pane) => {
+                let id = match reopen_id {
+                    Some(id) => id.to_string(), // already persisted
+                    None => {
+                        let id = AppState::new_shell_session_id();
+                        self.state.add_embedded_session(ws_id, &id);
+                        // Merge over disk (like save_state) so this doesn't clobber
+                        // a concurrent `kmd` write; keep the Result to surface a
+                        // failure.
+                        if self.persist_state().is_err() {
+                            self.embed_error = Some((
+                                ws_id.to_string(),
+                                "Couldn't persist this tab: it may not reopen after \
+                                 restarting kommand0."
+                                    .to_string(),
+                            ));
+                        }
+                        id
+                    }
+                };
+                self.embedded
+                    .entry(ws_id.to_string())
+                    .or_default()
+                    .push(SessionTab {
+                        id,
+                        pane,
+                        // Always false: it keeps reopened shells out of both the
+                        // resume_failed net and the resume-miss scan (both gate
+                        // on it).
+                        was_resume: false,
+                        spawned: Instant::now(),
+                        kind: TabKind::Shell,
+                    });
+                true
+            }
+            Err(e) => {
+                // A reopen that couldn't even spawn: forget the sentinel so the
+                // persisted Vec stays aligned with the runtime tabs.
+                if let Some(id) = reopen_id {
+                    self.state.remove_embedded_session(ws_id, id);
+                    self.save_state();
+                }
+                self.embed_error = Some((ws_id.to_string(), format!("Failed to start shell: {e}")));
+                false
+            }
+        }
+    }
+
     /// Auto-heal a resume that found no session: forget the gone id and replace
     /// its tab in place with a fresh session (same slot, so the active tab and
     /// numbering are preserved). Returns `false` if the fresh spawn itself failed
@@ -1145,20 +1220,12 @@ impl App {
         tracing::warn!(
             "resume miss: session {gone_id} not found in Claude's store for {ws_dir}; starting fresh"
         );
-        // Carry the user's tab title to the replacement (capture before the
-        // remove, which now also forgets the title). The tab's *purpose* is still
-        // meaningful even though its conversation is gone.
-        let prior_title = self
-            .state
-            .embedded_session_title(ws_id, gone_id)
-            .map(str::to_string);
-        self.state.remove_embedded_session(ws_id, gone_id);
         match self.spawn_pane(ws_dir, None) {
             Ok((pane, new_id, was_resume)) => {
-                self.state.add_embedded_session(ws_id, &new_id);
-                if let Some(title) = &prior_title {
-                    self.state.set_embedded_session_title(ws_id, &new_id, title);
-                }
+                // In place (same index) so the persisted order matches the
+                // in-slot runtime replace below; the helper also moves the
+                // user's tab title onto the fresh id.
+                self.state.replace_embedded_session(ws_id, gone_id, &new_id);
                 self.save_state();
                 if let Some(sessions) = self.embedded.get_mut(ws_id)
                     && let Some(slot) = sessions.tabs.iter().position(|t| t.id == gone_id)
@@ -1183,6 +1250,9 @@ impl App {
                 true
             }
             Err(_) => {
+                // The fresh spawn failed too: forget the gone id (the caller
+                // drops the tab) so it isn't re-resumed on the next reopen.
+                self.state.remove_embedded_session(ws_id, gone_id);
                 self.save_state();
                 false
             }
@@ -1475,8 +1545,8 @@ impl App {
             };
             (tab_id, sessions.remove_tab(active))
         };
-        // Closing a tab forgets its session (it won't resume next time). A shell
-        // tab's id was never persisted, so this is a harmless no-op for it.
+        // Closing a tab forgets its persisted entry, whatever its kind: a Claude
+        // id won't resume next time, a shell sentinel won't respawn.
         self.state.remove_embedded_session(&ws_id, &tab_id);
         self.save_state();
         if now_empty {
@@ -1495,20 +1565,14 @@ impl App {
         let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
             return;
         };
-        let Some((session_id, kind)) = self
+        let Some(session_id) = self
             .embedded
             .get(&ws_id)
             .and_then(|s| s.active_tab())
-            .map(|t| (t.id.clone(), t.kind))
+            .map(|t| t.id.clone())
         else {
             return;
         };
-        // A shell tab is ephemeral, so its title isn't persisted — renaming would
-        // silently do nothing. Say so rather than open a dead-end modal.
-        if kind == TabKind::Shell {
-            self.embed_error = Some((ws_id, "Shell tabs can't be renamed.".to_string()));
-            return;
-        }
         let current = self
             .state
             .embedded_session_title(&ws_id, &session_id)
@@ -1545,8 +1609,9 @@ impl App {
         }
     }
 
-    /// Open a new shell tab for a workspace — `$SHELL` (or the configured `shell`)
-    /// in the worktree. Ephemeral: a generated id, not persisted, never resumed.
+    /// Open a new shell tab for a workspace: `$SHELL` (or the configured `shell`)
+    /// in the worktree. Persisted as a `shell:` sentinel so reopening the
+    /// workspace respawns it (a fresh shell, same tab slot); never `--resume`d.
     fn new_shell_session(&mut self, ws_id: &str) {
         self.select_workspace_row(ws_id);
         let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
@@ -1560,22 +1625,12 @@ impl App {
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
             return;
         };
-        match self.spawn_shell_pane(&ws.working_dir) {
-            Ok(pane) => {
-                self.embed_error = None;
-                self.embedded.entry(ws_id.to_string()).or_default().push(SessionTab {
-                    id: kommand0_core::generate_id(),
-                    pane,
-                    was_resume: false,
-                    spawned: Instant::now(),
-                    kind: TabKind::Shell,
-                });
-                self.focus = Focus::Embedded;
-                self.embedded_prefix = false;
-            }
-            Err(e) => {
-                self.embed_error = Some((ws_id.to_string(), format!("Failed to start shell: {e}")));
-            }
+        // Cleared BEFORE the spawn so opening a shell drops a stale error without
+        // swallowing a persist-failure warning the spawn itself may set.
+        self.embed_error = None;
+        if self.spawn_shell_tab(ws_id, &ws.working_dir, None) {
+            self.focus = Focus::Embedded;
+            self.embedded_prefix = false;
         }
     }
 
@@ -1664,7 +1719,7 @@ impl App {
         // error — claude prints it and STAYS ALIVE, so the exit-code net alone
         // would never see it and the dead id would never be cleared (every reopen
         // would re-resume the same gone session).
-        let mut exited: Vec<(String, String, bool, Instant, Option<i32>)> = Vec::new();
+        let mut exited: Vec<(String, String, bool, Instant, Option<i32>, TabKind)> = Vec::new();
         let mut resume_missed: Vec<(String, String)> = Vec::new();
         // The miss scan is paced (see RESUME_MISS_SCAN_EVERY); exit reaping
         // below stays per-tick.
@@ -1676,7 +1731,14 @@ impl App {
         for (ws_id, sessions) in self.embedded.iter_mut() {
             for tab in sessions.tabs.iter_mut() {
                 if let Some(code) = tab.pane.try_wait() {
-                    exited.push((ws_id.clone(), tab.id.clone(), tab.was_resume, tab.spawned, code));
+                    exited.push((
+                        ws_id.clone(),
+                        tab.id.clone(),
+                        tab.was_resume,
+                        tab.spawned,
+                        code,
+                        tab.kind,
+                    ));
                 } else if scan_misses
                     && tab.was_resume
                     && now.saturating_duration_since(tab.spawned) < RESUME_CHECK_WINDOW
@@ -1699,7 +1761,7 @@ impl App {
         // spawn also fails, fall back to dropping the tab with the reopen message.
         let mut failed_resume: Vec<(String, String)> = exited
             .iter()
-            .filter(|(_, _, was_resume, spawned, code)| resume_failed(*spawned, *was_resume, now, *code))
+            .filter(|(_, _, was_resume, spawned, code, _)| resume_failed(*spawned, *was_resume, now, *code))
             .map(|(ws, tab, ..)| (ws.clone(), tab.clone()))
             .collect();
         failed_resume.extend(resume_missed.iter().cloned());
@@ -1719,6 +1781,22 @@ impl App {
                     self.embed_error = Some((ws_id.clone(), RESUME_FAIL_MSG.to_string()));
                 }
             }
+        }
+
+        // A shell that exited (the user ended it, e.g. `exit`) is gone for good:
+        // forget its persisted entry so reopen doesn't respawn a tab the user
+        // ended. Claude exits keep their id (an /exit'd conversation resumes
+        // later). Shells never satisfy resume_failed (was_resume is always
+        // false), so this can't double-remove with the fallback above.
+        let mut forgot_shell = false;
+        for (ws_id, tab_id, .., kind) in &exited {
+            if *kind == TabKind::Shell {
+                self.state.remove_embedded_session(ws_id, tab_id);
+                forgot_shell = true;
+            }
+        }
+        if forgot_shell {
+            self.save_state();
         }
 
         let dead: HashSet<(String, String)> = exited
@@ -2588,7 +2666,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     return Ok(KeyOutcome::Continue);
                 }
                 KeyCode::Char('s') if !ctrl => {
-                    // New shell tab ($SHELL / configured shell), ephemeral.
+                    // New shell tab ($SHELL / configured shell).
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
                         app.new_shell_session(&ws_id);
                     }
@@ -4808,7 +4886,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn new_shell_session_adds_an_ephemeral_shell_tab() {
+    async fn new_shell_session_persists_a_shell_sentinel() {
         let mut app = test_app();
         app.config.shell = Some("sh".to_string()); // deterministic, not the real $SHELL
         // Make sure the spawn cwd exists.
@@ -4822,23 +4900,78 @@ mod key_tests {
         let s = app.embedded.get("w1").expect("a tab was opened");
         assert_eq!(s.tabs.len(), 1);
         assert_eq!(s.tabs[0].kind, TabKind::Shell, "it's a shell tab");
-        assert_eq!(app.focus, Focus::Embedded);
-        // Ephemeral: a shell tab is NOT persisted for resume.
         assert!(
-            app.state.embedded_session_ids("w1").is_empty(),
-            "shell tab must not be persisted"
+            s.tabs[0].id.starts_with("shell:"),
+            "the tab id IS the persisted sentinel: {}",
+            s.tabs[0].id
+        );
+        assert_eq!(app.focus, Focus::Embedded);
+        // Persisted at creation, so reopening the workspace restores the tab.
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            std::slice::from_ref(&s.tabs[0].id),
+            "the shell sentinel is persisted for reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_embedded_restores_mixed_tabs_in_order() {
+        let mut app = test_app();
+        // `sh --resume <id>` (claude) and bare `sh` (shell) both spawn; the
+        // children may exit at once, but tabs live until a reap runs, so the
+        // assertions right after the call are deterministic.
+        app.config.claude_bin = Some("sh".to_string());
+        app.config.shell = Some("sh".to_string());
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        // Ten interleaved entries: one past MAX_SESSION_TABS, so the cap shows too.
+        let seeded: Vec<String> = (0..10)
+            .map(|n| if n % 2 == 0 { format!("c{n}") } else { format!("shell:s{n}") })
+            .collect();
+        for id in &seeded {
+            app.state.add_embedded_session("w1", id);
+        }
+
+        app.toggle_embedded();
+
+        let s = app.embedded.get("w1").expect("tabs restored");
+        assert_eq!(s.tabs.len(), MAX_SESSION_TABS, "capped at the tab limit");
+        for (tab, want) in s.tabs.iter().zip(&seeded) {
+            assert_eq!(&tab.id, want, "ids restored in persisted order");
+            let want_kind =
+                if want.starts_with("shell:") { TabKind::Shell } else { TabKind::Claude };
+            assert_eq!(tab.kind, want_kind, "kind follows the sentinel for {want}");
+            if want_kind == TabKind::Shell {
+                assert!(!tab.was_resume, "reopened shells stay out of the resume nets");
+            }
+        }
+        assert_eq!(s.active, 0, "reopen focuses the first tab");
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            seeded.as_slice(),
+            "persisted order and content unchanged"
         );
     }
 
     #[tokio::test]
     async fn reap_drops_an_exited_shell_tab_but_keeps_claude() {
         let mut app = test_app();
-        app.state.add_embedded_session("w1", "claude-1"); // a persisted Claude session
+        // All three persisted, so the reap's forgetting is observable per kind.
+        for id in ["claude-1", "shell:sh-1", "claude-2"] {
+            app.state.add_embedded_session("w1", id);
+        }
         let claude = tab("claude-1", &["-c", "sleep 30"]); // stays alive
-        let mut shell = tab("shell-1", &["-c", "exit 0"]); // exits immediately
+        let mut shell = tab("shell:sh-1", &["-c", "exit 0"]); // exits immediately
         shell.kind = TabKind::Shell;
-        let mut s = WorkspaceSessions { tabs: vec![claude, shell], active: 1, last_active: None };
+        let claude2 = tab("claude-2", &["-c", "exit 0"]); // a clean claude exit (code 0)
+        let mut s =
+            WorkspaceSessions { tabs: vec![claude, shell, claude2], active: 1, last_active: None };
         wait_exit(&mut s.tabs[1].pane);
+        wait_exit(&mut s.tabs[2].pane);
         app.embedded.insert("w1".to_string(), s);
 
         app.reap_embedded(Instant::now());
@@ -4848,12 +4981,144 @@ mod key_tests {
             .get("w1")
             .map(|s| s.tabs.iter().map(|t| t.id.clone()).collect())
             .unwrap_or_default();
-        assert_eq!(ids, vec!["claude-1".to_string()], "exited shell dropped, Claude kept");
+        assert_eq!(ids, vec!["claude-1".to_string()], "exited tabs dropped, live Claude kept");
+        // The asymmetry, pinned both ways: an exited shell forgets its sentinel
+        // (that shell is gone for good), while an exited claude keeps its id
+        // (an /exit'd conversation resumes later).
         assert_eq!(
             app.state.embedded_session_ids("w1"),
-            &["claude-1".to_string()],
-            "the persisted Claude id stays aligned"
+            &["claude-1".to_string(), "claude-2".to_string()],
+            "shell forgotten; exited claude still persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn closing_a_shell_tab_forgets_entry_and_title() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.state.add_embedded_session("w1", "shell:s1");
+        app.state.set_embedded_session_title("w1", "shell:s1", "build");
+        let mut sh = tab("shell:s1", &["-c", "sleep 30"]);
+        sh.kind = TabKind::Shell;
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![sh], active: 0, last_active: None },
+        );
+        app.focus = Focus::Embedded;
+
+        app.close_active_session();
+
+        assert!(app.state.embedded_session_ids("w1").is_empty(), "the sentinel is forgotten");
+        assert_eq!(
+            app.state.embedded_session_title("w1", "shell:s1"),
+            None,
+            "the title goes in lockstep"
+        );
+        assert_eq!(app.focus, Focus::Tree, "last tab closed: back to the tree");
+    }
+
+    #[tokio::test]
+    async fn closed_tab_does_not_resurrect_from_a_stale_baseline() {
+        // The merge baseline must advance on every successful save. Left at the
+        // startup snapshot, a workspace key first persisted mid-run reads as a
+        // concurrent add once its last tab is closed (mine=absent,
+        // baseline=absent, disk=present) and the closed tab resurrects on the
+        // next reopen. Disk is modeled explicitly via merged_over (the exact
+        // merge merge_save applies) because the test suite shares one
+        // process-wide KOMMAND0_STATE_DIR, so reading state.json back races
+        // other saving tests.
+        let mut app = test_app();
+        app.config.shell = Some("sh".to_string());
+        app.config.claude_bin = Some("sh".to_string());
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        assert!(app.state_baseline.embedded_session_ids("w1").is_empty(), "fresh at startup");
+
+        // Shell flavor: the sentinel is born on disk mid-run.
+        app.new_shell_session("w1");
+        let shell_id = app.embedded["w1"].tabs[0].id.clone();
+        assert_eq!(
+            app.state_baseline.embedded_session_ids("w1"),
+            std::slice::from_ref(&shell_id),
+            "a successful save advances the baseline"
+        );
+        // The merge that close's own save performs: against the baseline as it
+        // stands at close time and a disk that holds the entry (what the
+        // spawn's save wrote). Pre-fix the baseline is still the startup
+        // snapshot, so the entry reads as a concurrent add and survives.
+        let baseline_at_close = app.state_baseline.clone();
+        app.close_active_session();
+        let mut disk = AppState::default();
+        disk.add_embedded_session("w1", &shell_id);
+        let merged = app.state.merged_over(&baseline_at_close, disk);
+        assert!(
+            merged.embedded_session_ids("w1").is_empty(),
+            "the closed shell must read as our deletion, not a concurrent add"
+        );
+        assert!(
+            app.state_baseline.embedded_session_ids("w1").is_empty(),
+            "close's save advances the baseline past the deletion"
+        );
+
+        // Claude flavor: same bug class, fresh --session-id persisted mid-run.
+        app.new_session("w1");
+        let claude_id = app.embedded["w1"].tabs[0].id.clone();
+        assert_eq!(
+            app.state_baseline.embedded_session_ids("w1"),
+            std::slice::from_ref(&claude_id),
+            "the claude save advances the baseline too"
+        );
+        let baseline_at_close = app.state_baseline.clone();
+        app.close_active_session();
+        let mut disk = AppState::default();
+        disk.add_embedded_session("w1", &claude_id);
+        let merged = app.state.merged_over(&baseline_at_close, disk);
+        assert!(
+            merged.embedded_session_ids("w1").is_empty(),
+            "the closed claude tab must not resurrect either"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_shell_spawn_failure_forgets_the_entry() {
+        // KOMMAND0_SHELL would override config.shell and mask the failure path.
+        assert!(
+            std::env::var("KOMMAND0_SHELL").is_err(),
+            "test needs the config-shell path; unset KOMMAND0_SHELL"
+        );
+        let mut app = test_app();
+        // A missing binary makes Pane::spawn return Err (the claude twin of this
+        // trick is pinned by the failed-resume e2e).
+        app.config.shell = Some("/nonexistent/kommand0-shell".to_string());
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.state.add_embedded_session("w1", "shell:s1");
+
+        app.toggle_embedded();
+
+        assert!(!app.embedded.contains_key("w1"), "no tabs opened");
+        assert!(
+            app.state.embedded_session_ids("w1").is_empty(),
+            "the unspawnable sentinel is forgotten so the Vec stays aligned"
+        );
+        assert!(
+            app.embed_error
+                .as_ref()
+                .is_some_and(|(_, m)| m.contains("Failed to start shell")),
+            "the failure is surfaced: {:?}",
+            app.embed_error
+        );
+        assert_eq!(app.focus, Focus::Tree, "nothing spawned: stay on the tree");
     }
 
     #[tokio::test]
@@ -7129,6 +7394,45 @@ mod key_tests {
         assert!(s.active < s.tabs.len(), "active stays in range");
     }
 
+    #[tokio::test]
+    async fn heal_resume_keeps_the_tab_position_in_persisted_order() {
+        // The heal replaces the runtime tab in its slot; the persisted entry must
+        // stay in the SAME slot too, or the row reopens out of order next time.
+        let mut app = test_app();
+        app.config.claude_bin = Some("sh".to_string()); // the fresh spawn must succeed
+        for id in ["a", "b", "c"] {
+            app.state.add_embedded_session("w1", id);
+        }
+        app.state.set_embedded_session_title("w1", "b", "build");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![
+                    tab("a", &["-c", "sleep 30"]),
+                    tab("b", &["-c", "sleep 30"]),
+                    tab("c", &["-c", "sleep 30"]),
+                ],
+                active: 0,
+                last_active: None,
+            },
+        );
+
+        assert!(app.heal_resume("w1", "b", "/tmp", Instant::now()), "fresh spawn succeeded");
+
+        let persisted = app.state.embedded_session_ids("w1").to_vec();
+        assert_eq!(persisted.len(), 3, "still three entries: {persisted:?}");
+        assert_eq!(persisted[0], "a");
+        assert_eq!(persisted[2], "c");
+        let new_id = &persisted[1];
+        assert_ne!(new_id.as_str(), "b", "the gone id was replaced, in its own slot");
+        assert_eq!(app.state.embedded_session_title("w1", "b"), None, "b's title is gone");
+        assert_eq!(
+            app.state.embedded_session_title("w1", new_id),
+            Some("build"),
+            "the replacement carries b's title"
+        );
+    }
+
     #[test]
     fn resume_miss_scan_is_paced_not_per_tick() {
         // The miss scan serializes the pane grid under the reader's parser
@@ -7219,6 +7523,36 @@ mod key_tests {
         }
         press(&mut app, KeyCode::Enter).await;
         assert_eq!(app.state.embedded_session_title("w1", "sess-1"), None);
+    }
+
+    #[tokio::test]
+    async fn shell_tabs_can_be_renamed_and_title_persists() {
+        // Shell tabs have stable persisted ids now, so the old "can't be
+        // renamed" guard is gone and the rename pipeline is kind-agnostic.
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.state.add_embedded_session("w1", "shell:s1");
+        let mut sh = tab("shell:s1", &["-c", "sleep 30"]);
+        sh.kind = TabKind::Shell;
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![sh], active: 0, last_active: None },
+        );
+        app.focus = Focus::Embedded;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        press(&mut app, KeyCode::Char('r')).await;
+        assert!(app.modal.is_active(), "the rename modal opens for a shell tab");
+        assert!(app.embed_error.is_none(), "no 'Shell tabs can't be renamed.' error");
+        for c in "build".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.state.embedded_session_title("w1", "shell:s1"), Some("build"));
     }
 
     #[tokio::test]

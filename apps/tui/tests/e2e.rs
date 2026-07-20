@@ -778,6 +778,57 @@ fn reopen_resumes_all_persisted_sessions_as_tabs() {
 }
 
 #[test]
+fn reopen_restores_shell_tabs_in_order() {
+    // A stored mixed row (a claude id, then a shell sentinel) reopens as the
+    // same tab row: tab 1 resumes the claude session, tab 2 is a shell-marked
+    // fresh shell. Both entries survive quit (quit does not reap).
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": [
+                "11111111-1111-1111-1111-111111111111",
+                "shell:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            ]
+        }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[("KOMMAND0_CLAUDE_BIN", "embed-stub"), ("KOMMAND0_SHELL", "embed-stub")],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("--resume"); // the claude tab resumed, not freshly created
+    tui.wait_for("11111111"); // tab 1 is active and shows the stored claude id
+    tui.wait_for_row(1, "2$"); // tab 2 is shell-marked: kind AND order restored
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    // Quit does not reap: the whole row is still stored for the next reopen.
+    let st = tui.read_state();
+    assert_eq!(
+        st["embedded_sessions"]["w1"],
+        serde_json::json!([
+            "11111111-1111-1111-1111-111111111111",
+            "shell:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        ]),
+        "both seeded entries survive quit: {st}"
+    );
+}
+
+#[test]
 fn failed_resume_shows_error_and_forgets_the_id() {
     // A stored session whose binary can't start: the error is shown and the id is
     // forgotten so it doesn't desync / keep failing.

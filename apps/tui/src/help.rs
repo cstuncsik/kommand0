@@ -30,7 +30,7 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "[Ctrl+A] then [s]",
-        description: "New shell tab (ephemeral)",
+        description: "New shell tab (reopens fresh)",
     },
     KeyBinding {
         keys: "[Ctrl+A] then [ / ]",
