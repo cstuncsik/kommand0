@@ -1,0 +1,47 @@
+apps/tui/src/help.rs
+  s_ae7c076b7de8d9::t_d4dfbf6b1f7ef3 33
+apps/tui/src/main.rs
+  s_ae7c076b7de8d9::t_3043f4c3804ff3 999-1000
+  s_ae7c076b7de8d9::t_3151271c25e122 1019-1023
+  s_ae7c076b7de8d9::t_4faa66c6bff82e 1210-1213
+  s_ae7c076b7de8d9::t_73f8c2df0bff9f 1749
+  s_ae7c076b7de8d9::t_69607dd61731b4 1553,1557
+  s_ae7c076b7de8d9::t_04741fad46c59f 1771-1786
+  s_ae7c076b7de8d9::t_9fde872368e26a 1707
+  s_ae7c076b7de8d9::t_0dcadb6c44edc4 243-245,252-253,255-256
+  s_ae7c076b7de8d9::t_914a87489d3721 1597-1599,1613-1618
+  s_ae7c076b7de8d9::t_b1d05359e6c82c 1143-1196
+  s_ae7c076b7de8d9::t_822e2f83a095bb 1719-1726
+  s_ae7c076b7de8d9::t_357c01b8ff1672 2654
+  s_ae7c076b7de8d9::t_6b584402b03dd2 4874,4889-4941,4948-4951,4953,4955-4957,4959,4969-4972,4975-4976,4980-5035
+  s_ae7c076b7de8d9::t_eb73435044b6b8 1238-1240
+  s_ae7c076b7de8d9::t_5045e83a17ea63 1533-1534
+  s_ae7c076b7de8d9::t_4cfb70bc2fd720 7311-7349,7442
+  s_ae7c076b7de8d9::t_2454981f5a0ecd 5036,7443-7470
+  s_ae7c076b7de8d9::t_94170bf830c7f3 5037
+  s_ae7c076b7de8d9::t_10ab16f4d84d01 7441
+README.md
+  s_ae7c076b7de8d9::t_1513b7dce6922c 128
+  s_ae7c076b7de8d9::t_b408d825634692 166
+CHANGELOG.md
+  s_ae7c076b7de8d9::t_bae148fdf57946 8-21
+apps/tui/tests/e2e.rs
+  s_ae7c076b7de8d9::t_a70905996042e9 781-830
+  s_ae7c076b7de8d9::t_a73e805dfe77a5 780
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "d15ecfb5123c718cd5612b8b79e6cd38ff2289a4",
+  "prompts": {},
+  "sessions": {
+    "s_ae7c076b7de8d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ece0a7b-8224-41af-8d50-9069346970fa",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
