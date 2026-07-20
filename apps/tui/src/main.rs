@@ -970,7 +970,7 @@ impl App {
         Ok(())
     }
 
-    /// Persist state, logging (not silently dropping) any failure — a save error
+    /// Persist state, logging (not silently dropping) any failure: a save error
     /// is otherwise invisible while the TUI owns the terminal.
     pub(crate) fn save_state(&mut self) {
         if let Err(e) = self.persist_state() {
