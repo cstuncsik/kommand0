@@ -38,9 +38,11 @@ pub struct AppState {
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
     pub sessions: Vec<Session>,
-    /// Per-workspace Claude session ids (caller-assigned UUIDs), one per session
-    /// tab, in tab order — so reopening a workspace resumes each of its sessions
-    /// (`claude --resume <id>`) across app restarts.
+    /// Per-workspace session entries, one per session tab, in tab order: a
+    /// Claude session id (caller-assigned UUID, resumed on reopen via
+    /// `claude --resume <id>`), or a `shell:<uuid>` sentinel for a shell tab
+    /// (reopens as a fresh shell). So reopening a workspace restores its whole
+    /// tab row across app restarts.
     #[serde(default, deserialize_with = "de_embedded_sessions")]
     pub embedded_sessions: HashMap<String, Vec<String>>,
     /// Optional per-session display titles, keyed workspace-id → session-id →
@@ -126,6 +128,10 @@ pub const PROFILE_ENV: &str = "KOMMAND0_PROFILE";
 /// crates, and "which dir" is already ambient state (the env override is read
 /// the same way).
 static PROFILE: OnceLock<String> = OnceLock::new();
+
+/// Prefix marking a persisted embedded-session entry as a shell tab. The one
+/// place the sentinel shape is built/inspected.
+const SHELL_SESSION_PREFIX: &str = "shell:";
 
 impl AppState {
     /// The profile-independent dev-build data root (also the release fallback
@@ -805,7 +811,20 @@ impl AppState {
         uuid::Uuid::new_v4().to_string()
     }
 
-    /// The stored Claude session ids for a workspace's session tabs, in tab
+    /// Mint a persisted embedded-session entry for a shell tab. The entry is also
+    /// the tab's runtime id, so close/reap removal needs no translation. UUIDs
+    /// contain no ':', so a sentinel can never collide with a Claude session id.
+    pub fn new_shell_session_id() -> String {
+        format!("{SHELL_SESSION_PREFIX}{}", uuid::Uuid::new_v4())
+    }
+
+    /// Whether a persisted embedded-session entry denotes a shell tab.
+    pub fn is_shell_session_id(id: &str) -> bool {
+        id.starts_with(SHELL_SESSION_PREFIX)
+    }
+
+    /// The stored session entries (Claude session ids, or `shell:<uuid>`
+    /// sentinels for shell tabs) for a workspace's session tabs, in tab
     /// order (empty slice when none).
     pub fn embedded_session_ids(&self, workspace_id: &str) -> &[String] {
         self.embedded_sessions
@@ -814,7 +833,7 @@ impl AppState {
             .unwrap_or(&[])
     }
 
-    /// Append a Claude session id for a workspace (idempotent — no duplicates).
+    /// Append a session entry for a workspace (idempotent, no duplicates).
     pub fn add_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
         let ids = self.embedded_sessions.entry(workspace_id.to_string()).or_default();
         if !ids.iter().any(|id| id == session_id) {
@@ -822,9 +841,10 @@ impl AppState {
         }
     }
 
-    /// Forget a single session id for a workspace (its tab was closed, or its
-    /// resume failed because the Claude session was purged). Removes the
-    /// workspace entry when its last id is gone. Preserves the order of the rest.
+    /// Forget a single session entry for a workspace (its tab was closed, its
+    /// shell exited, or its resume failed because the Claude session was
+    /// purged). Removes the workspace entry when its last id is gone. Preserves
+    /// the order of the rest.
     pub fn remove_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
         if let Some(ids) = self.embedded_sessions.get_mut(workspace_id) {
             ids.retain(|id| id != session_id);
@@ -835,6 +855,27 @@ impl AppState {
         // Keep titles in lockstep so a renamed-then-closed session leaves nothing
         // behind (a title must never outlive its session id).
         self.set_embedded_session_title(workspace_id, session_id, "");
+    }
+
+    /// Replace `old_id` with `new_id` in place (same index) so tab order is
+    /// preserved (used by resume auto-heal); appends when `old_id` is absent
+    /// (including a missing workspace key), so the persisted Vec stays aligned
+    /// with the runtime tabs either way. Moves `old_id`'s title to `new_id`
+    /// (a title never outlives its id, and the tab's purpose survives the swap).
+    pub fn replace_embedded_session(&mut self, workspace_id: &str, old_id: &str, new_id: &str) {
+        if let Some(ids) = self.embedded_sessions.get_mut(workspace_id)
+            && let Some(pos) = ids.iter().position(|id| id == old_id)
+        {
+            // `new_id` is a fresh UUID v4, so no duplicate check is needed.
+            ids[pos] = new_id.to_string();
+        } else {
+            self.add_embedded_session(workspace_id, new_id);
+        }
+        let title = self.embedded_session_title(workspace_id, old_id).map(str::to_string);
+        self.set_embedded_session_title(workspace_id, old_id, "");
+        if let Some(title) = &title {
+            self.set_embedded_session_title(workspace_id, new_id, title);
+        }
     }
 
     /// Forget all of a workspace's session ids (on workspace/repo delete).
@@ -1432,12 +1473,13 @@ mod tests {
             pairs.iter().map(|(k, v)| (k.to_string(), vec![v.to_string()])).collect()
         };
         let baseline = AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b")]), ..Default::default() };
-        // TUI deleted B and re-tabbed A; a CLI added C.
-        let mine = AppState { embedded_sessions: mk(&[("A", "a2")]), ..Default::default() };
+        // TUI deleted B and re-tabbed A with a shell tab (the merge treats the
+        // Vec opaquely, so a sentinel entry rides through untouched); a CLI added C.
+        let mine = AppState { embedded_sessions: mk(&[("A", "shell:a2")]), ..Default::default() };
         let disk =
             AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b"), ("C", "c")]), ..Default::default() };
         let merged = mine.merged_over(&baseline, disk);
-        assert_eq!(merged.embedded_sessions.get("A").unwrap(), &vec!["a2".to_string()], "mine wins");
+        assert_eq!(merged.embedded_sessions.get("A").unwrap(), &vec!["shell:a2".to_string()], "mine wins");
         assert!(!merged.embedded_sessions.contains_key("B"), "TUI delete respected");
         assert!(merged.embedded_sessions.contains_key("C"), "CLI add preserved");
     }
@@ -1548,6 +1590,20 @@ mod tests {
     }
 
     #[test]
+    fn shell_session_id_mint_and_classify() {
+        let a = AppState::new_shell_session_id();
+        let b = AppState::new_shell_session_id();
+        assert!(a.starts_with("shell:"), "sentinel carries the prefix: {a}");
+        assert_ne!(a, b, "each mint is unique");
+        assert!(AppState::is_shell_session_id(&a));
+        assert!(
+            !AppState::is_shell_session_id(&AppState::new_claude_session_id()),
+            "a Claude session id is never a shell sentinel"
+        );
+        assert!(!AppState::is_shell_session_id("plain-id"));
+    }
+
+    #[test]
     fn embedded_sessions_multiple_per_workspace_in_order() {
         let mut state = AppState::default();
         state.add_embedded_session("w1", "a");
@@ -1568,10 +1624,42 @@ mod tests {
     }
 
     #[test]
+    fn replace_embedded_session_keeps_position_and_moves_title() {
+        let mut state = AppState::default();
+        for id in ["a", "b", "c"] {
+            state.add_embedded_session("w1", id);
+        }
+        state.set_embedded_session_title("w1", "b", "build");
+
+        state.replace_embedded_session("w1", "b", "x");
+        assert_eq!(
+            state.embedded_session_ids("w1"),
+            &["a".to_string(), "x".to_string(), "c".to_string()],
+            "the replacement takes b's slot, not the tail"
+        );
+        assert_eq!(state.embedded_session_title("w1", "b"), None, "the old id's title is gone");
+        assert_eq!(state.embedded_session_title("w1", "x"), Some("build"), "the title moved");
+
+        // A missing old id appends, keeping the Vec aligned with runtime tabs.
+        state.replace_embedded_session("w1", "ghost", "y");
+        assert_eq!(
+            state.embedded_session_ids("w1"),
+            &["a".to_string(), "x".to_string(), "c".to_string(), "y".to_string()]
+        );
+
+        // A wholly absent workspace key is created via the append path.
+        state.replace_embedded_session("w2", "ghost", "z");
+        assert_eq!(state.embedded_session_ids("w2"), &["z".to_string()]);
+    }
+
+    #[test]
     fn embedded_sessions_serialize_as_array_and_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let mut state = AppState::default();
         state.add_embedded_session("w1", "a");
+        // A shell sentinel is a plain string on disk: it must round-trip
+        // verbatim, in order, with no special serialization.
+        state.add_embedded_session("w1", "shell:5e0f");
         state.add_embedded_session("w1", "b");
         state.save_to(tmp.path()).unwrap();
 
@@ -1582,7 +1670,10 @@ mod tests {
         assert!(v["embedded_sessions"]["w1"].is_array());
 
         let loaded = AppState::load_from(tmp.path()).unwrap();
-        assert_eq!(loaded.embedded_session_ids("w1"), &["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            loaded.embedded_session_ids("w1"),
+            &["a".to_string(), "shell:5e0f".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
@@ -1673,9 +1764,14 @@ mod tests {
         });
         state.add_embedded_session("w1", "keep");
         state.add_embedded_session("w-gone", "drop");
+        // A shell sentinel (with a user title) on the gone workspace is pruned
+        // like any other entry, titles in lockstep.
+        state.add_embedded_session("w-gone", "shell:drop2");
+        state.set_embedded_session_title("w-gone", "shell:drop2", "build");
         state.prune_embedded_sessions();
         assert_eq!(state.embedded_session_ids("w1"), &["keep".to_string()]);
         assert!(state.embedded_session_ids("w-gone").is_empty());
+        assert!(state.embedded_titles.is_empty(), "titles pruned with the workspace");
     }
 
     #[test]
