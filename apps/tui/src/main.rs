@@ -1022,9 +1022,9 @@ impl App {
         let ws_name = ws.name.clone();
         let ws_dir = ws.working_dir.clone();
         if !self.embedded.contains_key(&ws_id) {
-            // Cleared up front; spawn_session_tab re-sets it on any failure, so a
-            // partial-resume failure's message survives (a later clear would
-            // swallow it).
+            // Cleared up front; spawn_session_tab / spawn_shell_tab re-set it on
+            // any failure, so a partial-reopen failure's message survives (a
+            // later clear would swallow it).
             self.embed_error = None;
             let persisted: Vec<String> = self.state.embedded_session_ids(&ws_id).to_vec();
             if persisted.is_empty() {
@@ -4953,7 +4953,7 @@ mod key_tests {
         assert_eq!(
             app.state.embedded_session_ids("w1"),
             seeded.as_slice(),
-            "a fully successful reopen makes no add/remove state calls"
+            "persisted order and content unchanged"
         );
     }
 
@@ -5087,6 +5087,11 @@ mod key_tests {
 
     #[tokio::test]
     async fn reopen_shell_spawn_failure_forgets_the_entry() {
+        // KOMMAND0_SHELL would override config.shell and mask the failure path.
+        assert!(
+            std::env::var("KOMMAND0_SHELL").is_err(),
+            "test needs the config-shell path; unset KOMMAND0_SHELL"
+        );
         let mut app = test_app();
         // A missing binary makes Pane::spawn return Err (the claude twin of this
         // trick is pinned by the failed-resume e2e).
