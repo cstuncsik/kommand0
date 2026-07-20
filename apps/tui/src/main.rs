@@ -953,12 +953,27 @@ impl App {
         }
     }
 
-    /// Persist state, logging (not silently dropping) any failure — a save error
-    /// is otherwise invisible while the TUI owns the terminal.
-    pub(crate) fn save_state(&self) {
+    /// Merge this state over disk and, on success, advance the merge baseline
+    /// to the in-memory state just written (git's fetch-updates-tracking-ref
+    /// model). The baseline must track the last state of OURS known to be on
+    /// disk: left at the startup snapshot, a key first persisted mid-run reads
+    /// as a concurrent add once we delete it (mine=absent, baseline=absent,
+    /// disk=present) and the closed tab resurrects on the next reopen.
+    /// Deliberately NOT the merged result: a concurrent `kmd` add lives on disk
+    /// but not in `self.state`, and baselining it would flip it into "our
+    /// deletion" on the next save.
+    fn persist_state(&mut self) -> anyhow::Result<()> {
         // Merge over the current on-disk state (a `kmd` command may have written
         // it while we were open) rather than blindly overwriting it.
-        if let Err(e) = self.state.merge_save(&self.state_baseline) {
+        self.state.merge_save(&self.state_baseline)?;
+        self.state_baseline = self.state.clone();
+        Ok(())
+    }
+
+    /// Persist state, logging (not silently dropping) any failure — a save error
+    /// is otherwise invisible while the TUI owns the terminal.
+    pub(crate) fn save_state(&mut self) {
+        if let Err(e) = self.persist_state() {
             tracing::warn!("failed to persist state: {e}");
         }
     }
@@ -1105,7 +1120,7 @@ impl App {
                     self.state.add_embedded_session(ws_id, &session_id);
                     // Merge over disk (like save_state) so this doesn't clobber a
                     // concurrent `kmd` write; keep the Result to surface a failure.
-                    if self.state.merge_save(&self.state_baseline).is_err() {
+                    if self.persist_state().is_err() {
                         self.embed_error = Some((
                             ws_id.to_string(),
                             "Couldn't persist this session — it may not resume \
@@ -1155,7 +1170,7 @@ impl App {
                         // Merge over disk (like save_state) so this doesn't clobber
                         // a concurrent `kmd` write; keep the Result to surface a
                         // failure.
-                        if self.state.merge_save(&self.state_baseline).is_err() {
+                        if self.persist_state().is_err() {
                             self.embed_error = Some((
                                 ws_id.to_string(),
                                 "Couldn't persist this tab: it may not reopen after \
@@ -5002,6 +5017,72 @@ mod key_tests {
             "the title goes in lockstep"
         );
         assert_eq!(app.focus, Focus::Tree, "last tab closed: back to the tree");
+    }
+
+    #[tokio::test]
+    async fn closed_tab_does_not_resurrect_from_a_stale_baseline() {
+        // The merge baseline must advance on every successful save. Left at the
+        // startup snapshot, a workspace key first persisted mid-run reads as a
+        // concurrent add once its last tab is closed (mine=absent,
+        // baseline=absent, disk=present) and the closed tab resurrects on the
+        // next reopen. Disk is modeled explicitly via merged_over (the exact
+        // merge merge_save applies) because the test suite shares one
+        // process-wide KOMMAND0_STATE_DIR, so reading state.json back races
+        // other saving tests.
+        let mut app = test_app();
+        app.config.shell = Some("sh".to_string());
+        app.config.claude_bin = Some("sh".to_string());
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        assert!(app.state_baseline.embedded_session_ids("w1").is_empty(), "fresh at startup");
+
+        // Shell flavor: the sentinel is born on disk mid-run.
+        app.new_shell_session("w1");
+        let shell_id = app.embedded["w1"].tabs[0].id.clone();
+        assert_eq!(
+            app.state_baseline.embedded_session_ids("w1"),
+            std::slice::from_ref(&shell_id),
+            "a successful save advances the baseline"
+        );
+        // The merge that close's own save performs: against the baseline as it
+        // stands at close time and a disk that holds the entry (what the
+        // spawn's save wrote). Pre-fix the baseline is still the startup
+        // snapshot, so the entry reads as a concurrent add and survives.
+        let baseline_at_close = app.state_baseline.clone();
+        app.close_active_session();
+        let mut disk = AppState::default();
+        disk.add_embedded_session("w1", &shell_id);
+        let merged = app.state.merged_over(&baseline_at_close, disk);
+        assert!(
+            merged.embedded_session_ids("w1").is_empty(),
+            "the closed shell must read as our deletion, not a concurrent add"
+        );
+        assert!(
+            app.state_baseline.embedded_session_ids("w1").is_empty(),
+            "close's save advances the baseline past the deletion"
+        );
+
+        // Claude flavor: same bug class, fresh --session-id persisted mid-run.
+        app.new_session("w1");
+        let claude_id = app.embedded["w1"].tabs[0].id.clone();
+        assert_eq!(
+            app.state_baseline.embedded_session_ids("w1"),
+            std::slice::from_ref(&claude_id),
+            "the claude save advances the baseline too"
+        );
+        let baseline_at_close = app.state_baseline.clone();
+        app.close_active_session();
+        let mut disk = AppState::default();
+        disk.add_embedded_session("w1", &claude_id);
+        let merged = app.state.merged_over(&baseline_at_close, disk);
+        assert!(
+            merged.embedded_session_ids("w1").is_empty(),
+            "the closed claude tab must not resurrect either"
+        );
     }
 
     #[tokio::test]
