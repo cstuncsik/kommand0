@@ -5,6 +5,20 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Shell tabs survive restarts**: reopening a workspace's sessions restores
+  the whole tab row in its original order. Claude tabs resume their
+  conversation as before; shell tabs come back as fresh shells (a shell's
+  running command and scrollback are not recoverable). Shell tabs can now be
+  renamed too, and the title sticks across restarts; a shell tab you close or
+  `exit` stays closed.
+
+### Fixed
+
+- A resume that auto-heals to a fresh session no longer drifts to the end of
+  the stored tab order: the healed tab keeps its position on the next reopen.
+
 ## [0.19.1] - 2026-07-19
 
 ### Fixed
