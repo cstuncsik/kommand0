@@ -16,8 +16,9 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ### Fixed
 
-- A resume that auto-heals to a fresh session no longer drifts to the end of
-  the stored tab order: the healed tab keeps its position on the next reopen.
+- **Healed resumes keep their tab position**: a resume that auto-heals to a
+  fresh session no longer drifts to the end of the stored tab order; the
+  healed tab keeps its position on the next reopen.
 - **Closed tabs stay closed**: closing (or exiting) the last session tab of a
   workspace whose sessions were first persisted during the same run could
   resurrect it on the next reopen; the save merge now tracks what it last
