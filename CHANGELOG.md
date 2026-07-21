@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-07-21
+
 ### Added
 
 - **Horizontal scroll switches session tabs**: a tilt-wheel tick (or
@@ -642,7 +644,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/cstuncsik/kommand0/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/cstuncsik/kommand0/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/cstuncsik/kommand0/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/cstuncsik/kommand0/compare/v0.18.2...v0.19.0
