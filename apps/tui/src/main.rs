@@ -1528,6 +1528,41 @@ impl App {
         self.embedded.get_mut(&ws_id)
     }
 
+    /// A horizontal-wheel tick (or Shift+vertical, for terminals that don't
+    /// translate it) anywhere in the right pane switches the visible
+    /// workspace's session tab. Whole right-pane rect on purpose (tab strip +
+    /// border included; wheel-over-tab-strip is where the gesture is most
+    /// expected). Returns whether the event was consumed.
+    fn hscroll_switch_tab(&mut self, mouse: MouseEvent) -> bool {
+        use ratatui::crossterm::event::MouseEventKind;
+        let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+        let prev = match mouse.kind {
+            MouseEventKind::ScrollLeft => true,
+            MouseEventKind::ScrollRight => false,
+            MouseEventKind::ScrollUp if shift => true,
+            MouseEventKind::ScrollDown if shift => false,
+            _ => return false,
+        };
+        if !mouse::contains(self.right_pane_area, mouse.column, mouse.row) {
+            return false;
+        }
+        // Consumed from here even with no sessions: reachable only via hover
+        // (Embedded focus implies live tabs), where today's behavior is
+        // forward-into-nothing, so consume-and-noop is observationally
+        // identical and keeps the gesture single-sited.
+        if let Some(s) = self.selected_sessions_mut() {
+            if prev { s.prev() } else { s.next() }
+        }
+        // A tab switch invalidates a lingering selection highlight and a
+        // half-typed Ctrl+A prefix, matching the sibling switch routes: the
+        // key route clears the selection in handle_key, the click route
+        // clears the prefix in select_session_tab; the wheel route gets
+        // neither, so both happen here.
+        self.pane_selection = None;
+        self.embedded_prefix = false;
+        true
+    }
+
     /// Close the active session tab of the selected workspace: drop its pane,
     /// forget its persisted id, and re-focus the previous tab (or the tree when
     /// the last tab is gone).
@@ -1672,6 +1707,13 @@ impl App {
     /// active session (translated to its coords).
     fn handle_embedded_mouse(&mut self, mouse: MouseEvent) {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        // ponytail: deliberately hijacks ScrollLeft/Right (and Shift+wheel)
+        // from a focused mouse-mode child (encode_mouse SGR buttons 66/67):
+        // claude has no horizontal-scroll UI. Gate the helper on wants_mouse()
+        // if a horizontal-scrolling child ever matters.
+        if self.hscroll_switch_tab(mouse) {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Moved => {
                 // Keep mouse_pos current so tab hover styling works in Embedded mode.
@@ -6984,6 +7026,11 @@ mod key_tests {
         MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
     }
 
+    /// `m` with SHIFT held: the shift+wheel tab-switch gesture.
+    fn ms(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::SHIFT }
+    }
+
     /// App with workspace w1 selected and one embedded tab running `cmd`;
     /// right pane at (30,0) 70x30 → content cells start at screen (31, 2).
     fn app_with_pane(cmd: &str) -> App {
@@ -7265,6 +7312,128 @@ mod key_tests {
         wait_wants_mouse(&app);
         mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollUp, 30, 5));
         assert!(app.embedded["w1"].tabs[0].pane.last_input_at().is_none());
+    }
+
+    #[test]
+    fn hover_tilt_switches_tabs_with_wrap() {
+        let mut app = app_with_pane("sleep 30");
+        let s = app.embedded.get_mut("w1").unwrap();
+        s.tabs.push(tab("b", &["-c", "sleep 30"]));
+        s.tabs.push(tab("c", &["-c", "sleep 30"]));
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (0, 3), dragging: false });
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 1, "tilt right = next tab");
+        assert_eq!(app.focus, Focus::Tree, "the hover gesture must not steal focus");
+        assert!(app.pane_selection.is_none(), "a tab switch drops the highlight");
+        // The wheel switch went through switch_to, so Ctrl+A l returns to the
+        // tab we left, exactly like the key route.
+        app.embedded.get_mut("w1").unwrap().select_last_active();
+        assert_eq!(app.embedded["w1"].active, 0, "last-active bookkeeping holds");
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollLeft, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 2, "tilt left = prev, wrapping at the start");
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 0, "next wraps at the end");
+    }
+
+    #[test]
+    fn hover_shift_wheel_switches_instead_of_forwarding() {
+        // Tab a is a mouse-mode child: without the gesture a shifted wheel at
+        // a content cell would hover-forward to it. Pins the one deliberately
+        // removed behavior (a shifted wheel no longer hover-forwards to a
+        // mouse-mode child) AND re-pins that the unmodified wheel still
+        // forwards. Three tabs, not two: with two, next and prev are congruent
+        // mod 2 and a shift-arm direction swap would pass unnoticed.
+        let mut app = app_with_pane("printf '\\033[?1000h'; sleep 30");
+        wait_wants_mouse(&app);
+        app.embedded.get_mut("w1").unwrap().tabs.push(tab("b", &["-c", "sleep 30"]));
+        app.embedded.get_mut("w1").unwrap().tabs.push(tab("c", &["-c", "sleep 30"]));
+        mouse::handle_mouse(&mut app, ms(MouseEventKind::ScrollDown, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 1, "shift+down = next tab");
+        assert!(
+            app.embedded["w1"].tabs[0].pane.last_input_at().is_none(),
+            "the shifted wheel was intercepted, not forwarded"
+        );
+        mouse::handle_mouse(&mut app, ms(MouseEventKind::ScrollUp, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 0, "shift+up = prev tab");
+        assert!(app.embedded["w1"].tabs[0].pane.last_input_at().is_none());
+        // Control half: the unmodified wheel still hover-forwards to the child.
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollDown, 50, 10));
+        assert!(
+            app.embedded["w1"].tabs[0].pane.last_input_at().is_some(),
+            "the unmodified vertical wheel still forwards to the content"
+        );
+    }
+
+    #[test]
+    fn gesture_outside_right_pane_is_inert() {
+        let mut app = app_with_pane("sleep 30");
+        app.embedded.get_mut("w1").unwrap().tabs.push(tab("b", &["-c", "sleep 30"]));
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 8);
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 5, 3)); // tree pane
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 35)); // below both panes
+        assert_eq!(app.embedded["w1"].active, 0, "a tilt outside the right pane never flips tabs");
+    }
+
+    #[test]
+    fn shift_scroll_over_tree_still_navigates() {
+        let mut app = app_with_pane("sleep 30");
+        app.embedded.get_mut("w1").unwrap().tabs.push(tab("b", &["-c", "sleep 30"]));
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 8);
+        let before = app.selected_index;
+        mouse::handle_mouse(&mut app, ms(MouseEventKind::ScrollUp, 5, 3));
+        assert_ne!(app.selected_index, before, "shift+wheel over the tree still navigates");
+        mouse::handle_mouse(&mut app, ms(MouseEventKind::ScrollDown, 5, 3));
+        assert_eq!(app.selected_index, before, "both shifted directions navigate");
+        assert_eq!(app.embedded["w1"].active, 0, "tree-area shift never flips tabs");
+    }
+
+    #[test]
+    fn focused_tilt_intercepts_before_child() {
+        let mut app = app_with_pane("printf '\\033[?1000h'; sleep 30");
+        wait_wants_mouse(&app);
+        app.embedded.get_mut("w1").unwrap().tabs.push(tab("b", &["-c", "sleep 30"]));
+        app.focus = Focus::Embedded;
+        app.embedded_prefix = true; // a half-typed Ctrl+A, mid-gesture
+        // (50, 10) is a CONTENT cell (row >= y+2): a forwarded event would
+        // pass translate_mouse, so a None below proves interception, not
+        // strip/border rejection.
+        app.handle_embedded_mouse(m(MouseEventKind::ScrollRight, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 1, "focused tilt switches tabs");
+        assert!(
+            app.embedded["w1"].tabs[0].pane.last_input_at().is_none(),
+            "the tilt was intercepted before the mouse-mode child"
+        );
+        assert!(!app.embedded_prefix, "a tab switch drops the half-typed prefix");
+        app.handle_embedded_mouse(ms(MouseEventKind::ScrollDown, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 0, "focused shift+down = next, wrapping");
+        assert!(app.embedded["w1"].tabs[0].pane.last_input_at().is_none());
+    }
+
+    #[test]
+    fn single_tab_wheel_keeps_last_active_none() {
+        let mut app = app_with_pane("sleep 30");
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 0);
+        assert!(
+            app.embedded["w1"].last_active.is_none(),
+            "a single-tab wheel must not clobber Ctrl+A l history"
+        );
+    }
+
+    #[test]
+    fn wheel_with_no_sessions_is_safe() {
+        // The horizontal sibling of scroll_over_content_without_a_session_is_a_noop.
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 8);
+        app.right_pane_area = ratatui::layout::Rect::new(30, 0, 70, 30);
+        let before = app.selected_index;
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
+        assert_eq!(app.focus, Focus::Tree, "no sessions: focus untouched");
+        assert_eq!(app.selected_index, before, "tree selection unchanged");
     }
 
     #[test]

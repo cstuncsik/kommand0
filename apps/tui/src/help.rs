@@ -37,6 +37,10 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
         description: "Previous / next tab",
     },
     KeyBinding {
+        keys: "(wheel tilt)",
+        description: "Prev / next tab (also Shift+wheel)",
+    },
+    KeyBinding {
         keys: "[Ctrl+A] then [1]-[9]",
         description: "Jump to tab N",
     },
