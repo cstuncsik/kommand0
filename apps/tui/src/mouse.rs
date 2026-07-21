@@ -16,6 +16,9 @@ pub(crate) struct PaneAreas {
 
 /// Handle a mouse event, updating app state accordingly.
 pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if app.hscroll_switch_tab(mouse) {
+        return;
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // A click the tree/buttons didn't consume, landing in the content

@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Horizontal scroll switches session tabs**: a tilt-wheel tick (or
+  Shift+scroll) anywhere over the right pane switches the visible workspace's
+  session tabs, wrapping, whether the pane is focused or just hovered; the
+  unmodified vertical wheel keeps scrolling content.
+
 ## [0.20.0] - 2026-07-20
 
 ### Added
