@@ -351,11 +351,10 @@ fn cleanup_removes_a_merged_workspace() {
 }
 
 #[test]
-fn cleanup_aborts_before_git_work_when_the_id_is_shadowed() {
-    // A workspace NAMED another workspace's id makes the post-cleanup by-id
-    // row drop ambiguous; the pre-flight must abort BEFORE the destructive
-    // git work (the gh stub reports MERGED, so without it the worktree would
-    // be removed), leaving the worktree intact.
+fn cleanup_succeeds_when_the_id_is_shadowed() {
+    // A workspace NAMED another workspace's id must not break cleanup: the
+    // post-cleanup row drop matches the exact id only, so the right row goes
+    // and the shadowing workspace (row + worktree) survives.
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
     let list = stdout(&kmd(&state, &[], &["workspace", "list"]));
@@ -372,7 +371,7 @@ fn cleanup_aborts_before_git_work_when_the_id_is_shadowed() {
         kmd(&state, &[], &["workspace", "create", &feat_id, "--repo", repo.to_str().unwrap()]);
     assert!(shadow.status.success(), "shadow create: {}", String::from_utf8_lossy(&shadow.stderr));
     let show = stdout(&kmd(&state, &[], &["workspace", "show", "feat"]));
-    let dir = show
+    let feat_dir = show
         .lines()
         .find(|l| l.starts_with("Dir:"))
         .expect("Dir line")
@@ -391,10 +390,25 @@ fn cleanup_aborts_before_git_work_when_the_id_is_shadowed() {
         &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
         &["workspace", "cleanup", "feat", "--force"],
     );
-    assert!(!out.status.success(), "cleanup must abort");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("use the ID"), "aborted on the ambiguity: {err}");
-    assert!(std::path::Path::new(&dir).exists(), "worktree untouched, no partial cleanup");
+    assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("Cleaned up"));
+    assert!(!std::path::Path::new(&feat_dir).exists(), "feat's worktree removed");
+
+    // Exactly the id-matched row went ('feat' can't occur in a hex id, so a
+    // bare contains is a safe row probe); the shadow survives with its worktree.
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(!list.contains("feat"), "feat row gone: {list}");
+    assert!(list.contains(&feat_id), "shadow row (named the old id) survives: {list}");
+    let show = stdout(&kmd(&state, &[], &["workspace", "show", &feat_id]));
+    let shadow_dir = show
+        .lines()
+        .find(|l| l.starts_with("Dir:"))
+        .expect("Dir line")
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    assert!(std::path::Path::new(&shadow_dir).exists(), "shadow worktree untouched");
 }
 
 #[test]

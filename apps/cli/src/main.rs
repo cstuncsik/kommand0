@@ -438,11 +438,6 @@ fn main() -> anyhow::Result<()> {
             WorkspaceAction::Cleanup { name, force } => {
                 let mut state = AppState::load()?;
                 let ws = state.show_workspace(&name)?.clone();
-                // Pre-flight: the post-cleanup row drop resolves by id, and in
-                // the pathological state where another workspace is NAMED this
-                // id that delete errors AFTER the destructive git work. Refuse
-                // up front instead.
-                state.show_workspace(&ws.id)?;
                 let (Some(worktree), Some(branch)) =
                     (ws.worktree_path.clone(), ws.branch_name.clone())
                 else {
@@ -474,9 +469,10 @@ fn main() -> anyhow::Result<()> {
                 match cleanup_merged_workspace(&repo, &worktree, &branch) {
                     Ok(()) => {
                         // The worktree + branch are gone; drop the workspace
-                        // entry by id (never re-resolve the user's string after
-                        // the destructive git work).
-                        state.delete_workspace(&ws.id)?;
+                        // entry by exact id (never re-resolve the user's string
+                        // after the destructive git work, and never fall back
+                        // to a name match on the id).
+                        state.delete_workspace_by_id(&ws.id)?;
                         println!("Cleaned up workspace: {name}");
                     }
                     Err(e) => anyhow::bail!("{e}"),
