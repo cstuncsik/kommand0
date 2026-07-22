@@ -276,6 +276,57 @@ fn workspace_create_over_existing_branch_and_workspace_errors_without_a_note() {
 }
 
 #[test]
+fn workspace_names_are_per_repo_and_ids_disambiguate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let mk_repo = |name: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "t@t"]);
+        run_git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-m", "init"]);
+        dir
+    };
+    for repo in [mk_repo("alpha"), mk_repo("beta")] {
+        let add = kmd(&state, &[], &["repo", "add", repo.to_str().unwrap()]);
+        assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+        let create =
+            kmd(&state, &[], &["workspace", "create", "dev", "--repo", repo.to_str().unwrap()]);
+        assert!(
+            create.status.success(),
+            "the same name in another repo must succeed: {}",
+            String::from_utf8_lossy(&create.stderr)
+        );
+    }
+
+    // The bare name is ambiguous now: show refuses and names the remedy.
+    let show = kmd(&state, &[], &["workspace", "show", "dev"]);
+    assert!(!show.status.success(), "ambiguous bare name must fail");
+    let err = String::from_utf8_lossy(&show.stderr);
+    assert!(err.contains("use the ID"), "remedy named: {err}");
+
+    // `workspace list` prints the ID as its first column; by ID, show hits
+    // exactly the addressed repo's row.
+    let list = stdout(&kmd(&state, &[], &["workspace", "list"]));
+    let id = list
+        .lines()
+        .find(|l| l.contains("alpha"))
+        .expect("alpha row listed")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let show = kmd(&state, &[], &["workspace", "show", &id]);
+    assert!(show.status.success(), "by-ID show: {}", String::from_utf8_lossy(&show.stderr));
+    let out = stdout(&show);
+    assert!(out.contains("dev") && out.contains("alpha"), "the right row shown: {out}");
+}
+
+#[test]
 fn cleanup_removes_a_merged_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
