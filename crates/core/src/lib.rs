@@ -1109,12 +1109,13 @@ impl AppState {
     }
 
     /// Validate a would-be workspace name: it becomes a path segment under
-    /// `worktrees/` and the branch name itself, so reject anything that could
-    /// escape the dir or trip git's arg parsing (empty/whitespace, `.`/`..`, a
-    /// path separator, a leading dash), the two names git refuses as bare
-    /// branches (`HEAD`, `@` — `git worktree add -b` would fail and silently
-    /// fall back to the repo root), and a name already in use.
-    pub fn validate_new_workspace_name(&self, name: &str) -> anyhow::Result<()> {
+    /// `worktrees/<repo-id>/` and the branch name itself, so reject anything
+    /// that could escape the dir or trip git's arg parsing (empty/whitespace,
+    /// `.`/`..`, a path separator, a leading dash), the two names git refuses
+    /// as bare branches (`HEAD`, `@`: `git worktree add -b` would fail and
+    /// silently fall back to the repo root), and a name already in use within
+    /// that repo (names are per-repo; other repos may reuse them).
+    pub fn validate_new_workspace_name(&self, name: &str, repo_id: &str) -> anyhow::Result<()> {
         if name.trim().is_empty()
             || name == "."
             || name == ".."
@@ -1129,7 +1130,7 @@ impl AppState {
                  'HEAD', '@', contain a path separator, or start with '-'"
             );
         }
-        if self.workspaces.iter().any(|w| w.name == name) {
+        if self.workspaces.iter().any(|w| w.repo_id == repo_id && w.name == name) {
             bail!("workspace already exists: {name}");
         }
         Ok(())
@@ -1155,7 +1156,7 @@ impl AppState {
             },
         };
 
-        self.validate_new_workspace_name(&ws_name)?;
+        self.validate_new_workspace_name(&ws_name, &repo.id)?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1167,7 +1168,7 @@ impl AppState {
         let (working_dir, worktree_path, branch_name) = if !use_worktree {
             (repo.path.clone(), None, None)
         } else if let Some(branch_ref) = from_branch {
-            match worktree::create_worktree_from_branch(&repo.path, &ws_name, base, branch_ref) {
+            match worktree::create_worktree_from_branch(&repo.path, &repo.id, &ws_name, base, branch_ref) {
                 worktree::WorktreeResult::Created { worktree_path, branch_name } => {
                     (worktree_path.clone(), Some(worktree_path), Some(branch_name))
                 }
@@ -1178,7 +1179,7 @@ impl AppState {
                 }
             }
         } else {
-            match worktree::create_worktree(&repo.path, &ws_name, base) {
+            match worktree::create_worktree(&repo.path, &repo.id, &ws_name, base) {
                 worktree::WorktreeResult::Created { worktree_path, branch_name } => {
                     (worktree_path.clone(), Some(worktree_path), Some(branch_name))
                 }
@@ -1235,26 +1236,66 @@ impl AppState {
         Ok(result)
     }
 
-    /// Show a workspace by name.
-    pub fn show_workspace(&self, name: &str) -> anyhow::Result<&Workspace> {
-        self.workspaces
+    /// Resolve a workspace reference (exact ID first, then name) to its index.
+    ///
+    /// ID-first deliberately diverges from [`Self::resolve_repo`] (name-first):
+    /// the ambiguous-name error's remedy is "use the ID", so an ID must be
+    /// un-shadowable by a name. A name carried by workspaces in several repos
+    /// is ambiguous, as is a ref that matches one workspace's ID and a
+    /// DIFFERENT workspace's name (fail-safe over a silent wrong-target delete
+    /// when a workspace is named with another workspace's id-shaped string).
+    fn workspace_index(&self, ws_ref: &str) -> anyhow::Result<usize> {
+        let id_match = self.workspaces.iter().position(|w| w.id == ws_ref);
+        let name_matches: Vec<usize> = self
+            .workspaces
             .iter()
-            .find(|w| w.name == name)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))
+            .enumerate()
+            .filter_map(|(i, w)| (w.name == ws_ref).then_some(i))
+            .collect();
+        match id_match {
+            Some(i) if name_matches.iter().all(|&j| j == i) => return Ok(i),
+            None if name_matches.is_empty() => bail!("workspace not found: {ws_ref}"),
+            None if name_matches.len() == 1 => return Ok(name_matches[0]),
+            _ => {}
+        }
+        // Several workspaces answer to this ref: refuse rather than act on the
+        // wrong repo's workspace. List every match so the error self-documents.
+        let mut matches: Vec<usize> = id_match.into_iter().chain(name_matches).collect();
+        matches.sort_unstable();
+        matches.dedup();
+        let list = matches
+            .iter()
+            .map(|&i| {
+                let w = &self.workspaces[i];
+                let repo = self
+                    .repos
+                    .iter()
+                    .find(|r| r.id == w.repo_id)
+                    .map(|r| r.name.as_str())
+                    .unwrap_or("(unknown)");
+                format!("{} (repo {repo})", w.id)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "ambiguous workspace reference '{ws_ref}': matches {list}; \
+             use the ID (shown by `kmd workspace list`)"
+        )
     }
 
-    /// Delete a workspace by name, saving to custom base directory.
+    /// Show a workspace by name or ID (an ambiguous name is an error).
+    pub fn show_workspace(&self, ws_ref: &str) -> anyhow::Result<&Workspace> {
+        Ok(&self.workspaces[self.workspace_index(ws_ref)?])
+    }
+
+    /// Delete a workspace by name or ID, saving to custom base directory.
     /// Also removes the git worktree if one was created.
     pub fn delete_workspace_with_base(
         &mut self,
-        name: &str,
+        ws_ref: &str,
         base: &Path,
     ) -> anyhow::Result<Workspace> {
-        let idx = self
-            .workspaces
-            .iter()
-            .position(|w| w.name == name)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))?;
+        let idx = self.workspace_index(ws_ref)?;
         let removed = self.workspaces.remove(idx);
         self.embedded_sessions.remove(&removed.id);
         self.embedded_titles.remove(&removed.id);
@@ -1270,43 +1311,35 @@ impl AppState {
         Ok(removed)
     }
 
-    /// Delete a workspace by name, saving to the default state directory.
-    pub fn delete_workspace(&mut self, name: &str) -> anyhow::Result<Workspace> {
-        self.delete_workspace_with_base(name, Self::state_dir().as_path())
+    /// Delete a workspace by name or ID, saving to the default state directory.
+    pub fn delete_workspace(&mut self, ws_ref: &str) -> anyhow::Result<Workspace> {
+        self.delete_workspace_with_base(ws_ref, Self::state_dir().as_path())
     }
 
     /// Archive a workspace (set active=false) with custom base directory.
-    pub fn archive_workspace_with_base(&mut self, name: &str, base: &Path) -> anyhow::Result<()> {
-        let ws = self
-            .workspaces
-            .iter_mut()
-            .find(|w| w.name == name)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))?;
-        ws.active = false;
+    pub fn archive_workspace_with_base(&mut self, ws_ref: &str, base: &Path) -> anyhow::Result<()> {
+        let idx = self.workspace_index(ws_ref)?;
+        self.workspaces[idx].active = false;
         self.save_to(base)?;
         Ok(())
     }
 
-    /// Archive a workspace (set active=false).
-    pub fn archive_workspace(&mut self, name: &str) -> anyhow::Result<()> {
-        self.archive_workspace_with_base(name, Self::state_dir().as_path())
+    /// Archive a workspace by name or ID (set active=false).
+    pub fn archive_workspace(&mut self, ws_ref: &str) -> anyhow::Result<()> {
+        self.archive_workspace_with_base(ws_ref, Self::state_dir().as_path())
     }
 
     /// Activate a workspace (set active=true) with custom base directory.
-    pub fn activate_workspace_with_base(&mut self, name: &str, base: &Path) -> anyhow::Result<()> {
-        let ws = self
-            .workspaces
-            .iter_mut()
-            .find(|w| w.name == name)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {name}"))?;
-        ws.active = true;
+    pub fn activate_workspace_with_base(&mut self, ws_ref: &str, base: &Path) -> anyhow::Result<()> {
+        let idx = self.workspace_index(ws_ref)?;
+        self.workspaces[idx].active = true;
         self.save_to(base)?;
         Ok(())
     }
 
-    /// Activate a workspace (set active=true).
-    pub fn activate_workspace(&mut self, name: &str) -> anyhow::Result<()> {
-        self.activate_workspace_with_base(name, Self::state_dir().as_path())
+    /// Activate a workspace by name or ID (set active=true).
+    pub fn activate_workspace(&mut self, ws_ref: &str) -> anyhow::Result<()> {
+        self.activate_workspace_with_base(ws_ref, Self::state_dir().as_path())
     }
 
     // --- Session methods ---
@@ -1442,6 +1475,21 @@ mod tests {
         }
     }
 
+    /// Init a real git repo at `tmp/<name>` (identity + initial commit, branch
+    /// main) and return its path.
+    fn init_git_repo(tmp: &TempDir, name: &str) -> std::path::PathBuf {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "--allow-empty", "-m", "init"]);
+        dir
+    }
+
     #[test]
     fn merge_preserves_cli_adds_and_respects_tui_deletes() {
         // baseline = what the TUI loaded; mine = TUI's in-memory state (deleted B,
@@ -1540,6 +1588,136 @@ mod tests {
         // A branch that doesn't exist is an error, not a silent repo-root fallback.
         let err = state.create_workspace_from_branch_with_base(None, "r", &base, "ghost").unwrap_err();
         assert!(err.to_string().contains("couldn't check out branch"), "got: {err}");
+    }
+
+    #[test]
+    fn same_workspace_name_in_two_repos_nests_worktrees_per_repo() {
+        // The motivating bug: `development` in one repo used to block creating
+        // `development` in another. Both must succeed, with worktrees at
+        // distinct `worktrees/<repo-id>/development` paths.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("state");
+        let repo_a = init_git_repo(&tmp, "alpha");
+        let repo_b = init_git_repo(&tmp, "beta");
+        let mut state = AppState::default();
+        let a = state.add_repo_with_base(repo_a.to_str().unwrap(), &base).unwrap();
+        let b = state.add_repo_with_base(repo_b.to_str().unwrap(), &base).unwrap();
+
+        let wa = state.create_workspace_with_base(Some("development"), &a.id, &base).unwrap();
+        let wb = state.create_workspace_with_base(Some("development"), &b.id, &base).unwrap();
+
+        let pa = wa.worktree_path.as_deref().unwrap();
+        let pb = wb.worktree_path.as_deref().unwrap();
+        assert_ne!(pa, pb, "each repo gets its own worktree dir");
+        assert!(
+            pa.ends_with(&format!("worktrees/{}/development", a.id)),
+            "nested under the repo id: {pa}"
+        );
+        assert!(
+            pb.ends_with(&format!("worktrees/{}/development", b.id)),
+            "nested under the repo id: {pb}"
+        );
+        assert!(Path::new(pa).exists() && Path::new(pb).exists(), "both worktrees on disk");
+    }
+
+    #[test]
+    fn legacy_flat_worktree_coexists_with_a_nested_same_name() {
+        // A pre-nesting workspace with a real FLAT worktree (worktrees/<name>)
+        // must keep working next to a new nested one of the same name: the new
+        // one nests, the flat dir is untouched, and deleting the legacy row
+        // removes the flat dir while the nested sibling survives.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("state");
+        let repo_a = init_git_repo(&tmp, "alpha");
+        let repo_b = init_git_repo(&tmp, "beta");
+        let mut state = AppState::default();
+        let a = state.add_repo_with_base(repo_a.to_str().unwrap(), &base).unwrap();
+        let b = state.add_repo_with_base(repo_b.to_str().unwrap(), &base).unwrap();
+
+        // Hand-craft the legacy flat worktree, as pre-nesting versions laid it out.
+        let flat = base.join("worktrees").join("development");
+        let out = std::process::Command::new("git")
+            .args(["-C", &a.path, "worktree", "add", flat.to_str().unwrap(), "-b", "development"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "flat worktree add: {}", String::from_utf8_lossy(&out.stderr));
+        state.workspaces.push(Workspace {
+            id: "legacy".into(),
+            name: "development".into(),
+            repo_id: a.id.clone(),
+            working_dir: flat.to_string_lossy().into_owned(),
+            active: true,
+            created_at: 0,
+            worktree_path: Some(flat.to_string_lossy().into_owned()),
+            branch_name: Some("development".into()),
+        });
+
+        let wb = state.create_workspace_with_base(Some("development"), &b.id, &base).unwrap();
+        let nested = wb.worktree_path.as_deref().unwrap();
+        assert!(
+            nested.ends_with(&format!("worktrees/{}/development", b.id)),
+            "new workspace nests: {nested}"
+        );
+        assert!(flat.exists(), "legacy flat dir untouched by the nested create");
+
+        // Deleting the legacy workspace (by id, the name is now ambiguous)
+        // removes the flat dir; the other repo's nested worktree survives.
+        state.delete_workspace_with_base("legacy", &base).unwrap();
+        assert!(!flat.exists(), "legacy flat worktree removed");
+        assert!(Path::new(nested).exists(), "nested sibling survives the flat delete");
+    }
+
+    #[test]
+    fn ambiguous_workspace_name_errors_and_id_hits_the_right_row() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("state");
+        let repo_a = init_git_repo(&tmp, "alpha");
+        let repo_b = init_git_repo(&tmp, "beta");
+        let mut state = AppState::default();
+        let a = state.add_repo_with_base(repo_a.to_str().unwrap(), &base).unwrap();
+        let b = state.add_repo_with_base(repo_b.to_str().unwrap(), &base).unwrap();
+        let wa = state.create_workspace_with_base(Some("dev"), &a.id, &base).unwrap();
+        let wb = state.create_workspace_with_base(Some("dev"), &b.id, &base).unwrap();
+        let pa = wa.worktree_path.clone().unwrap();
+        let pb = wb.worktree_path.clone().unwrap();
+
+        // The bare name is ambiguous; the error names each match and the remedy.
+        let err = state.show_workspace("dev").unwrap_err().to_string();
+        assert!(err.contains("use the ID"), "remedy named: {err}");
+        assert!(err.contains(&wa.id) && err.contains(&wb.id), "lists each match: {err}");
+        assert!(err.contains("alpha") && err.contains("beta"), "names the repos: {err}");
+
+        // Delete by ambiguous name refuses AND leaves both rows + dirs intact
+        // (pins the destructive surface directly, not just via show).
+        let err = state.delete_workspace_with_base("dev", &base).unwrap_err().to_string();
+        assert!(err.contains("use the ID"), "{err}");
+        assert_eq!(state.workspaces.len(), 2, "no row deleted on the ambiguity error");
+        assert!(Path::new(&pa).exists() && Path::new(&pb).exists(), "both worktrees intact");
+        assert!(state.archive_workspace_with_base("dev", &base).is_err(), "archive refuses too");
+        assert!(state.activate_workspace_with_base("dev", &base).is_err(), "activate refuses too");
+
+        // By ID everything targets the right row.
+        assert_eq!(state.show_workspace(&wa.id).unwrap().repo_id, a.id);
+        let removed = state.delete_workspace_with_base(&wa.id, &base).unwrap();
+        assert_eq!(removed.id, wa.id);
+        assert!(!Path::new(&pa).exists(), "the addressed worktree is removed");
+        assert!(Path::new(&pb).exists(), "the other repo's worktree survives");
+    }
+
+    #[test]
+    fn workspace_named_as_another_workspaces_id_is_ambiguous() {
+        // Workspace A's NAME equals workspace B's ID: resolving that string
+        // matches B by id and A by name: refuse rather than silently act on
+        // either (fail-safe over fail-wrong).
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        state.workspaces.push(ws("b-id", "b-name"));
+        state.workspaces.push(ws("a-id", "b-id")); // A named exactly B's id
+        let err = state.show_workspace("b-id").unwrap_err().to_string();
+        assert!(err.contains("use the ID"), "{err}");
+        let err = state.delete_workspace_with_base("b-id", tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("use the ID"), "{err}");
+        assert_eq!(state.workspaces.len(), 2, "nothing mutated on the double match");
     }
 
     #[test]
@@ -2268,7 +2446,10 @@ mod tests {
         let renamed = AppState::load_from(&personal).unwrap();
         let feat = renamed.workspaces.iter().find(|w| w.name == "feat").unwrap();
         let wt = feat.worktree_path.as_deref().unwrap();
-        assert!(wt.contains("/profiles/personal/worktrees/feat"), "worktree rewritten: {wt}");
+        assert!(
+            wt.contains(&format!("/profiles/personal/worktrees/{}/feat", repo.id)),
+            "worktree rewritten: {wt}"
+        );
         assert_eq!(feat.working_dir, wt, "working_dir follows its worktree");
         let legacy = renamed.workspaces.iter().find(|w| w.name == "legacy-ws").unwrap();
         assert_eq!(
@@ -2293,7 +2474,10 @@ mod tests {
         // move — `worktree list` showing the NEW path proves it ran and stuck.
         let list = git(&["worktree", "list"]);
         let list = String::from_utf8_lossy(&list.stdout).to_string();
-        assert!(list.contains("profiles/personal/worktrees/feat"), "gitdir repaired: {list}");
+        assert!(
+            list.contains(&format!("profiles/personal/worktrees/{}/feat", repo.id)),
+            "gitdir repaired: {list}"
+        );
         assert!(!list.contains("profiles/work/"), "no stale old worktree path: {list}");
     }
 

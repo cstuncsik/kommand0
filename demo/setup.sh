@@ -36,7 +36,8 @@ for ws in auth payments search; do
 done
 
 # Leave one workspace dirty so the demo shows an uncommitted-changes marker.
-echo '    // wip: rate limiter' >>"$WORK/state/worktrees/auth/main.rs"
+# Worktrees nest under the repo id (worktrees/<repo-id>/<name>); glob it.
+echo '    // wip: rate limiter' >>"$WORK"/state/worktrees/*/auth/main.rs
 
 echo "demo env ready at $WORK" >&2
 echo "now record with:  vhs demo/demo.tape" >&2

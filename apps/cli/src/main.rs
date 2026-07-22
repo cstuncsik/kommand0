@@ -293,11 +293,11 @@ fn main() -> anyhow::Result<()> {
                         // fork that then fails). `--fork` and the no-name case skip
                         // detection entirely.
                         let offer = match (&name, fork) {
-                            (Some(n), false) => state.validate_new_workspace_name(n).is_ok()
-                                && kommand0_core::worktree::branch_exists_bare(
-                                    &state.resolve_repo(&repo)?.path,
-                                    n,
-                                ),
+                            (Some(n), false) => {
+                                let r = state.resolve_repo(&repo)?;
+                                state.validate_new_workspace_name(n, &r.id).is_ok()
+                                    && kommand0_core::worktree::branch_exists_bare(&r.path, n)
+                            }
                             _ => false,
                         };
                         let ws = if !offer {

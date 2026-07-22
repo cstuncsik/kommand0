@@ -53,14 +53,32 @@ pub fn branch_exists_bare(repo_path: &str, name: &str) -> bool {
         || verify_ref(repo_path, &format!("refs/remotes/origin/{name}"))
 }
 
-/// Resolve `<base_dir>/worktrees/<name>` to an absolute path string, clearing a
-/// stale worktree already there. `Err(reason)` if a dir still blocks the path.
+/// Resolve `<base_dir>/worktrees/<repo_id>/<workspace_name>` to an absolute
+/// path string, clearing a stale worktree already there. `Err(reason)` if the
+/// repo id is unsafe as a path segment or a dir still blocks the path.
+///
+/// Coexistence invariant: `worktrees/` may contain legacy flat `<name>` dirs
+/// (pre-nesting layout) alongside `<repo-id>/` dirs. Paths are read from
+/// state, never re-derived from names; never sweep `worktrees/` by pattern.
 fn prepare_worktree_dir(
     repo_path: &str,
+    repo_id: &str,
     workspace_name: &str,
     base_dir: &Path,
 ) -> std::result::Result<String, String> {
-    let worktree_dir = base_dir.join("worktrees").join(workspace_name);
+    // state.json is hand-editable: an id that is `.`/`..` or carries a path
+    // separator would make `join` escape `worktrees/`. Same rule
+    // `validate_new_workspace_name` enforces for the sibling name segment.
+    if repo_id.trim().is_empty()
+        || repo_id == "."
+        || repo_id == ".."
+        || repo_id.contains('/')
+        || repo_id.contains('\\')
+        || repo_id.starts_with('-')
+    {
+        return Err(format!("invalid repo id for worktree dir: {repo_id:?}"));
+    }
+    let worktree_dir = base_dir.join("worktrees").join(repo_id).join(workspace_name);
     // The worktree dir doesn't exist yet; make the path absolute so git is happy.
     let worktree_dir = if worktree_dir.is_relative() {
         std::env::current_dir().unwrap_or_default().join(&worktree_dir)
@@ -103,7 +121,7 @@ fn unique_branch_name(repo_path: &str, base: &str) -> String {
 
 /// Create a git worktree for a workspace.
 ///
-/// The worktree is placed at `<base_dir>/worktrees/<workspace_name>`.
+/// The worktree is placed at `<base_dir>/worktrees/<repo_id>/<workspace_name>`.
 /// A new branch named after the workspace is created (suffixed `-2`, `-3`, …
 /// when a branch of that name already exists locally or on origin).
 ///
@@ -111,6 +129,7 @@ fn unique_branch_name(repo_path: &str, base: &str) -> String {
 /// if worktree creation fails for any reason.
 pub fn create_worktree(
     repo_path: &str,
+    repo_id: &str,
     workspace_name: &str,
     base_dir: &Path,
 ) -> WorktreeResult {
@@ -121,7 +140,7 @@ pub fn create_worktree(
         };
     }
 
-    let worktree_path = match prepare_worktree_dir(repo_path, workspace_name, base_dir) {
+    let worktree_path = match prepare_worktree_dir(repo_path, repo_id, workspace_name, base_dir) {
         Ok(p) => p,
         Err(reason) => return WorktreeResult::Fallback { reason },
     };
@@ -338,7 +357,8 @@ fn copy_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Create a worktree that checks out an EXISTING branch instead of forking a
+/// Create a worktree (at `<base_dir>/worktrees/<repo_id>/<workspace_name>`)
+/// that checks out an EXISTING branch instead of forking a
 /// new one. `branch_ref` may be a local branch (`feat/x`), a
 /// remote-tracking ref (`origin/feat/x`), or a bare name that exists under
 /// `origin/`. For a remote-only ref a local tracking branch is created; for a
@@ -346,6 +366,7 @@ fn copy_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
 /// out in another worktree — surfaced as a `Fallback`).
 pub fn create_worktree_from_branch(
     repo_path: &str,
+    repo_id: &str,
     workspace_name: &str,
     base_dir: &Path,
     branch_ref: &str,
@@ -355,7 +376,7 @@ pub fn create_worktree_from_branch(
             reason: format!("{repo_path} is not a git repository"),
         };
     }
-    let worktree_path = match prepare_worktree_dir(repo_path, workspace_name, base_dir) {
+    let worktree_path = match prepare_worktree_dir(repo_path, repo_id, workspace_name, base_dir) {
         Ok(p) => p,
         Err(reason) => return WorktreeResult::Fallback { reason },
     };
@@ -384,11 +405,27 @@ pub fn create_worktree_from_branch(
     finish_worktree_add(repo_path, output, worktree_path, branch_name)
 }
 
+/// Best-effort rmdir of the worktree's parent (`worktrees/<repo-id>/`) once
+/// its last worktree is gone. `remove_dir` (never `_all`) only deletes an
+/// EMPTY dir, so a sibling worktree keeps it alive; for a legacy flat
+/// worktree the parent is `worktrees/` itself, removed only when empty and
+/// recreated on demand, a harmless no-op.
+fn remove_empty_parent(worktree_path: &str) {
+    if let Some(parent) = Path::new(worktree_path).parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
 /// Remove a git worktree. Idempotent — returns Ok if path doesn't exist.
 ///
 /// Uses `--force` to handle dirty worktrees (since the workspace is being deleted).
 pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<()> {
     if !Path::new(worktree_path).exists() {
+        // Common flow: the merged-PR cleanup already removed the worktree and
+        // the follow-up workspace delete lands here; still clear a now-empty
+        // worktrees/<repo-id>/ parent. NOT done on the failure arms below
+        // (git refusing can mean the state path never was a worktree).
+        remove_empty_parent(worktree_path);
         return Ok(());
     }
 
@@ -404,7 +441,10 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<()> {
         .output();
 
     match output {
-        Ok(result) if result.status.success() => Ok(()),
+        Ok(result) if result.status.success() => {
+            remove_empty_parent(worktree_path);
+            Ok(())
+        }
         Ok(result) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
             // Log but don't fail — worktree removal shouldn't block workspace
@@ -456,6 +496,7 @@ mod tests {
         let base = TempDir::new().unwrap();
         let result = create_worktree(
             tmp.path().to_str().unwrap(),
+            "r1",
             "test-ws",
             base.path(),
         );
@@ -475,6 +516,7 @@ mod tests {
 
         let result = create_worktree(
             repo.path().to_str().unwrap(),
+            "r1",
             "my-feature",
             base.path(),
         );
@@ -512,6 +554,77 @@ mod tests {
     }
 
     #[test]
+    fn create_worktree_rejects_unsafe_repo_ids() {
+        // state.json is hand-editable: a repo id with a path separator or
+        // `..` must not let the worktree dir escape `worktrees/` (analogue of
+        // create_workspace_rejects_unsafe_names for the sibling segment).
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        for bad in ["", "  ", ".", "..", "a/b", "a\\b", "-rf"] {
+            match create_worktree(repo.path().to_str().unwrap(), bad, "ws", base.path()) {
+                WorktreeResult::Fallback { reason } => {
+                    assert!(reason.contains("invalid repo id"), "{bad:?}: {reason}");
+                }
+                WorktreeResult::Created { .. } => panic!("{bad:?} must be rejected"),
+            }
+        }
+        // Nothing escaped `worktrees/` (a `..` id would land at base/ws) and
+        // the rejection fired before any dir was created at all.
+        assert!(!base.path().join("ws").exists(), "`..` id must not escape worktrees/");
+        assert!(!base.path().join("worktrees").exists(), "no dir created for a rejected id");
+    }
+
+    #[test]
+    fn remove_worktree_clears_the_empty_repo_id_parent() {
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        let create = |name: &str| match create_worktree(rp, "r1", name, base.path()) {
+            WorktreeResult::Created { worktree_path, .. } => worktree_path,
+            WorktreeResult::Fallback { reason } => panic!("expected Created, got: {reason}"),
+        };
+        let a = create("a");
+        let b = create("b");
+        let parent = base.path().join("worktrees").join("r1");
+
+        remove_worktree(rp, &a).unwrap();
+        assert!(Path::new(&b).exists(), "sibling worktree survives (rmdir, not remove_dir_all)");
+        assert!(parent.exists(), "parent stays while a sibling remains");
+
+        remove_worktree(rp, &b).unwrap();
+        assert!(!parent.exists(), "empty worktrees/<repo-id>/ removed with the last worktree");
+    }
+
+    #[test]
+    fn remove_worktree_already_gone_still_clears_the_empty_parent() {
+        // The merged-PR cleanup removes the worktree first; the follow-up
+        // workspace delete hits remove_worktree's early return, which must
+        // still clear the now-empty worktrees/<repo-id>/ dir.
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        let path = match create_worktree(rp, "r1", "ws", base.path()) {
+            WorktreeResult::Created { worktree_path, .. } => worktree_path,
+            WorktreeResult::Fallback { reason } => panic!("expected Created, got: {reason}"),
+        };
+        // Remove the worktree out-of-band (as cleanup_merged_workspace does).
+        Command::new("git")
+            .args(["-C", rp, "worktree", "remove", &path, "--force"])
+            .output()
+            .unwrap();
+        assert!(!Path::new(&path).exists(), "sanity: worktree gone");
+
+        remove_worktree(rp, &path).unwrap();
+        assert!(
+            !base.path().join("worktrees").join("r1").exists(),
+            "empty parent cleared on the early return"
+        );
+    }
+
+    #[test]
     fn unique_branch_handles_collision() {
         let repo = TempDir::new().unwrap();
         let base = TempDir::new().unwrap();
@@ -520,6 +633,7 @@ mod tests {
         // Create first worktree
         let result1 = create_worktree(
             repo.path().to_str().unwrap(),
+            "r1",
             "feature",
             base.path(),
         );
@@ -529,6 +643,7 @@ mod tests {
         let base2 = TempDir::new().unwrap();
         let result2 = create_worktree(
             repo.path().to_str().unwrap(),
+            "r1",
             "feature",
             base2.path(),
         );
@@ -571,7 +686,7 @@ mod tests {
         let rp = repo.path().to_str().unwrap();
         Command::new("git").args(["-C", rp, "branch", "feat"]).output().unwrap();
 
-        match create_worktree_from_branch(rp, "ws", base.path(), "feat") {
+        match create_worktree_from_branch(rp, "r1", "ws", base.path(), "feat") {
             WorktreeResult::Created { worktree_path, branch_name } => {
                 assert!(Path::new(&worktree_path).exists());
                 assert_eq!(branch_name, "feat", "existing branch checked out as-is (no fork)");
@@ -681,7 +796,7 @@ mod tests {
         let repo = TempDir::new().unwrap();
         let base = TempDir::new().unwrap();
         init_git_repo(repo.path());
-        match create_worktree_from_branch(repo.path().to_str().unwrap(), "ws", base.path(), "nope") {
+        match create_worktree_from_branch(repo.path().to_str().unwrap(), "r1", "ws", base.path(), "nope") {
             WorktreeResult::Fallback { reason } => assert!(reason.contains("branch not found"), "got: {reason}"),
             WorktreeResult::Created { .. } => panic!("expected Fallback for a missing branch"),
         }
@@ -700,7 +815,7 @@ mod tests {
         Command::new("git").args(["clone", op, clone.to_str().unwrap()]).output().unwrap();
         let base = TempDir::new().unwrap();
 
-        match create_worktree_from_branch(clone.to_str().unwrap(), "ws", base.path(), "feat") {
+        match create_worktree_from_branch(clone.to_str().unwrap(), "r1", "ws", base.path(), "feat") {
             WorktreeResult::Created { worktree_path, branch_name } => {
                 assert_eq!(branch_name, "feat", "a local branch is created for the remote ref");
                 let up = Command::new("git")
@@ -989,7 +1104,7 @@ mod tests {
         // No manifest -> fallback copies `.env*` into the new worktree.
         write_file(repo.path(), ".env", "API=1");
 
-        match create_worktree(repo.path().to_str().unwrap(), "ws", base.path()) {
+        match create_worktree(repo.path().to_str().unwrap(), "r1", "ws", base.path()) {
             WorktreeResult::Created { worktree_path, .. } => {
                 let env = std::fs::read_to_string(Path::new(&worktree_path).join(".env")).unwrap();
                 assert_eq!(env, "API=1", ".env copied into the worktree on the Created arm");
@@ -1006,8 +1121,8 @@ mod tests {
         let base = TempDir::new().unwrap();
         write_file(repo.path(), ".env", "API=1");
 
-        let worktree_dir = base.path().join("worktrees").join("ws");
-        match create_worktree(repo.path().to_str().unwrap(), "ws", base.path()) {
+        let worktree_dir = base.path().join("worktrees").join("r1").join("ws");
+        match create_worktree(repo.path().to_str().unwrap(), "r1", "ws", base.path()) {
             WorktreeResult::Fallback { .. } => {
                 assert!(!worktree_dir.exists(), "no worktree created, nothing copied");
             }

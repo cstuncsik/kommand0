@@ -644,6 +644,12 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     }]);
     std::fs::write(&state_path, v.to_string()).unwrap();
 
+    // Worktrees nest under the repo id (`worktrees/<repo-id>/<name>`); fetch
+    // the id from `repo list` (prints `id name path`) to build expected paths.
+    let list = kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "list"]);
+    assert!(list.status.success(), "repo list: {}", String::from_utf8_lossy(&list.stderr));
+    let repo_id = stdout(&list).split_whitespace().next().unwrap().to_string();
+
     // Seed a Claude project store for the worktree under a REDIRECTED config
     // dir (never the real ~/.claude). The store dir name is claude's cwd
     // slug; the binary's stored worktree path is cwd-absolutized against the
@@ -652,7 +658,7 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
         path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
     };
     let canon = tmp.path().canonicalize().unwrap();
-    let old_wt = canon.join(".kommand0-dev/profiles/work/worktrees/feat");
+    let old_wt = canon.join(format!(".kommand0-dev/profiles/work/worktrees/{repo_id}/feat"));
     let claude_dir = tmp.path().join("claude-config");
     let projects = claude_dir.join("projects");
     let old_store = projects.join(claude_slug(&old_wt.to_string_lossy()));
@@ -677,7 +683,7 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     );
 
     // The Claude session store followed the worktree.
-    let new_wt = canon.join(".kommand0-dev/profiles/personal/worktrees/feat");
+    let new_wt = canon.join(format!(".kommand0-dev/profiles/personal/worktrees/{repo_id}/feat"));
     let new_store = projects.join(claude_slug(&new_wt.to_string_lossy()));
     assert!(new_store.join("abc.jsonl").exists(), "store migrated with its transcript");
     assert!(!old_store.exists(), "old store dir gone");
@@ -686,7 +692,10 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     let list =
         Command::new("git").args(["worktree", "list"]).current_dir(&repo).output().unwrap();
     let list = String::from_utf8_lossy(&list.stdout).to_string();
-    assert!(list.contains("profiles/personal/worktrees/feat"), "gitdir repaired: {list}");
+    assert!(
+        list.contains(&format!("profiles/personal/worktrees/{repo_id}/feat")),
+        "gitdir repaired: {list}"
+    );
 
     // …and the profile's state carries both rewritten paths.
     let new_state = std::fs::read_to_string(
@@ -694,7 +703,7 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     )
     .unwrap();
     assert!(
-        new_state.contains("profiles/personal/worktrees/feat"),
+        new_state.contains(&format!("profiles/personal/worktrees/{repo_id}/feat")),
         "worktree path rewritten: {new_state}"
     );
     assert!(

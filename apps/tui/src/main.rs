@@ -3052,7 +3052,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // name whose bare branch already exists — otherwise fall
                     // through to create, which surfaces core's canonical error
                     // (a duplicate or invalid name never opens the offer).
-                    else if app.state.validate_new_workspace_name(&name).is_ok()
+                    else if app.state.validate_new_workspace_name(&name, &repo_id).is_ok()
                         && kommand0_core::worktree::branch_exists_bare(&repo.path, &name)
                     {
                         app.modal = modal::ModalState::ConfirmBranchCheckout {
@@ -4725,7 +4725,8 @@ mod key_tests {
     async fn checkout_choice_fork_on_free_name_creates_the_suffixed_branch() {
         let mut app = test_app();
         // Unique workspace name: worktrees land in the shared per-process state
-        // dir (`worktrees/<name>`), so reusing "feat" would race the checkout
+        // dir and these tests share the literal repo id "real"
+        // (`worktrees/real/<name>`), so reusing "feat" would race the checkout
         // test's worktree under parallel runs.
         let _repo = add_real_repo(&mut app, "forkme");
         // The prompt is open because local `forkme` exists; `f` forks — the
