@@ -9,10 +9,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::theme::Theme;
 
-/// What kind of delete is being confirmed.
+/// What kind of delete is being confirmed. The workspace target carries the
+/// id (the delete key: names are only unique per repo) plus name + repo for
+/// the confirm text.
 #[derive(Clone)]
 pub(crate) enum DeleteTarget {
-    Workspace { name: String },
+    Workspace { id: String, name: String, repo: String },
     Repo { id: String, name: String, workspace_count: usize },
 }
 
@@ -844,9 +846,11 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             frame.render_widget(Clear, area);
 
             let (title, message) = match target {
-                DeleteTarget::Workspace { name } => (
+                // Name the repo: duplicate names across repos are legal and
+                // this is the one destructive surface without repo context.
+                DeleteTarget::Workspace { name, repo, .. } => (
                     " Delete Workspace ".to_string(),
-                    format!("Delete workspace '{name}'?"),
+                    format!("Delete workspace '{name}' (repo {repo})?"),
                 ),
                 DeleteTarget::Repo { name, workspace_count, .. } => {
                     if *workspace_count > 0 {
@@ -1206,7 +1210,7 @@ mod tests {
     fn paste_is_a_noop_on_confirm_modals() {
         // Confirm-only modals have no field — must not panic or change variant.
         let mut modal = ModalState::ConfirmDelete {
-            target: DeleteTarget::Workspace { name: "w".into() },
+            target: DeleteTarget::Workspace { id: "w1".into(), name: "w".into(), repo: "r".into() },
         };
         handle_modal_paste(&mut modal, "ignored");
         assert!(matches!(modal, ModalState::ConfirmDelete { .. }));
