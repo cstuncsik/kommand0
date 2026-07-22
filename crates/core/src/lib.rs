@@ -1247,9 +1247,10 @@ impl AppState {
     /// ambiguous, as is a ref matching one workspace's ID and a DIFFERENT
     /// workspace's name (fail-safe over a silent wrong-target delete when a
     /// workspace is named with another workspace's id-shaped string).
-    /// Trade-off: in that shadow state even by-id callers (the TUI's
-    /// `let _ =` sites) hit the error and silently no-op until the shadowing
-    /// row is deleted by its own id.
+    /// Trade-off: in that shadow state the TUI's by-id archive/activate
+    /// calls hit the error and silently no-op until the shadowing row is
+    /// deleted by its own id; destructive deletes are immune, they use the
+    /// exact-id [`Self::delete_workspace_by_id`] path instead.
     fn workspace_index(&self, ws_ref: &str) -> anyhow::Result<usize> {
         let matches: Vec<usize> = self
             .workspaces
@@ -1290,14 +1291,10 @@ impl AppState {
         Ok(&self.workspaces[self.workspace_index(ws_ref)?])
     }
 
-    /// Delete a workspace by name or ID, saving to custom base directory.
-    /// Also removes the git worktree if one was created.
-    pub fn delete_workspace_with_base(
-        &mut self,
-        ws_ref: &str,
-        base: &Path,
-    ) -> anyhow::Result<Workspace> {
-        let idx = self.workspace_index(ws_ref)?;
+    /// Shared removal body once a delete entry point has resolved the row
+    /// index: drop the row, its embedded-session bookkeeping, and its
+    /// worktree, then save.
+    fn remove_workspace_at(&mut self, idx: usize, base: &Path) -> anyhow::Result<Workspace> {
         let removed = self.workspaces.remove(idx);
         self.embedded_sessions.remove(&removed.id);
         self.embedded_titles.remove(&removed.id);
@@ -1313,9 +1310,46 @@ impl AppState {
         Ok(removed)
     }
 
+    /// Delete a workspace by name or ID, saving to custom base directory.
+    /// Also removes the git worktree if one was created.
+    pub fn delete_workspace_with_base(
+        &mut self,
+        ws_ref: &str,
+        base: &Path,
+    ) -> anyhow::Result<Workspace> {
+        let idx = self.workspace_index(ws_ref)?;
+        self.remove_workspace_at(idx, base)
+    }
+
     /// Delete a workspace by name or ID, saving to the default state directory.
     pub fn delete_workspace(&mut self, ws_ref: &str) -> anyhow::Result<Workspace> {
         self.delete_workspace_with_base(ws_ref, Self::state_dir().as_path())
+    }
+
+    /// Delete a workspace by its EXACT id, never falling back to a name
+    /// match: "workspace not found" when the id is absent. For callers
+    /// holding an authentic state-held id (the TUI's tree actions, the CLI
+    /// cleanup's second step): immune to name shadowing AND to the race
+    /// where the row is deleted meanwhile and a new workspace is created
+    /// NAMED that id string, which a ws_ref lookup would mis-target.
+    /// User-facing refs stay on [`Self::delete_workspace`].
+    pub fn delete_workspace_by_id_with_base(
+        &mut self,
+        id: &str,
+        base: &Path,
+    ) -> anyhow::Result<Workspace> {
+        let idx = self
+            .workspaces
+            .iter()
+            .position(|w| w.id == id)
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {id}"))?;
+        self.remove_workspace_at(idx, base)
+    }
+
+    /// [`Self::delete_workspace_by_id_with_base`] against the default state
+    /// directory.
+    pub fn delete_workspace_by_id(&mut self, id: &str) -> anyhow::Result<Workspace> {
+        self.delete_workspace_by_id_with_base(id, Self::state_dir().as_path())
     }
 
     /// Archive a workspace (set active=false) with custom base directory.
@@ -1708,6 +1742,27 @@ mod tests {
         assert_eq!(removed.id, wa.id);
         assert!(!Path::new(&pa).exists(), "the addressed worktree is removed");
         assert!(Path::new(&pb).exists(), "the other repo's worktree survives");
+    }
+
+    #[test]
+    fn delete_workspace_by_id_ignores_name_shadowing() {
+        // Shadow state: workspace A is NAMED exactly workspace B's id. The
+        // exact-id delete must hit the id-matched row, never the name.
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        state.workspaces.push(ws("b-id", "b-name"));
+        state.workspaces.push(ws("a-id", "b-id")); // A named exactly B's id
+        let removed = state.delete_workspace_by_id_with_base("b-id", tmp.path()).unwrap();
+        assert_eq!(removed.id, "b-id", "the id match wins over the shadowing name");
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].id, "a-id", "the shadowing row is untouched");
+
+        // The id row is gone and a workspace NAMED that id string remains
+        // (the deleted-row-plus-name-reuse race): the by-id delete must NOT
+        // fall back to the name match. Error, nothing mutated.
+        let err = state.delete_workspace_by_id_with_base("b-id", tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("workspace not found"), "{err}");
+        assert_eq!(state.workspaces.len(), 1, "no name-match fallback delete");
     }
 
     #[test]
