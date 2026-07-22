@@ -36,8 +36,11 @@ for ws in auth payments search; do
 done
 
 # Leave one workspace dirty so the demo shows an uncommitted-changes marker.
-# Worktrees nest under the repo id (worktrees/<repo-id>/<name>); glob it.
-echo '    // wip: rate limiter' >>"$WORK"/state/worktrees/*/auth/main.rs
+# Worktrees nest under the repo id (worktrees/<repo-id>/<name>); a glob in a
+# redirection word is NOT expanded by sh, so loop instead.
+for f in "$WORK"/state/worktrees/*/auth/main.rs; do
+	echo '    // wip: rate limiter' >>"$f"
+done
 
 echo "demo env ready at $WORK" >&2
 echo "now record with:  vhs demo/demo.tape" >&2
