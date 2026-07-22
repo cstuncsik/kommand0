@@ -14,6 +14,20 @@ All notable changes to kommand0 are documented here. The format is based on
   session tabs, wrapping, whether the pane is focused or just hovered; the
   unmodified vertical wheel keeps scrolling content.
 
+### Changed
+
+- **New worktrees are created at `worktrees/<repo-id>/<name>`** inside the
+  profile dir (previously flat `worktrees/<name>`); existing worktrees stay
+  where they are and keep working, no migration needed. Where a workspace name
+  now matches rows in several repos, `kmd` workspace commands ask for the ID
+  (the first column of `kmd workspace list`) instead of guessing.
+
+### Fixed
+
+- **Workspace names only need to be unique within their repo** (was: globally,
+  so a `development` workspace in one repo blocked creating `development` in
+  another).
+
 ## [0.20.0] - 2026-07-20
 
 ### Added

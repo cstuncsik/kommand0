@@ -1500,9 +1500,9 @@ impl App {
             return;
         };
         let res = if ws.active {
-            self.state.archive_workspace(&ws.name)
+            self.state.archive_workspace(&ws.id)
         } else {
-            self.state.activate_workspace(&ws.name)
+            self.state.activate_workspace(&ws.id)
         };
         if res.is_ok() {
             self.workspaces = self.state.workspaces.clone();
@@ -2961,33 +2961,22 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             },
             modal::ModalResult::ConfirmDelete(target) => {
                 match target {
-                    modal::DeleteTarget::Workspace { name } => {
-                        // Gather IDs before mutating
-                        let ws_info =
-                            app.state
-                                .workspaces
-                                .iter()
-                                .find(|w| w.name == name)
-                                .map(|w| {
-                                    let sid = app
-                                        .state
-                                        .find_session_by_workspace(&w.id)
-                                        .filter(|s| s.status == SessionStatus::Running)
-                                        .map(|s| s.id.clone());
-                                    (w.id.clone(), sid)
-                                });
-                        if let Some((ws_id, running_sid)) = ws_info {
-                            if let Some(sid) = running_sid {
-                                let _ = app
-                                    .state
-                                    .update_session_status(&sid, SessionStatus::Stopped);
-                            }
-                            // Tear the embedded pane down here (at user-action
-                            // time) rather than letting reap_embedded block the
-                            // 50ms tick on the pane's Drop.
-                            app.embedded.remove(&ws_id);
+                    modal::DeleteTarget::Workspace { id, .. } => {
+                        if let Some(sid) = app
+                            .state
+                            .find_session_by_workspace(&id)
+                            .filter(|s| s.status == SessionStatus::Running)
+                            .map(|s| s.id.clone())
+                        {
+                            let _ = app
+                                .state
+                                .update_session_status(&sid, SessionStatus::Stopped);
                         }
-                        let _ = app.state.delete_workspace(&name);
+                        // Tear the embedded pane down here (at user-action
+                        // time) rather than letting reap_embedded block the
+                        // 50ms tick on the pane's Drop.
+                        app.embedded.remove(&id);
+                        let _ = app.state.delete_workspace_by_id(&id);
                         app.workspaces = app.state.workspaces.clone();
                         app.rebuild_tree();
                         app.update_active_session();
@@ -3052,7 +3041,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // name whose bare branch already exists — otherwise fall
                     // through to create, which surfaces core's canonical error
                     // (a duplicate or invalid name never opens the offer).
-                    else if app.state.validate_new_workspace_name(&name).is_ok()
+                    else if app.state.validate_new_workspace_name(&name, &repo_id).is_ok()
                         && kommand0_core::worktree::branch_exists_bare(&repo.path, &name)
                     {
                         app.modal = modal::ModalState::ConfirmBranchCheckout {
@@ -3330,10 +3319,12 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     }
                 }
                 Action::Delete => match app.tree_items.get(app.selected_index).cloned() {
-                    Some(TreeNode::Workspace { ws, .. }) => {
+                    Some(TreeNode::Workspace { ws, repo_name }) => {
                         app.modal = modal::ModalState::ConfirmDelete {
                             target: modal::DeleteTarget::Workspace {
-                                name: ws.name.clone(),
+                                id: ws.id,
+                                name: ws.name,
+                                repo: repo_name,
                             },
                         };
                     }
@@ -3352,28 +3343,21 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 },
                 Action::ForceDelete => match app.tree_items.get(app.selected_index).cloned() {
                     Some(TreeNode::Workspace { ws, .. }) => {
-                        let ws_info = app
+                        // The tree node carries the workspace: key everything
+                        // on its id (a by-name refetch could hit another
+                        // repo's same-named workspace and its live session).
+                        if let Some(sid) = app
                             .state
-                            .workspaces
-                            .iter()
-                            .find(|w| w.name == ws.name)
-                            .map(|w| {
-                                let sid = app
-                                    .state
-                                    .find_session_by_workspace(&w.id)
-                                    .filter(|s| s.status == SessionStatus::Running)
-                                    .map(|s| s.id.clone());
-                                (w.id.clone(), sid)
-                            });
-                        if let Some((ws_id, running_sid)) = ws_info {
-                            if let Some(sid) = running_sid {
-                                let _ = app
-                                    .state
-                                    .update_session_status(&sid, SessionStatus::Stopped);
-                            }
-                            app.embedded.remove(&ws_id);
+                            .find_session_by_workspace(&ws.id)
+                            .filter(|s| s.status == SessionStatus::Running)
+                            .map(|s| s.id.clone())
+                        {
+                            let _ = app
+                                .state
+                                .update_session_status(&sid, SessionStatus::Stopped);
                         }
-                        let _ = app.state.delete_workspace(&ws.name);
+                        app.embedded.remove(&ws.id);
+                        let _ = app.state.delete_workspace_by_id(&ws.id);
                         app.workspaces = app.state.workspaces.clone();
                         app.rebuild_tree();
                         app.update_active_session();
@@ -3830,11 +3814,10 @@ async fn run(
                 app.cleanup_inflight.remove(&ws_id);
                 match result {
                     Ok(()) => {
-                        // The worktree + branch are gone — drop the workspace too.
-                        if let Some(name) = app.state.workspaces.iter()
-                            .find(|w| w.id == ws_id).map(|w| w.name.clone())
-                        {
-                            let _ = app.state.delete_workspace(&name);
+                        // The worktree + branch are gone; drop the workspace too
+                        // (exact id; a no-op if it was already deleted meanwhile,
+                        // even when a new workspace has reused the id as a name).
+                        if app.state.delete_workspace_by_id(&ws_id).is_ok() {
                             app.workspaces = app.state.workspaces.clone();
                             app.expanded_icon_rows.remove(&ws_id);
                             app.cleanup_result.remove(&ws_id);
@@ -4005,7 +3988,7 @@ async fn run(
                             }
                         }
                         buttons::HitAction::DeleteWorkspaceFor { workspace_id } => {
-                            // Find workspace name from ID
+                            // Only act while the workspace still exists
                             if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
                                 // Stop running session first
                                 if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
@@ -4014,7 +3997,7 @@ async fn run(
                                 {
                                     let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                 }
-                                if app.state.delete_workspace(&ws.name).is_ok() {
+                                if app.state.delete_workspace_by_id(&ws.id).is_ok() {
                                     app.embedded.remove(&workspace_id);
                                     app.expanded_icon_rows.remove(&workspace_id);
                                     app.repos = app.state.repos.clone();
@@ -4725,7 +4708,8 @@ mod key_tests {
     async fn checkout_choice_fork_on_free_name_creates_the_suffixed_branch() {
         let mut app = test_app();
         // Unique workspace name: worktrees land in the shared per-process state
-        // dir (`worktrees/<name>`), so reusing "feat" would race the checkout
+        // dir and these tests share the literal repo id "real"
+        // (`worktrees/real/<name>`), so reusing "feat" would race the checkout
         // test's worktree under parallel runs.
         let _repo = add_real_repo(&mut app, "forkme");
         // The prompt is open because local `forkme` exists; `f` forks — the

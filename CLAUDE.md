@@ -64,6 +64,10 @@ git worktree. A `kmd` CLI mirrors the core actions.
   carry a legacy `kommand0/<name>` branch — still fully supported);
   a **fallback workspace has no `worktree_path`** (its `working_dir` is the repo
   root) — per-workspace git/PR features gate on `worktree_path.is_some()`.
+  Workspace names are unique **per repo**, not globally; new worktrees are created
+  at `worktrees/<repo-id>/<name>`, and `worktrees/` may still hold legacy flat
+  `<name>` dirs alongside the `<repo-id>/` dirs (paths are read from state, never
+  re-derived from names; never sweep `worktrees/` by pattern).
 
 ## Testing
 - Unit tests inline (`#[cfg(test)] mod tests`). **Core** tests build real temp git

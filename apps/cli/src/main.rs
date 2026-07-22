@@ -104,12 +104,12 @@ enum WorkspaceAction {
     },
     /// Show workspace details
     Show {
-        /// Workspace name
+        /// Workspace name or ID
         name: String,
     },
     /// Delete a workspace
     Delete {
-        /// Workspace name
+        /// Workspace name or ID
         name: String,
         /// Skip confirmation prompt
         #[arg(long)]
@@ -117,22 +117,22 @@ enum WorkspaceAction {
     },
     /// Archive a workspace (set inactive)
     Archive {
-        /// Workspace name
+        /// Workspace name or ID
         name: String,
     },
     /// Activate a workspace (set active)
     Activate {
-        /// Workspace name
+        /// Workspace name or ID
         name: String,
     },
     /// Show git branch/diff status (one workspace, or all)
     Status {
-        /// Workspace name (omit for all)
+        /// Workspace name or ID (omit for all)
         name: Option<String>,
     },
     /// Remove a merged workspace's worktree and delete its branch
     Cleanup {
-        /// Workspace name
+        /// Workspace name or ID
         name: String,
         /// Skip confirmation prompt
         #[arg(long)]
@@ -144,23 +144,23 @@ enum WorkspaceAction {
 enum SessionAction {
     /// Start a Claude session in a workspace
     Start {
-        /// Workspace name
+        /// Workspace name or ID
         workspace: String,
     },
     /// Stop a running session
     Stop {
-        /// Workspace name
+        /// Workspace name or ID
         workspace: String,
     },
     /// List sessions (optionally for one workspace)
     List {
-        /// Only sessions for this workspace
+        /// Only sessions for this workspace (name or ID)
         #[arg(long)]
         workspace: Option<String>,
     },
     /// Clear session metadata and log file
     Clear {
-        /// Workspace name
+        /// Workspace name or ID
         workspace: String,
     },
 }
@@ -293,11 +293,11 @@ fn main() -> anyhow::Result<()> {
                         // fork that then fails). `--fork` and the no-name case skip
                         // detection entirely.
                         let offer = match (&name, fork) {
-                            (Some(n), false) => state.validate_new_workspace_name(n).is_ok()
-                                && kommand0_core::worktree::branch_exists_bare(
-                                    &state.resolve_repo(&repo)?.path,
-                                    n,
-                                ),
+                            (Some(n), false) => {
+                                let r = state.resolve_repo(&repo)?;
+                                state.validate_new_workspace_name(n, &r.id).is_ok()
+                                    && kommand0_core::worktree::branch_exists_bare(&r.path, n)
+                            }
                             _ => false,
                         };
                         let ws = if !offer {
@@ -468,8 +468,11 @@ fn main() -> anyhow::Result<()> {
 
                 match cleanup_merged_workspace(&repo, &worktree, &branch) {
                     Ok(()) => {
-                        // The worktree + branch are gone — drop the workspace entry.
-                        state.delete_workspace(&name)?;
+                        // The worktree + branch are gone; drop the workspace
+                        // entry by exact id (never re-resolve the user's string
+                        // after the destructive git work, and never fall back
+                        // to a name match on the id).
+                        state.delete_workspace_by_id(&ws.id)?;
                         println!("Cleaned up workspace: {name}");
                     }
                     Err(e) => anyhow::bail!("{e}"),

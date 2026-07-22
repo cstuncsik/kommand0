@@ -276,6 +276,57 @@ fn workspace_create_over_existing_branch_and_workspace_errors_without_a_note() {
 }
 
 #[test]
+fn workspace_names_are_per_repo_and_ids_disambiguate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let mk_repo = |name: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "t@t"]);
+        run_git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-m", "init"]);
+        dir
+    };
+    for repo in [mk_repo("alpha"), mk_repo("beta")] {
+        let add = kmd(&state, &[], &["repo", "add", repo.to_str().unwrap()]);
+        assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+        let create =
+            kmd(&state, &[], &["workspace", "create", "dev", "--repo", repo.to_str().unwrap()]);
+        assert!(
+            create.status.success(),
+            "the same name in another repo must succeed: {}",
+            String::from_utf8_lossy(&create.stderr)
+        );
+    }
+
+    // The bare name is ambiguous now: show refuses and names the remedy.
+    let show = kmd(&state, &[], &["workspace", "show", "dev"]);
+    assert!(!show.status.success(), "ambiguous bare name must fail");
+    let err = String::from_utf8_lossy(&show.stderr);
+    assert!(err.contains("use the ID"), "remedy named: {err}");
+
+    // `workspace list` prints the ID as its first column; by ID, show hits
+    // exactly the addressed repo's row.
+    let list = stdout(&kmd(&state, &[], &["workspace", "list"]));
+    let id = list
+        .lines()
+        .find(|l| l.contains("alpha"))
+        .expect("alpha row listed")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let show = kmd(&state, &[], &["workspace", "show", &id]);
+    assert!(show.status.success(), "by-ID show: {}", String::from_utf8_lossy(&show.stderr));
+    let out = stdout(&show);
+    assert!(out.contains("dev") && out.contains("alpha"), "the right row shown: {out}");
+}
+
+#[test]
 fn cleanup_removes_a_merged_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
@@ -297,6 +348,67 @@ fn cleanup_removes_a_merged_workspace() {
     // The workspace is gone from `workspace list`.
     let list = kmd(&state, &[], &["workspace", "list", "--all"]);
     assert!(!stdout(&list).contains("feat"), "workspace dropped: {}", stdout(&list));
+}
+
+#[test]
+fn cleanup_succeeds_when_the_id_is_shadowed() {
+    // A workspace NAMED another workspace's id must not break cleanup: the
+    // post-cleanup row drop matches the exact id only, so the right row goes
+    // and the shadowing workspace (row + worktree) survives.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let list = stdout(&kmd(&state, &[], &["workspace", "list"]));
+    let feat_id = list
+        .lines()
+        .find(|l| l.contains("feat"))
+        .expect("feat row listed")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let repo = tmp.path().join("repo");
+    let shadow =
+        kmd(&state, &[], &["workspace", "create", &feat_id, "--repo", repo.to_str().unwrap()]);
+    assert!(shadow.status.success(), "shadow create: {}", String::from_utf8_lossy(&shadow.stderr));
+    let show = stdout(&kmd(&state, &[], &["workspace", "show", "feat"]));
+    let feat_dir = show
+        .lines()
+        .find(|l| l.starts_with("Dir:"))
+        .expect("Dir line")
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_string();
+
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
+    );
+    let out = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+        &["workspace", "cleanup", "feat", "--force"],
+    );
+    assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("Cleaned up"));
+    assert!(!std::path::Path::new(&feat_dir).exists(), "feat's worktree removed");
+
+    // Exactly the id-matched row went ('feat' can't occur in a hex id, so a
+    // bare contains is a safe row probe); the shadow survives with its worktree.
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(!list.contains("feat"), "feat row gone: {list}");
+    assert!(list.contains(&feat_id), "shadow row (named the old id) survives: {list}");
+    let show = stdout(&kmd(&state, &[], &["workspace", "show", &feat_id]));
+    let shadow_dir = show
+        .lines()
+        .find(|l| l.starts_with("Dir:"))
+        .expect("Dir line")
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    assert!(std::path::Path::new(&shadow_dir).exists(), "shadow worktree untouched");
 }
 
 #[test]
@@ -644,6 +756,12 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     }]);
     std::fs::write(&state_path, v.to_string()).unwrap();
 
+    // Worktrees nest under the repo id (`worktrees/<repo-id>/<name>`); fetch
+    // the id from `repo list` (prints `id name path`) to build expected paths.
+    let list = kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "list"]);
+    assert!(list.status.success(), "repo list: {}", String::from_utf8_lossy(&list.stderr));
+    let repo_id = stdout(&list).split_whitespace().next().unwrap().to_string();
+
     // Seed a Claude project store for the worktree under a REDIRECTED config
     // dir (never the real ~/.claude). The store dir name is claude's cwd
     // slug; the binary's stored worktree path is cwd-absolutized against the
@@ -652,7 +770,7 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
         path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
     };
     let canon = tmp.path().canonicalize().unwrap();
-    let old_wt = canon.join(".kommand0-dev/profiles/work/worktrees/feat");
+    let old_wt = canon.join(format!(".kommand0-dev/profiles/work/worktrees/{repo_id}/feat"));
     let claude_dir = tmp.path().join("claude-config");
     let projects = claude_dir.join("projects");
     let old_store = projects.join(claude_slug(&old_wt.to_string_lossy()));
@@ -677,7 +795,7 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     );
 
     // The Claude session store followed the worktree.
-    let new_wt = canon.join(".kommand0-dev/profiles/personal/worktrees/feat");
+    let new_wt = canon.join(format!(".kommand0-dev/profiles/personal/worktrees/{repo_id}/feat"));
     let new_store = projects.join(claude_slug(&new_wt.to_string_lossy()));
     assert!(new_store.join("abc.jsonl").exists(), "store migrated with its transcript");
     assert!(!old_store.exists(), "old store dir gone");
@@ -686,7 +804,10 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     let list =
         Command::new("git").args(["worktree", "list"]).current_dir(&repo).output().unwrap();
     let list = String::from_utf8_lossy(&list.stdout).to_string();
-    assert!(list.contains("profiles/personal/worktrees/feat"), "gitdir repaired: {list}");
+    assert!(
+        list.contains(&format!("profiles/personal/worktrees/{repo_id}/feat")),
+        "gitdir repaired: {list}"
+    );
 
     // …and the profile's state carries both rewritten paths.
     let new_state = std::fs::read_to_string(
@@ -694,7 +815,7 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     )
     .unwrap();
     assert!(
-        new_state.contains("profiles/personal/worktrees/feat"),
+        new_state.contains(&format!("profiles/personal/worktrees/{repo_id}/feat")),
         "worktree path rewritten: {new_state}"
     );
     assert!(

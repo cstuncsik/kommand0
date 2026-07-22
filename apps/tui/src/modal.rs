@@ -9,11 +9,40 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::theme::Theme;
 
-/// What kind of delete is being confirmed.
+/// What kind of delete is being confirmed. The workspace target carries the
+/// id (the delete key: names are only unique per repo) plus name + repo for
+/// the confirm text.
 #[derive(Clone)]
 pub(crate) enum DeleteTarget {
-    Workspace { name: String },
+    Workspace { id: String, name: String, repo: String },
     Repo { id: String, name: String, workspace_count: usize },
+}
+
+/// The confirm-delete modal's (title, message) for a target. The workspace
+/// message names the repo: duplicate names across repos are legal and this is
+/// the one destructive surface without repo context.
+fn delete_confirm_text(target: &DeleteTarget) -> (String, String) {
+    match target {
+        DeleteTarget::Workspace { name, repo, .. } => (
+            " Delete Workspace ".to_string(),
+            format!("Delete workspace '{name}' (repo {repo})?"),
+        ),
+        DeleteTarget::Repo { name, workspace_count, .. } => {
+            if *workspace_count > 0 {
+                (
+                    " Delete Repository ".to_string(),
+                    format!(
+                        "Delete repo '{name}' and its {workspace_count} workspace(s)?"
+                    ),
+                )
+            } else {
+                (
+                    " Delete Repository ".to_string(),
+                    format!("Delete repo '{name}'?"),
+                )
+            }
+        }
+    }
 }
 
 /// The focused field in the Add-Workspace modal.
@@ -843,27 +872,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             let area = centered_rect(50, 20, frame.area());
             frame.render_widget(Clear, area);
 
-            let (title, message) = match target {
-                DeleteTarget::Workspace { name } => (
-                    " Delete Workspace ".to_string(),
-                    format!("Delete workspace '{name}'?"),
-                ),
-                DeleteTarget::Repo { name, workspace_count, .. } => {
-                    if *workspace_count > 0 {
-                        (
-                            " Delete Repository ".to_string(),
-                            format!(
-                                "Delete repo '{name}' and its {workspace_count} workspace(s)?"
-                            ),
-                        )
-                    } else {
-                        (
-                            " Delete Repository ".to_string(),
-                            format!("Delete repo '{name}'?"),
-                        )
-                    }
-                }
-            };
+            let (title, message) = delete_confirm_text(target);
 
             let inner = Layout::vertical([
                 Constraint::Length(2), // message
@@ -1203,10 +1212,23 @@ mod tests {
     }
 
     #[test]
+    fn workspace_delete_confirm_names_the_repo() {
+        // Duplicate names across repos are legal, so the destructive confirm
+        // must say which repo's workspace is going.
+        let (title, msg) = delete_confirm_text(&DeleteTarget::Workspace {
+            id: "w1".into(),
+            name: "dev".into(),
+            repo: "r".into(),
+        });
+        assert_eq!(title, " Delete Workspace ");
+        assert_eq!(msg, "Delete workspace 'dev' (repo r)?");
+    }
+
+    #[test]
     fn paste_is_a_noop_on_confirm_modals() {
         // Confirm-only modals have no field — must not panic or change variant.
         let mut modal = ModalState::ConfirmDelete {
-            target: DeleteTarget::Workspace { name: "w".into() },
+            target: DeleteTarget::Workspace { id: "w1".into(), name: "w".into(), repo: "r".into() },
         };
         handle_modal_paste(&mut modal, "ignored");
         assert!(matches!(modal, ModalState::ConfirmDelete { .. }));
