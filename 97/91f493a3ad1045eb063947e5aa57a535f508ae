@@ -1,0 +1,28 @@
+apps/tui/src/main.rs
+  s_44f4b6fdc2baf8::t_312d900e492301 3348-3351,3353-3359,3361-3362
+  s_44f4b6fdc2baf8::t_9ae170267b7361 1503,1505
+  s_44f4b6fdc2baf8::t_22413332d29ba2 2964-2975,2977-2981
+  s_44f4b6fdc2baf8::t_d8987e9273c08e 3819-3821
+  s_44f4b6fdc2baf8::t_0d4e34f27897ae 3992,4001
+  s_44f4b6fdc2baf8::t_4d7234c63547dd 3324,3327,3329
+apps/tui/src/modal.rs
+  s_44f4b6fdc2baf8::t_57f3cf4ce8310c 1213
+  s_44f4b6fdc2baf8::t_494665fa78cc47 12-14,17
+  s_44f4b6fdc2baf8::t_e7b069e1d0dc08 849-851,853
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "9791f493a3ad1045eb063947e5aa57a535f508ae",
+  "prompts": {},
+  "sessions": {
+    "s_44f4b6fdc2baf8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ef5ad3d-ec4d-48f3-8dad-3bc270c45fdc",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
