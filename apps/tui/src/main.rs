@@ -2970,8 +2970,6 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             modal::ModalResult::ConfirmDelete(target) => {
                 match target {
                     modal::DeleteTarget::Workspace { id, .. } => {
-                        // The target carries the workspace id (names are only
-                        // unique per repo, so id is the delete key).
                         if let Some(sid) = app
                             .state
                             .find_session_by_workspace(&id)
@@ -3332,9 +3330,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     Some(TreeNode::Workspace { ws, repo_name }) => {
                         app.modal = modal::ModalState::ConfirmDelete {
                             target: modal::DeleteTarget::Workspace {
-                                id: ws.id.clone(),
-                                name: ws.name.clone(),
-                                repo: repo_name.clone(),
+                                id: ws.id,
+                                name: ws.name,
+                                repo: repo_name,
                             },
                         };
                     }
