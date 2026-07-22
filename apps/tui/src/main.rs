@@ -2510,14 +2510,6 @@ impl App {
         let Some(tx) = self.cleanup_tx.clone() else {
             return; // not wired (unit tests)
         };
-        // Pre-flight: the post-cleanup row drop resolves by id, and in the
-        // pathological state where another workspace is NAMED this id that
-        // delete errors AFTER the destructive git work, stranding a
-        // half-cleaned workspace. Refuse up front instead.
-        if let Err(e) = self.state.show_workspace(ws_id) {
-            self.cleanup_result.insert(ws_id.to_string(), e.to_string());
-            return;
-        }
         // Tear down the embedded pane synchronously (Drop terminates the child),
         // so the worktree dir isn't removed while a claude is running inside it.
         self.embedded.remove(ws_id);
@@ -2984,7 +2976,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         // time) rather than letting reap_embedded block the
                         // 50ms tick on the pane's Drop.
                         app.embedded.remove(&id);
-                        let _ = app.state.delete_workspace(&id);
+                        let _ = app.state.delete_workspace_by_id(&id);
                         app.workspaces = app.state.workspaces.clone();
                         app.rebuild_tree();
                         app.update_active_session();
@@ -3365,7 +3357,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                                 .update_session_status(&sid, SessionStatus::Stopped);
                         }
                         app.embedded.remove(&ws.id);
-                        let _ = app.state.delete_workspace(&ws.id);
+                        let _ = app.state.delete_workspace_by_id(&ws.id);
                         app.workspaces = app.state.workspaces.clone();
                         app.rebuild_tree();
                         app.update_active_session();
@@ -3823,8 +3815,9 @@ async fn run(
                 match result {
                     Ok(()) => {
                         // The worktree + branch are gone; drop the workspace too
-                        // (by id; a no-op if it was already deleted meanwhile).
-                        if app.state.delete_workspace(&ws_id).is_ok() {
+                        // (exact id; a no-op if it was already deleted meanwhile,
+                        // even when a new workspace has reused the id as a name).
+                        if app.state.delete_workspace_by_id(&ws_id).is_ok() {
                             app.workspaces = app.state.workspaces.clone();
                             app.expanded_icon_rows.remove(&ws_id);
                             app.cleanup_result.remove(&ws_id);
@@ -4004,7 +3997,7 @@ async fn run(
                                 {
                                     let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                 }
-                                if app.state.delete_workspace(&ws.id).is_ok() {
+                                if app.state.delete_workspace_by_id(&ws.id).is_ok() {
                                     app.embedded.remove(&workspace_id);
                                     app.expanded_icon_rows.remove(&workspace_id);
                                     app.repos = app.state.repos.clone();
