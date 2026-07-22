@@ -1,0 +1,23 @@
+crates/core/src/lib.rs
+  s_44f4b6fdc2baf8::t_e851506efbd2cc 1294-1297,1313-1323,1329-1352
+  s_44f4b6fdc2baf8::t_51d8f18abb4d74 1353,1748-1767
+  s_44f4b6fdc2baf8::t_36cf81339d9cc7 1250-1253
+  s_44f4b6fdc2baf8::t_1ff2af7380b4a5 1354
+  s_44f4b6fdc2baf8::t_0daa7264311a79 1747
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "7873837e4cc612fa6bf6603548bc9bdf745687cd",
+  "prompts": {},
+  "sessions": {
+    "s_44f4b6fdc2baf8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ef5ad3d-ec4d-48f3-8dad-3bc270c45fdc",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
