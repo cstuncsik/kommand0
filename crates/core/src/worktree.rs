@@ -66,19 +66,28 @@ fn prepare_worktree_dir(
     workspace_name: &str,
     base_dir: &Path,
 ) -> std::result::Result<String, String> {
-    // state.json is hand-editable: an id that is `.`/`..` or carries a path
-    // separator would make `join` escape `worktrees/`. Same rule
-    // `validate_new_workspace_name` enforces for the sibling name segment.
+    // state.json is hand-editable: the id must be exactly one normal path
+    // segment (rejects `.`/`..`, separators, and a Windows drive prefix like
+    // `C:x`, any of which would make `join` escape `worktrees/`). A leading
+    // dash could trip git arg parsing, and a backslash is refused even where
+    // it is a plain segment char (mirrors `validate_new_workspace_name`).
+    let mut comps = Path::new(repo_id).components();
+    let one_normal = matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none();
     if repo_id.trim().is_empty()
-        || repo_id == "."
-        || repo_id == ".."
-        || repo_id.contains('/')
-        || repo_id.contains('\\')
         || repo_id.starts_with('-')
+        || repo_id.contains('\\')
+        || !one_normal
     {
         return Err(format!("invalid repo id for worktree dir: {repo_id:?}"));
     }
-    let worktree_dir = base_dir.join("worktrees").join(repo_id).join(workspace_name);
+    let parent = base_dir.join("worktrees").join(repo_id);
+    // A legacy flat WORKTREE that happens to be named like this repo's id:
+    // nesting inside a checked-out tree would let that legacy workspace's
+    // later deletion recursively remove the nested worktrees. Refuse instead.
+    if parent.join(".git").exists() {
+        return Err(format!("parent dir is a checked-out worktree: {}", parent.display()));
+    }
+    let worktree_dir = parent.join(workspace_name);
     // The worktree dir doesn't exist yet; make the path absolute so git is happy.
     let worktree_dir = if worktree_dir.is_relative() {
         std::env::current_dir().unwrap_or_default().join(&worktree_dir)
@@ -573,6 +582,32 @@ mod tests {
         // the rejection fired before any dir was created at all.
         assert!(!base.path().join("ws").exists(), "`..` id must not escape worktrees/");
         assert!(!base.path().join("worktrees").exists(), "no dir created for a rejected id");
+    }
+
+    #[test]
+    fn create_worktree_refuses_a_flat_worktree_parent() {
+        // A legacy flat worktree named exactly like this repo's id: nesting
+        // inside a checked-out tree would let its later deletion recursively
+        // remove the nested worktrees, so it must fall back instead.
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        let flat = base.path().join("worktrees").join("r1");
+        let out = Command::new("git")
+            .args(["-C", rp, "worktree", "add", flat.to_str().unwrap(), "-b", "legacy"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "flat add: {}", String::from_utf8_lossy(&out.stderr));
+
+        match create_worktree(rp, "r1", "ws", base.path()) {
+            WorktreeResult::Fallback { reason } => {
+                assert!(reason.contains("checked-out worktree"), "{reason}");
+            }
+            WorktreeResult::Created { .. } => panic!("must not nest inside a checked-out tree"),
+        }
+        assert!(flat.join(".git").exists(), "flat worktree untouched");
+        assert!(!flat.join("ws").exists(), "nothing created inside it");
     }
 
     #[test]
