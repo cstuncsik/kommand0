@@ -1696,6 +1696,10 @@ mod tests {
         assert_eq!(state.workspaces.len(), 2, "no row deleted on the ambiguity error");
         assert!(Path::new(&pa).exists() && Path::new(&pb).exists(), "both worktrees intact");
         assert!(state.archive_workspace_with_base("dev", &base).is_err(), "archive refuses too");
+        assert!(
+            state.workspaces.iter().all(|w| w.active),
+            "the ambiguous archive mutated nothing (all rows still active)"
+        );
         assert!(state.activate_workspace_with_base("dev", &base).is_err(), "activate refuses too");
 
         // By ID everything targets the right row.
