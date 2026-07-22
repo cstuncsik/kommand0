@@ -1236,51 +1236,53 @@ impl AppState {
         Ok(result)
     }
 
-    /// Resolve a workspace reference (exact ID first, then name) to its index.
+    /// Resolve a workspace reference to its index: one pass collecting every
+    /// workspace whose ID or name equals the ref; exactly one distinct match
+    /// wins, several are an ambiguity error.
     ///
-    /// ID-first deliberately diverges from [`Self::resolve_repo`] (name-first):
-    /// the ambiguous-name error's remedy is "use the ID", so an ID must be
-    /// un-shadowable by a name. A name carried by workspaces in several repos
-    /// is ambiguous, as is a ref that matches one workspace's ID and a
-    /// DIFFERENT workspace's name (fail-safe over a silent wrong-target delete
-    /// when a workspace is named with another workspace's id-shaped string).
+    /// Letting IDs match here deliberately diverges from
+    /// [`Self::resolve_repo`] (name-first, where a name can shadow an id):
+    /// the ambiguity error's remedy is "use the ID", so an ID must be
+    /// un-shadowable. A name carried by workspaces in several repos is
+    /// ambiguous, as is a ref matching one workspace's ID and a DIFFERENT
+    /// workspace's name (fail-safe over a silent wrong-target delete when a
+    /// workspace is named with another workspace's id-shaped string).
+    /// Trade-off: in that shadow state even by-id callers (the TUI's
+    /// `let _ =` sites) hit the error and silently no-op until the shadowing
+    /// row is deleted by its own id.
     fn workspace_index(&self, ws_ref: &str) -> anyhow::Result<usize> {
-        let id_match = self.workspaces.iter().position(|w| w.id == ws_ref);
-        let name_matches: Vec<usize> = self
+        let matches: Vec<usize> = self
             .workspaces
             .iter()
             .enumerate()
-            .filter_map(|(i, w)| (w.name == ws_ref).then_some(i))
+            .filter_map(|(i, w)| (w.id == ws_ref || w.name == ws_ref).then_some(i))
             .collect();
-        match id_match {
-            Some(i) if name_matches.iter().all(|&j| j == i) => return Ok(i),
-            None if name_matches.is_empty() => bail!("workspace not found: {ws_ref}"),
-            None if name_matches.len() == 1 => return Ok(name_matches[0]),
-            _ => {}
-        }
-        // Several workspaces answer to this ref: refuse rather than act on the
-        // wrong repo's workspace. List every match so the error self-documents.
-        let mut matches: Vec<usize> = id_match.into_iter().chain(name_matches).collect();
-        matches.sort_unstable();
-        matches.dedup();
-        let list = matches
-            .iter()
-            .map(|&i| {
-                let w = &self.workspaces[i];
-                let repo = self
-                    .repos
+        match matches.as_slice() {
+            [] => bail!("workspace not found: {ws_ref}"),
+            [i] => Ok(*i),
+            _ => {
+                // Refuse rather than act on the wrong repo's workspace; list
+                // every match (in state order) so the error self-documents.
+                let list = matches
                     .iter()
-                    .find(|r| r.id == w.repo_id)
-                    .map(|r| r.name.as_str())
-                    .unwrap_or("(unknown)");
-                format!("{} (repo {repo})", w.id)
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!(
-            "ambiguous workspace reference '{ws_ref}': matches {list}; \
-             use the ID (shown by `kmd workspace list`)"
-        )
+                    .map(|&i| {
+                        let w = &self.workspaces[i];
+                        let repo = self
+                            .repos
+                            .iter()
+                            .find(|r| r.id == w.repo_id)
+                            .map(|r| r.name.as_str())
+                            .unwrap_or("(unknown)");
+                        format!("{} (repo {repo})", w.id)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "ambiguous workspace reference '{ws_ref}': matches {list}; \
+                     use the ID (shown by `kmd workspace list`)"
+                )
+            }
+        }
     }
 
     /// Show a workspace by name or ID (an ambiguous name is an error).
