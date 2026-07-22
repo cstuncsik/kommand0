@@ -2510,6 +2510,14 @@ impl App {
         let Some(tx) = self.cleanup_tx.clone() else {
             return; // not wired (unit tests)
         };
+        // Pre-flight: the post-cleanup row drop resolves by id, and in the
+        // pathological state where another workspace is NAMED this id that
+        // delete errors AFTER the destructive git work, stranding a
+        // half-cleaned workspace. Refuse up front instead.
+        if let Err(e) = self.state.show_workspace(ws_id) {
+            self.cleanup_result.insert(ws_id.to_string(), e.to_string());
+            return;
+        }
         // Tear down the embedded pane synchronously (Drop terminates the child),
         // so the worktree dir isn't removed while a claude is running inside it.
         self.embedded.remove(ws_id);
