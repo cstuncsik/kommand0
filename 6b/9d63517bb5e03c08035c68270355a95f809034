@@ -1,0 +1,21 @@
+crates/core/src/worktree.rs
+  s_44f4b6fdc2baf8::t_bc9b78e32522ce 69-75,78-79,83-90
+  s_44f4b6fdc2baf8::t_bbe605eda43242 588-612
+  s_44f4b6fdc2baf8::t_68b8d31665edad 587
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "6b9d63517bb5e03c08035c68270355a95f809034",
+  "prompts": {},
+  "sessions": {
+    "s_44f4b6fdc2baf8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ef5ad3d-ec4d-48f3-8dad-3bc270c45fdc",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
