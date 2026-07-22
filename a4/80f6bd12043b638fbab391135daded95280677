@@ -1,0 +1,58 @@
+CLAUDE.md
+  s_44f4b6fdc2baf8::t_6550a1c1064f08 67-70
+CHANGELOG.md
+  s_44f4b6fdc2baf8::t_47b8959f29431f 15-28
+demo/setup.sh
+  s_44f4b6fdc2baf8::t_40a2068bb1d55a 39-40
+crates/core/src/lib.rs
+  s_44f4b6fdc2baf8::t_c3710f062ed884 1239-1266,1268-1283,1286-1291,1295,1298
+  s_44f4b6fdc2baf8::t_f28f6749279c22 1478-1492
+  s_44f4b6fdc2baf8::t_7eacc467965cfb 1593,1624-1722
+  s_44f4b6fdc2baf8::t_7bc33ba2283ec7 1182
+  s_44f4b6fdc2baf8::t_4c1ef82a21aa6c 2477-2480
+  s_44f4b6fdc2baf8::t_ca729a89cacdad 1159
+  s_44f4b6fdc2baf8::t_083c6244ba69f1 2449-2452
+  s_44f4b6fdc2baf8::t_0ce72a4637af13 1594-1623
+  s_44f4b6fdc2baf8::t_2fcac5bf8bfd4b 1112-1118,1133
+  s_44f4b6fdc2baf8::t_a96906399f3c9d 1171
+  s_44f4b6fdc2baf8::t_cf78cb763eebd5 1314-1316,1320-1322,1327-1329,1333-1335,1340-1342
+apps/cli/src/main.rs
+  s_44f4b6fdc2baf8::t_97ca4da7384a4d 296-300
+crates/core/src/worktree.rs
+  s_44f4b6fdc2baf8::t_632fb6ac037613 1107
+  s_44f4b6fdc2baf8::t_cc7a4b4a1d0c48 556-626
+  s_44f4b6fdc2baf8::t_0917c84ac242ce 408-418,424-428,444-447
+  s_44f4b6fdc2baf8::t_6689c9d0361b82 124,132,143
+  s_44f4b6fdc2baf8::t_e2de83729a5b31 499
+  s_44f4b6fdc2baf8::t_245c0d9e1ae249 799
+  s_44f4b6fdc2baf8::t_bb9759fc30b282 1124-1125
+  s_44f4b6fdc2baf8::t_99e6bb14190194 689
+  s_44f4b6fdc2baf8::t_01d507a41e6eaf 519
+  s_44f4b6fdc2baf8::t_d066054c8eccf8 56-62,65,69-81
+  s_44f4b6fdc2baf8::t_dd31817d897d85 636,646
+  s_44f4b6fdc2baf8::t_30c2218cc24d7e 360-361,369,379
+  s_44f4b6fdc2baf8::t_b4f6b62ee967a3 818
+apps/tui/src/main.rs
+  s_44f4b6fdc2baf8::t_350932c791b287 3055
+  s_44f4b6fdc2baf8::t_62a2b367384f40 4728-4729
+apps/cli/tests/cli.rs
+  s_44f4b6fdc2baf8::t_501823b90d1d14 695-698,706
+  s_44f4b6fdc2baf8::t_03ff8c02a14d23 686
+  s_44f4b6fdc2baf8::t_0fa692aecbcfff 647-652,661
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "a480f6bd12043b638fbab391135daded95280677",
+  "prompts": {},
+  "sessions": {
+    "s_44f4b6fdc2baf8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ef5ad3d-ec4d-48f3-8dad-3bc270c45fdc",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
