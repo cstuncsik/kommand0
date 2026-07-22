@@ -351,6 +351,53 @@ fn cleanup_removes_a_merged_workspace() {
 }
 
 #[test]
+fn cleanup_aborts_before_git_work_when_the_id_is_shadowed() {
+    // A workspace NAMED another workspace's id makes the post-cleanup by-id
+    // row drop ambiguous; the pre-flight must abort BEFORE the destructive
+    // git work (the gh stub reports MERGED, so without it the worktree would
+    // be removed), leaving the worktree intact.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let list = stdout(&kmd(&state, &[], &["workspace", "list"]));
+    let feat_id = list
+        .lines()
+        .find(|l| l.contains("feat"))
+        .expect("feat row listed")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let repo = tmp.path().join("repo");
+    let shadow =
+        kmd(&state, &[], &["workspace", "create", &feat_id, "--repo", repo.to_str().unwrap()]);
+    assert!(shadow.status.success(), "shadow create: {}", String::from_utf8_lossy(&shadow.stderr));
+    let show = stdout(&kmd(&state, &[], &["workspace", "show", "feat"]));
+    let dir = show
+        .lines()
+        .find(|l| l.starts_with("Dir:"))
+        .expect("Dir line")
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_string();
+
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
+    );
+    let out = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+        &["workspace", "cleanup", "feat", "--force"],
+    );
+    assert!(!out.status.success(), "cleanup must abort");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("use the ID"), "aborted on the ambiguity: {err}");
+    assert!(std::path::Path::new(&dir).exists(), "worktree untouched, no partial cleanup");
+}
+
+#[test]
 fn session_list_filters_by_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let state_dir = tmp.path().join("state");

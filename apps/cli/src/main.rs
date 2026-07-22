@@ -438,6 +438,11 @@ fn main() -> anyhow::Result<()> {
             WorkspaceAction::Cleanup { name, force } => {
                 let mut state = AppState::load()?;
                 let ws = state.show_workspace(&name)?.clone();
+                // Pre-flight: the post-cleanup row drop resolves by id, and in
+                // the pathological state where another workspace is NAMED this
+                // id that delete errors AFTER the destructive git work. Refuse
+                // up front instead.
+                state.show_workspace(&ws.id)?;
                 let (Some(worktree), Some(branch)) =
                     (ws.worktree_path.clone(), ws.branch_name.clone())
                 else {
