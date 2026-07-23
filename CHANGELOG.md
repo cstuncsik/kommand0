@@ -5,6 +5,15 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`Ctrl+A d` detaches a workspace's sessions from inside the pane**: kills
+  the embedded processes to free memory but keeps every session entry, so
+  reopening the workspace restores the full tab row (Claude tabs resume their
+  conversation, shell tabs respawn fresh). The in-pane counterpart of closing
+  the pane with `x` from the tree; `Ctrl+A x` still closes-and-forgets the
+  active tab.
+
 ## [0.21.0] - 2026-07-21
 
 ### Added

@@ -169,6 +169,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `Ctrl+A` then `l` | Embedded | Jump to the last-active tab |
 | `Ctrl+A` then `r` | Embedded | Rename the active tab |
 | `Ctrl+A` then `x` | Embedded | Close the active tab |
+| `Ctrl+A` then `d` | Embedded | Detach: close the panes, keep the sessions resumable |
 | `Ctrl+A` then `t` | Embedded | Back to tree (also `Tab` / `Esc`) |
 | `Ctrl+A` then `q` | Embedded | Quit kommand0 |
 | `Ctrl+A` then `Ctrl+A` | Embedded | Send a literal `Ctrl+A` to Claude |

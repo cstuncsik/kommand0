@@ -1592,6 +1592,19 @@ impl App {
         self.request_branch_status_refresh();
     }
 
+    /// Detach the selected workspace's embedded panes (tmux prefix-d): kill the
+    /// processes to free their memory but keep the persisted session entries, so
+    /// reopening restores every tab (Claude tabs resume their conversation,
+    /// shell tabs respawn fresh). The keep-the-ids counterpart of
+    /// [`Self::close_active_session`].
+    fn detach_selected_workspace(&mut self) {
+        let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
+            return;
+        };
+        self.embedded.remove(&ws_id);
+        self.focus = Focus::Tree;
+    }
+
     /// Open the Rename Session modal for the selected workspace's active tab,
     /// prefilled with its current title. Focus stays on the embedded pane (the
     /// modal renders over it and intercepts keys via the `!modal.is_active()`
@@ -2716,6 +2729,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 }
                 KeyCode::Char('x') if !ctrl => {
                     app.close_active_session();
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('d') if !ctrl => {
+                    app.detach_selected_workspace();
                     return Ok(KeyOutcome::Continue);
                 }
                 KeyCode::Char('r') if !ctrl => {
@@ -5109,6 +5126,34 @@ mod key_tests {
             merged.embedded_session_ids("w1").is_empty(),
             "the closed claude tab must not resurrect either"
         );
+    }
+
+    #[tokio::test]
+    async fn detach_kills_panes_but_keeps_persisted_sessions() {
+        let mut app = test_app();
+        app.config.shell = Some("sh".to_string());
+        app.config.claude_bin = Some("sh".to_string());
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.new_session("w1");
+        app.new_shell_session("w1");
+        let ids = app.state.embedded_session_ids("w1").to_vec();
+        assert_eq!(ids.len(), 2, "one claude + one shell tab persisted");
+        assert_eq!(app.focus, Focus::Embedded);
+
+        app.detach_selected_workspace();
+
+        assert!(!app.embedded.contains_key("w1"), "the live panes are gone");
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            ids,
+            "detach keeps every persisted entry (unlike close_active_session)"
+        );
+        assert_eq!(app.focus, Focus::Tree, "detach lands back on the tree");
     }
 
     #[tokio::test]

@@ -57,6 +57,10 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
         description: "Close the active tab",
     },
     KeyBinding {
+        keys: "[Ctrl+A] then [d]",
+        description: "Detach: close panes, keep sessions",
+    },
+    KeyBinding {
         keys: "[Ctrl+A] then [t]",
         description: "Back to tree (also Tab/Esc)",
     },
