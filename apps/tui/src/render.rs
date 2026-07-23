@@ -219,7 +219,7 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         // the prefix accepts instead of the resting hint. Pure render: no
         // state lives here.
         Focus::Embedded if app.embedded_prefix => {
-            "Ctrl+A … t tree · c new · s shell · r rename · x close · [ ] tabs · l last · 1-9"
+            "Ctrl+A … t tree · c new · s shell · r rename · x close · d detach · [ ] tabs · l last · 1-9"
         }
         Focus::Embedded => "Ctrl+A t / Ctrl+] tree · Ctrl+A q quit",
     };
