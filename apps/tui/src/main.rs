@@ -1592,17 +1592,51 @@ impl App {
         self.request_branch_status_refresh();
     }
 
-    /// Detach the selected workspace's embedded panes (tmux prefix-d): kill the
-    /// processes to free their memory but keep the persisted session entries, so
-    /// reopening restores every tab (Claude tabs resume their conversation,
-    /// shell tabs respawn fresh). The keep-the-ids counterpart of
-    /// [`Self::close_active_session`].
+    /// Detach the selected workspace's embedded panes (tmux prefix-d, and the
+    /// tree's `x`): kill the processes to free their memory but keep the
+    /// persisted session entries, so reopening restores every tab (Claude tabs
+    /// resume their conversation, shell tabs respawn fresh; a mid-turn Claude is
+    /// interrupted, only what it flushed resumes). The keep-the-ids counterpart
+    /// of [`Self::close_active_session`].
     fn detach_selected_workspace(&mut self) {
         let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
             return;
         };
+        // The workspace-scoped twin of [`Self::shutdown_panes`]: dropping the
+        // panes one by one costs a full SIGHUP→250ms→SIGKILL each (a Node
+        // `claude` ignores SIGHUP), so a 9-tab detach would freeze the UI
+        // ~2.25s. Broadcast the hangup, wait one shared grace, SIGKILL+reap
+        // stragglers — the per-pane `Drop` then sees an exited child and
+        // returns instantly.
+        if let Some(sessions) = self.embedded.get_mut(&ws_id) {
+            for tab in sessions.tabs.iter_mut() {
+                tab.pane.signal_hangup();
+            }
+            for _ in 0..5 {
+                if sessions.tabs.iter_mut().all(|t| t.pane.has_exited()) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            for tab in sessions.tabs.iter_mut() {
+                tab.pane.force_kill_and_reap();
+            }
+        }
         self.embedded.remove(&ws_id);
+        // Also flip a legacy `Running` stream session to Stopped: those are
+        // never resurrected, so one left `Running` keeps a phantom "running"
+        // tree icon until the next startup normalization.
+        let legacy = self
+            .state
+            .find_session_by_workspace(&ws_id)
+            .filter(|s| s.status == SessionStatus::Running)
+            .map(|s| s.id.clone());
+        if let Some(session_id) = legacy {
+            let _ = self.state.update_session_status(&session_id, SessionStatus::Stopped);
+        }
         self.focus = Focus::Tree;
+        // The sessions likely committed; refresh this workspace's branch status.
+        self.request_branch_status_refresh();
     }
 
     /// Open the Rename Session modal for the selected workspace's active tab,
@@ -3252,21 +3286,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     }
                 }
                 Action::CloseSession => {
-                    if let Some(ws) = app.selected_workspace().cloned() {
-                        // Close an embedded claude pane (Pane's Drop kills it).
-                        app.embedded.remove(&ws.id);
-                        // Also stop any legacy stream session.
-                        let session_info = app
-                            .state
-                            .find_session_by_workspace(&ws.id)
-                            .filter(|s| s.status == SessionStatus::Running)
-                            .map(|s| s.id.clone());
-                        if let Some(session_id) = session_info {
-                            let _ = app
-                                .state
-                                .update_session_status(&session_id, SessionStatus::Stopped);
-                        }
-                    }
+                    // Same teardown as the embedded `Ctrl+A d`: kill the panes,
+                    // keep the persisted sessions (the focus flip is a no-op
+                    // here — action dispatch only runs in tree focus).
+                    app.detach_selected_workspace();
                 }
                 Action::ReviewDiff => {
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
@@ -5129,7 +5152,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn detach_kills_panes_but_keeps_persisted_sessions() {
+    async fn ctrl_a_d_detaches_panes_but_keeps_persisted_sessions() {
         let mut app = test_app();
         app.config.shell = Some("sh".to_string());
         app.config.claude_bin = Some("sh".to_string());
@@ -5144,10 +5167,29 @@ mod key_tests {
         let ids = app.state.embedded_session_ids("w1").to_vec();
         assert_eq!(ids.len(), 2, "one claude + one shell tab persisted");
         assert_eq!(app.focus, Focus::Embedded);
+        // An unrelated workspace's live pane must survive the detach.
+        app.embedded.insert(
+            "w2".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("sess-w2", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
 
-        app.detach_selected_workspace();
+        // Through the real dispatch, not a direct method call: Ctrl+A arms the
+        // prefix, d detaches.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        press(&mut app, KeyCode::Char('d')).await;
 
         assert!(!app.embedded.contains_key("w1"), "the live panes are gone");
+        assert!(
+            app.embedded.contains_key("w2"),
+            "detach is scoped to the selected workspace"
+        );
+        assert!(!app.embedded_prefix, "the prefix is consumed");
         assert_eq!(
             app.state.embedded_session_ids("w1"),
             ids,
@@ -6106,6 +6148,7 @@ mod key_tests {
         app.embedded_prefix = true;
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Ctrl+A …"), "armed indicator shown:\n{text}");
+        assert!(text.contains("d detach"), "hint lists detach:\n{text}");
 
         // Disarmed (the very next key clears the prefix): back to the
         // resting hint, no armed marker.
