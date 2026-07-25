@@ -17,7 +17,7 @@ without leaving the keyboard. A `kmd` CLI mirrors the core actions for scripting
 ## Prerequisites
 
 - Rust toolchain (edition 2024)
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed and authenticated
+- [Claude Code CLI](https://code.claude.com/docs) installed and authenticated
 - Git on PATH
 - macOS or Linux
 
@@ -263,6 +263,33 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `shell` — command for a shell session tab (`Ctrl+A s`); defaults to `$SHELL`, then `/bin/sh`. Can be any command — e.g. `"tmux"` to open a tmux session (with its own splits) directly. The `KOMMAND0_SHELL` env var takes precedence.
 
 The config is read once at startup, so hand-edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border. The simple fields above (everything except `keybindings` and `theme_colors`) can also be edited in-app on the settings page (`,`): each save rewrites only that key — preserving any hand-edited or unknown keys — and `theme`, `tree_width_pct`, and `notify` apply immediately, while `claude_args`/`claude_bin`/`shell` apply to the next tab you open.
+
+## Troubleshooting
+
+**No PR/CI status in the tree.** PR status needs the [GitHub CLI](https://cli.github.com):
+`gh` installed and authenticated (`gh auth status` to check, `gh auth login` to fix).
+Without it the tree simply omits the PR segment, nothing else breaks.
+
+**The embedded pane won't open (or exits immediately).** The `claude` binary
+isn't on PATH, or the one found isn't the Claude Code CLI. Install it, or point
+`claude_bin` in `config.json` (or the `KOMMAND0_CLAUDE_BIN` env var) at the right
+binary. `kommand0.log` in the state directory has the spawn error.
+
+**Shift+Enter submits instead of inserting a newline.** You're under tmux without
+extended keys, see [Terminals & tmux](#terminals--tmux) for the two-line
+`tmux.conf` fix. `Alt+Enter` inserts a newline everywhere, no config needed.
+
+**Drag-copying from an embedded pane never reaches the clipboard under tmux.**
+tmux drops OSC 52 from applications by default; add `set -s set-clipboard on` to
+`tmux.conf` (details in [Terminals & tmux](#terminals--tmux)).
+
+**The tree is empty but you had repos.** You're looking at a different state
+directory: another `--profile`, an inherited `KOMMAND0_PROFILE`/`KOMMAND0_STATE_DIR`,
+or a debug build (`cargo run`), which keeps its state in `.kommand0-dev/` relative
+to the current directory instead of the platform data dir. See [State](#state).
+
+**Reporting a bug?** Include `kommand0 --version` and the tail of `kommand0.log`
+from the state directory (see [State](#state) for where that is).
 
 ## Releasing
 

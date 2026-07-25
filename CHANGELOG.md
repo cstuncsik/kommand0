@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- README: added a Troubleshooting section (missing PR status, embedded pane not
+  opening, tmux Shift+Enter and clipboard, empty tree from a different
+  profile/state dir, what to include in bug reports) and fixed the dead Claude
+  Code CLI docs link.
+
 ## [0.23.0] - 2026-07-23
 
 ### Added
