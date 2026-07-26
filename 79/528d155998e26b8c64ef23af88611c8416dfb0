@@ -1,0 +1,21 @@
+demo/demo.tape
+  s_15608547bf3409::t_6ea05b85bcb94d 26
+  s_15608547bf3409::t_7031e51ed09954 19
+  s_15608547bf3409::t_62e65698d8d992 59,62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "79528d155998e26b8c64ef23af88611c8416dfb0",
+  "prompts": {},
+  "sessions": {
+    "s_15608547bf3409": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a2858f29-4d2a-4a3b-885d-b1b8af440a6b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
