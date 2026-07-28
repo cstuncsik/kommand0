@@ -242,6 +242,12 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 {
   "claude_args": ["--model", "sonnet"],
   "claude_bin": "/usr/local/bin/claude",
+  "codex_args": ["--model", "o3"],
+  "codex_bin": "/usr/local/bin/codex",
+  "gemini_args": ["--model", "gemini-2.5-pro"],
+  "gemini_bin": "/usr/local/bin/gemini",
+  "opencode_args": ["--model", "anthropic/claude-sonnet-4-5"],
+  "opencode_bin": "/usr/local/bin/opencode",
   "status_refresh_secs": 2,
   "tree_width_pct": 30,
   "keybindings": { "quit": ["ctrl+q"], "open": ["o"] },
@@ -263,7 +269,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `shell` — command for a shell session tab (`Ctrl+A s`); defaults to `$SHELL`, then `/bin/sh`. Can be any command — e.g. `"tmux"` to open a tmux session (with its own splits) directly. The `KOMMAND0_SHELL` env var takes precedence.
 - `codex_bin`/`codex_args`, `gemini_bin`/`gemini_args`, `opencode_bin`/`opencode_args`: the same binary-override + extra-args pair for the codex (`Ctrl+A e`), gemini (`Ctrl+A g`) and opencode (`Ctrl+A o`) session tabs (also in the command palette). The `KOMMAND0_CODEX_BIN`/`KOMMAND0_GEMINI_BIN`/`KOMMAND0_OPENCODE_BIN` env vars take precedence over the config bins. Gemini tabs resume their conversation when a workspace reopens (kommand0 manages `--session-id`/`--resume`, so don't put those in `gemini_args`); codex and opencode tabs reopen fresh.
 
-The config is read once at startup, so hand-edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border. The simple fields above (everything except `keybindings` and `theme_colors`) can also be edited in-app on the settings page (`,`): each save rewrites only that key — preserving any hand-edited or unknown keys — and `theme`, `tree_width_pct`, and `notify` apply immediately, while `claude_args`/`claude_bin`/`shell` apply to the next tab you open.
+The config is read once at startup, so hand-edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border. The simple fields above (everything except `keybindings` and `theme_colors`) can also be edited in-app on the settings page (`,`): each save rewrites only that key — preserving any hand-edited or unknown keys — and `theme`, `tree_width_pct`, and `notify` apply immediately, while `shell` and the per-tool `*_bin`/`*_args` fields apply to the next tab you open.
 
 ## Troubleshooting
 

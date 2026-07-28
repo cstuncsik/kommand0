@@ -1038,6 +1038,9 @@ fn stale_resume_auto_heals_to_a_fresh_session() {
         Some(state),
         &[("KOMMAND0_CLAUDE_BIN", "embed-stub-resume-miss")],
     );
+    // Wide enough that the heal banner's tail (the claude-only store
+    // parenthetical asserted below) isn't clipped by the right pane's border.
+    tui.resize(ROWS, 240);
 
     tui.wait_for("demo");
     tui.send("l");
@@ -1045,6 +1048,7 @@ fn stale_resume_auto_heals_to_a_fresh_session() {
     tui.send("j");
     tui.send("e"); // open -> resume the gone session (stub stays alive on the error)
     tui.wait_for("not found in claude's store"); // detected, healed in place with a new session
+    tui.wait_for("~/.claude/projects"); // the claude heal banner names claude's store
     tui.wait_for("1 live"); // still embedded — the slot now holds the fresh session
 
     tui.send("\x01");

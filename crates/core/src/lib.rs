@@ -812,10 +812,13 @@ impl AppState {
     }
 
     /// Whether `bare` (a persisted entry with its kind prefix stripped) is a
-    /// kommand0-minted session uuid. Only these may reach a `--resume` argv:
-    /// a hand-edited entry must not smuggle flags into the spawn.
+    /// canonical kommand0-minted session uuid: lowercase hyphenated, exactly
+    /// as [`Self::new_prefixed_session_id`] writes it. Only these may reach a
+    /// `--resume` argv: a hand-edited entry must not smuggle flags into the
+    /// spawn, and `parse_str`'s looser spellings (uppercase, braced, urn,
+    /// bare 32-hex) never came from a mint.
     pub fn is_valid_session_uuid(bare: &str) -> bool {
-        uuid::Uuid::parse_str(bare).is_ok()
+        uuid::Uuid::parse_str(bare).is_ok_and(|u| u.hyphenated().to_string() == bare)
     }
 
     /// The stored session entries (prefixed sentinels: `shell:<uuid>`,
@@ -1837,9 +1840,16 @@ mod tests {
     #[test]
     fn is_valid_session_uuid_accepts_only_uuids() {
         assert!(AppState::is_valid_session_uuid(&AppState::new_prefixed_session_id("")));
+        assert!(AppState::is_valid_session_uuid("12345678-1234-4123-8123-123456789abc"));
         assert!(!AppState::is_valid_session_uuid("--yolo"));
         assert!(!AppState::is_valid_session_uuid("plain-id"));
         assert!(!AppState::is_valid_session_uuid(""));
+        // Canonical minted form only: uuid::parse_str's looser spellings never
+        // came from a kommand0 mint, so they stay junk.
+        assert!(!AppState::is_valid_session_uuid("12345678-1234-4123-8123-123456789ABC"));
+        assert!(!AppState::is_valid_session_uuid("{12345678-1234-4123-8123-123456789abc}"));
+        assert!(!AppState::is_valid_session_uuid("urn:uuid:12345678-1234-4123-8123-123456789abc"));
+        assert!(!AppState::is_valid_session_uuid("12345678123441238123123456789abc"));
     }
 
     #[test]

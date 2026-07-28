@@ -21,6 +21,9 @@ All notable changes to kommand0 are documented here. The format is based on
 
 - The right pane's border title and the status bar's mode badge now name the
   active tab's kind (previously always "claude", wrong for shell tabs).
+- Reopening a claude or gemini tab whose persisted entry isn't a kommand0-minted
+  uuid (hand-edited or corrupt `state.json`) now persists the fresh session's id
+  in the entry's place, instead of keeping the junk entry forever.
 
 ## [0.23.1] - 2026-07-25
 

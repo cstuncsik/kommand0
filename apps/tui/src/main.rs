@@ -140,8 +140,10 @@ fn session_args(kind: TabKind, prior_id: Option<&str>) -> (Vec<String>, Option<S
             return (vec!["--resume".to_string(), bare.to_string()], None);
         }
     }
-    let id = AppState::new_prefixed_session_id(kind.id_prefix());
-    let bare = id.strip_prefix(kind.id_prefix()).unwrap_or(&id).to_string();
+    // Mint bare-first: the persisted entry is the prefix + this exact uuid,
+    // so the argv can't disagree with it (no fallible re-strip).
+    let bare = AppState::new_prefixed_session_id("");
+    let id = format!("{}{bare}", kind.id_prefix());
     (vec!["--session-id".to_string(), bare], Some(id))
 }
 
@@ -162,8 +164,8 @@ fn pick_bin(kind: TabKind, env_bin: Option<String>, config_bin: Option<&str>) ->
     }
 }
 
-/// Whether an exited embedded pane looks like a failed `--resume` (the Claude
-/// session was purged): it was resumed, died within the window, and exited with
+/// Whether an exited embedded pane looks like a failed `--resume` (the session
+/// was purged): it was resumed, died within the window, and exited with
 /// a non-zero code (a clean `/exit` is code 0 and must not trip this).
 fn resume_failed(spawned: Instant, was_resume: bool, now: Instant, exit_code: Option<i32>) -> bool {
     const RESUME_FAIL_WINDOW: Duration = Duration::from_millis(2000);
@@ -1158,7 +1160,9 @@ impl App {
     /// Spawn a pane of `kind` (no persistence, no tab append). `prior_id`
     /// reopens that persisted entry (resumable kinds resume it, the rest
     /// respawn fresh); `None` mints a fresh one. Returns the pane plus its
-    /// `(session_id, was_resume)`, or the spawn error.
+    /// `(session_id, was_resume)`, or the spawn error. A junk resumable
+    /// `prior_id` (failed the uuid guard) spawns fresh, and the returned
+    /// `session_id` IS that mint: the caller persists the swap.
     fn spawn_pane(
         &self,
         kind: TabKind,
@@ -1177,11 +1181,11 @@ impl App {
         // prior id falls through to a fresh mint in session_args and must
         // stay out of the resume-failure nets).
         let was_resume = kind.resumable() && prior_id.is_some() && minted.is_none();
-        // The tab keeps its persisted entry as its id; only a brand-new tab
-        // takes the minted one.
-        let session_id = prior_id
-            .map(String::from)
-            .unwrap_or_else(|| minted.unwrap());
+        // The tab adopts the minted id whenever one exists: a brand-new tab,
+        // or a reopen whose junk prior id was replaced by a fresh mint (the
+        // caller converges the persisted entry on it). A valid reopen keeps
+        // its prior entry.
+        let session_id = minted.or_else(|| prior_id.map(String::from)).unwrap();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let pane = self.spawn_pane_cmd(ws_dir, &bin, &arg_refs)?;
         Ok((pane, session_id, was_resume))
@@ -1213,9 +1217,10 @@ impl App {
 
     /// Spawn one tab of `kind` for a workspace and append it. `prior_id`
     /// reopens that persisted entry (resumable kinds resume it, the rest
-    /// respawn fresh); `None` mints + persists a fresh one. Returns whether
-    /// the pane started (on failure `embed_error` is set, and a reopened
-    /// entry is forgotten so the persisted Vec stays aligned).
+    /// respawn fresh); `None` mints + persists a fresh one; a junk resumable
+    /// entry is replaced in state by the fresh mint spawned in its stead.
+    /// Returns whether the pane started (on failure `embed_error` is set, and
+    /// a reopened entry is forgotten so the persisted Vec stays aligned).
     fn spawn_tab(
         &mut self,
         kind: TabKind,
@@ -1226,18 +1231,31 @@ impl App {
     ) -> bool {
         match self.spawn_pane(kind, ws_dir, prior_id) {
             Ok((pane, session_id, was_resume)) => {
-                if prior_id.is_none() {
-                    self.state.add_embedded_session(ws_id, &session_id);
-                    // Merge over disk (like save_state) so this doesn't clobber a
-                    // concurrent `kmd` write; keep the Result to surface a failure.
-                    if self.persist_state().is_err() {
-                        self.embed_error = Some((
-                            ws_id.to_string(),
-                            "Couldn't persist this tab: it may not reopen after \
-                             restarting kommand0."
-                                .to_string(),
-                        ));
+                // A brand-new tab persists its minted entry; a reopen whose
+                // junk prior id was replaced by a fresh mint (session_args'
+                // uuid guard) converges on the mint in place, like heal_resume,
+                // so order and any title survive. A valid reopen (session_id
+                // == prior) has nothing to write.
+                let persist = match prior_id {
+                    None => {
+                        self.state.add_embedded_session(ws_id, &session_id);
+                        true
                     }
+                    Some(prior) if prior != session_id => {
+                        self.state.replace_embedded_session(ws_id, prior, &session_id);
+                        true
+                    }
+                    Some(_) => false,
+                };
+                // Merge over disk (like save_state) so this doesn't clobber a
+                // concurrent `kmd` write; keep the Result to surface a failure.
+                if persist && self.persist_state().is_err() {
+                    self.embed_error = Some((
+                        ws_id.to_string(),
+                        "Couldn't persist this tab: it may not reopen after \
+                         restarting kommand0."
+                            .to_string(),
+                    ));
                 }
                 self.embedded
                     .entry(ws_id.to_string())
@@ -5113,6 +5131,53 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn reopening_a_junk_resumable_entry_persists_the_fresh_mint() {
+        // A resumable entry that fails the uuid guard (hand-edited or legacy
+        // junk) spawns fresh instead of resuming; the persisted entry and the
+        // tab must both converge on the minted id, or the junk would stick
+        // across restarts forever.
+        let mut app = test_app();
+        // `echo` as the bin: the child prints its own argv into the pane, so
+        // the test can pin that the spawn used the mint's bare uuid.
+        app.config.gemini_bin = Some("echo".to_string());
+        app.config.claude_bin = Some("echo".to_string());
+        app.state.add_embedded_session("w1", "gemini:--yolo");
+        app.state.add_embedded_session("w1", "gone-junk"); // legacy bare-id junk
+
+        assert!(app.spawn_tab(TabKind::Gemini, "w1", "/tmp", "ws-one", Some("gemini:--yolo")));
+        assert!(app.spawn_tab(TabKind::Claude, "w1", "/tmp", "ws-one", Some("gone-junk")));
+
+        let persisted = app.state.embedded_session_ids("w1").to_vec();
+        assert_eq!(persisted.len(), 2, "replaced in place, not appended: {persisted:?}");
+        let g_bare = persisted[0].strip_prefix("gemini:").expect("the mint keeps the kind prefix");
+        assert!(
+            AppState::is_valid_session_uuid(g_bare),
+            "the junk entry converged on a real mint: {persisted:?}"
+        );
+        assert!(
+            AppState::is_valid_session_uuid(&persisted[1]),
+            "bare claude junk converges too: {persisted:?}"
+        );
+        let s = &app.embedded["w1"];
+        assert_eq!(s.tabs[0].id, persisted[0], "the tab id IS the persisted mint");
+        assert_eq!(s.tabs[1].id, persisted[1]);
+        assert!(!s.tabs[0].was_resume, "a junk reopen is a fresh spawn, not a resume");
+        assert!(!s.tabs[1].was_resume);
+        // The argv (echoed by the stand-in bin) carried the mint's bare uuid,
+        // so the running session matches the persisted entry.
+        let want = format!("--session-id {g_bare}");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !s.tabs[0].pane.screen_contents().contains(&want) {
+            assert!(
+                Instant::now() < deadline,
+                "pane never echoed {want}:\n{}",
+                s.tabs[0].pane.screen_contents()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[tokio::test]
     async fn palette_new_tab_actions_carry_their_kind() {
         let mut app = test_app();
         // Pinned bins: never launch the real CLIs (see pick_bin's fallback).
@@ -5170,15 +5235,17 @@ mod key_tests {
         app.rebuild_tree();
         app.select_workspace_row("w1");
         // Ten interleaved entries of every kind: one past MAX_SESSION_TABS, so
-        // the cap shows too. The gemini entry carries a real uuid: only
-        // kommand0-minted uuids are resumed (see session_args' junk guard).
+        // the cap shows too. The gemini entry and one claude entry carry real
+        // uuids (only kommand0-minted uuids resume, see session_args' junk
+        // guard); the junk claude ids fall through to fresh mints, and the
+        // persisted slots converge on those mints.
         let seeded: Vec<String> = [
             "c0",
             "shell:s1",
             "gemini:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
             "codex:c3",
             "opencode:o4",
-            "c5",
+            "55555555-5555-4555-8555-555555555555",
             "shell:s6",
             "c7",
             "shell:s8",
@@ -5207,23 +5274,40 @@ mod key_tests {
             TabKind::Shell,
         ];
         for ((tab, want), want_kind) in s.tabs.iter().zip(&seeded).zip(want_kinds) {
-            assert_eq!(&tab.id, want, "ids restored in persisted order");
             assert_eq!(tab.kind, want_kind, "kind follows the sentinel for {want}");
             match want_kind {
                 TabKind::Gemini => {
+                    assert_eq!(&tab.id, want, "a valid gemini uuid is kept");
                     assert!(tab.was_resume, "a reopened gemini uuid resumes")
                 }
                 TabKind::Shell | TabKind::Codex | TabKind::Opencode => {
+                    assert_eq!(&tab.id, want, "non-resumable sentinels reopen as-is");
                     assert!(!tab.was_resume, "non-resumable reopens stay out of the resume nets")
                 }
-                TabKind::Claude => {}
+                TabKind::Claude if AppState::is_valid_session_uuid(want) => {
+                    assert_eq!(&tab.id, want, "a valid claude uuid is kept");
+                    assert!(tab.was_resume, "a reopened claude uuid resumes")
+                }
+                TabKind::Claude => {
+                    assert_ne!(&tab.id, want, "junk claude ids fall through to a fresh mint");
+                    assert!(
+                        AppState::is_valid_session_uuid(&tab.id),
+                        "the mint is a real uuid: {}",
+                        tab.id
+                    );
+                    assert!(!tab.was_resume, "a junk reopen is a fresh spawn, not a resume")
+                }
             }
         }
         assert_eq!(s.active, 0, "reopen focuses the first tab");
+        // Persisted list: same slots, junk claude entries converged on the
+        // mints (== the tab ids), the capped 10th entry untouched.
+        let mut want_persisted: Vec<String> = s.tabs.iter().map(|t| t.id.clone()).collect();
+        want_persisted.push(seeded[9].clone());
         assert_eq!(
             app.state.embedded_session_ids("w1"),
-            seeded.as_slice(),
-            "persisted order and content unchanged"
+            want_persisted.as_slice(),
+            "persisted order kept; junk slots replaced in place"
         );
     }
 
@@ -7125,7 +7209,7 @@ mod key_tests {
     #[test]
     fn session_args_assigns_or_resumes_per_kind() {
         // Claude, no prior id: a fresh --session-id is assigned and returned
-        // to persist (bare uuid — claude's prefix is empty).
+        // to persist (bare uuid: claude's prefix is empty).
         let (args, minted) = session_args(TabKind::Claude, None);
         assert_eq!(args[0], "--session-id");
         assert_eq!(minted.as_deref(), Some(args[1].as_str()));
@@ -7169,11 +7253,19 @@ mod key_tests {
         for junk in ["--dangerously-skip-permissions", "sess-1"] {
             let (args, minted) = session_args(TabKind::Claude, Some(junk));
             assert_eq!(args[0], "--session-id", "junk id spawns fresh: {args:?}");
-            assert!(minted.is_some(), "the fresh mint is returned to persist");
+            assert_eq!(
+                minted.as_deref(),
+                Some(args[1].as_str()),
+                "the fresh mint is returned to persist and matches the argv"
+            );
         }
         let (args, minted) = session_args(TabKind::Gemini, Some("gemini:--yolo"));
         assert_eq!(args[0], "--session-id", "junk gemini id spawns fresh: {args:?}");
-        assert!(minted.unwrap().starts_with("gemini:"), "the mint keeps the kind prefix");
+        assert_eq!(
+            minted.unwrap(),
+            format!("gemini:{}", args[1]),
+            "the mint keeps the kind prefix and its bare uuid is the argv's"
+        );
     }
 
     #[test]
@@ -7203,6 +7295,31 @@ mod key_tests {
         // fails fast into the existing forget/heal nets).
         assert_eq!(TabKind::from_session_id("plain-id"), TabKind::Claude);
         assert_eq!(TabKind::from_session_id("foo:123"), TabKind::Claude);
+    }
+
+    #[test]
+    fn kind_accessors_read_their_own_config_fields() {
+        // Distinct sentinels per field: a cross-wired accessor arm (codex
+        // reading gemini's bin, say) would pass every spawn test, so pin the
+        // field wiring directly.
+        let cfg = Config {
+            codex_bin: Some("codex-bin".to_string()),
+            gemini_bin: Some("gemini-bin".to_string()),
+            opencode_bin: Some("opencode-bin".to_string()),
+            codex_args: vec!["codex-arg".to_string()],
+            gemini_args: vec!["gemini-arg".to_string()],
+            opencode_args: vec!["opencode-arg".to_string()],
+            ..Config::default()
+        };
+        for (kind, bin, arg, env) in [
+            (TabKind::Codex, "codex-bin", "codex-arg", "KOMMAND0_CODEX_BIN"),
+            (TabKind::Gemini, "gemini-bin", "gemini-arg", "KOMMAND0_GEMINI_BIN"),
+            (TabKind::Opencode, "opencode-bin", "opencode-arg", "KOMMAND0_OPENCODE_BIN"),
+        ] {
+            assert_eq!(kind.config_bin(&cfg), Some(bin), "{kind:?} reads its own bin field");
+            assert_eq!(kind.config_args(&cfg), &[arg.to_string()], "{kind:?} reads its own args field");
+            assert_eq!(kind.bin_env(), env, "{kind:?} names its own env override");
+        }
     }
 
     #[tokio::test]
@@ -8011,14 +8128,51 @@ mod key_tests {
     }
 
     #[test]
+    fn reap_heals_a_failed_gemini_resume_as_gemini() {
+        // Through reap_embedded, not heal_resume directly: pins that the reap
+        // hands the exited tab's KIND to the heal (a hardcoded TabKind::Claude
+        // there would respawn claude in the gemini slot and pass every other
+        // test).
+        let mut app = test_app();
+        // Pin the bin: the heal's fresh spawn must never launch a real
+        // `gemini` (present on dev machines, absent on CI).
+        app.config.gemini_bin = Some("sh".to_string());
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.state.add_embedded_session("w1", "gemini:gm-1");
+        let mut g = tab("gemini:gm-1", &["-c", "exit 1"]); // a resume that failed fast
+        g.kind = TabKind::Gemini;
+        g.was_resume = true;
+        let mut s = WorkspaceSessions { tabs: vec![g], active: 0, last_active: None };
+        wait_exit(&mut s.tabs[0].pane);
+        app.embedded.insert("w1".to_string(), s);
+
+        app.reap_embedded(Instant::now());
+
+        let s = &app.embedded["w1"];
+        assert_eq!(s.tabs.len(), 1, "healed in place, not dropped");
+        assert_eq!(s.tabs[0].kind, TabKind::Gemini, "the reap passes the tab's kind to the heal");
+        let persisted = app.state.embedded_session_ids("w1").to_vec();
+        assert_eq!(persisted.len(), 1, "one fresh entry: {persisted:?}");
+        assert!(
+            persisted[0].starts_with("gemini:"),
+            "the fresh entry keeps the kind prefix: {persisted:?}"
+        );
+        assert_ne!(persisted[0], "gemini:gm-1", "the gone id was replaced");
+    }
+
+    #[test]
     fn resume_miss_scan_ignores_non_claude_kinds() {
         // The resume-miss marker is claude's text: a gemini tab printing it
         // (plus its own id) must survive past the scan stride (the gate also
         // skips full-grid serialization of non-claude panes). A regression
         // would false-heal the healthy gemini tab below.
         let mut app = test_app();
-        app.config.claude_bin = Some("sh".to_string()); // no real spawn either way
         app.config.gemini_bin = Some("sh".to_string());
+        // Spawned only if the kind gate regresses (resume_missed heals as
+        // Claude); keeps that failing run off the real claude binary.
+        app.config.claude_bin = Some("sh".to_string());
         let mut g = tab(
             "gemini:gm-1",
             &["-c", &format!("printf '{RESUME_MISS_MARKER} gemini:gm-1'; sleep 30")],
