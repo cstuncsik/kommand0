@@ -156,8 +156,18 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let th = app.theme;
     let (mode, mode_color) = match app.focus {
-        Focus::Tree => (" TREE ", th.accent),
-        Focus::Embedded => (" CLAUDE ", th.active),
+        Focus::Tree => (" TREE ".to_string(), th.accent),
+        Focus::Embedded => {
+            // Name the active tab's kind (claude/shell/codex/...); the
+            // fallback covers the transient frame where the pane is gone.
+            let label = app
+                .selected_workspace()
+                .and_then(|ws| app.embedded.get(&ws.id))
+                .and_then(|s| s.active_tab())
+                .map(|t| t.kind.label())
+                .unwrap_or("claude");
+            (format!(" {} ", label.to_uppercase()), th.active)
+        }
     };
     let context = match app.tree_items.get(app.selected_index) {
         Some(TreeNode::Workspace { ws, .. }) => ws.name.clone(),
@@ -765,9 +775,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             th.muted
         };
+        // Title the border with the ACTIVE tab's kind (a shell/codex/... tab
+        // is not claude).
+        let kind_label = app
+            .embedded
+            .get(ws_id)
+            .and_then(|s| s.active_tab())
+            .map(|t| t.kind.label())
+            .unwrap_or("claude");
         let mut block = Block::default()
             .title(format!(
-                " {ws_name} — claude · Ctrl+A: c new · [ ] switch · r rename · x close · t tree · q quit "
+                " {ws_name} — {kind_label} · Ctrl+A: c new · [ ] switch · r rename · x close · t tree · q quit "
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border));

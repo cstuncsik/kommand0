@@ -32,6 +32,12 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
         keys: "[Ctrl+A] then [s]",
         description: "New shell tab (reopens fresh)",
     },
+    // One line, and short enough not to wrap in the 60%-wide popup (a wrapped
+    // row breaks the scroll clamp below).
+    KeyBinding {
+        keys: "[Ctrl+A] then [e/g/o]",
+        description: "New codex/gemini/opencode tab",
+    },
     KeyBinding {
         keys: "[Ctrl+A] then [ / ]",
         description: "Previous / next tab",

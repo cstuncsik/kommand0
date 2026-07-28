@@ -24,6 +24,21 @@ pub struct Config {
     /// Override the `claude` binary. Lower precedence than the
     /// `KOMMAND0_CLAUDE_BIN` env var; falls back to `claude`.
     pub claude_bin: Option<String>,
+    /// Extra args appended to every embedded `codex` spawn.
+    pub codex_args: Vec<String>,
+    /// Override the `codex` binary. Lower precedence than the
+    /// `KOMMAND0_CODEX_BIN` env var; falls back to `codex`.
+    pub codex_bin: Option<String>,
+    /// Extra args appended to every embedded `gemini` spawn.
+    pub gemini_args: Vec<String>,
+    /// Override the `gemini` binary. Lower precedence than the
+    /// `KOMMAND0_GEMINI_BIN` env var; falls back to `gemini`.
+    pub gemini_bin: Option<String>,
+    /// Extra args appended to every embedded `opencode` spawn.
+    pub opencode_args: Vec<String>,
+    /// Override the `opencode` binary. Lower precedence than the
+    /// `KOMMAND0_OPENCODE_BIN` env var; falls back to `opencode`.
+    pub opencode_bin: Option<String>,
     /// Seconds between background git-status refreshes (default 2).
     pub status_refresh_secs: Option<u64>,
     /// Tree-pane key rebindings: action name (e.g. `"quit"`) → key specs (e.g.
@@ -188,6 +203,7 @@ mod tests {
         let cfg = Config::load_from(tmp.path());
         assert_eq!(cfg.claude_args, vec!["--model", "sonnet"]);
         assert_eq!(cfg.claude_bin, None); // absent field defaults
+        assert_eq!(cfg.codex_bin, None);
     }
 
     #[test]

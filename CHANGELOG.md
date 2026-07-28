@@ -5,6 +5,23 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Codex, gemini and opencode session tabs**: `Ctrl+A e`/`g`/`o` (and the
+  "New codex/gemini/opencode" palette entries) open an embedded `codex`,
+  `gemini` or `opencode` alongside the Claude and shell tabs. New config
+  fields `codex_bin`/`codex_args`, `gemini_bin`/`gemini_args` and
+  `opencode_bin`/`opencode_args` mirror claude's pair, with `KOMMAND0_CODEX_BIN`,
+  `KOMMAND0_GEMINI_BIN` and `KOMMAND0_OPENCODE_BIN` env overrides taking
+  precedence. Gemini tabs resume their conversation when the workspace
+  reopens (like Claude tabs); codex and opencode tabs reopen fresh (like
+  shell tabs), their history stays in the tools' own stores.
+
+### Fixed
+
+- The right pane's border title and the status bar's mode badge now name the
+  active tab's kind (previously always "claude", wrong for shell tabs).
+
 ## [0.23.1] - 2026-07-25
 
 ### Changed

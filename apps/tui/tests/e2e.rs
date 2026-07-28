@@ -112,6 +112,9 @@ impl Tui {
         // exactly what it needs via extra_env below.
         cmd.env_remove("KOMMAND0_CONFIG");
         cmd.env_remove("KOMMAND0_CLAUDE_BIN");
+        cmd.env_remove("KOMMAND0_CODEX_BIN");
+        cmd.env_remove("KOMMAND0_GEMINI_BIN");
+        cmd.env_remove("KOMMAND0_OPENCODE_BIN");
         cmd.env_remove("KOMMAND0_GH_BIN");
         cmd.env_remove("KOMMAND0_PROFILE");
         // Deterministic keyboard setup whether or not the test run itself
@@ -713,6 +716,120 @@ fn ctrl_a_s_opens_a_shell_tab() {
     tui.send("t");
     tui.send("q");
     tui.wait_exit();
+}
+
+#[test]
+fn ctrl_a_e_g_o_open_agent_tabs() {
+    // All three agent binaries are the embed-stub, so each prefix key opens a
+    // deterministic tab; the strip marks codex `>`, gemini `✦`, opencode `○`.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[
+            ("KOMMAND0_CLAUDE_BIN", "embed-stub"),
+            ("KOMMAND0_CODEX_BIN", "embed-stub"),
+            ("KOMMAND0_GEMINI_BIN", "embed-stub"),
+            ("KOMMAND0_OPENCODE_BIN", "embed-stub"),
+        ],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY"); // claude tab (1)
+
+    // Ctrl+A e: a codex tab, spawned bare (no --session-id/--resume).
+    tui.send("\x01");
+    tui.send("e");
+    tui.wait_for_row(1, "2>");
+    tui.wait_for("ARGS:[]");
+    tui.wait_for(" CODEX "); // the status bar names the active tab's kind
+
+    // Ctrl+A g: a gemini tab, spawned with a pre-assigned session id.
+    tui.send("\x01");
+    tui.send("g");
+    tui.wait_for_row(1, "3✦");
+    tui.wait_for("--session-id");
+
+    // Ctrl+A o: an opencode tab.
+    tui.send("\x01");
+    tui.send("o");
+    tui.wait_for_row(1, "4○");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn reopen_restores_agent_tabs_in_order() {
+    // A stored mixed row (claude id, gemini id, codex sentinel) reopens as the
+    // same tab row: claude and gemini resume (gemini with the BARE uuid, its
+    // prefix stripped), codex respawns fresh. All three entries survive quit.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": [
+                "11111111-1111-1111-1111-111111111111",
+                "gemini:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "codex:cccccccc-cccc-cccc-cccc-cccccccccccc"
+            ]
+        }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[
+            ("KOMMAND0_CLAUDE_BIN", "embed-stub"),
+            ("KOMMAND0_CODEX_BIN", "embed-stub"),
+            ("KOMMAND0_GEMINI_BIN", "embed-stub"),
+        ],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("--resume"); // tab 1 (claude) resumed, not freshly created
+    tui.wait_for("11111111"); // and it is the active tab
+    tui.wait_for_row(1, "2✦"); // gemini and codex kinds restored, in order
+    tui.wait_for_row(1, "3>");
+
+    // Ctrl+A 2: the gemini tab resumed with the BARE uuid (prefix stripped).
+    tui.send("\x01");
+    tui.send("2");
+    tui.wait_for("--resume bbbbbbbb");
+
+    // Ctrl+A 3: the codex tab reopened fresh (no session args).
+    tui.send("\x01");
+    tui.send("3");
+    tui.wait_for("ARGS:[]");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    // Quit does not reap: the whole row is still stored for the next reopen.
+    let st = tui.read_state();
+    assert_eq!(
+        st["embedded_sessions"]["w1"],
+        serde_json::json!([
+            "11111111-1111-1111-1111-111111111111",
+            "gemini:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "codex:cccccccc-cccc-cccc-cccc-cccccccccccc"
+        ]),
+        "all three seeded entries survive quit: {st}"
+    );
 }
 
 #[test]

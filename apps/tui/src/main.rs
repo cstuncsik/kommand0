@@ -259,6 +259,9 @@ pub(crate) enum DiffFocus {
 pub(crate) enum TabKind {
     Claude,
     Shell,
+    Codex,
+    Gemini,
+    Opencode,
 }
 
 impl TabKind {
@@ -267,6 +270,9 @@ impl TabKind {
         match self {
             TabKind::Claude => "claude",
             TabKind::Shell => "shell",
+            TabKind::Codex => "codex",
+            TabKind::Gemini => "gemini",
+            TabKind::Opencode => "opencode",
         }
     }
 
@@ -277,15 +283,20 @@ impl TabKind {
         match self {
             TabKind::Claude => "",
             TabKind::Shell => "shell:",
+            TabKind::Codex => "codex:",
+            TabKind::Gemini => "gemini:",
+            TabKind::Opencode => "opencode:",
         }
     }
 
     /// Whether a reopened tab resumes its conversation (`--resume`) rather
-    /// than spawning fresh; also keeps an exited tab's persisted id.
+    /// than spawning fresh; also keeps an exited tab's persisted id. Codex
+    /// and opencode can't pre-assign a session id, so their tabs reopen
+    /// fresh like shells (their history stays in the tools' own stores).
     fn resumable(self) -> bool {
         match self {
-            TabKind::Claude => true,
-            TabKind::Shell => false,
+            TabKind::Claude | TabKind::Gemini => true,
+            TabKind::Shell | TabKind::Codex | TabKind::Opencode => false,
         }
     }
 
@@ -294,6 +305,9 @@ impl TabKind {
         match self {
             TabKind::Claude => "KOMMAND0_CLAUDE_BIN",
             TabKind::Shell => "KOMMAND0_SHELL",
+            TabKind::Codex => "KOMMAND0_CODEX_BIN",
+            TabKind::Gemini => "KOMMAND0_GEMINI_BIN",
+            TabKind::Opencode => "KOMMAND0_OPENCODE_BIN",
         }
     }
 
@@ -302,6 +316,9 @@ impl TabKind {
         match self {
             TabKind::Claude => cfg.claude_bin.as_deref(),
             TabKind::Shell => cfg.shell.as_deref(),
+            TabKind::Codex => cfg.codex_bin.as_deref(),
+            TabKind::Gemini => cfg.gemini_bin.as_deref(),
+            TabKind::Opencode => cfg.opencode_bin.as_deref(),
         }
     }
 
@@ -310,22 +327,29 @@ impl TabKind {
         match self {
             TabKind::Claude => &cfg.claude_args,
             TabKind::Shell => &[],
+            TabKind::Codex => &cfg.codex_args,
+            TabKind::Gemini => &cfg.gemini_args,
+            TabKind::Opencode => &cfg.opencode_args,
         }
     }
 
-    /// One-char tab-strip suffix marking the kind; claude is unmarked.
+    /// One-char tab-strip suffix marking the kind; claude is unmarked. All
+    /// width-1 under unicode-width (the strip's hit-region math depends on it).
     fn marker(self) -> &'static str {
         match self {
             TabKind::Claude => "",
             TabKind::Shell => "$",
+            TabKind::Codex => ">",
+            TabKind::Gemini => "✦",
+            TabKind::Opencode => "○",
         }
     }
 
     /// Classify a persisted entry by its prefix; a bare uuid (or any unknown
-    /// form) is claude's — legacy tolerance, and unknown junk fails fast into
+    /// form) is claude's: legacy tolerance, and unknown junk fails fast into
     /// the existing forget/heal nets.
     fn from_session_id(id: &str) -> Self {
-        [TabKind::Shell]
+        [TabKind::Shell, TabKind::Codex, TabKind::Gemini, TabKind::Opencode]
             .into_iter()
             .find(|k| id.starts_with(k.id_prefix()))
             .unwrap_or(TabKind::Claude)
@@ -1433,7 +1457,22 @@ impl App {
             out.push(mk(
                 "new session",
                 format!("New session — {}", w.name),
-                PaletteAction::NewSession { ws_id: w.id.clone() },
+                PaletteAction::NewSession { ws_id: w.id.clone(), kind: TabKind::Claude },
+            ));
+            out.push(mk(
+                "new codex",
+                format!("New codex — {}", w.name),
+                PaletteAction::NewSession { ws_id: w.id.clone(), kind: TabKind::Codex },
+            ));
+            out.push(mk(
+                "new gemini",
+                format!("New gemini — {}", w.name),
+                PaletteAction::NewSession { ws_id: w.id.clone(), kind: TabKind::Gemini },
+            ));
+            out.push(mk(
+                "new opencode",
+                format!("New opencode — {}", w.name),
+                PaletteAction::NewSession { ws_id: w.id.clone(), kind: TabKind::Opencode },
             ));
         }
 
@@ -1470,9 +1509,9 @@ impl App {
                 }
             }
             ArchiveToggle { ws_id } => self.archive_toggle(&ws_id),
-            NewSession { ws_id } => {
+            NewSession { ws_id, kind } => {
                 if self.reveal_workspace(&ws_id) {
-                    self.new_tab(TabKind::Claude, &ws_id);
+                    self.new_tab(kind, &ws_id);
                 }
             }
             JumpTab { ws_id, index } => {
@@ -2794,6 +2833,27 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // New shell tab ($SHELL / configured shell).
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
                         app.new_tab(TabKind::Shell, &ws_id);
+                    }
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('e') if !ctrl => {
+                    // New codex tab (cod-E-x: c, x and d are taken).
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.new_tab(TabKind::Codex, &ws_id);
+                    }
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('g') if !ctrl => {
+                    // New gemini tab.
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.new_tab(TabKind::Gemini, &ws_id);
+                    }
+                    return Ok(KeyOutcome::Continue);
+                }
+                KeyCode::Char('o') if !ctrl => {
+                    // New opencode tab.
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.new_tab(TabKind::Opencode, &ws_id);
                     }
                     return Ok(KeyOutcome::Continue);
                 }
@@ -5017,23 +5077,116 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn new_tab_persists_kind_prefixed_sentinels() {
+        let mut app = test_app();
+        // Pinned bins: never launch the real CLIs (see pick_bin's fallback).
+        app.config.codex_bin = Some("sh".to_string());
+        app.config.gemini_bin = Some("sh".to_string());
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+
+        app.new_tab(TabKind::Codex, "w1");
+        app.new_tab(TabKind::Gemini, "w1");
+
+        let s = app.embedded.get("w1").expect("tabs opened");
+        assert_eq!(s.tabs.len(), 2);
+        assert_eq!(s.tabs[0].kind, TabKind::Codex);
+        assert!(
+            s.tabs[0].id.starts_with("codex:"),
+            "a codex tab persists a codex: sentinel: {}",
+            s.tabs[0].id
+        );
+        assert_eq!(s.tabs[1].kind, TabKind::Gemini);
+        assert!(
+            s.tabs[1].id.starts_with("gemini:"),
+            "a gemini tab persists a gemini: id: {}",
+            s.tabs[1].id
+        );
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &[s.tabs[0].id.clone(), s.tabs[1].id.clone()],
+            "both persisted for reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn palette_new_tab_actions_carry_their_kind() {
+        let mut app = test_app();
+        // Pinned bins: never launch the real CLIs (see pick_bin's fallback).
+        app.config.codex_bin = Some("sh".to_string());
+        app.config.gemini_bin = Some("sh".to_string());
+        app.config.opencode_bin = Some("sh".to_string());
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+
+        // Pull each agent entry out of the live candidate list and run it
+        // through the real dispatch: the tab kind and persisted prefix must
+        // follow the label (the snapshot pins labels only, so a copy-pasted
+        // Claude kind would otherwise ship green).
+        for (label, kind, prefix) in [
+            ("New codex — ws-one", TabKind::Codex, "codex:"),
+            ("New gemini — ws-one", TabKind::Gemini, "gemini:"),
+            ("New opencode — ws-one", TabKind::Opencode, "opencode:"),
+        ] {
+            let action = app
+                .palette_candidates()
+                .into_iter()
+                .find(|c| c.label == label)
+                .unwrap_or_else(|| panic!("palette offers {label}"))
+                .action;
+            app.dispatch_palette_action(action);
+            let t = app.embedded["w1"].tabs.last().unwrap();
+            assert_eq!(t.kind, kind, "{label} opens its own kind");
+            assert!(t.id.starts_with(prefix), "{label} persists {prefix}: {}", t.id);
+            assert!(
+                app.state.embedded_session_ids("w1").contains(&t.id),
+                "{label}'s tab is persisted"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn toggle_embedded_restores_mixed_tabs_in_order() {
         let mut app = test_app();
-        // `sh --resume <id>` (claude) and bare `sh` (shell) both spawn; the
-        // children may exit at once, but tabs live until a reap runs, so the
-        // assertions right after the call are deterministic.
+        // Every kind's bin pinned to `sh` so a restore can never launch the
+        // real CLIs (present on dev machines, absent on CI); the children may
+        // exit at once, but tabs live until a reap runs, so the assertions
+        // right after the call are deterministic.
         app.config.claude_bin = Some("sh".to_string());
         app.config.shell = Some("sh".to_string());
+        app.config.codex_bin = Some("sh".to_string());
+        app.config.gemini_bin = Some("sh".to_string());
+        app.config.opencode_bin = Some("sh".to_string());
         if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
             w.working_dir = "/tmp".into();
         }
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
         app.select_workspace_row("w1");
-        // Ten interleaved entries: one past MAX_SESSION_TABS, so the cap shows too.
-        let seeded: Vec<String> = (0..10)
-            .map(|n| if n % 2 == 0 { format!("c{n}") } else { format!("shell:s{n}") })
-            .collect();
+        // Ten interleaved entries of every kind: one past MAX_SESSION_TABS, so
+        // the cap shows too. The gemini entry carries a real uuid: only
+        // kommand0-minted uuids are resumed (see session_args' junk guard).
+        let seeded: Vec<String> = [
+            "c0",
+            "shell:s1",
+            "gemini:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            "codex:c3",
+            "opencode:o4",
+            "c5",
+            "shell:s6",
+            "c7",
+            "shell:s8",
+            "c9",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         for id in &seeded {
             app.state.add_embedded_session("w1", id);
         }
@@ -5042,13 +5195,28 @@ mod key_tests {
 
         let s = app.embedded.get("w1").expect("tabs restored");
         assert_eq!(s.tabs.len(), MAX_SESSION_TABS, "capped at the tab limit");
-        for (tab, want) in s.tabs.iter().zip(&seeded) {
+        let want_kinds = [
+            TabKind::Claude,
+            TabKind::Shell,
+            TabKind::Gemini,
+            TabKind::Codex,
+            TabKind::Opencode,
+            TabKind::Claude,
+            TabKind::Shell,
+            TabKind::Claude,
+            TabKind::Shell,
+        ];
+        for ((tab, want), want_kind) in s.tabs.iter().zip(&seeded).zip(want_kinds) {
             assert_eq!(&tab.id, want, "ids restored in persisted order");
-            let want_kind =
-                if want.starts_with("shell:") { TabKind::Shell } else { TabKind::Claude };
             assert_eq!(tab.kind, want_kind, "kind follows the sentinel for {want}");
-            if want_kind == TabKind::Shell {
-                assert!(!tab.was_resume, "reopened shells stay out of the resume nets");
+            match want_kind {
+                TabKind::Gemini => {
+                    assert!(tab.was_resume, "a reopened gemini uuid resumes")
+                }
+                TabKind::Shell | TabKind::Codex | TabKind::Opencode => {
+                    assert!(!tab.was_resume, "non-resumable reopens stay out of the resume nets")
+                }
+                TabKind::Claude => {}
             }
         }
         assert_eq!(s.active, 0, "reopen focuses the first tab");
@@ -5062,18 +5230,29 @@ mod key_tests {
     #[tokio::test]
     async fn reap_drops_an_exited_shell_tab_but_keeps_claude() {
         let mut app = test_app();
-        // All three persisted, so the reap's forgetting is observable per kind.
-        for id in ["claude-1", "shell:sh-1", "claude-2"] {
+        // All persisted, so the reap's forgetting is observable per kind.
+        for id in ["claude-1", "shell:sh-1", "claude-2", "codex:cx-1", "opencode:oc-1", "gemini:gm-1"]
+        {
             app.state.add_embedded_session("w1", id);
         }
         let claude = tab("claude-1", &["-c", "sleep 30"]); // stays alive
         let mut shell = tab("shell:sh-1", &["-c", "exit 0"]); // exits immediately
         shell.kind = TabKind::Shell;
         let claude2 = tab("claude-2", &["-c", "exit 0"]); // a clean claude exit (code 0)
-        let mut s =
-            WorkspaceSessions { tabs: vec![claude, shell, claude2], active: 1, last_active: None };
-        wait_exit(&mut s.tabs[1].pane);
-        wait_exit(&mut s.tabs[2].pane);
+        let mut codex = tab("codex:cx-1", &["-c", "exit 0"]);
+        codex.kind = TabKind::Codex;
+        let mut opencode = tab("opencode:oc-1", &["-c", "exit 0"]);
+        opencode.kind = TabKind::Opencode;
+        let mut gemini = tab("gemini:gm-1", &["-c", "exit 0"]); // a clean gemini exit
+        gemini.kind = TabKind::Gemini;
+        let mut s = WorkspaceSessions {
+            tabs: vec![claude, shell, claude2, codex, opencode, gemini],
+            active: 1,
+            last_active: None,
+        };
+        for i in 1..=5 {
+            wait_exit(&mut s.tabs[i].pane);
+        }
         app.embedded.insert("w1".to_string(), s);
 
         app.reap_embedded(Instant::now());
@@ -5084,13 +5263,14 @@ mod key_tests {
             .map(|s| s.tabs.iter().map(|t| t.id.clone()).collect())
             .unwrap_or_default();
         assert_eq!(ids, vec!["claude-1".to_string()], "exited tabs dropped, live Claude kept");
-        // The asymmetry, pinned both ways: an exited shell forgets its sentinel
-        // (that shell is gone for good), while an exited claude keeps its id
-        // (an /exit'd conversation resumes later).
+        // The asymmetry, pinned both ways: an exited non-resumable tab (shell,
+        // codex, opencode) forgets its sentinel (that tab is gone for good),
+        // while an exited resumable one (claude, gemini) keeps its id (an
+        // exited conversation resumes later).
         assert_eq!(
             app.state.embedded_session_ids("w1"),
-            &["claude-1".to_string(), "claude-2".to_string()],
-            "shell forgotten; exited claude still persisted"
+            &["claude-1".to_string(), "claude-2".to_string(), "gemini:gm-1".to_string()],
+            "shell/codex/opencode forgotten; exited claude and gemini still persisted"
         );
     }
 
@@ -5865,7 +6045,7 @@ mod key_tests {
     async fn settings_invalid_number_keeps_edit_open_with_error() {
         let mut app = test_app();
         press(&mut app, KeyCode::Char(',')).await;
-        for _ in 0..5 {
+        for _ in 0..11 {
             press(&mut app, KeyCode::Char('j')).await; // -> status_refresh_secs
         }
         press(&mut app, KeyCode::Enter).await;
@@ -5890,7 +6070,7 @@ mod key_tests {
     async fn settings_tree_width_commit_applies_and_clamps() {
         let mut app = test_app();
         press(&mut app, KeyCode::Char(',')).await;
-        for _ in 0..6 {
+        for _ in 0..12 {
             press(&mut app, KeyCode::Char('j')).await; // -> tree_width_pct (last row)
         }
         press(&mut app, KeyCode::Enter).await;
@@ -5935,7 +6115,7 @@ mod key_tests {
         // A hand-edited role override must survive a theme change from the page.
         app.config.theme_colors.insert("accent".into(), "#ff8800".into());
         press(&mut app, KeyCode::Char(',')).await;
-        for _ in 0..4 {
+        for _ in 0..10 {
             press(&mut app, KeyCode::Char('j')).await; // -> theme
         }
         press(&mut app, KeyCode::Enter).await;
@@ -6956,13 +7136,29 @@ mod key_tests {
         assert_eq!(args, vec!["--resume".to_string(), prior.to_string()]);
         assert!(minted.is_none());
 
-        // Shell: no session args; a fresh tab mints its persisted sentinel,
-        // a reopen keeps the prior one.
-        let (args, minted) = session_args(TabKind::Shell, None);
-        assert!(args.is_empty());
-        assert!(minted.unwrap().starts_with("shell:"));
-        let (args, minted) = session_args(TabKind::Shell, Some("shell:s1"));
-        assert!(args.is_empty() && minted.is_none());
+        // Gemini mints/persists with its prefix but puts the BARE uuid on the
+        // argv (gemini's --session-id/--resume take a plain uuid).
+        let (args, minted) = session_args(TabKind::Gemini, None);
+        assert_eq!(args[0], "--session-id");
+        assert_eq!(minted.unwrap(), format!("gemini:{}", args[1]));
+        let (args, minted) =
+            session_args(TabKind::Gemini, Some("gemini:12345678-1234-4123-8123-123456789abc"));
+        assert_eq!(
+            args,
+            vec!["--resume".to_string(), "12345678-1234-4123-8123-123456789abc".to_string()],
+            "the stored prefix is stripped before the argv"
+        );
+        assert!(minted.is_none());
+
+        // Shell/codex/opencode: no session args; a fresh tab mints its
+        // persisted sentinel, a reopen keeps the prior one.
+        for kind in [TabKind::Shell, TabKind::Codex, TabKind::Opencode] {
+            let (args, minted) = session_args(kind, None);
+            assert!(args.is_empty(), "{kind:?} spawns bare");
+            assert!(minted.unwrap().starts_with(kind.id_prefix()));
+            let (args, minted) = session_args(kind, Some("reopened"));
+            assert!(args.is_empty() && minted.is_none(), "{kind:?} reopen keeps its entry");
+        }
     }
 
     #[test]
@@ -6975,6 +7171,38 @@ mod key_tests {
             assert_eq!(args[0], "--session-id", "junk id spawns fresh: {args:?}");
             assert!(minted.is_some(), "the fresh mint is returned to persist");
         }
+        let (args, minted) = session_args(TabKind::Gemini, Some("gemini:--yolo"));
+        assert_eq!(args[0], "--session-id", "junk gemini id spawns fresh: {args:?}");
+        assert!(minted.unwrap().starts_with("gemini:"), "the mint keeps the kind prefix");
+    }
+
+    #[test]
+    fn from_session_id_classifies_every_kind_and_falls_back_to_claude() {
+        // Exhaustiveness canary: a new TabKind variant must extend this list
+        // AND the prefix array inside from_session_id (claude's "" prefix
+        // keeps that array hand-maintained, so nothing derives it).
+        let all = [
+            TabKind::Claude,
+            TabKind::Shell,
+            TabKind::Codex,
+            TabKind::Gemini,
+            TabKind::Opencode,
+        ];
+        for k in all {
+            match k {
+                TabKind::Claude
+                | TabKind::Shell
+                | TabKind::Codex
+                | TabKind::Gemini
+                | TabKind::Opencode => {}
+            }
+            let id = format!("{}12345678-1234-4123-8123-123456789abc", k.id_prefix());
+            assert_eq!(TabKind::from_session_id(&id), k, "roundtrip for {id}");
+        }
+        // Bare uuids and unknown forms are claude's (legacy tolerance; junk
+        // fails fast into the existing forget/heal nets).
+        assert_eq!(TabKind::from_session_id("plain-id"), TabKind::Claude);
+        assert_eq!(TabKind::from_session_id("foo:123"), TabKind::Claude);
     }
 
     #[tokio::test]
@@ -7004,6 +7232,9 @@ mod key_tests {
         // No env -> config; nothing -> the kind's tool name.
         assert_eq!(pick_bin(TabKind::Claude, None, Some("cfgbin")), "cfgbin");
         assert_eq!(pick_bin(TabKind::Claude, None, None), "claude");
+        assert_eq!(pick_bin(TabKind::Codex, None, None), "codex");
+        assert_eq!(pick_bin(TabKind::Gemini, None, None), "gemini");
+        assert_eq!(pick_bin(TabKind::Opencode, None, None), "opencode");
         // An empty config bin is ignored too (else the spawn would fail on "").
         assert_eq!(pick_bin(TabKind::Claude, None, Some("")), "claude");
         // Shell keeps the same env > config head; its ambient $SHELL then
@@ -7737,6 +7968,79 @@ mod key_tests {
             app.state.embedded_session_title("w1", new_id),
             Some("build"),
             "the replacement carries b's title"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_respawns_the_same_kind_not_claude() {
+        let mut app = test_app();
+        // Pin the bin: the heal's fresh spawn must never launch a real
+        // `gemini` (present on dev machines, absent on CI).
+        app.config.gemini_bin = Some("sh".to_string());
+        app.state.add_embedded_session("w1", "gemini:g1");
+        let mut g = tab("gemini:g1", &["-c", "sleep 30"]);
+        g.kind = TabKind::Gemini;
+        g.was_resume = true;
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![g], active: 0, last_active: None },
+        );
+
+        assert!(
+            app.heal_resume(TabKind::Gemini, "w1", "gemini:g1", "/tmp", Instant::now()),
+            "fresh spawn succeeded"
+        );
+
+        let s = &app.embedded["w1"];
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(s.tabs[0].kind, TabKind::Gemini, "heal respawns the same kind, not claude");
+        let persisted = app.state.embedded_session_ids("w1").to_vec();
+        assert_eq!(persisted.len(), 1);
+        assert!(
+            persisted[0].starts_with("gemini:"),
+            "the fresh id keeps the kind prefix: {persisted:?}"
+        );
+        assert_ne!(persisted[0], "gemini:g1", "the gone id was replaced");
+        assert_eq!(s.tabs[0].id, persisted[0], "runtime tab carries the fresh id");
+        let (_, msg) = app.embed_error.as_ref().expect("heal banner set");
+        assert!(msg.contains("gemini"), "banner names the kind: {msg}");
+        assert!(
+            !msg.contains("~/.claude/projects"),
+            "the claude-store parenthetical is claude-only: {msg}"
+        );
+    }
+
+    #[test]
+    fn resume_miss_scan_ignores_non_claude_kinds() {
+        // The resume-miss marker is claude's text: a gemini tab printing it
+        // (plus its own id) must survive past the scan stride (the gate also
+        // skips full-grid serialization of non-claude panes). A regression
+        // would false-heal the healthy gemini tab below.
+        let mut app = test_app();
+        app.config.claude_bin = Some("sh".to_string()); // no real spawn either way
+        app.config.gemini_bin = Some("sh".to_string());
+        let mut g = tab(
+            "gemini:gm-1",
+            &["-c", &format!("printf '{RESUME_MISS_MARKER} gemini:gm-1'; sleep 30")],
+        );
+        g.kind = TabKind::Gemini;
+        g.was_resume = true;
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![g], active: 0, last_active: None },
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.embedded["w1"].tabs[0].pane.screen_contents().contains(RESUME_MISS_MARKER) {
+            assert!(Instant::now() < deadline, "pane never showed the miss marker");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let t = Instant::now();
+        app.last_resume_scan = t;
+        // Past the stride: the scan runs, but only for claude tabs.
+        app.reap_embedded(t + RESUME_MISS_SCAN_EVERY);
+        assert!(
+            ids(&app.embedded["w1"]).contains(&"gemini:gm-1"),
+            "a gemini tab survives the claude-only miss scan"
         );
     }
 
