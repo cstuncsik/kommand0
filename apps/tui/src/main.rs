@@ -25,18 +25,6 @@ use ratatui::{
     crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent},
 };
 
-/// Decide the `claude` CLI args for opening a workspace's embedded pane.
-///
-/// If the workspace already has a stored session id, resume it; otherwise assign
-/// a fresh UUID. Returns `(args, new_session_id)` where `new_session_id` is
-/// `Some` only when a new session was created (and should be persisted on a
-/// successful spawn).
-///
-/// Known edge: if the very first launch is abandoned before any turn, the id is
-/// still persisted but no conversation exists on disk. Reopening then runs
-/// `--resume <id>`, which `claude` rejects ("No conversation found") and exits
-/// non-zero — caught by [`resume_failed`], which forgets the id so the next open
-/// starts fresh. So the worst case self-heals in one reopen.
 /// Height of the session tab strip at the top of the right pane.
 const TAB_BAR_HEIGHT: u16 = 1;
 
@@ -108,7 +96,7 @@ const RESUME_MISS_MARKER: &str = "No conversation found with session ID";
 
 /// Shown when a resume fails so the user knows reopening starts fresh.
 const RESUME_FAIL_MSG: &str =
-    "Couldn't resume the previous Claude session (it may have been cleared) — reopen to start fresh.";
+    "Couldn't resume the previous session (it may have been cleared): reopen to start fresh.";
 
 /// A resumed tab still showing the resume-miss marker within this window of spawn
 /// is a genuine miss (claude prints it at startup). After the window we stop
@@ -122,34 +110,56 @@ const RESUME_CHECK_WINDOW: Duration = Duration::from_secs(8);
 /// this often within [`RESUME_CHECK_WINDOW`].
 const RESUME_MISS_SCAN_EVERY: Duration = Duration::from_millis(500);
 
-fn claude_args(resume_id: Option<&str>) -> (Vec<String>, Option<String>) {
-    match resume_id {
-        Some(id) => (vec!["--resume".to_string(), id.to_string()], None),
-        None => {
-            let uuid = AppState::new_claude_session_id();
-            (vec!["--session-id".to_string(), uuid.clone()], Some(uuid))
+/// Decide the spawn args for a tab of `kind`, given the persisted entry to
+/// reopen (`prior_id`, kind-prefixed) or `None` for a brand-new tab.
+///
+/// Returns `(args, minted)`: `minted` is the freshly-minted prefixed entry to
+/// persist on a successful spawn (`None` when a reopen keeps its prior entry).
+/// Resumable kinds resume with the BARE uuid (prefix stripped); anything but a
+/// kommand0-minted uuid falls through to a fresh mint, so a hand-edited entry
+/// can't smuggle flags into the argv. Non-resumable kinds spawn bare.
+///
+/// Known edge: if the very first launch is abandoned before any turn, the id is
+/// still persisted but no conversation exists on disk. Reopening then runs
+/// `--resume <id>`, which the tool rejects and exits non-zero, caught by
+/// [`resume_failed`], which forgets the id so the next open starts fresh. So
+/// the worst case self-heals in one reopen.
+fn session_args(kind: TabKind, prior_id: Option<&str>) -> (Vec<String>, Option<String>) {
+    if !kind.resumable() {
+        // Fresh every open; a brand-new tab mints its persisted sentinel here.
+        return (
+            Vec::new(),
+            prior_id
+                .is_none()
+                .then(|| AppState::new_prefixed_session_id(kind.id_prefix())),
+        );
+    }
+    if let Some(id) = prior_id {
+        let bare = id.strip_prefix(kind.id_prefix()).unwrap_or(id);
+        if AppState::is_valid_session_uuid(bare) {
+            return (vec!["--resume".to_string(), bare.to_string()], None);
         }
     }
+    let id = AppState::new_prefixed_session_id(kind.id_prefix());
+    let bare = id.strip_prefix(kind.id_prefix()).unwrap_or(&id).to_string();
+    (vec!["--session-id".to_string(), bare], Some(id))
 }
 
-/// Resolve the `claude` binary: `KOMMAND0_CLAUDE_BIN` env (used by tests and
-/// ad-hoc overrides) wins, then the config's `claude_bin`, then `claude`.
-fn pick_claude_bin(env_bin: Option<String>, config_bin: Option<&str>) -> String {
-    env_bin
+/// Resolve the binary for a tab kind: the kind's `KOMMAND0_*` env override
+/// (used by tests and ad-hoc overrides; read by the caller, kept a parameter
+/// here for testability) wins, then the config's override, then the default.
+/// Shell falls back to `$SHELL` then `/bin/sh`; every other kind defaults to
+/// its tool name.
+fn pick_bin(kind: TabKind, env_bin: Option<String>, config_bin: Option<&str>) -> String {
+    let picked = env_bin
         .filter(|s| !s.is_empty())
-        .or_else(|| config_bin.filter(|s| !s.is_empty()).map(str::to_string))
-        .unwrap_or_else(|| "claude".to_string())
-}
-
-/// The command for a shell tab: the configured `shell`, else `$SHELL`, else
-/// `/bin/sh`. The `KOMMAND0_SHELL` env var takes precedence (used by tests).
-fn pick_shell(config_shell: Option<&str>) -> String {
-    std::env::var("KOMMAND0_SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| config_shell.filter(|s| !s.is_empty()).map(str::to_string))
-        .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "/bin/sh".to_string())
+        .or_else(|| config_bin.filter(|s| !s.is_empty()).map(str::to_string));
+    match kind {
+        TabKind::Shell => picked
+            .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "/bin/sh".to_string()),
+        _ => picked.unwrap_or_else(|| kind.label().to_string()),
+    }
 }
 
 /// Whether an exited embedded pane looks like a failed `--resume` (the Claude
@@ -240,20 +250,94 @@ pub(crate) enum DiffFocus {
     Diff,
 }
 
-/// What a session tab runs. Both kinds persist across restarts: Claude tabs
-/// resume their conversation (`claude --resume`); shell tabs reopen as fresh
-/// shells (a shell's process, unlike a conversation, can't be resumed).
+/// What a session tab runs. Every kind persists an entry across restarts:
+/// resumable kinds reopen with `--resume <uuid>` (the conversation continues),
+/// the rest respawn fresh (a shell's process, unlike a conversation, can't be
+/// resumed). All kind-specific knobs live in the accessors below, one match
+/// arm each, so adding a kind is a compile-guided fill-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TabKind {
     Claude,
     Shell,
 }
 
+impl TabKind {
+    /// Lowercase tool name; doubles as the default binary for non-shell kinds.
+    fn label(self) -> &'static str {
+        match self {
+            TabKind::Claude => "claude",
+            TabKind::Shell => "shell",
+        }
+    }
+
+    /// Prefix of this kind's persisted entries; claude's is empty (a bare
+    /// uuid: legacy entries predate the prefixes). UUIDs contain no ':', so
+    /// prefixed sentinels can never collide with claude ids.
+    fn id_prefix(self) -> &'static str {
+        match self {
+            TabKind::Claude => "",
+            TabKind::Shell => "shell:",
+        }
+    }
+
+    /// Whether a reopened tab resumes its conversation (`--resume`) rather
+    /// than spawning fresh; also keeps an exited tab's persisted id.
+    fn resumable(self) -> bool {
+        match self {
+            TabKind::Claude => true,
+            TabKind::Shell => false,
+        }
+    }
+
+    /// The env var overriding this kind's binary (tests, ad-hoc overrides).
+    fn bin_env(self) -> &'static str {
+        match self {
+            TabKind::Claude => "KOMMAND0_CLAUDE_BIN",
+            TabKind::Shell => "KOMMAND0_SHELL",
+        }
+    }
+
+    /// The configured binary override for this kind.
+    fn config_bin(self, cfg: &Config) -> Option<&str> {
+        match self {
+            TabKind::Claude => cfg.claude_bin.as_deref(),
+            TabKind::Shell => cfg.shell.as_deref(),
+        }
+    }
+
+    /// The configured passthrough args appended to every spawn of this kind.
+    fn config_args(self, cfg: &Config) -> &[String] {
+        match self {
+            TabKind::Claude => &cfg.claude_args,
+            TabKind::Shell => &[],
+        }
+    }
+
+    /// One-char tab-strip suffix marking the kind; claude is unmarked.
+    fn marker(self) -> &'static str {
+        match self {
+            TabKind::Claude => "",
+            TabKind::Shell => "$",
+        }
+    }
+
+    /// Classify a persisted entry by its prefix; a bare uuid (or any unknown
+    /// form) is claude's — legacy tolerance, and unknown junk fails fast into
+    /// the existing forget/heal nets.
+    fn from_session_id(id: &str) -> Self {
+        [TabKind::Shell]
+            .into_iter()
+            .find(|k| id.starts_with(k.id_prefix()))
+            .unwrap_or(TabKind::Claude)
+    }
+}
+
 /// One session tab within a workspace: a live PTY pane plus the metadata
 /// to persist/resume it and to detect a failed resume.
 pub(crate) struct SessionTab {
-    /// Claude session id (UUID) for a Claude tab, else its persisted `shell:`
-    /// sentinel: the stable key for activity tracking either way.
+    /// The persisted embedded-session entry: a bare uuid for a claude tab,
+    /// else a kind-prefixed sentinel (`shell:<uuid>`, …), the stable key for
+    /// activity tracking either way.
     pub(crate) id: String,
     pub(crate) pane: pane::Pane,
     was_resume: bool,
@@ -1011,9 +1095,9 @@ impl App {
     /// Enter (spawning if needed) the embedded interactive `claude` pane for the
     /// selected workspace. Experimental PTY-passthrough toggle (Phase 2).
     /// Open the selected workspace's embedded sessions: if it has none live yet,
-    /// restore every persisted entry as a tab (Claude ids resume the session,
-    /// `shell:` sentinels respawn as fresh shells; or start a first session when
-    /// none are stored), then focus the first tab.
+    /// restore every persisted entry as a tab of its kind (resumable kinds
+    /// resume their session, the rest respawn fresh; or start a first claude
+    /// session when none are stored), then focus the first tab.
     fn toggle_embedded(&mut self) {
         let Some(ws) = self.selected_workspace() else {
             return;
@@ -1022,20 +1106,17 @@ impl App {
         let ws_name = ws.name.clone();
         let ws_dir = ws.working_dir.clone();
         if !self.embedded.contains_key(&ws_id) {
-            // Cleared up front; spawn_session_tab / spawn_shell_tab re-set it on
-            // any failure, so a partial-reopen failure's message survives (a
-            // later clear would swallow it).
+            // Cleared up front; spawn_tab re-sets it on any failure, so a
+            // partial-reopen failure's message survives (a later clear would
+            // swallow it).
             self.embed_error = None;
             let persisted: Vec<String> = self.state.embedded_session_ids(&ws_id).to_vec();
             if persisted.is_empty() {
-                self.spawn_session_tab(&ws_id, &ws_dir, &ws_name, None);
+                self.spawn_tab(TabKind::Claude, &ws_id, &ws_dir, &ws_name, None);
             } else {
                 for id in persisted.iter().take(MAX_SESSION_TABS) {
-                    if AppState::is_shell_session_id(id) {
-                        self.spawn_shell_tab(&ws_id, &ws_dir, Some(id));
-                    } else {
-                        self.spawn_session_tab(&ws_id, &ws_dir, &ws_name, Some(id));
-                    }
+                    let kind = TabKind::from_session_id(id);
+                    self.spawn_tab(kind, &ws_id, &ws_dir, &ws_name, Some(id));
                 }
             }
             // If every spawn failed, embed_error is set — stay on the tree.
@@ -1050,25 +1131,33 @@ impl App {
         self.embedded_prefix = false;
     }
 
-    /// Spawn a claude pane (no persistence, no tab append). `resume_id` resumes
-    /// that session; `None` assigns a fresh session id. Returns the pane plus its
+    /// Spawn a pane of `kind` (no persistence, no tab append). `prior_id`
+    /// reopens that persisted entry (resumable kinds resume it, the rest
+    /// respawn fresh); `None` mints a fresh one. Returns the pane plus its
     /// `(session_id, was_resume)`, or the spawn error.
     fn spawn_pane(
         &self,
+        kind: TabKind,
         ws_dir: &str,
-        resume_id: Option<&str>,
+        prior_id: Option<&str>,
     ) -> anyhow::Result<(pane::Pane, String, bool)> {
-        let bin = pick_claude_bin(
-            std::env::var("KOMMAND0_CLAUDE_BIN").ok(),
-            self.config.claude_bin.as_deref(),
+        let bin = pick_bin(
+            kind,
+            std::env::var(kind.bin_env()).ok(),
+            kind.config_bin(&self.config),
         );
-        let (mut args, new_id) = claude_args(resume_id);
+        let (mut args, minted) = session_args(kind, prior_id);
         // Append the user's configured passthrough args (e.g. `--model sonnet`).
-        args.extend(self.config.claude_args.iter().cloned());
-        let was_resume = resume_id.is_some();
-        let session_id = resume_id
+        args.extend(kind.config_args(&self.config).iter().cloned());
+        // A resume = a resumable kind reopening a usable prior id (a junk
+        // prior id falls through to a fresh mint in session_args and must
+        // stay out of the resume-failure nets).
+        let was_resume = kind.resumable() && prior_id.is_some() && minted.is_none();
+        // The tab keeps its persisted entry as its id; only a brand-new tab
+        // takes the minted one.
+        let session_id = prior_id
             .map(String::from)
-            .unwrap_or_else(|| new_id.unwrap());
+            .unwrap_or_else(|| minted.unwrap());
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let pane = self.spawn_pane_cmd(ws_dir, &bin, &arg_refs)?;
         Ok((pane, session_id, was_resume))
@@ -1098,33 +1187,30 @@ impl App {
         )
     }
 
-    /// Spawn a shell pane (`$SHELL`, or the configured `shell`) in `ws_dir`.
-    fn spawn_shell_pane(&self, ws_dir: &str) -> anyhow::Result<pane::Pane> {
-        let shell = pick_shell(self.config.shell.as_deref());
-        self.spawn_pane_cmd(ws_dir, &shell, &[])
-    }
-
-    /// Spawn one Claude session (a tab) for a workspace and append it. `resume_id`
-    /// resumes that session; `None` assigns + persists a fresh id. Returns whether
-    /// the pane started (on failure, `embed_error` is set).
-    fn spawn_session_tab(
+    /// Spawn one tab of `kind` for a workspace and append it. `prior_id`
+    /// reopens that persisted entry (resumable kinds resume it, the rest
+    /// respawn fresh); `None` mints + persists a fresh one. Returns whether
+    /// the pane started (on failure `embed_error` is set, and a reopened
+    /// entry is forgotten so the persisted Vec stays aligned).
+    fn spawn_tab(
         &mut self,
+        kind: TabKind,
         ws_id: &str,
         ws_dir: &str,
         ws_name: &str,
-        resume_id: Option<&str>,
+        prior_id: Option<&str>,
     ) -> bool {
-        match self.spawn_pane(ws_dir, resume_id) {
+        match self.spawn_pane(kind, ws_dir, prior_id) {
             Ok((pane, session_id, was_resume)) => {
-                if !was_resume {
+                if prior_id.is_none() {
                     self.state.add_embedded_session(ws_id, &session_id);
                     // Merge over disk (like save_state) so this doesn't clobber a
                     // concurrent `kmd` write; keep the Result to surface a failure.
                     if self.persist_state().is_err() {
                         self.embed_error = Some((
                             ws_id.to_string(),
-                            "Couldn't persist this session — it may not resume \
-                             after restarting kommand0."
+                            "Couldn't persist this tab: it may not reopen after \
+                             restarting kommand0."
                                 .to_string(),
                         ));
                     }
@@ -1137,90 +1223,47 @@ impl App {
                         pane,
                         was_resume,
                         spawned: Instant::now(),
-                        kind: TabKind::Claude,
+                        kind,
                     });
                 true
             }
             Err(e) => {
-                // A resume that couldn't even spawn: forget the id so the
+                // A reopen that couldn't even spawn: forget the entry so the
                 // persisted Vec stays aligned with the runtime tabs.
-                if let Some(id) = resume_id {
+                if let Some(id) = prior_id {
                     self.state.remove_embedded_session(ws_id, id);
                     self.save_state();
                 }
-                self.embed_error =
-                    Some((ws_id.to_string(), format!("Failed to start claude in {ws_name}: {e}")));
-                false
-            }
-        }
-    }
-
-    /// Spawn one shell tab for a workspace and append it. `reopen_id` reuses a
-    /// persisted `shell:` sentinel as the tab id; `None` mints + persists a fresh
-    /// one. Returns whether the pane started (on failure `embed_error` is set,
-    /// and a reopened entry is forgotten so the persisted Vec stays aligned).
-    fn spawn_shell_tab(&mut self, ws_id: &str, ws_dir: &str, reopen_id: Option<&str>) -> bool {
-        match self.spawn_shell_pane(ws_dir) {
-            Ok(pane) => {
-                let id = match reopen_id {
-                    Some(id) => id.to_string(), // already persisted
-                    None => {
-                        let id = AppState::new_shell_session_id();
-                        self.state.add_embedded_session(ws_id, &id);
-                        // Merge over disk (like save_state) so this doesn't clobber
-                        // a concurrent `kmd` write; keep the Result to surface a
-                        // failure.
-                        if self.persist_state().is_err() {
-                            self.embed_error = Some((
-                                ws_id.to_string(),
-                                "Couldn't persist this tab: it may not reopen after \
-                                 restarting kommand0."
-                                    .to_string(),
-                            ));
-                        }
-                        id
-                    }
-                };
-                self.embedded
-                    .entry(ws_id.to_string())
-                    .or_default()
-                    .push(SessionTab {
-                        id,
-                        pane,
-                        // Always false: it keeps reopened shells out of both the
-                        // resume_failed net and the resume-miss scan (both gate
-                        // on it).
-                        was_resume: false,
-                        spawned: Instant::now(),
-                        kind: TabKind::Shell,
-                    });
-                true
-            }
-            Err(e) => {
-                // A reopen that couldn't even spawn: forget the sentinel so the
-                // persisted Vec stays aligned with the runtime tabs.
-                if let Some(id) = reopen_id {
-                    self.state.remove_embedded_session(ws_id, id);
-                    self.save_state();
-                }
-                self.embed_error = Some((ws_id.to_string(), format!("Failed to start shell: {e}")));
+                self.embed_error = Some((
+                    ws_id.to_string(),
+                    format!("Failed to start {} in {ws_name}: {e}", kind.label()),
+                ));
                 false
             }
         }
     }
 
     /// Auto-heal a resume that found no session: forget the gone id and replace
-    /// its tab in place with a fresh session (same slot, so the active tab and
-    /// numbering are preserved). Returns `false` if the fresh spawn itself failed
-    /// (the caller then drops the tab). `now` stamps the new tab.
-    fn heal_resume(&mut self, ws_id: &str, gone_id: &str, ws_dir: &str, now: Instant) -> bool {
+    /// its tab in place with a fresh session of the same kind (same slot, so
+    /// the active tab and numbering are preserved). Returns `false` if the
+    /// fresh spawn itself failed (the caller then drops the tab). `now` stamps
+    /// the new tab.
+    fn heal_resume(
+        &mut self,
+        kind: TabKind,
+        ws_id: &str,
+        gone_id: &str,
+        ws_dir: &str,
+        now: Instant,
+    ) -> bool {
         // Surface the miss loudly (log here, banner below): healing silently
         // would convert a recoverable store mismatch (e.g. a worktree moved
         // out from under claude's cwd-keyed store) into a forgotten id.
         tracing::warn!(
-            "resume miss: session {gone_id} not found in Claude's store for {ws_dir}; starting fresh"
+            "resume miss: session {gone_id} not found in {}'s store for {ws_dir}; starting fresh",
+            kind.label()
         );
-        match self.spawn_pane(ws_dir, None) {
+        match self.spawn_pane(kind, ws_dir, None) {
             Ok((pane, new_id, was_resume)) => {
                 // In place (same index) so the persisted order matches the
                 // in-slot runtime replace below; the helper also moves the
@@ -1235,18 +1278,20 @@ impl App {
                         pane,
                         was_resume,
                         spawned: now,
-                        kind: TabKind::Claude,
+                        kind,
                     };
                 }
-                self.embed_error = Some((
-                    ws_id.to_string(),
-                    format!(
-                        "session {} not found in Claude's store for this directory — started \
-                         fresh (the old transcript keeps its uuid filename under \
-                         ~/.claude/projects/)",
-                        gone_id.get(..8).unwrap_or(gone_id)
-                    ),
-                ));
+                let mut msg = format!(
+                    "session {} not found in {}'s store for this directory: started fresh",
+                    gone_id.get(..8).unwrap_or(gone_id),
+                    kind.label()
+                );
+                if kind == TabKind::Claude {
+                    msg.push_str(
+                        " (the old transcript keeps its uuid filename under ~/.claude/projects/)",
+                    );
+                }
+                self.embed_error = Some((ws_id.to_string(), msg));
                 true
             }
             Err(_) => {
@@ -1427,7 +1472,7 @@ impl App {
             ArchiveToggle { ws_id } => self.archive_toggle(&ws_id),
             NewSession { ws_id } => {
                 if self.reveal_workspace(&ws_id) {
-                    self.new_session(&ws_id);
+                    self.new_tab(TabKind::Claude, &ws_id);
                 }
             }
             JumpTab { ws_id, index } => {
@@ -1671,8 +1716,9 @@ impl App {
         };
     }
 
-    /// Open an additional session tab for a workspace (up to the cap) and focus it.
-    fn new_session(&mut self, ws_id: &str) {
+    /// Open an additional tab of `kind` for a workspace (up to the shared cap)
+    /// and focus it.
+    fn new_tab(&mut self, kind: TabKind, ws_id: &str) {
         self.select_workspace_row(ws_id);
         let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
         if count >= MAX_SESSION_TABS {
@@ -1685,32 +1731,10 @@ impl App {
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
             return;
         };
-        if self.spawn_session_tab(ws_id, &ws.working_dir, &ws.name, None) {
-            self.focus = Focus::Embedded;
-            self.embedded_prefix = false;
-        }
-    }
-
-    /// Open a new shell tab for a workspace: `$SHELL` (or the configured `shell`)
-    /// in the worktree. Persisted as a `shell:` sentinel so reopening the
-    /// workspace respawns it (a fresh shell, same tab slot); never `--resume`d.
-    fn new_shell_session(&mut self, ws_id: &str) {
-        self.select_workspace_row(ws_id);
-        let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
-        if count >= MAX_SESSION_TABS {
-            self.embed_error = Some((
-                ws_id.to_string(),
-                format!("Maximum {MAX_SESSION_TABS} session tabs reached."),
-            ));
-            return;
-        }
-        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
-            return;
-        };
-        // Cleared BEFORE the spawn so opening a shell drops a stale error without
+        // Cleared BEFORE the spawn so opening a tab drops a stale error without
         // swallowing a persist-failure warning the spawn itself may set.
         self.embed_error = None;
-        if self.spawn_shell_tab(ws_id, &ws.working_dir, None) {
+        if self.spawn_tab(kind, ws_id, &ws.working_dir, &ws.name, None) {
             self.focus = Focus::Embedded;
             self.embedded_prefix = false;
         }
@@ -1829,11 +1853,16 @@ impl App {
                         tab.kind,
                     ));
                 } else if scan_misses
+                    && tab.kind == TabKind::Claude
                     && tab.was_resume
                     && now.saturating_duration_since(tab.spawned) < RESUME_CHECK_WINDOW
                 {
-                    // Require BOTH the marker and this tab's (random uuid) session
-                    // id, so a resumed conversation that merely mentions the phrase
+                    // The marker is claude's text, so the scan is claude-only
+                    // (which also skips full-grid serialization of the other
+                    // kinds' panes); a failed resume of any other resumable
+                    // kind rides the fast-exit net above. Require BOTH the
+                    // marker and this tab's (random uuid) session id, so a
+                    // resumed conversation that merely mentions the phrase
                     // can't be mistaken for a real miss.
                     let screen = tab.pane.screen_contents();
                     if screen.contains(RESUME_MISS_MARKER) && screen.contains(&tab.id) {
@@ -1845,23 +1874,29 @@ impl App {
 
         // Resume failures: a resumed tab that exited fast non-zero, OR one still
         // alive showing the resume-miss marker. Auto-heal each by replacing the
-        // gone session with a fresh one in the SAME tab slot (the replacement
-        // gets a new id, so the retain pass below leaves it alone). If the fresh
-        // spawn also fails, fall back to dropping the tab with the reopen message.
-        let mut failed_resume: Vec<(String, String)> = exited
+        // gone session with a fresh one of the SAME kind in the SAME tab slot
+        // (the replacement gets a new id, so the retain pass below leaves it
+        // alone). If the fresh spawn also fails, fall back to dropping the tab
+        // with the reopen message.
+        let mut failed_resume: Vec<(String, String, TabKind)> = exited
             .iter()
             .filter(|(_, _, was_resume, spawned, code, _)| resume_failed(*spawned, *was_resume, now, *code))
-            .map(|(ws, tab, ..)| (ws.clone(), tab.clone()))
+            .map(|(ws, tab, .., kind)| (ws.clone(), tab.clone(), *kind))
             .collect();
-        failed_resume.extend(resume_missed.iter().cloned());
-        for (ws_id, tab_id) in &failed_resume {
+        failed_resume.extend(
+            resume_missed
+                .iter()
+                .cloned()
+                .map(|(ws, tab)| (ws, tab, TabKind::Claude)),
+        );
+        for (ws_id, tab_id, kind) in &failed_resume {
             let ws_dir = self
                 .workspaces
                 .iter()
                 .find(|w| &w.id == ws_id)
                 .map(|w| w.working_dir.clone());
             match ws_dir {
-                Some(dir) if self.heal_resume(ws_id, tab_id, &dir, now) => {}
+                Some(dir) if self.heal_resume(*kind, ws_id, tab_id, &dir, now) => {}
                 _ => {
                     // Couldn't start a fresh session — forget the id and drop the
                     // stuck/dead tab; the message tells the user to reopen.
@@ -1872,19 +1907,20 @@ impl App {
             }
         }
 
-        // A shell that exited (the user ended it, e.g. `exit`) is gone for good:
-        // forget its persisted entry so reopen doesn't respawn a tab the user
-        // ended. Claude exits keep their id (an /exit'd conversation resumes
-        // later). Shells never satisfy resume_failed (was_resume is always
-        // false), so this can't double-remove with the fallback above.
-        let mut forgot_shell = false;
+        // A non-resumable tab (e.g. a shell the user `exit`ed) that exited is
+        // gone for good: forget its persisted entry so reopen doesn't respawn
+        // a tab the user ended. Resumable kinds keep their id (an exited
+        // conversation resumes later). Non-resumable tabs never satisfy
+        // resume_failed (was_resume is always false), so this can't
+        // double-remove with the fallback above.
+        let mut forgot = false;
         for (ws_id, tab_id, .., kind) in &exited {
-            if *kind == TabKind::Shell {
+            if !kind.resumable() {
                 self.state.remove_embedded_session(ws_id, tab_id);
-                forgot_shell = true;
+                forgot = true;
             }
         }
-        if forgot_shell {
+        if forgot {
             self.save_state();
         }
 
@@ -2750,14 +2786,14 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 }
                 KeyCode::Char('c') if !ctrl => {
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                        app.new_session(&ws_id);
+                        app.new_tab(TabKind::Claude, &ws_id);
                     }
                     return Ok(KeyOutcome::Continue);
                 }
                 KeyCode::Char('s') if !ctrl => {
                     // New shell tab ($SHELL / configured shell).
                     if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                        app.new_shell_session(&ws_id);
+                        app.new_tab(TabKind::Shell, &ws_id);
                     }
                     return Ok(KeyOutcome::Continue);
                 }
@@ -3998,7 +4034,7 @@ async fn run(
                             app.select_session_tab(&workspace_id, index);
                         }
                         buttons::HitAction::NewSessionTab { workspace_id } => {
-                            app.new_session(&workspace_id);
+                            app.new_tab(TabKind::Claude, &workspace_id);
                         }
                         buttons::HitAction::CleanupWorkspaceFor { workspace_id } => {
                             app.cleanup_workspace_prompt(&workspace_id);
@@ -4962,7 +4998,7 @@ mod key_tests {
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
 
-        app.new_shell_session("w1");
+        app.new_tab(TabKind::Shell, "w1");
         let s = app.embedded.get("w1").expect("a tab was opened");
         assert_eq!(s.tabs.len(), 1);
         assert_eq!(s.tabs[0].kind, TabKind::Shell, "it's a shell tab");
@@ -5107,7 +5143,7 @@ mod key_tests {
         assert!(app.state_baseline.embedded_session_ids("w1").is_empty(), "fresh at startup");
 
         // Shell flavor: the sentinel is born on disk mid-run.
-        app.new_shell_session("w1");
+        app.new_tab(TabKind::Shell, "w1");
         let shell_id = app.embedded["w1"].tabs[0].id.clone();
         assert_eq!(
             app.state_baseline.embedded_session_ids("w1"),
@@ -5133,7 +5169,7 @@ mod key_tests {
         );
 
         // Claude flavor: same bug class, fresh --session-id persisted mid-run.
-        app.new_session("w1");
+        app.new_tab(TabKind::Claude, "w1");
         let claude_id = app.embedded["w1"].tabs[0].id.clone();
         assert_eq!(
             app.state_baseline.embedded_session_ids("w1"),
@@ -5162,8 +5198,8 @@ mod key_tests {
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
         app.select_workspace_row("w1");
-        app.new_session("w1");
-        app.new_shell_session("w1");
+        app.new_tab(TabKind::Claude, "w1");
+        app.new_tab(TabKind::Shell, "w1");
         let ids = app.state.embedded_session_ids("w1").to_vec();
         assert_eq!(ids.len(), 2, "one claude + one shell tab persisted");
         assert_eq!(app.focus, Focus::Embedded);
@@ -6907,16 +6943,38 @@ mod key_tests {
     }
 
     #[test]
-    fn claude_args_assigns_or_resumes() {
-        // No resume id: a fresh --session-id is assigned and returned to persist.
-        let (args, new) = claude_args(None);
+    fn session_args_assigns_or_resumes_per_kind() {
+        // Claude, no prior id: a fresh --session-id is assigned and returned
+        // to persist (bare uuid — claude's prefix is empty).
+        let (args, minted) = session_args(TabKind::Claude, None);
         assert_eq!(args[0], "--session-id");
-        assert_eq!(new.as_deref(), Some(args[1].as_str()));
+        assert_eq!(minted.as_deref(), Some(args[1].as_str()));
 
-        // With a resume id: resume that exact id (no new id to store).
-        let (args2, new2) = claude_args(Some("sess-1"));
-        assert_eq!(args2, vec!["--resume".to_string(), "sess-1".to_string()]);
-        assert!(new2.is_none());
+        // Claude, prior uuid: resume that exact id (no new id to store).
+        let prior = "12345678-1234-4123-8123-123456789abc";
+        let (args, minted) = session_args(TabKind::Claude, Some(prior));
+        assert_eq!(args, vec!["--resume".to_string(), prior.to_string()]);
+        assert!(minted.is_none());
+
+        // Shell: no session args; a fresh tab mints its persisted sentinel,
+        // a reopen keeps the prior one.
+        let (args, minted) = session_args(TabKind::Shell, None);
+        assert!(args.is_empty());
+        assert!(minted.unwrap().starts_with("shell:"));
+        let (args, minted) = session_args(TabKind::Shell, Some("shell:s1"));
+        assert!(args.is_empty() && minted.is_none());
+    }
+
+    #[test]
+    fn session_args_refuses_a_non_uuid_resume_target() {
+        // A hand-edited state entry must not smuggle flags into the argv:
+        // anything but a kommand0-minted uuid falls through to a clean fresh
+        // spawn instead of `--resume <junk>`.
+        for junk in ["--dangerously-skip-permissions", "sess-1"] {
+            let (args, minted) = session_args(TabKind::Claude, Some(junk));
+            assert_eq!(args[0], "--session-id", "junk id spawns fresh: {args:?}");
+            assert!(minted.is_some(), "the fresh mint is returned to persist");
+        }
     }
 
     #[tokio::test]
@@ -6939,15 +6997,20 @@ mod key_tests {
     }
 
     #[test]
-    fn pick_claude_bin_precedence() {
+    fn pick_bin_precedence() {
         // Env wins (tests/e2e rely on this); empty env is ignored.
-        assert_eq!(pick_claude_bin(Some("envbin".into()), Some("cfgbin")), "envbin");
-        assert_eq!(pick_claude_bin(Some(String::new()), Some("cfgbin")), "cfgbin");
-        // No env -> config; nothing -> default.
-        assert_eq!(pick_claude_bin(None, Some("cfgbin")), "cfgbin");
-        assert_eq!(pick_claude_bin(None, None), "claude");
+        assert_eq!(pick_bin(TabKind::Claude, Some("envbin".into()), Some("cfgbin")), "envbin");
+        assert_eq!(pick_bin(TabKind::Claude, Some(String::new()), Some("cfgbin")), "cfgbin");
+        // No env -> config; nothing -> the kind's tool name.
+        assert_eq!(pick_bin(TabKind::Claude, None, Some("cfgbin")), "cfgbin");
+        assert_eq!(pick_bin(TabKind::Claude, None, None), "claude");
         // An empty config bin is ignored too (else the spawn would fail on "").
-        assert_eq!(pick_claude_bin(None, Some("")), "claude");
+        assert_eq!(pick_bin(TabKind::Claude, None, Some("")), "claude");
+        // Shell keeps the same env > config head; its ambient $SHELL then
+        // /bin/sh tail stays unasserted (env mutation is unsafe in edition
+        // 2024 and racy under the parallel runner).
+        assert_eq!(pick_bin(TabKind::Shell, Some("envsh".into()), Some("cfgsh")), "envsh");
+        assert_eq!(pick_bin(TabKind::Shell, None, Some("cfgsh")), "cfgsh");
     }
 
     #[test]
@@ -7658,7 +7721,10 @@ mod key_tests {
             },
         );
 
-        assert!(app.heal_resume("w1", "b", "/tmp", Instant::now()), "fresh spawn succeeded");
+        assert!(
+            app.heal_resume(TabKind::Claude, "w1", "b", "/tmp", Instant::now()),
+            "fresh spawn succeeded"
+        );
 
         let persisted = app.state.embedded_session_ids("w1").to_vec();
         assert_eq!(persisted.len(), 3, "still three entries: {persisted:?}");

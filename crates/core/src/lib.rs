@@ -129,10 +129,6 @@ pub const PROFILE_ENV: &str = "KOMMAND0_PROFILE";
 /// the same way).
 static PROFILE: OnceLock<String> = OnceLock::new();
 
-/// Prefix marking a persisted embedded-session entry as a shell tab. The one
-/// place the sentinel shape is built/inspected.
-const SHELL_SESSION_PREFIX: &str = "shell:";
-
 impl AppState {
     /// The profile-independent dev-build data root (also the release fallback
     /// when the platform data dir can't be resolved).
@@ -806,25 +802,11 @@ impl AppState {
         }
     }
 
-    /// A fresh Claude session id (UUID v4) to assign to a new embedded session.
-    pub fn new_claude_session_id() -> String {
-        uuid::Uuid::new_v4().to_string()
-    }
-
-    /// Mint a persisted embedded-session entry for a shell tab. The entry is also
-    /// the tab's runtime id, so close/reap removal needs no translation. UUIDs
-    /// contain no ':', so a sentinel can never collide with a Claude session id.
-    pub fn new_shell_session_id() -> String {
-        format!("{SHELL_SESSION_PREFIX}{}", uuid::Uuid::new_v4())
-    }
-
-    /// Whether a persisted embedded-session entry denotes a shell tab.
-    pub fn is_shell_session_id(id: &str) -> bool {
-        id.starts_with(SHELL_SESSION_PREFIX)
-    }
-
     /// Mint a persisted embedded-session entry: `prefix` + a fresh UUID v4.
-    /// `""` yields a bare claude id; kind prefixes (`shell:` etc.) live in the TUI.
+    /// `""` yields a bare claude id; kind prefixes (`shell:` etc.) live in the
+    /// TUI. The entry is also the tab's runtime id, so close/reap removal needs
+    /// no translation. UUIDs contain no ':', so a prefixed sentinel can never
+    /// collide with a bare claude id.
     pub fn new_prefixed_session_id(prefix: &str) -> String {
         format!("{prefix}{}", uuid::Uuid::new_v4())
     }
@@ -836,9 +818,9 @@ impl AppState {
         uuid::Uuid::parse_str(bare).is_ok()
     }
 
-    /// The stored session entries (Claude session ids, or `shell:<uuid>`
-    /// sentinels for shell tabs) for a workspace's session tabs, in tab
-    /// order (empty slice when none).
+    /// The stored session entries (prefixed sentinels: `shell:<uuid>`,
+    /// `codex:<uuid>`, …; a bare uuid is claude's) for a workspace's session
+    /// tabs, in tab order (empty slice when none).
     pub fn embedded_session_ids(&self, workspace_id: &str) -> &[String] {
         self.embedded_sessions
             .get(workspace_id)
@@ -855,7 +837,7 @@ impl AppState {
     }
 
     /// Forget a single session entry for a workspace (its tab was closed, its
-    /// shell exited, or its resume failed because the Claude session was
+    /// non-resumable tab exited, or its resume failed because the session was
     /// purged). Removes the workspace entry when its last id is gone. Preserves
     /// the order of the rest.
     pub fn remove_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
@@ -1825,7 +1807,7 @@ mod tests {
         let mut state = AppState::default();
         assert!(state.embedded_session_ids("w1").is_empty());
 
-        let id = AppState::new_claude_session_id();
+        let id = AppState::new_prefixed_session_id("");
         state.add_embedded_session("w1", &id);
         assert_eq!(state.embedded_session_ids("w1"), std::slice::from_ref(&id));
         state.save_to(tmp.path()).unwrap();
@@ -1835,28 +1817,6 @@ mod tests {
 
         state.clear_all_embedded_sessions("w1");
         assert!(state.embedded_session_ids("w1").is_empty());
-    }
-
-    #[test]
-    fn new_claude_session_id_is_a_unique_uuid() {
-        let a = AppState::new_claude_session_id();
-        let b = AppState::new_claude_session_id();
-        assert_ne!(a, b);
-        assert!(uuid::Uuid::parse_str(&a).is_ok(), "should be a valid UUID: {a}");
-    }
-
-    #[test]
-    fn shell_session_id_mint_and_classify() {
-        let a = AppState::new_shell_session_id();
-        let b = AppState::new_shell_session_id();
-        assert!(a.starts_with("shell:"), "sentinel carries the prefix: {a}");
-        assert_ne!(a, b, "each mint is unique");
-        assert!(AppState::is_shell_session_id(&a));
-        assert!(
-            !AppState::is_shell_session_id(&AppState::new_claude_session_id()),
-            "a Claude session id is never a shell sentinel"
-        );
-        assert!(!AppState::is_shell_session_id("plain-id"));
     }
 
     #[test]

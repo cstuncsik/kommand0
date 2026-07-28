@@ -649,7 +649,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     }
     // Snapshot what we need (incl. the session id, to look up its title) so we
     // can mutate app.hit_regions afterward.
-    let snapshot: Vec<(usize, bool, bool, String, bool)> = match app.embedded.get(ws_id) {
+    let snapshot: Vec<(usize, bool, bool, String, &'static str)> = match app.embedded.get(ws_id) {
         Some(s) => s
             .tabs
             .iter()
@@ -660,7 +660,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
                     i == s.active,
                     app.waiting_response.contains(&t.id),
                     t.id.clone(),
-                    matches!(t.kind, super::TabKind::Shell),
+                    t.kind.marker(),
                 )
             })
             .collect(),
@@ -675,7 +675,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     let mut regions: Vec<(Rect, HitAction)> = Vec::new();
     let mut x = strip.x;
     let right = strip.x + strip.width;
-    for (i, is_active, producing, id, is_shell) in &snapshot {
+    for (i, is_active, producing, id, marker) in &snapshot {
         // Producing replaces the number with the spinner (unchanged); a user
         // title, when set, is appended so the tab is identifiable by name too.
         let glyph = if *producing {
@@ -683,8 +683,9 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
         } else {
             (i + 1).to_string()
         };
-        // A `$` suffix marks a shell tab (vs a Claude tab).
-        let marker = if *is_shell { "$" } else { "" };
+        // A one-char suffix marks the tab's kind (`$` shell; claude is
+        // unmarked): see `TabKind::marker`.
+        let marker = *marker;
         let label = match app.state.embedded_session_title(ws_id, id) {
             Some(title) if !title.is_empty() => {
                 if UnicodeWidthStr::width(title) > MAX_TITLE_COLS {

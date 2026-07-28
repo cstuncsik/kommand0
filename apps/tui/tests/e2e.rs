@@ -841,7 +841,7 @@ fn failed_resume_shows_error_and_forgets_the_id() {
             "working_dir": d, "active": true, "created_at": 0
         }],
         "sessions": [],
-        "embedded_sessions": { "w1": ["dead-session-id"] }
+        "embedded_sessions": { "w1": ["dddddddd-dddd-dddd-dddd-dddddddddddd"] }
     })
     .to_string();
     let mut tui = Tui::launch_with(
@@ -914,7 +914,7 @@ fn stale_resume_auto_heals_to_a_fresh_session() {
             "working_dir": d, "active": true, "created_at": 0
         }],
         "sessions": [],
-        "embedded_sessions": { "w1": ["gone-session-id"] }
+        "embedded_sessions": { "w1": ["99999999-9999-9999-9999-999999999999"] }
     })
     .to_string();
     let mut tui = Tui::launch_with(
@@ -927,7 +927,7 @@ fn stale_resume_auto_heals_to_a_fresh_session() {
     tui.wait_for("demo-ws");
     tui.send("j");
     tui.send("e"); // open -> resume the gone session (stub stays alive on the error)
-    tui.wait_for("not found in Claude's store"); // detected, healed in place with a new session
+    tui.wait_for("not found in claude's store"); // detected, healed in place with a new session
     tui.wait_for("1 live"); // still embedded — the slot now holds the fresh session
 
     tui.send("\x01");
@@ -944,7 +944,7 @@ fn stale_resume_auto_heals_to_a_fresh_session() {
     assert_eq!(ids.len(), 1, "exactly one fresh session persisted: {st}");
     assert_ne!(
         ids[0].as_str(),
-        Some("gone-session-id"),
+        Some("99999999-9999-9999-9999-999999999999"),
         "the stale resume id should be replaced, not re-persisted: {st}"
     );
 }
