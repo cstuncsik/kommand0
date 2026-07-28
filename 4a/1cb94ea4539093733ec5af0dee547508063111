@@ -1,0 +1,43 @@
+CHANGELOG.md
+  s_204b5a01a8e774::t_c64c11786e0bee 24-26
+apps/tui/src/main.rs
+  s_204b5a01a8e774::t_c1c70ecfc77d0d 5134-5179
+  s_204b5a01a8e774::t_caa12dece2e0bf 1184-1188
+  s_204b5a01a8e774::t_c5140eee342eeb 8173-8175
+  s_204b5a01a8e774::t_47eafab76fa0bd 8131-8164
+  s_204b5a01a8e774::t_2e710b45f7e11e 1163-1165
+  s_204b5a01a8e774::t_c54d71900ac48e 5280,5284,5287-5299,5303-5306,5309-5310
+  s_204b5a01a8e774::t_a9eb5f8127fe3d 143-146
+  s_204b5a01a8e774::t_033aeeb0debe51 7212
+  s_204b5a01a8e774::t_45ac2ddd06308e 7300-7324,8130
+  s_204b5a01a8e774::t_b4864c923564ae 1220-1223
+  s_204b5a01a8e774::t_d8969a132f5f0b 7256-7260,7264-7268
+  s_204b5a01a8e774::t_ea120c6ffafb83 1234-1242,1244-1258
+  s_204b5a01a8e774::t_039b45bd8a3d9c 5238-5241,5248
+  s_204b5a01a8e774::t_4b00a01d8d7378 167-168
+  s_204b5a01a8e774::t_92e0173c20b2a0 5133
+apps/tui/tests/e2e.rs
+  s_204b5a01a8e774::t_0704fd12e035d4 1041-1043,1051
+README.md
+  s_204b5a01a8e774::t_69a888208a04ab 272
+  s_204b5a01a8e774::t_cbb299003c4842 245-250
+crates/core/src/lib.rs
+  s_204b5a01a8e774::t_82a2f342db3e6c 1843,1847-1852
+  s_204b5a01a8e774::t_0d2fde7caafccc 815-819,821
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "4a1cb94ea4539093733ec5af0dee547508063111",
+  "prompts": {},
+  "sessions": {
+    "s_204b5a01a8e774": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cf285bce-b5d2-4e6a-9fff-06a10041c98d",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}
