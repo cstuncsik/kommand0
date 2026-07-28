@@ -1,0 +1,59 @@
+crates/core/src/config.rs
+  s_204b5a01a8e774::t_cccc1fc6e3de2d 27-41
+  s_204b5a01a8e774::t_2525d29b5ed762 206
+apps/tui/src/main.rs
+  s_204b5a01a8e774::t_0184f1845a1cc7 1512,1514
+  s_204b5a01a8e774::t_1be0df93e2dc05 5157-5160,5163-5165,5172-5189,5198-5209,5212-5219
+  s_204b5a01a8e774::t_2a618837190e81 2839-2859
+  s_204b5a01a8e774::t_2f35c8ddf80e14 7174-7205
+  s_204b5a01a8e774::t_d657328ea0b45a 6048
+  s_204b5a01a8e774::t_f4400d01e62cb8 5080-5153
+  s_204b5a01a8e774::t_024abb125f864a 349
+  s_204b5a01a8e774::t_cd18121fea23a2 5079,7974-8015,8018-8046
+  s_204b5a01a8e774::t_f8634c2bf952d8 6073
+  s_204b5a01a8e774::t_4a86fcfc31701c 7139-7161
+  s_204b5a01a8e774::t_0dad8077a7e423 8016-8017
+  s_204b5a01a8e774::t_75f14de4e4d843 7235-7237
+  s_204b5a01a8e774::t_b0a08b6e76fe4c 5233-5235,5242-5255,5266-5269,5272-5273
+  s_204b5a01a8e774::t_c35598393b9b12 1460-1475
+  s_204b5a01a8e774::t_973407eaece506 262-264,273-275,286-288,293-295,298-299,308-310,319-321,330-332,336-337,342-344,352
+  s_204b5a01a8e774::t_b9bc1fd3b051b4 6118
+apps/tui/tests/e2e.rs
+  s_204b5a01a8e774::t_dff17395a683c3 721-834
+  s_204b5a01a8e774::t_df52bf5d777b1c 115-117
+apps/tui/src/help.rs
+  s_204b5a01a8e774::t_0f9c529aae4b7b 35-40
+CHANGELOG.md
+  s_204b5a01a8e774::t_41ac03b5b23622 8-24
+apps/tui/src/settings.rs
+  s_204b5a01a8e774::t_76336328b4d3d4 287-292
+  s_204b5a01a8e774::t_58b19b894579d2 158-162,164,167-172
+  s_204b5a01a8e774::t_98fd7c884d8c61 30-35,47-52,66-71,79-81,87-92,112-114,117-121
+apps/tui/src/render.rs
+  s_204b5a01a8e774::t_82412de1de0e2f 159-170
+  s_204b5a01a8e774::t_97a7d15769438a 778-785,788
+README.md
+  s_204b5a01a8e774::t_ddf001d258cd3e 264
+apps/tui/src/palette.rs
+  s_204b5a01a8e774::t_6d613c11089e5f 17,30-31
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_palette_overlay.snap
+  s_204b5a01a8e774::t_b584e2220bf337 3,18-20
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_settings_overlay.snap
+  s_204b5a01a8e774::t_086b6d25816075 3,11-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "ac3fbc134955965f1eedd3c48e58159b0cfcedd6",
+  "prompts": {},
+  "sessions": {
+    "s_204b5a01a8e774": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cf285bce-b5d2-4e6a-9fff-06a10041c98d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
