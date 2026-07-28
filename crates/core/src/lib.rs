@@ -823,6 +823,19 @@ impl AppState {
         id.starts_with(SHELL_SESSION_PREFIX)
     }
 
+    /// Mint a persisted embedded-session entry: `prefix` + a fresh UUID v4.
+    /// `""` yields a bare claude id; kind prefixes (`shell:` etc.) live in the TUI.
+    pub fn new_prefixed_session_id(prefix: &str) -> String {
+        format!("{prefix}{}", uuid::Uuid::new_v4())
+    }
+
+    /// Whether `bare` (a persisted entry with its kind prefix stripped) is a
+    /// kommand0-minted session uuid. Only these may reach a `--resume` argv:
+    /// a hand-edited entry must not smuggle flags into the spawn.
+    pub fn is_valid_session_uuid(bare: &str) -> bool {
+        uuid::Uuid::parse_str(bare).is_ok()
+    }
+
     /// The stored session entries (Claude session ids, or `shell:<uuid>`
     /// sentinels for shell tabs) for a workspace's session tabs, in tab
     /// order (empty slice when none).
@@ -1844,6 +1857,29 @@ mod tests {
             "a Claude session id is never a shell sentinel"
         );
         assert!(!AppState::is_shell_session_id("plain-id"));
+    }
+
+    #[test]
+    fn new_prefixed_session_id_mints_prefix_plus_uuid() {
+        let a = AppState::new_prefixed_session_id("shell:");
+        let b = AppState::new_prefixed_session_id("shell:");
+        assert!(a.starts_with("shell:"), "sentinel carries the prefix: {a}");
+        assert_ne!(a, b, "each mint is unique");
+        assert!(
+            uuid::Uuid::parse_str(a.strip_prefix("shell:").unwrap()).is_ok(),
+            "the tail is a valid UUID: {a}"
+        );
+        // An empty prefix mints a bare (claude) id.
+        let bare = AppState::new_prefixed_session_id("");
+        assert!(uuid::Uuid::parse_str(&bare).is_ok(), "should be a valid UUID: {bare}");
+    }
+
+    #[test]
+    fn is_valid_session_uuid_accepts_only_uuids() {
+        assert!(AppState::is_valid_session_uuid(&AppState::new_prefixed_session_id("")));
+        assert!(!AppState::is_valid_session_uuid("--yolo"));
+        assert!(!AppState::is_valid_session_uuid("plain-id"));
+        assert!(!AppState::is_valid_session_uuid(""));
     }
 
     #[test]
