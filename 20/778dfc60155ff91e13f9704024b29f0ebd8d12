@@ -1,0 +1,43 @@
+apps/tui/src/main.rs
+  s_204b5a01a8e774::t_ed89ee131c0981 5685
+  s_204b5a01a8e774::t_4dc903aabaedf5 1428
+  s_204b5a01a8e774::t_d16bd21482ad79 8525
+  s_204b5a01a8e774::t_0a45df0201011f 146
+  s_204b5a01a8e774::t_5897326e1dcaed 465-468
+  s_204b5a01a8e774::t_3de947a58f1c9e 5724-5725,5727
+  s_204b5a01a8e774::t_bcc38d27e4acf3 2012-2027,2031
+  s_204b5a01a8e774::t_572f6c47959f26 1222-1223
+  s_204b5a01a8e774::t_527b4d23e51d33 7876-7886
+  s_204b5a01a8e774::t_3d475f8ab4d8c5 347-349
+  s_204b5a01a8e774::t_0ecdbafd7c8cf9 113-119
+  s_204b5a01a8e774::t_da420cfa071724 406-416
+  s_204b5a01a8e774::t_2ccfb814efa83b 5597-5632
+  s_204b5a01a8e774::t_3a8c85593e015e 7859
+  s_204b5a01a8e774::t_4a152883023fdb 1372
+  s_204b5a01a8e774::t_a870b760f07901 5520-5522
+  s_204b5a01a8e774::t_568466c4d4c031 5566-5568,5571-5572
+  s_204b5a01a8e774::t_01e25ccc73fa9d 5649
+  s_204b5a01a8e774::t_e88b860df97f20 5596
+apps/tui/src/pane.rs
+  s_204b5a01a8e774::t_d95faaf2e501a7 1063-1080
+  s_204b5a01a8e774::t_69d70d4b8efd50 502-510
+  s_204b5a01a8e774::t_9eebb4fca90e33 1062
+apps/tui/tests/fixtures/embed-stub-exit-hint
+  s_204b5a01a8e774::t_582770e97b22b5 4-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "20778dfc60155ff91e13f9704024b29f0ebd8d12",
+  "prompts": {},
+  "sessions": {
+    "s_204b5a01a8e774": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cf285bce-b5d2-4e6a-9fff-06a10041c98d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
