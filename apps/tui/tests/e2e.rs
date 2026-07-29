@@ -766,9 +766,10 @@ fn ctrl_a_e_g_o_open_agent_tabs() {
 
 #[test]
 fn reopen_restores_agent_tabs_in_order() {
-    // A stored mixed row (claude id, gemini id, codex sentinel) reopens as the
-    // same tab row: claude and gemini resume (gemini with the BARE uuid, its
-    // prefix stripped), codex respawns fresh. All three entries survive quit.
+    // A stored mixed row (claude id, gemini id, codex tab- sentinel) reopens
+    // as the same tab row: claude and gemini resume (gemini with the BARE
+    // uuid, its prefix stripped), the codex tab- sentinel respawns fresh (a
+    // kommand0 mint is never a resume target). All three entries survive quit.
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().to_str().unwrap();
     let state = serde_json::json!({
@@ -782,7 +783,7 @@ fn reopen_restores_agent_tabs_in_order() {
             "w1": [
                 "11111111-1111-1111-1111-111111111111",
                 "gemini:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-                "codex:cccccccc-cccc-cccc-cccc-cccccccccccc"
+                "codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"
             ]
         }
     })
@@ -826,9 +827,75 @@ fn reopen_restores_agent_tabs_in_order() {
         serde_json::json!([
             "11111111-1111-1111-1111-111111111111",
             "gemini:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-            "codex:cccccccc-cccc-cccc-cccc-cccccccccccc"
+            "codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"
         ]),
         "all three seeded entries survive quit: {st}"
+    );
+}
+
+#[test]
+fn codex_exit_hint_is_captured_and_resumed() {
+    // A codex tab prints `codex resume <uuid>` when its session closes; the
+    // reap captures that id in place of the tab- sentinel, and the next
+    // reopen resumes it. Quit doesn't reap, so the captured entry survives.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": ["codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"]
+        }
+    })
+    .to_string();
+    let mut tui =
+        Tui::launch_with(Some(state), &[("KOMMAND0_CODEX_BIN", "embed-stub-exit-hint")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("HINT-STUB-READY");
+    tui.wait_for("ARGS:[]"); // the tab- sentinel opens fresh, no resume argv
+
+    // One byte: the stub prints the close-time hint and exits. The reap
+    // captures the id, drops the dead tab (focus falls back to the tree) and
+    // persists the swap synchronously; poll the state file for it.
+    tui.send("x");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = tui.read_state();
+        if st["embedded_sessions"]["w1"][0]
+            == serde_json::json!("codex:019f7db3-4810-7213-83c7-58e1e93baded")
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "captured id never persisted; state: {st}; screen:\n{}",
+                tui.screen()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Reopen the workspace: the captured id resumes (positional subcommand).
+    tui.send("e");
+    tui.wait_for("ARGS:[resume 019f7db3");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    let st = tui.read_state();
+    assert_eq!(
+        st["embedded_sessions"]["w1"],
+        serde_json::json!(["codex:019f7db3-4810-7213-83c7-58e1e93baded"]),
+        "quit does not reap: the captured entry survives: {st}"
     );
 }
 

@@ -812,18 +812,19 @@ impl AppState {
     }
 
     /// Whether `bare` (a persisted entry with its kind prefix stripped) is a
-    /// canonical kommand0-minted session uuid: lowercase hyphenated, exactly
-    /// as [`Self::new_prefixed_session_id`] writes it. Only these may reach a
-    /// `--resume` argv: a hand-edited entry must not smuggle flags into the
-    /// spawn, and `parse_str`'s looser spellings (uppercase, braced, urn,
-    /// bare 32-hex) never came from a mint.
+    /// canonical session uuid: lowercase hyphenated, exactly as
+    /// [`Self::new_prefixed_session_id`] writes it (captured codex ids share
+    /// the shape, v7 instead of v4). Only these may reach a resume argv: a
+    /// hand-edited entry must not smuggle flags into the spawn, and
+    /// `parse_str`'s looser spellings (uppercase, braced, urn, bare 32-hex)
+    /// never came from a mint or a codex exit hint.
     pub fn is_valid_session_uuid(bare: &str) -> bool {
         uuid::Uuid::parse_str(bare).is_ok_and(|u| u.hyphenated().to_string() == bare)
     }
 
     /// The stored session entries (prefixed sentinels: `shell:<uuid>`,
-    /// `codex:<uuid>`, …; a bare uuid is claude's) for a workspace's session
-    /// tabs, in tab order (empty slice when none).
+    /// `codex:tab-<uuid>`, …; a bare uuid is claude's) for a workspace's
+    /// session tabs, in tab order (empty slice when none).
     pub fn embedded_session_ids(&self, workspace_id: &str) -> &[String] {
         self.embedded_sessions
             .get(workspace_id)

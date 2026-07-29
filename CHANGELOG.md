@@ -14,8 +14,10 @@ All notable changes to kommand0 are documented here. The format is based on
   `opencode_bin`/`opencode_args` mirror claude's pair, with `KOMMAND0_CODEX_BIN`,
   `KOMMAND0_GEMINI_BIN` and `KOMMAND0_OPENCODE_BIN` env overrides taking
   precedence. Gemini tabs resume their conversation when the workspace
-  reopens (like Claude tabs); codex and opencode tabs reopen fresh (like
-  shell tabs), their history stays in the tools' own stores.
+  reopens (like Claude tabs). Codex and opencode tabs capture the session id
+  their CLI prints when a session closes and resume it on reopen; without a
+  captured hint (for example the tab was still open when kommand0 quit) they
+  reopen fresh.
 
 ### Fixed
 
