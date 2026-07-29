@@ -26,17 +26,23 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "[Ctrl+A] then [c]",
-        description: "New session tab",
+        description: "New Claude Code tab",
     },
     KeyBinding {
         keys: "[Ctrl+A] then [s]",
         description: "New shell tab (reopens fresh)",
     },
-    // One line, and short enough not to wrap in the 60%-wide popup (a wrapped
-    // row breaks the scroll clamp below).
     KeyBinding {
-        keys: "[Ctrl+A] then [e/g/o]",
-        description: "New codex/gemini/opencode tab",
+        keys: "[Ctrl+A] then [e]",
+        description: "New codex tab",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [g]",
+        description: "New gemini tab",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [o]",
+        description: "New opencode tab",
     },
     KeyBinding {
         keys: "[Ctrl+A] then [ / ]",
