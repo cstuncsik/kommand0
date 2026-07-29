@@ -112,6 +112,9 @@ impl Tui {
         // exactly what it needs via extra_env below.
         cmd.env_remove("KOMMAND0_CONFIG");
         cmd.env_remove("KOMMAND0_CLAUDE_BIN");
+        cmd.env_remove("KOMMAND0_CODEX_BIN");
+        cmd.env_remove("KOMMAND0_GEMINI_BIN");
+        cmd.env_remove("KOMMAND0_OPENCODE_BIN");
         cmd.env_remove("KOMMAND0_GH_BIN");
         cmd.env_remove("KOMMAND0_PROFILE");
         // Deterministic keyboard setup whether or not the test run itself
@@ -127,6 +130,11 @@ impl Tui {
         }
         cmd.env("PATH", path_env);
         cmd.env("TERM", "xterm-256color");
+        // Hermetic codex store: point the early-capture poller at a dir that
+        // doesn't exist by default, so no test ever reads the developer's
+        // real ~/.codex/sessions (tests that need a store override this
+        // below via extra_env).
+        cmd.env("KOMMAND0_CODEX_SESSIONS_DIR", state_dir.path().join("codex-sessions"));
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -716,6 +724,326 @@ fn ctrl_a_s_opens_a_shell_tab() {
 }
 
 #[test]
+fn ctrl_a_e_g_o_open_agent_tabs() {
+    // All three agent binaries are the embed-stub, so each prefix key opens a
+    // deterministic tab; the strip marks codex `>`, gemini `✦`, opencode `○`.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[
+            ("KOMMAND0_CLAUDE_BIN", "embed-stub"),
+            ("KOMMAND0_CODEX_BIN", "embed-stub"),
+            ("KOMMAND0_GEMINI_BIN", "embed-stub"),
+            ("KOMMAND0_OPENCODE_BIN", "embed-stub"),
+        ],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY"); // claude tab (1)
+
+    // Ctrl+A e: a codex tab, spawned bare (no --session-id/--resume).
+    tui.send("\x01");
+    tui.send("e");
+    tui.wait_for_row(1, "2>");
+    tui.wait_for("ARGS:[]");
+    tui.wait_for(" CODEX "); // the status bar names the active tab's kind
+
+    // Ctrl+A g: a gemini tab, spawned with a pre-assigned session id.
+    tui.send("\x01");
+    tui.send("g");
+    tui.wait_for_row(1, "3✦");
+    tui.wait_for("--session-id");
+
+    // Ctrl+A o: an opencode tab.
+    tui.send("\x01");
+    tui.send("o");
+    tui.wait_for_row(1, "4○");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn reopen_restores_agent_tabs_in_order() {
+    // A stored mixed row (claude id, gemini id, codex tab- sentinel) reopens
+    // as the same tab row: claude and gemini resume (gemini with the BARE
+    // uuid, its prefix stripped), the codex tab- sentinel respawns fresh (a
+    // kommand0 mint is never a resume target). All three entries survive quit.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": [
+                "11111111-1111-1111-1111-111111111111",
+                "gemini:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"
+            ]
+        }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[
+            ("KOMMAND0_CLAUDE_BIN", "embed-stub"),
+            ("KOMMAND0_CODEX_BIN", "embed-stub"),
+            ("KOMMAND0_GEMINI_BIN", "embed-stub"),
+        ],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("--resume"); // tab 1 (claude) resumed, not freshly created
+    tui.wait_for("11111111"); // and it is the active tab
+    tui.wait_for_row(1, "2✦"); // gemini and codex kinds restored, in order
+    tui.wait_for_row(1, "3>");
+
+    // Ctrl+A 2: the gemini tab resumed with the BARE uuid (prefix stripped).
+    tui.send("\x01");
+    tui.send("2");
+    tui.wait_for("--resume bbbbbbbb");
+
+    // Ctrl+A 3: the codex tab reopened fresh (no session args).
+    tui.send("\x01");
+    tui.send("3");
+    tui.wait_for("ARGS:[]");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    // Quit does not reap: the whole row is still stored for the next reopen.
+    let st = tui.read_state();
+    assert_eq!(
+        st["embedded_sessions"]["w1"],
+        serde_json::json!([
+            "11111111-1111-1111-1111-111111111111",
+            "gemini:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"
+        ]),
+        "all three seeded entries survive quit: {st}"
+    );
+}
+
+#[test]
+fn codex_exit_hint_is_captured_and_resumed() {
+    // A codex tab prints `codex resume <uuid>` when its session closes; the
+    // reap captures that id in place of the tab- sentinel, and the next
+    // reopen resumes it. Quit doesn't reap, so the captured entry survives.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": ["codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"]
+        }
+    })
+    .to_string();
+    let mut tui =
+        Tui::launch_with(Some(state), &[("KOMMAND0_CODEX_BIN", "embed-stub-exit-hint")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("HINT-STUB-READY");
+    tui.wait_for("ARGS:[]"); // the tab- sentinel opens fresh, no resume argv
+
+    // One byte: the stub prints the close-time hint and exits. The reap
+    // captures the id, drops the dead tab (focus falls back to the tree) and
+    // persists the swap synchronously; poll the state file for it.
+    tui.send("x");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = tui.read_state();
+        if st["embedded_sessions"]["w1"][0]
+            == serde_json::json!("codex:019f7db3-4810-7213-83c7-58e1e93baded")
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "captured id never persisted; state: {st}; screen:\n{}",
+                tui.screen()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Reopen the workspace: the captured id resumes (positional subcommand).
+    tui.send("e");
+    tui.wait_for("ARGS:[resume 019f7db3");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    let st = tui.read_state();
+    assert_eq!(
+        st["embedded_sessions"]["w1"],
+        serde_json::json!(["codex:019f7db3-4810-7213-83c7-58e1e93baded"]),
+        "quit does not reap: the captured entry survives: {st}"
+    );
+}
+
+#[test]
+fn codex_early_capture_survives_quit() {
+    // Codex prints nothing on SIGTERM, so a codex tab still open at quit can
+    // only resume via the store poller: after the tab spawns, a rollout file
+    // whose meta matches the workspace cwd appears in the (test-seam) store,
+    // the poller captures its uuid into the entry while the tab is LIVE, and
+    // the entry survives detach and quit; the reopen resumes it.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": ["codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"]
+        }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[
+            ("KOMMAND0_CODEX_BIN", "embed-stub"),
+            ("KOMMAND0_CODEX_SESSIONS_DIR", store.path().to_str().unwrap()),
+        ],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("ARGS:[]"); // the tab- sentinel opens fresh
+
+    // Only now (after the spawn stamped its `since`) does the rollout
+    // appear, exactly like a real codex writing it at session start.
+    let uuid = "019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa";
+    let day_dir = store
+        .path()
+        .join(chrono::Local::now().date_naive().format("%Y/%m/%d").to_string());
+    std::fs::create_dir_all(&day_dir).unwrap();
+    let meta = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "type": "session_meta",
+        "payload": {
+            "id": uuid,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "cwd": d,
+            "originator": "codex-tui",
+            "cli_version": "0.145.0",
+        }
+    });
+    std::fs::write(
+        day_dir.join(format!("rollout-2026-01-01T00-00-00-{uuid}.jsonl")),
+        format!("{meta}\n"),
+    )
+    .unwrap();
+
+    // The poller captures it and the event loop persists synchronously.
+    let want = format!("codex:{uuid}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = tui.read_state();
+        if st["embedded_sessions"]["w1"][0] == serde_json::json!(want) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "early capture never persisted; state: {st}; screen:\n{}",
+                tui.screen()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Detach: the teardown capture SIGTERMs the stub (which, like real
+    // codex, prints nothing on TERM); the captured entry must survive.
+    tui.send("\x01");
+    tui.send("d");
+    tui.wait_gone("EMBED-STUB-READY");
+    // Reopen: the captured id resumes (positional `resume <uuid>` argv).
+    tui.send("e");
+    tui.wait_for("ARGS:[resume 019faaaa");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    let st = tui.read_state();
+    assert_eq!(
+        st["embedded_sessions"]["w1"],
+        serde_json::json!([want]),
+        "the early-captured id survives quit: {st}"
+    );
+}
+
+#[test]
+fn opencode_live_at_quit_captures_on_sigterm() {
+    // The whole M1 chain, end to end: a live opencode tab at quit is
+    // SIGTERMed, its exit summary (with the resumable session id) drains
+    // into the grid, the scan adopts it in the sentinel's slot, and the
+    // state is saved BEFORE the process exits.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": ["opencode:tab-oooooooo-oooo-oooo-oooo-oooooooooooo"]
+        }
+    })
+    .to_string();
+    let mut tui =
+        Tui::launch_with(Some(state), &[("KOMMAND0_OPENCODE_BIN", "embed-stub-term-hint")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("TERM-STUB-READY"); // printed after the TERM trap is installed
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    let st = tui.read_state();
+    assert_eq!(
+        st["embedded_sessions"]["w1"],
+        serde_json::json!(["opencode:ses_e2eQuitCapture42"]),
+        "the SIGTERM-printed id is captured and saved before exit: {st}"
+    );
+}
+
+#[test]
 fn enter_opens_embedded_claude_by_default() {
     // Phase 3: opening a workspace (Enter) launches the embedded claude — no more
     // old stream output+composer.
@@ -841,7 +1169,7 @@ fn failed_resume_shows_error_and_forgets_the_id() {
             "working_dir": d, "active": true, "created_at": 0
         }],
         "sessions": [],
-        "embedded_sessions": { "w1": ["dead-session-id"] }
+        "embedded_sessions": { "w1": ["dddddddd-dddd-dddd-dddd-dddddddddddd"] }
     })
     .to_string();
     let mut tui = Tui::launch_with(
@@ -914,20 +1242,24 @@ fn stale_resume_auto_heals_to_a_fresh_session() {
             "working_dir": d, "active": true, "created_at": 0
         }],
         "sessions": [],
-        "embedded_sessions": { "w1": ["gone-session-id"] }
+        "embedded_sessions": { "w1": ["99999999-9999-9999-9999-999999999999"] }
     })
     .to_string();
     let mut tui = Tui::launch_with(
         Some(state),
         &[("KOMMAND0_CLAUDE_BIN", "embed-stub-resume-miss")],
     );
+    // Wide enough that the heal banner's tail (the claude-only store
+    // parenthetical asserted below) isn't clipped by the right pane's border.
+    tui.resize(ROWS, 240);
 
     tui.wait_for("demo");
     tui.send("l");
     tui.wait_for("demo-ws");
     tui.send("j");
     tui.send("e"); // open -> resume the gone session (stub stays alive on the error)
-    tui.wait_for("not found in Claude's store"); // detected, healed in place with a new session
+    tui.wait_for("not found in claude's store"); // detected, healed in place with a new session
+    tui.wait_for("~/.claude/projects"); // the claude heal banner names claude's store
     tui.wait_for("1 live"); // still embedded — the slot now holds the fresh session
 
     tui.send("\x01");
@@ -944,7 +1276,7 @@ fn stale_resume_auto_heals_to_a_fresh_session() {
     assert_eq!(ids.len(), 1, "exactly one fresh session persisted: {st}");
     assert_ne!(
         ids[0].as_str(),
-        Some("gone-session-id"),
+        Some("99999999-9999-9999-9999-999999999999"),
         "the stale resume id should be replaced, not re-persisted: {st}"
     );
 }

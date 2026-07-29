@@ -26,11 +26,23 @@ const EMBEDDED_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "[Ctrl+A] then [c]",
-        description: "New session tab",
+        description: "New Claude Code tab",
     },
     KeyBinding {
         keys: "[Ctrl+A] then [s]",
         description: "New shell tab (reopens fresh)",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [e]",
+        description: "New codex tab",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [g]",
+        description: "New gemini tab",
+    },
+    KeyBinding {
+        keys: "[Ctrl+A] then [o]",
+        description: "New opencode tab",
     },
     KeyBinding {
         keys: "[Ctrl+A] then [ / ]",

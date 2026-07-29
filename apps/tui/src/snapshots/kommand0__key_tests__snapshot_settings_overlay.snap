@@ -1,6 +1,6 @@
 ---
 source: apps/tui/src/main.rs
-assertion_line: 5195
+assertion_line: 6414
 expression: "render_to_string(&mut app, 100, 30)"
 ---
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
@@ -8,6 +8,12 @@ expression: "render_to_string(&mut app, 100, 30)"
 │  > claude_args           --model opus                                                            │
 │    claude_bin            (default)                                                               │
 │    shell                 (default)                                                               │
+│    codex_args            (default)                                                               │
+│    codex_bin             (default)                                                               │
+│    gemini_args           (default)                                                               │
+│    gemini_bin            (default)                                                               │
+│    opencode_args         (default)                                                               │
+│    opencode_bin          (default)                                                               │
 │    notify                (default)                                                               │
 │    theme                 (default)                                                               │
 │    status_refresh_secs   (default)                                                               │
@@ -16,12 +22,6 @@ expression: "render_to_string(&mut app, 100, 30)"
 │    keybindings / theme_colors: edit /home/user/.config/kommand0/config.json                      │
 │                                                                                                  │
 │    j/k move · Enter edit · Esc close                                                             │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

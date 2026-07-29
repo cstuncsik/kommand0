@@ -5,6 +5,31 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Codex, gemini and opencode session tabs**: `Ctrl+A e`/`g`/`o` (and the
+  "New codex/gemini/opencode" palette entries) open an embedded `codex`,
+  `gemini` or `opencode` alongside the Claude and shell tabs. New config
+  fields `codex_bin`/`codex_args`, `gemini_bin`/`gemini_args` and
+  `opencode_bin`/`opencode_args` mirror claude's pair, with `KOMMAND0_CODEX_BIN`,
+  `KOMMAND0_GEMINI_BIN` and `KOMMAND0_OPENCODE_BIN` env overrides taking
+  precedence. Gemini tabs resume their conversation when the workspace
+  reopens (like Claude tabs). Codex and opencode tabs capture the session id
+  their CLI prints when a session closes and resume it on reopen; quitting
+  kommand0 (or detaching a workspace) now gracefully terminates them first
+  and captures the id opencode prints on SIGTERM, and codex session ids are
+  captured from codex's own session store right after the tab starts, so a
+  codex tab still open at quit, or lost to a kommand0 crash, resumes too.
+  Anything uncaptured still reopens fresh.
+
+### Fixed
+
+- The right pane's border title and the status bar's mode badge now name the
+  active tab's kind (previously always "claude", wrong for shell tabs).
+- Reopening a claude or gemini tab whose persisted entry isn't a kommand0-minted
+  uuid (hand-edited or corrupt `state.json`) now persists the fresh session's id
+  in the entry's place, instead of keeping the junk entry forever.
+
 ## [0.23.1] - 2026-07-25
 
 ### Changed
