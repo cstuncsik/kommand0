@@ -16,7 +16,7 @@ mod settings;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyEvent, KeyEventKind};
 use kommand0_core::{AppState, Config, DEFAULT_PROFILE, RepoEntry, SessionStatus, Workspace};
@@ -481,6 +481,12 @@ pub(crate) struct SessionTab {
     pub(crate) pane: pane::Pane,
     was_resume: bool,
     spawned: Instant,
+    /// The store-scan cutoff stamped just before this pane spawned, kept on
+    /// fresh codex tabs (the ones whose early-capture poller was armed) so
+    /// the quit-time sweep can re-run the store match once for a tab still
+    /// on its `tab-` sentinel (see [`App::sweep_codex_captures`]). `None`
+    /// for every other kind and for resumed codex tabs.
+    capture_since: Option<SystemTime>,
     /// When the reap first observed the child exited; bounds the capture
     /// kinds' drain-defer (see [`App::reap_embedded`] and
     /// [`EXIT_DRAIN_GRACE`]). Runtime-only, never persisted.
@@ -782,10 +788,10 @@ pub(crate) struct App {
     cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>>,
 
     /// Codex early-capture poller → event-loop channel carrying
-    /// `(workspace_id, tab_id, captured entry)`. `None` when not wired
-    /// (unit tests), which also disables the pollers entirely; see
-    /// [`Self::request_codex_early_capture`].
-    codex_capture_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String, String)>>,
+    /// `(workspace_id, tab_id, captured entry, spawn generation)`. `None`
+    /// when not wired (unit tests), which also disables the pollers
+    /// entirely; see [`Self::request_codex_early_capture`].
+    codex_capture_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String, String, Instant)>>,
 
     /// User config (claude passthrough + tunables), loaded once at startup.
     pub(crate) config: Config,
@@ -1359,8 +1365,19 @@ impl App {
         ws_name: &str,
         prior_id: Option<&str>,
     ) -> bool {
+        // The codex early-capture cutoff is stamped BEFORE the spawn: codex
+        // writes its rollout at session start, so a cutoff taken after
+        // spawn+persist could land past the rollout's creation on a
+        // pathologically slow persist and reject the very session being
+        // captured (the matcher's 2s skew grace notwithstanding).
+        let since = SystemTime::now();
         match self.spawn_pane(kind, ws_dir, prior_id) {
             Ok((pane, session_id, was_resume)) => {
+                // One spawn stamp shared by the poller request and the tab:
+                // the poller echoes it back as its generation, and
+                // [`Self::apply_codex_capture`] drops an event whose stamp
+                // doesn't match the live tab's.
+                let spawned = Instant::now();
                 // A brand-new tab persists its minted entry; a reopen whose
                 // junk prior id was replaced by a fresh mint (session_args'
                 // uuid guard) converges on the mint in place, like heal_resume,
@@ -1394,7 +1411,7 @@ impl App {
                 // (whether `codex resume` mints a new rollout is unverified;
                 // their exit hint still updates the entry on a clean close).
                 if kind == TabKind::Codex && !was_resume {
-                    self.request_codex_early_capture(ws_id, &session_id, ws_dir);
+                    self.request_codex_early_capture(ws_id, &session_id, ws_dir, since, spawned);
                 }
                 self.embedded
                     .entry(ws_id.to_string())
@@ -1403,7 +1420,8 @@ impl App {
                         id: session_id,
                         pane,
                         was_resume,
-                        spawned: Instant::now(),
+                        spawned,
+                        capture_since: (kind == TabKind::Codex && !was_resume).then_some(since),
                         exit_seen: None,
                         kind,
                     });
@@ -1445,6 +1463,8 @@ impl App {
             "resume miss: session {gone_id} not found in {}'s store for {ws_dir}; starting fresh",
             kind.label()
         );
+        // Pre-spawn cutoff stamp for the early store capture (see spawn_tab).
+        let since = SystemTime::now();
         match self.spawn_pane(kind, ws_dir, None) {
             Ok((pane, new_id, was_resume)) => {
                 // In place (same index) so the persisted order matches the
@@ -1453,9 +1473,11 @@ impl App {
                 self.state.replace_embedded_session(ws_id, gone_id, &new_id);
                 self.save_state();
                 // A heal spawn is always a fresh codex session: re-arm the
-                // early store capture for the new sentinel.
+                // early store capture for the new sentinel. `now` doubles as
+                // the generation stamp (it is what the slot replace below
+                // stores as `spawned`).
                 if kind == TabKind::Codex {
-                    self.request_codex_early_capture(ws_id, &new_id, ws_dir);
+                    self.request_codex_early_capture(ws_id, &new_id, ws_dir, since, now);
                 }
                 if let Some(sessions) = self.embedded.get_mut(ws_id)
                     && let Some(slot) = sessions.tabs.iter().position(|t| t.id == gone_id)
@@ -1465,6 +1487,7 @@ impl App {
                         pane,
                         was_resume,
                         spawned: now,
+                        capture_since: (kind == TabKind::Codex).then_some(since),
                         exit_seen: None,
                         kind,
                     };
@@ -1496,27 +1519,37 @@ impl App {
     /// prints nothing on SIGTERM, but it writes its rollout file (with the
     /// session id) at session START, so polling the store right after the
     /// spawn captures an id that survives a kommand0 crash or quit, not just
-    /// a clean close. Sends `(ws_id, tab_id, "codex:<uuid>")` back to the
-    /// event loop on a match (see [`kommand0_core::latest_codex_rollout`]
-    /// for the matching rules); gives up silently after
-    /// [`CODEX_EARLY_CAPTURE_POLLS`] rounds, degrading to fresh-open like
-    /// any other miss. Tx-gated like `request_branch_status_refresh`: unit
-    /// tests never wire `codex_capture_tx`, so they spawn no threads and
-    /// never touch a developer's real `~/.codex/sessions`. No inflight
-    /// guard on purpose: one shot per spawned tab, at most one send, and a
-    /// stale/duplicate event is dropped by [`Self::adopt_captured_hint`].
-    /// Known ambiguity, bounded by that same guard: two near-simultaneous
-    /// fresh codex tabs in one workspace (or a detach-then-fast-reopen,
-    /// where the old tab's poller may still be running) can cross-attribute
-    /// two just-created, still-empty sessions.
-    fn request_codex_early_capture(&self, ws_id: &str, tab_id: &str, ws_dir: &str) {
+    /// a clean close. Sends `(ws_id, tab_id, "codex:<uuid>", spawned)` back
+    /// to the event loop on a match (see
+    /// [`kommand0_core::latest_codex_rollout`] for the matching rules);
+    /// gives up silently after [`CODEX_EARLY_CAPTURE_POLLS`] rounds,
+    /// degrading to fresh-open like any other miss. `since` is stamped by
+    /// the caller just BEFORE the pane spawn; `spawned` is the tab's
+    /// generation stamp, echoed back so [`Self::apply_codex_capture`] can
+    /// drop this poller's event once the same sentinel has been respawned
+    /// by a newer process (detach then fast reopen). Tx-gated like
+    /// `request_branch_status_refresh`: unit tests never wire
+    /// `codex_capture_tx`, so they spawn no threads and never touch a
+    /// developer's real `~/.codex/sessions`. No inflight guard on purpose:
+    /// one shot per spawned tab, at most one send, and a stale/duplicate
+    /// event is dropped by the generation guard plus
+    /// [`Self::adopt_captured_hint`]. Known ambiguity, bounded by that
+    /// adopt guard: two near-simultaneous fresh codex tabs in one workspace
+    /// can cross-attribute two just-created, still-empty sessions.
+    fn request_codex_early_capture(
+        &self,
+        ws_id: &str,
+        tab_id: &str,
+        ws_dir: &str,
+        since: SystemTime,
+        spawned: Instant,
+    ) {
         let Some(tx) = self.codex_capture_tx.clone() else {
             return; // not wired (unit tests: no threads, no real store reads)
         };
         let Some(store) = kommand0_core::codex_sessions_dir() else {
             return; // no home dir: nowhere to look
         };
-        let since = std::time::SystemTime::now();
         let ws_id = ws_id.to_string();
         let tab_id = tab_id.to_string();
         let cwd = std::path::PathBuf::from(ws_dir);
@@ -1525,7 +1558,7 @@ impl App {
                 if let Some(uuid) = kommand0_core::latest_codex_rollout(&store, &cwd, since) {
                     // A send failure means the app quit: the capture is
                     // lost, which is exactly the pre-capture behavior.
-                    let _ = tx.send((ws_id, tab_id, format!("codex:{uuid}")));
+                    let _ = tx.send((ws_id, tab_id, format!("codex:{uuid}"), spawned));
                     return;
                 }
                 std::thread::sleep(CODEX_EARLY_CAPTURE_POLL_EVERY);
@@ -1533,27 +1566,48 @@ impl App {
         });
     }
 
-    /// Apply a codex early-capture event on the event loop: adopt the
-    /// captured entry (the shared guards drop stale events: tab closed, id
-    /// already present, workspace gone), rename the live runtime tab to keep
-    /// the SessionTab.id == persisted-entry invariant, and migrate the
-    /// id-keyed activity state so a background tab's seen watermark survives
-    /// the rename (a reset watermark reads as unseen output, which would
-    /// latch a false "needs you" and fire a phantom notification). A missing
-    /// runtime tab is the detached-before-capture case: the persisted entry
-    /// still adopts, which is the point of early capture.
-    /// (`WorkspaceSessions::last_active` may keep the old id; the prefix-l
-    /// chord then degrades to a no-op, harmless.)
-    fn apply_codex_capture(&mut self, ws_id: &str, tab_id: &str, captured: &str) {
+    /// Apply a codex early-capture event on the event loop. An event whose
+    /// `generation` doesn't match the live runtime tab's spawn stamp is a
+    /// stale poller's and is dropped whole: detach then reopen respawns the
+    /// SAME `tab-` sentinel with a NEW process, and the old process's
+    /// poller must not rename the entry off the old rollout (nor cross-fire
+    /// with the new tab's poller). Otherwise adopt the captured entry (the
+    /// shared guards drop the other stale shapes: tab closed, id already
+    /// present, workspace gone), rename the live runtime tab to keep the
+    /// SessionTab.id == persisted-entry invariant, and migrate the id-keyed
+    /// activity state so the rename is invisible: a reset seen watermark
+    /// reads as unseen output (a false "needs you" latch and a phantom
+    /// notification), a stale `last_active` degrades Ctrl+A l to a no-op,
+    /// and a dropped `waiting_response` entry blinks the spinner for a
+    /// tick. A missing runtime tab is the detached-before-capture case: the
+    /// persisted entry still adopts (with no generation to check; the
+    /// entry-still-present adopt guard bounds it), which is the point of
+    /// early capture.
+    fn apply_codex_capture(
+        &mut self,
+        ws_id: &str,
+        tab_id: &str,
+        captured: &str,
+        generation: Instant,
+    ) {
+        if let Some(tab) = self
+            .embedded
+            .get(ws_id)
+            .and_then(|s| s.tabs.iter().find(|t| t.id == tab_id))
+            && tab.spawned != generation
+        {
+            return;
+        }
         if !self.adopt_captured_hint(ws_id, tab_id, captured) {
             return;
         }
-        if let Some(tab) = self
-            .embedded
-            .get_mut(ws_id)
-            .and_then(|s| s.tabs.iter_mut().find(|t| t.id == tab_id))
-        {
-            tab.id = captured.to_string();
+        if let Some(sessions) = self.embedded.get_mut(ws_id) {
+            if let Some(tab) = sessions.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.id = captured.to_string();
+            }
+            if sessions.last_active.as_deref() == Some(tab_id) {
+                sessions.last_active = Some(captured.to_string());
+            }
         }
         if let Some(v) = self.pane_seen.remove(tab_id) {
             self.pane_seen.insert(captured.to_string(), v);
@@ -1573,7 +1627,60 @@ impl App {
         if self.attention.remove(tab_id) {
             self.attention.insert(captured.to_string());
         }
+        if self.waiting_response.remove(tab_id) {
+            self.waiting_response.insert(captured.to_string());
+        }
         self.save_state();
+    }
+
+    /// Quit-time complement of the early-capture poller: the event loop is
+    /// about to break, so a poller's send can no longer be received, and a
+    /// codex tab opened shortly before quit would keep its `tab-` sentinel
+    /// forever (codex prints no hint on SIGTERM). Give every live codex tab
+    /// still on its sentinel ONE final synchronous store scan (no polling,
+    /// no sleeps), using the cutoff stamped at its spawn; adoption rides
+    /// the normal apply path, whose per-adoption save is the
+    /// persist-before-exit guarantee. A miss stays a fresh-open like any
+    /// other. `store` is resolved by the caller
+    /// ([`kommand0_core::codex_sessions_dir`]); tests pass a temp store.
+    fn sweep_codex_captures(&mut self, store: &std::path::Path) {
+        let mut captures: Vec<(String, String, String, Instant)> = Vec::new();
+        for (ws_id, sessions) in &self.embedded {
+            let Some(ws) = self.workspaces.iter().find(|w| &w.id == ws_id) else {
+                continue; // workspace gone: nothing to adopt into
+            };
+            for tab in &sessions.tabs {
+                // Still on its sentinel? An adopted entry's bare part is a
+                // valid resume target; a sentinel's never is (the same test
+                // as the reap's forget arm).
+                if tab.kind != TabKind::Codex
+                    || tab
+                        .kind
+                        .resume_args(tab.id.strip_prefix(tab.kind.id_prefix()).unwrap_or(&tab.id))
+                        .is_some()
+                {
+                    continue;
+                }
+                let Some(since) = tab.capture_since else {
+                    continue; // resumed tab: no poller was armed (non-goal)
+                };
+                if let Some(uuid) = kommand0_core::latest_codex_rollout(
+                    store,
+                    std::path::Path::new(&ws.working_dir),
+                    since,
+                ) {
+                    captures.push((
+                        ws_id.clone(),
+                        tab.id.clone(),
+                        format!("codex:{uuid}"),
+                        tab.spawned,
+                    ));
+                }
+            }
+        }
+        for (ws_id, tab_id, captured, generation) in captures {
+            self.apply_codex_capture(&ws_id, &tab_id, &captured, generation);
+        }
     }
 
     /// The active session's pane for the selected workspace, if any.
@@ -4292,9 +4399,9 @@ async fn run(
     app.cleanup_tx = Some(cleanup_tx);
 
     // Codex early-capture pollers → event loop, carrying the captured entry
-    // as `(workspace_id, tab_id, "codex:<uuid>")`.
+    // as `(workspace_id, tab_id, "codex:<uuid>", spawn generation)`.
     let (codex_capture_tx, mut codex_capture_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, String, String)>();
+        tokio::sync::mpsc::unbounded_channel::<(String, String, String, Instant)>();
     app.codex_capture_tx = Some(codex_capture_tx);
 
     // Redraw coalescing for the wake arm: the visible pane's `output_seq` as of
@@ -4396,11 +4503,11 @@ async fn run(
                 }
                 app.request_branch_status_refresh();
             }
-            Some((ws_id, tab_id, captured)) = codex_capture_rx.recv() => {
+            Some((ws_id, tab_id, captured, generation)) = codex_capture_rx.recv() => {
                 // `app` holds `codex_capture_tx` for the loop's lifetime, so
                 // recv() can never yield None while the loop runs (same
                 // pattern as the worker arms above).
-                app.apply_codex_capture(&ws_id, &tab_id, &captured);
+                app.apply_codex_capture(&ws_id, &tab_id, &captured, generation);
             }
             maybe_event = input_rx.recv() => {
                 let Some(event) = maybe_event else { break; }; // reader thread ended
@@ -4669,6 +4776,18 @@ async fn run(
         }
     }
 
+    // The quit window for codex early capture: a queued poller result (or
+    // one that lands during the teardown below) can no longer be received by
+    // the loop, and losing it would leave the tab's `tab-` sentinel forever
+    // (codex prints no hint on SIGTERM). Drain the queue, then give every
+    // codex tab still on its sentinel one final synchronous store scan; both
+    // run BEFORE the teardown, and each adoption persists itself.
+    while let Ok((ws_id, tab_id, captured, generation)) = codex_capture_rx.try_recv() {
+        app.apply_codex_capture(&ws_id, &tab_id, &captured, generation);
+    }
+    if let Some(store) = kommand0_core::codex_sessions_dir() {
+        app.sweep_codex_captures(&store);
+    }
     // Tear down all embedded panes in one shared grace period (not N×250ms).
     app.shutdown_panes();
     Ok(())
@@ -6206,9 +6325,12 @@ mod key_tests {
     fn codex_early_capture_adopts_id_and_updates_the_runtime_tab() {
         // An early-capture event for a LIVE codex tab: the entry is adopted
         // in its slot (title moved), the runtime tab is renamed to keep the
-        // SessionTab.id == persisted-entry invariant, and the id-keyed seen
-        // watermark migrates (a reset watermark would read as unseen output
-        // and false-latch "needs you" on a background tab).
+        // SessionTab.id == persisted-entry invariant, and the id-keyed
+        // activity state migrates: a reset seen watermark would read as
+        // unseen output and false-latch "needs you" on a background tab, a
+        // stale `last_active` would degrade Ctrl+A l to a no-op, and a
+        // dropped `waiting_response` entry would blink the spinner for a
+        // tick.
         let mut app = test_app();
         app.state.add_embedded_session("w1", "codex:tab-c1");
         app.state.set_embedded_session_title("w1", "codex:tab-c1", "build");
@@ -6216,12 +6338,18 @@ mod key_tests {
         cx.kind = TabKind::Codex;
         app.embedded.insert(
             "w1".to_string(),
-            WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None },
+            WorkspaceSessions {
+                tabs: vec![cx],
+                active: 0,
+                last_active: Some("codex:tab-c1".to_string()),
+            },
         );
         app.viewed_seq.insert("codex:tab-c1".to_string(), 7);
+        app.waiting_response.insert("codex:tab-c1".to_string());
 
         let captured = "codex:019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa";
-        app.apply_codex_capture("w1", "codex:tab-c1", captured);
+        let generation = app.embedded["w1"].tabs[0].spawned;
+        app.apply_codex_capture("w1", "codex:tab-c1", captured, generation);
 
         assert_eq!(
             app.state.embedded_session_ids("w1"),
@@ -6246,18 +6374,114 @@ mod key_tests {
             !app.viewed_seq.contains_key("codex:tab-c1"),
             "nothing stays keyed under the old id"
         );
+        assert_eq!(
+            app.embedded["w1"].last_active.as_deref(),
+            Some(captured),
+            "Ctrl+A l keeps pointing at the renamed tab"
+        );
+        assert!(
+            app.waiting_response.contains(captured)
+                && !app.waiting_response.contains("codex:tab-c1"),
+            "the activity spinner follows without a one-tick blip"
+        );
+    }
+
+    #[test]
+    fn codex_early_capture_drops_a_stale_generation() {
+        // Detach then reopen respawns the SAME `tab-` sentinel with a NEW
+        // process; an event from the OLD process's poller (carrying the old
+        // spawn stamp) must not rename the new tab's entry off the old
+        // process's rollout.
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "codex:tab-c1");
+        let mut cx = tab("codex:tab-c1", &["-c", "sleep 30"]);
+        cx.kind = TabKind::Codex;
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None },
+        );
+        let stale = app.embedded["w1"].tabs[0].spawned + Duration::from_secs(1);
+
+        let captured = "codex:019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa";
+        app.apply_codex_capture("w1", "codex:tab-c1", captured, stale);
+
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &["codex:tab-c1".to_string()],
+            "a stale poller's event never writes"
+        );
+        assert_eq!(
+            app.embedded["w1"].tabs[0].id, "codex:tab-c1",
+            "the runtime tab keeps its sentinel"
+        );
+    }
+
+    #[test]
+    fn quit_sweep_captures_an_uncaptured_codex_sentinel() {
+        // The quit window: a codex tab opened shortly before quit whose
+        // poller hasn't fired (or whose event was lost with the loop) must
+        // still converge via the final synchronous store sweep, or it keeps
+        // its `tab-` sentinel forever (codex prints no hint on SIGTERM).
+        let uuid = "019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa";
+        let store = tempfile::tempdir().unwrap();
+        let day = store
+            .path()
+            .join(chrono::Local::now().date_naive().format("%Y/%m/%d").to_string());
+        std::fs::create_dir_all(&day).unwrap();
+        // A codex-0.145.0-shaped line 1 for w1's working_dir (the format is
+        // pinned by core's latest_codex_rollout tests).
+        let line = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": uuid,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "cwd": "/tmp/alpha",
+                "originator": "codex-tui",
+            }
+        });
+        std::fs::write(
+            day.join(format!("rollout-2026-01-01T00-00-00-{uuid}.jsonl")),
+            format!("{line}\n"),
+        )
+        .unwrap();
+
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "codex:tab-c1");
+        let mut cx = tab("codex:tab-c1", &["-c", "sleep 30"]);
+        cx.kind = TabKind::Codex;
+        cx.capture_since = Some(SystemTime::now() - Duration::from_secs(5));
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None },
+        );
+
+        app.sweep_codex_captures(store.path());
+
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &[format!("codex:{uuid}")],
+            "the sweep adopts the rollout id before teardown"
+        );
+        assert_eq!(
+            app.embedded["w1"].tabs[0].id,
+            format!("codex:{uuid}"),
+            "the runtime tab follows"
+        );
     }
 
     #[test]
     fn codex_early_capture_guards_stale_events() {
         let captured = "codex:019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa";
+        // No case below has a runtime tab, so the generation guard never
+        // engages and any stamp will do.
+        let generation = Instant::now();
 
         // (a) The captured id is already persisted in the workspace (a
         // duplicate would break the id-keyed invariants): no write.
         let mut app = test_app();
         app.state.add_embedded_session("w1", captured);
         app.state.add_embedded_session("w1", "codex:tab-c1");
-        app.apply_codex_capture("w1", "codex:tab-c1", captured);
+        app.apply_codex_capture("w1", "codex:tab-c1", captured, generation);
         assert_eq!(
             app.state.embedded_session_ids("w1"),
             &[captured.to_string(), "codex:tab-c1".to_string()],
@@ -6267,7 +6491,7 @@ mod key_tests {
         // (b) The entry was closed/forgotten before the event landed: it
         // must not resurrect via replace's absent-old append fallback.
         let mut app = test_app();
-        app.apply_codex_capture("w1", "codex:tab-c1", captured);
+        app.apply_codex_capture("w1", "codex:tab-c1", captured, generation);
         assert!(
             app.state.embedded_session_ids("w1").is_empty(),
             "a late capture for a closed tab does not resurrect it"
@@ -6278,7 +6502,7 @@ mod key_tests {
         // the id survives without a live pane).
         let mut app = test_app();
         app.state.add_embedded_session("w1", "codex:tab-c1");
-        app.apply_codex_capture("w1", "codex:tab-c1", captured);
+        app.apply_codex_capture("w1", "codex:tab-c1", captured, generation);
         assert_eq!(
             app.state.embedded_session_ids("w1"),
             &[captured.to_string()],
@@ -8398,6 +8622,7 @@ mod key_tests {
             pane: pane::Pane::spawn("sh", args, std::path::Path::new("/tmp"), 24, 80).unwrap(),
             was_resume: false,
             spawned: Instant::now(),
+            capture_since: None,
             exit_seen: None,
             kind: TabKind::Claude,
         }
@@ -9064,6 +9289,7 @@ mod key_tests {
                     .unwrap(),
                     was_resume: true,
                     spawned: Instant::now(),
+                    capture_since: None,
                     exit_seen: None,
                     kind: TabKind::Claude,
                 },
