@@ -110,6 +110,13 @@ const RESUME_CHECK_WINDOW: Duration = Duration::from_secs(8);
 /// this often within [`RESUME_CHECK_WINDOW`].
 const RESUME_MISS_SCAN_EVERY: Duration = Duration::from_millis(500);
 
+/// How long the reap keeps deferring an exited capture-kind (codex/opencode)
+/// tab whose PTY reader thread hasn't drained yet. The exit hint lives in the
+/// child's final output chunk, so the grid can only be scanned once the reader
+/// hit EOF; the grace bounds a pathological never-finishing reader so a dead
+/// tab can't linger forever (its capture then just misses = reopen fresh).
+const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
 /// Decide the spawn args for a tab of `kind`, given the persisted entry to
 /// reopen (`prior_id`, kind-prefixed) or `None` for a brand-new tab.
 ///
@@ -136,7 +143,7 @@ fn session_args(kind: TabKind, prior_id: Option<&str>) -> (Vec<String>, Option<S
     }
     if !kind.resumable() {
         // Fresh every open; a brand-new tab mints its persisted sentinel here
-        // (the capture kinds' carry `tab-`, see TabKind::sentinel_prefix).
+        // (the capture kinds' sentinels carry `tab-`, see TabKind::sentinel_prefix).
         return (
             Vec::new(),
             prior_id
@@ -337,8 +344,9 @@ impl TabKind {
             // after it still parse (`codex resume <uuid> [OPTIONS]`).
             TabKind::Codex => AppState::is_valid_session_uuid(bare)
                 .then(|| vec!["resume".to_string(), bare.to_string()]),
-            // Opencode's own id shape: `ses_` + an ascii-alphanumeric tail,
-            // total length at most 64.
+            // Opencode's own id shape: `ses_` + an ascii-alphanumeric tail.
+            // The 64-char cap is a sanity bound against pathological grid
+            // captures; observed real ids are ~30 chars.
             TabKind::Opencode => {
                 let tail = bare.strip_prefix("ses_")?;
                 (!tail.is_empty()
@@ -395,6 +403,17 @@ impl TabKind {
         }
     }
 
+    /// Whether this kind's CLI prints a resumable session id when a session
+    /// closes (a [`Self::capture_exit_hint`] scan can succeed). The reap
+    /// defers these kinds' exited tabs until their PTY reader has drained
+    /// (see [`App::reap_embedded`]): the hint lives in the final chunk.
+    fn captures_exit_hint(self) -> bool {
+        match self {
+            TabKind::Codex | TabKind::Opencode => true,
+            TabKind::Claude | TabKind::Shell | TabKind::Gemini => false,
+        }
+    }
+
     /// Scan a dead pane's final grid for the session id the tool prints
     /// when a session closes (`codex resume <uuid>` / `opencode -s
     /// ses_<id>`); non-capture kinds never scan. Right-to-left iteration
@@ -443,6 +462,10 @@ pub(crate) struct SessionTab {
     pub(crate) pane: pane::Pane,
     was_resume: bool,
     spawned: Instant,
+    /// When the reap first observed the child exited; bounds the capture
+    /// kinds' drain-defer (see [`App::reap_embedded`] and
+    /// [`EXIT_DRAIN_GRACE`]). Runtime-only, never persisted.
+    exit_seen: Option<Instant>,
     pub(crate) kind: TabKind,
 }
 
@@ -1196,8 +1219,8 @@ impl App {
     /// Enter (spawning if needed) the embedded interactive `claude` pane for the
     /// selected workspace. Experimental PTY-passthrough toggle (Phase 2).
     /// Open the selected workspace's embedded sessions: if it has none live yet,
-    /// restore every persisted entry as a tab of its kind (resumable kinds
-    /// resume their session, the rest respawn fresh; or start a first claude
+    /// restore every persisted entry as a tab of its kind (a valid resume
+    /// target resumes, the rest respawn fresh; or start a first claude
     /// session when none are stored), then focus the first tab.
     fn toggle_embedded(&mut self) {
         let Some(ws) = self.selected_workspace() else {
@@ -1346,6 +1369,7 @@ impl App {
                         pane,
                         was_resume,
                         spawned: Instant::now(),
+                        exit_seen: None,
                         kind,
                     });
                 true
@@ -1401,6 +1425,7 @@ impl App {
                         pane,
                         was_resume,
                         spawned: now,
+                        exit_seen: None,
                         kind,
                     };
                 }
@@ -1984,12 +2009,26 @@ impl App {
         for (ws_id, sessions) in self.embedded.iter_mut() {
             for tab in sessions.tabs.iter_mut() {
                 if let Some(code) = tab.pane.try_wait() {
+                    // The exit hint lives in the child's FINAL output chunk,
+                    // and try_wait can report the exit before the reader
+                    // thread has parsed that chunk into the grid. Reader EOF
+                    // arrives only once the child exited AND the PTY was
+                    // fully read (see Pane::reader_finished), so defer a
+                    // capture kind's reap until the reader finishes, bounded
+                    // by a grace from the first observed exit so a
+                    // pathological never-finishing reader can't pin a dead
+                    // tab forever. The other kinds keep their per-tick reap
+                    // latency; a deferred tab is reaped on a later tick.
+                    if tab.kind.captures_exit_hint() && !tab.pane.reader_finished() {
+                        let seen = *tab.exit_seen.get_or_insert(now);
+                        if now.saturating_duration_since(seen) < EXIT_DRAIN_GRACE {
+                            continue;
+                        }
+                    }
                     // The session id the tool printed at close, if any (None
                     // for non-capture kinds). One full-grid serialization per
                     // tab EXIT, not per tick, so the miss-scan pacing concern
-                    // doesn't apply here. Known micro-race: the reader thread
-                    // may not have drained the final chunk yet; a lost race
-                    // is just no-hint = reopen fresh.
+                    // doesn't apply here.
                     let hint = tab.kind.capture_exit_hint(&tab.pane.screen_contents());
                     exited.push((
                         ws_id.clone(),
@@ -5478,6 +5517,9 @@ mod key_tests {
         for i in 1..=5 {
             wait_exit(&mut s.tabs[i].pane);
         }
+        // The capture kinds drain-defer their reap; wait so one call reaps.
+        wait_drained(&s.tabs[3].pane);
+        wait_drained(&s.tabs[4].pane);
         app.embedded.insert("w1".to_string(), s);
 
         app.reap_embedded(Instant::now());
@@ -5521,10 +5563,13 @@ mod key_tests {
         let mut s = WorkspaceSessions { tabs: vec![cx, oc], active: 0, last_active: None };
         wait_exit(&mut s.tabs[0].pane);
         wait_exit(&mut s.tabs[1].pane);
-        // The reader thread drains the hint after the exit; wait for both so
-        // the capture can't lose the race in this test.
+        // The reader thread drains the hint after the exit; wait for the
+        // hint AND the reader's EOF so the single reap below takes the
+        // no-defer fast path deterministically.
         wait_screen_contains(&s.tabs[0].pane, "codex resume ");
         wait_screen_contains(&s.tabs[1].pane, "opencode -s ");
+        wait_drained(&s.tabs[0].pane);
+        wait_drained(&s.tabs[1].pane);
         app.embedded.insert("w1".to_string(), s);
 
         app.reap_embedded(Instant::now());
@@ -5549,6 +5594,43 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn reap_defers_capture_until_the_reader_drains() {
+        // No drain wait before reaping (unlike the fast-path test above): the
+        // child prints the hint and exits in one breath, so try_wait can
+        // report the exit before the reader thread parsed the hint chunk.
+        // Reaped tick-style like the real event loop, the tab must be
+        // DEFERRED until reader EOF and the capture must still land.
+        let mut app = test_app();
+        app.config.codex_bin = Some("sh".to_string()); // never launch a real codex
+        app.state.add_embedded_session("w1", "codex:tab-c1");
+        let mut cx = tab(
+            "codex:tab-c1",
+            &["-c", "printf 'codex resume 019f7db3-4810-7213-83c7-58e1e93baded\\r\\n'"],
+        );
+        cx.kind = TabKind::Codex;
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None },
+        );
+
+        let want = vec!["codex:019f7db3-4810-7213-83c7-58e1e93baded".to_string()];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            app.reap_embedded(Instant::now());
+            if app.state.embedded_session_ids("w1") == want.as_slice() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the captured id never persisted: {:?}",
+                app.state.embedded_session_ids("w1")
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.embedded.contains_key("w1"), "the drained tab was reaped");
+    }
+
+    #[tokio::test]
     async fn reap_keeps_a_reprinted_captured_id_without_rewriting() {
         // A reopened captured id whose close re-prints the same id: keep the
         // entry (and its title) with no write. A replace here would trip
@@ -5564,6 +5646,7 @@ mod key_tests {
         let mut s = WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None };
         wait_exit(&mut s.tabs[0].pane);
         wait_screen_contains(&s.tabs[0].pane, "codex resume ");
+        wait_drained(&s.tabs[0].pane); // one reap call must not drain-defer
         app.embedded.insert("w1".to_string(), s);
 
         app.reap_embedded(Instant::now());
@@ -5599,6 +5682,7 @@ mod key_tests {
         let mut s = WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None };
         wait_exit(&mut s.tabs[0].pane);
         wait_screen_contains(&s.tabs[0].pane, "codex resume ");
+        wait_drained(&s.tabs[0].pane); // one reap call must not drain-defer
         app.embedded.insert("w1".to_string(), s);
 
         app.reap_embedded(Instant::now());
@@ -5637,8 +5721,10 @@ mod key_tests {
         let mut s = WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None };
         wait_exit(&mut s.tabs[0].pane);
         // Wait for the drain too, or the skip assertion below could pass
-        // vacuously on a lost reader race (no hint = nothing to skip).
+        // vacuously on a lost reader race (no hint = nothing to skip); the
+        // reader-EOF wait also keeps the single reap off the drain-defer.
         wait_screen_contains(&s.tabs[0].pane, "codex resume ");
+        wait_drained(&s.tabs[0].pane);
         app.embedded.insert("w1".to_string(), s);
 
         app.reap_embedded(Instant::now());
@@ -7770,6 +7856,7 @@ mod key_tests {
             pane: pane::Pane::spawn("sh", args, std::path::Path::new("/tmp"), 24, 80).unwrap(),
             was_resume: false,
             spawned: Instant::now(),
+            exit_seen: None,
             kind: TabKind::Claude,
         }
     }
@@ -7783,6 +7870,17 @@ mod key_tests {
         while pane.try_wait().is_none() {
             assert!(Instant::now() < deadline, "pane did not exit");
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Poll until the pane's reader thread finished (EOF = fully drained
+    /// grid): after this, a single `reap_embedded` call processes a
+    /// capture-kind tab deterministically instead of drain-deferring it.
+    fn wait_drained(pane: &pane::Pane) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pane.reader_finished() {
+            assert!(Instant::now() < deadline, "pane reader never drained");
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -8424,6 +8522,7 @@ mod key_tests {
                     .unwrap(),
                     was_resume: true,
                     spawned: Instant::now(),
+                    exit_seen: None,
                     kind: TabKind::Claude,
                 },
                 tab("b", &["-c", "sleep 30"]),
