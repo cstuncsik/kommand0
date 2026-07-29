@@ -130,6 +130,11 @@ impl Tui {
         }
         cmd.env("PATH", path_env);
         cmd.env("TERM", "xterm-256color");
+        // Hermetic codex store: point the early-capture poller at a dir that
+        // doesn't exist by default, so no test ever reads the developer's
+        // real ~/.codex/sessions (tests that need a store override this
+        // below via extra_env).
+        cmd.env("KOMMAND0_CODEX_SESSIONS_DIR", state_dir.path().join("codex-sessions"));
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -896,6 +901,145 @@ fn codex_exit_hint_is_captured_and_resumed() {
         st["embedded_sessions"]["w1"],
         serde_json::json!(["codex:019f7db3-4810-7213-83c7-58e1e93baded"]),
         "quit does not reap: the captured entry survives: {st}"
+    );
+}
+
+#[test]
+fn codex_early_capture_survives_quit() {
+    // Codex prints nothing on SIGTERM, so a codex tab still open at quit can
+    // only resume via the store poller: after the tab spawns, a rollout file
+    // whose meta matches the workspace cwd appears in the (test-seam) store,
+    // the poller captures its uuid into the entry while the tab is LIVE, and
+    // the entry survives detach and quit; the reopen resumes it.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": ["codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"]
+        }
+    })
+    .to_string();
+    let mut tui = Tui::launch_with(
+        Some(state),
+        &[
+            ("KOMMAND0_CODEX_BIN", "embed-stub"),
+            ("KOMMAND0_CODEX_SESSIONS_DIR", store.path().to_str().unwrap()),
+        ],
+    );
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("ARGS:[]"); // the tab- sentinel opens fresh
+
+    // Only now (after the spawn stamped its `since`) does the rollout
+    // appear, exactly like a real codex writing it at session start.
+    let uuid = "019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa";
+    let day_dir = store
+        .path()
+        .join(chrono::Local::now().date_naive().format("%Y/%m/%d").to_string());
+    std::fs::create_dir_all(&day_dir).unwrap();
+    let meta = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "type": "session_meta",
+        "payload": {
+            "id": uuid,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "cwd": d,
+            "originator": "codex-tui",
+            "cli_version": "0.145.0",
+        }
+    });
+    std::fs::write(
+        day_dir.join(format!("rollout-2026-01-01T00-00-00-{uuid}.jsonl")),
+        format!("{meta}\n"),
+    )
+    .unwrap();
+
+    // The poller captures it and the event loop persists synchronously.
+    let want = format!("codex:{uuid}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = tui.read_state();
+        if st["embedded_sessions"]["w1"][0] == serde_json::json!(want) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "early capture never persisted; state: {st}; screen:\n{}",
+                tui.screen()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Detach: the teardown capture SIGTERMs the stub (which, like real
+    // codex, prints nothing on TERM); the captured entry must survive.
+    tui.send("\x01");
+    tui.send("d");
+    tui.wait_gone("EMBED-STUB-READY");
+    // Reopen: the captured id resumes (positional `resume <uuid>` argv).
+    tui.send("e");
+    tui.wait_for("ARGS:[resume 019faaaa");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    let st = tui.read_state();
+    assert_eq!(
+        st["embedded_sessions"]["w1"],
+        serde_json::json!([want]),
+        "the early-captured id survives quit: {st}"
+    );
+}
+
+#[test]
+fn opencode_live_at_quit_captures_on_sigterm() {
+    // The whole M1 chain, end to end: a live opencode tab at quit is
+    // SIGTERMed, its exit summary (with the resumable session id) drains
+    // into the grid, the scan adopts it in the sentinel's slot, and the
+    // state is saved BEFORE the process exits.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": d }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": d, "active": true, "created_at": 0
+        }],
+        "sessions": [],
+        "embedded_sessions": {
+            "w1": ["opencode:tab-oooooooo-oooo-oooo-oooo-oooooooooooo"]
+        }
+    })
+    .to_string();
+    let mut tui =
+        Tui::launch_with(Some(state), &[("KOMMAND0_OPENCODE_BIN", "embed-stub-term-hint")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("TERM-STUB-READY"); // printed after the TERM trap is installed
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+    let st = tui.read_state();
+    assert_eq!(
+        st["embedded_sessions"]["w1"],
+        serde_json::json!(["opencode:ses_e2eQuitCapture42"]),
+        "the SIGTERM-printed id is captured and saved before exit: {st}"
     );
 }
 

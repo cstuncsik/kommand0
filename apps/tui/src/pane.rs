@@ -30,7 +30,9 @@ use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 /// a child that ignores SIGHUP (e.g. a Node-based `claude`) would survive. The
 /// pane therefore guarantees teardown itself: SIGHUP, a brief grace poll, then
 /// SIGKILL by pid (see [`Pane::terminate`]). SIGKILL closes the PTY slave, which
-/// gives the reader thread EOF so the detached thread ends.
+/// gives the reader thread EOF so the detached thread ends. Teardown capture
+/// may first SIGTERM a capture-kind child ([`Pane::signal_term`]) and drain the
+/// reader for its exit hint; the SIGHUP-then-SIGKILL guarantee still runs after.
 pub struct Pane {
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
@@ -516,6 +518,24 @@ impl Pane {
             return; // already exited
         }
         let _ = self.killer.kill(); // SIGHUP (gentle)
+    }
+
+    /// Send SIGTERM by pid without waiting (no reap loop). portable-pty's
+    /// cloned killer only delivers SIGHUP, and opencode prints its resumable
+    /// session id on SIGTERM, not SIGHUP, so the teardown exit-hint capture
+    /// needs the explicit signal. The caller drains the reader afterwards;
+    /// the SIGHUP-then-SIGKILL guarantee ([`Pane::terminate`]) still runs
+    /// later for a child that ignores this.
+    pub fn signal_term(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return; // already exited
+        }
+        if let Some(pid) = self.child.process_id() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
     }
 
     /// SIGKILL a child that's still alive (by pid) and briefly reap it, so a
@@ -1038,6 +1058,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("SIGHUP-ignoring child survived terminate()");
+    }
+
+    #[test]
+    fn signal_term_delivers_sigterm() {
+        // The teardown-capture contract: signal_term must deliver SIGTERM
+        // (not SIGHUP/SIGKILL), the trap below only fires on TERM. `sleep 60
+        // & wait $!` rather than a bare sleep: a foreground sleep defers the
+        // trap until sleep exits, a waited background child runs it promptly.
+        // READY gates the signal so it can't race the trap installation.
+        let mut pane = Pane::spawn(
+            "sh",
+            &["-c", "trap 'printf TERMED; exit 0' TERM; printf READY; sleep 60 & wait $!"],
+            &tmp(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_until(&pane, "READY"), "screen:\n{}", pane.screen_contents());
+        pane.signal_term();
+        assert!(wait_until(&pane, "TERMED"), "screen:\n{}", pane.screen_contents());
     }
 
     #[test]

@@ -117,6 +117,21 @@ const RESUME_MISS_SCAN_EVERY: Duration = Duration::from_millis(500);
 /// tab can't linger forever (its capture then just misses = reopen fresh).
 const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
+/// One shared grace for the teardown capture's reader drain (never per pane):
+/// a teardown with capture-kind tabs SIGTERMs them and waits at most this long
+/// for every reader to hit EOF before scanning the grids (see
+/// [`App::capture_panes_on_teardown`]). A SIGTERM-ignoring child just
+/// forfeits its scan at the deadline; a teardown with no capture-kind tabs
+/// pays nothing.
+const TEARDOWN_CAPTURE_GRACE: Duration = Duration::from_millis(1500);
+
+/// The codex early-capture poller's budget: this many store polls, this far
+/// apart (~15s total). Codex writes its rollout within a couple of seconds of
+/// a normal start; the slack covers a slow disk or a trust prompt answered
+/// promptly. A miss (e.g. the prompt answered later) degrades to fresh-open.
+const CODEX_EARLY_CAPTURE_POLLS: u32 = 30;
+const CODEX_EARLY_CAPTURE_POLL_EVERY: Duration = Duration::from_millis(500);
+
 /// Decide the spawn args for a tab of `kind`, given the persisted entry to
 /// reopen (`prior_id`, kind-prefixed) or `None` for a brand-new tab.
 ///
@@ -266,10 +281,14 @@ pub(crate) enum DiffFocus {
 /// What a session tab runs. Every kind persists an entry across restarts:
 /// claude and gemini pre-assign a uuid and reopen with `--resume` (the
 /// conversation continues); codex and opencode capture the session id their
-/// CLI prints at exit and resume it on reopen (without a captured hint they
-/// respawn fresh); a shell's process, unlike a conversation, can't be
-/// resumed. All kind-specific knobs live in the accessors below, one match
-/// arm each, so adding a kind is a compile-guided fill-in.
+/// CLI prints when a session closes (teardown SIGTERMs them at quit/detach
+/// to coax that hint out, see [`App::capture_panes_on_teardown`]), and codex
+/// ids are additionally captured from its session store right after a fresh
+/// spawn (see [`App::request_codex_early_capture`]); captured ids resume on
+/// reopen, anything uncaptured respawns fresh. A shell's process, unlike a
+/// conversation, can't be resumed. All kind-specific knobs live in the
+/// accessors below, one match arm each, so adding a kind is a
+/// compile-guided fill-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TabKind {
     Claude,
@@ -762,6 +781,12 @@ pub(crate) struct App {
     /// Cleanup worker → event-loop channel carrying `(workspace_id, result)`.
     cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>>,
 
+    /// Codex early-capture poller → event-loop channel carrying
+    /// `(workspace_id, tab_id, captured entry)`. `None` when not wired
+    /// (unit tests), which also disables the pollers entirely; see
+    /// [`Self::request_codex_early_capture`].
+    codex_capture_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String, String)>>,
+
     /// User config (claude passthrough + tunables), loaded once at startup.
     pub(crate) config: Config,
     /// Where the settings page writes config fields back to. Resolved once at
@@ -853,6 +878,7 @@ impl App {
             cleanup_inflight: HashSet::new(),
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
+            codex_capture_tx: None,
             config: Config::default(),
             config_path: Config::effective_path(),
             settings: None,
@@ -1361,6 +1387,15 @@ impl App {
                             .to_string(),
                     ));
                 }
+                // A fresh codex spawn (a brand-new tab, or a reopened
+                // non-resume entry: both start a NEW codex session) arms the
+                // one-shot store poller so the session id is captured while
+                // the tab is still running. Resumes are out of scope
+                // (whether `codex resume` mints a new rollout is unverified;
+                // their exit hint still updates the entry on a clean close).
+                if kind == TabKind::Codex && !was_resume {
+                    self.request_codex_early_capture(ws_id, &session_id, ws_dir);
+                }
                 self.embedded
                     .entry(ws_id.to_string())
                     .or_default()
@@ -1417,6 +1452,11 @@ impl App {
                 // user's tab title onto the fresh id.
                 self.state.replace_embedded_session(ws_id, gone_id, &new_id);
                 self.save_state();
+                // A heal spawn is always a fresh codex session: re-arm the
+                // early store capture for the new sentinel.
+                if kind == TabKind::Codex {
+                    self.request_codex_early_capture(ws_id, &new_id, ws_dir);
+                }
                 if let Some(sessions) = self.embedded.get_mut(ws_id)
                     && let Some(slot) = sessions.tabs.iter().position(|t| t.id == gone_id)
                 {
@@ -1450,6 +1490,90 @@ impl App {
                 false
             }
         }
+    }
+
+    /// One-shot store poller for a FRESH codex tab (M2 early capture): codex
+    /// prints nothing on SIGTERM, but it writes its rollout file (with the
+    /// session id) at session START, so polling the store right after the
+    /// spawn captures an id that survives a kommand0 crash or quit, not just
+    /// a clean close. Sends `(ws_id, tab_id, "codex:<uuid>")` back to the
+    /// event loop on a match (see [`kommand0_core::latest_codex_rollout`]
+    /// for the matching rules); gives up silently after
+    /// [`CODEX_EARLY_CAPTURE_POLLS`] rounds, degrading to fresh-open like
+    /// any other miss. Tx-gated like `request_branch_status_refresh`: unit
+    /// tests never wire `codex_capture_tx`, so they spawn no threads and
+    /// never touch a developer's real `~/.codex/sessions`. No inflight
+    /// guard on purpose: one shot per spawned tab, at most one send, and a
+    /// stale/duplicate event is dropped by [`Self::adopt_captured_hint`].
+    /// Known ambiguity, bounded by that same guard: two near-simultaneous
+    /// fresh codex tabs in one workspace (or a detach-then-fast-reopen,
+    /// where the old tab's poller may still be running) can cross-attribute
+    /// two just-created, still-empty sessions.
+    fn request_codex_early_capture(&self, ws_id: &str, tab_id: &str, ws_dir: &str) {
+        let Some(tx) = self.codex_capture_tx.clone() else {
+            return; // not wired (unit tests: no threads, no real store reads)
+        };
+        let Some(store) = kommand0_core::codex_sessions_dir() else {
+            return; // no home dir: nowhere to look
+        };
+        let since = std::time::SystemTime::now();
+        let ws_id = ws_id.to_string();
+        let tab_id = tab_id.to_string();
+        let cwd = std::path::PathBuf::from(ws_dir);
+        std::thread::spawn(move || {
+            for _ in 0..CODEX_EARLY_CAPTURE_POLLS {
+                if let Some(uuid) = kommand0_core::latest_codex_rollout(&store, &cwd, since) {
+                    // A send failure means the app quit: the capture is
+                    // lost, which is exactly the pre-capture behavior.
+                    let _ = tx.send((ws_id, tab_id, format!("codex:{uuid}")));
+                    return;
+                }
+                std::thread::sleep(CODEX_EARLY_CAPTURE_POLL_EVERY);
+            }
+        });
+    }
+
+    /// Apply a codex early-capture event on the event loop: adopt the
+    /// captured entry (the shared guards drop stale events: tab closed, id
+    /// already present, workspace gone), rename the live runtime tab to keep
+    /// the SessionTab.id == persisted-entry invariant, and migrate the
+    /// id-keyed activity state so a background tab's seen watermark survives
+    /// the rename (a reset watermark reads as unseen output, which would
+    /// latch a false "needs you" and fire a phantom notification). A missing
+    /// runtime tab is the detached-before-capture case: the persisted entry
+    /// still adopts, which is the point of early capture.
+    /// (`WorkspaceSessions::last_active` may keep the old id; the prefix-l
+    /// chord then degrades to a no-op, harmless.)
+    fn apply_codex_capture(&mut self, ws_id: &str, tab_id: &str, captured: &str) {
+        if !self.adopt_captured_hint(ws_id, tab_id, captured) {
+            return;
+        }
+        if let Some(tab) = self
+            .embedded
+            .get_mut(ws_id)
+            .and_then(|s| s.tabs.iter_mut().find(|t| t.id == tab_id))
+        {
+            tab.id = captured.to_string();
+        }
+        if let Some(v) = self.pane_seen.remove(tab_id) {
+            self.pane_seen.insert(captured.to_string(), v);
+        }
+        if self.pane_pending.remove(tab_id) {
+            self.pane_pending.insert(captured.to_string());
+        }
+        if let Some(v) = self.pane_active_until.remove(tab_id) {
+            self.pane_active_until.insert(captured.to_string(), v);
+        }
+        if let Some(v) = self.viewed_seq.remove(tab_id) {
+            self.viewed_seq.insert(captured.to_string(), v);
+        }
+        if let Some(v) = self.last_output_at.remove(tab_id) {
+            self.last_output_at.insert(captured.to_string(), v);
+        }
+        if self.attention.remove(tab_id) {
+            self.attention.insert(captured.to_string());
+        }
+        self.save_state();
     }
 
     /// The active session's pane for the selected workspace, if any.
@@ -1804,12 +1928,15 @@ impl App {
     /// tree's `x`): kill the processes to free their memory but keep the
     /// persisted session entries, so reopening restores every tab (Claude tabs
     /// resume their conversation, shell tabs respawn fresh; a mid-turn Claude is
-    /// interrupted, only what it flushed resumes). The keep-the-ids counterpart
+    /// interrupted, only what it flushed resumes). Codex/opencode tabs are
+    /// SIGTERMed first so a printed session id can be captured (see
+    /// [`Self::capture_panes_on_teardown`]). The keep-the-ids counterpart
     /// of [`Self::close_active_session`].
     fn detach_selected_workspace(&mut self) {
         let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
             return;
         };
+        self.capture_panes_on_teardown(Some(&ws_id));
         // The workspace-scoped twin of [`Self::shutdown_panes`]: dropping the
         // panes one by one costs a full SIGHUP→250ms→SIGKILL each (a Node
         // `claude` ignores SIGHUP), so a 9-tab detach would freeze the UI
@@ -1985,6 +2112,31 @@ impl App {
         }
     }
 
+    /// Shared guards for adopting a captured session id in place of a tab's
+    /// persisted entry, used by the reap's exit-hint capture, the teardown
+    /// capture, and the codex early-capture events. Rejects: a self-replace
+    /// (a reopened captured id re-printing itself needs no write, and a
+    /// replace would trip `replace_embedded_session`'s old == new
+    /// debug_assert); a workspace that no longer exists (the replace's
+    /// absent-old append fallback would orphan an entry); a captured id
+    /// already persisted in the workspace (a duplicate breaks the id-keyed
+    /// restore/remove invariants); and a tab entry no longer present (the
+    /// tab was closed/forgotten, so a late async capture must not resurrect
+    /// it via that same append fallback). On pass the entry is replaced in
+    /// its slot (order and the user's tab title survive); the CALLER saves
+    /// state.
+    fn adopt_captured_hint(&mut self, ws_id: &str, tab_id: &str, captured: &str) -> bool {
+        if captured == tab_id || !self.workspaces.iter().any(|w| w.id == ws_id) {
+            return false;
+        }
+        let ids = self.state.embedded_session_ids(ws_id);
+        if ids.iter().any(|id| id == captured) || !ids.iter().any(|id| id == tab_id) {
+            return false;
+        }
+        self.state.replace_embedded_session(ws_id, tab_id, captured);
+        true
+    }
+
     /// Drop session tabs whose child has exited, and whole workspaces that were
     /// deleted. Applies the per-tab resume-failure net, keeps the active tab
     /// stable by identity, and leaves Embedded focus if the selected workspace
@@ -2099,12 +2251,13 @@ impl App {
         // removed), so a write here would ghost-append next to the fresh
         // slot. A capture kind that printed its session id at close adopts
         // it in place of its entry (slot order and the user's tab title
-        // survive; reopen resumes it). Without a usable hint, a
-        // non-resumable tab (e.g. a shell the user `exit`ed) that exited is
-        // gone for good: forget its persisted entry so reopen doesn't
-        // respawn a tab the user ended. Resumable kinds keep their id (an
-        // exited conversation resumes later). Owned set (not &String): the
-        // save_state below needs &mut self.
+        // survive; reopen resumes it). Without a usable hint, a tab whose
+        // entry can't resume anything (a shell the user `exit`ed, a capture
+        // kind still on its tab- sentinel) is gone for good: forget its
+        // persisted entry so reopen doesn't respawn a tab the user ended.
+        // Resume-eligible entries keep their id (an exited conversation
+        // resumes later). Owned set (not &String): the save_state below
+        // needs &mut self.
         let live_ws: HashSet<String> = self.workspaces.iter().map(|w| w.id.clone()).collect();
         let mut changed = false;
         for (ws_id, tab_id, was_resume, spawned, code, kind, hint) in &exited {
@@ -2112,22 +2265,26 @@ impl App {
                 continue; // healed above
             }
             match hint.as_deref() {
-                // The adopt guards: a re-printed own id needs no write (a
-                // replace would trip its old == new debug_assert), an id
-                // already persisted in another slot must not be duplicated
-                // (both fall through to the forget arm), and a workspace
-                // deleted this same tick must not gain an orphan entry via
-                // replace's absent-old append fallback.
-                Some(captured)
-                    if captured != tab_id
-                        && !self.state.embedded_session_ids(ws_id).iter().any(|id| id == captured)
-                        && live_ws.contains(ws_id) =>
-                {
-                    self.state.replace_embedded_session(ws_id, tab_id, captured);
+                // A reopened captured id whose close re-prints the same id:
+                // keep the entry with no write (a replace would trip its
+                // old == new debug_assert). Everything else routes through
+                // the shared adopt guards; a rejected hint (duplicate slot,
+                // entry/workspace gone) falls through like a no-hint exit.
+                Some(captured) if captured == tab_id => {}
+                Some(captured) if self.adopt_captured_hint(ws_id, tab_id, captured) => {
                     changed = true;
                 }
-                Some(captured) if captured == tab_id => {}
-                _ if !kind.resumable() => {
+                // Forget only what can't resume: a non-resumable tab whose
+                // entry is no resume target either (a shell the user exited,
+                // a capture kind still on its tab- sentinel) is gone for
+                // good. A capture-kind entry already carrying a captured id
+                // (early store capture) survives a hint-less exit exactly
+                // like an exited claude tab: the session resumes on reopen.
+                _ if !kind.resumable()
+                    && kind
+                        .resume_args(tab_id.strip_prefix(kind.id_prefix()).unwrap_or(tab_id))
+                        .is_none() =>
+                {
                     self.state.remove_embedded_session(ws_id, tab_id);
                     changed = true;
                 }
@@ -2338,13 +2495,91 @@ impl App {
         }
     }
 
+    /// Capture session ids from capture-kind (codex/opencode) panes before a
+    /// teardown that kills live panes while keeping their entries (quit,
+    /// detach, the Stop button, workspace cleanup): SIGTERM them (opencode
+    /// prints its resumable session id on SIGTERM; codex prints nothing but
+    /// the signal is a bounded courtesy), wait ONE shared grace for their
+    /// readers to drain, scan the drained grids with the same exit-hint
+    /// capture the reap uses, and persist any adoption immediately (at quit
+    /// nothing else saves state after the event loop breaks). `only_ws`
+    /// scopes it to one workspace; `None` covers all (quit). Already-exited
+    /// capture-kind panes are scanned too (the user exited opencode and quit
+    /// before the reap's drain-defer fired). With no capture-kind tabs in
+    /// scope this returns immediately, so claude/shell-only teardowns stay
+    /// instant; the worst case adds [`TEARDOWN_CAPTURE_GRACE`] once.
+    fn capture_panes_on_teardown(&mut self, only_ws: Option<&str>) {
+        let in_scope = |ws_id: &str| only_ws.is_none_or(|w| w == ws_id);
+        let mut targets = 0usize;
+        for (ws_id, sessions) in self.embedded.iter_mut() {
+            if !in_scope(ws_id) {
+                continue;
+            }
+            for tab in sessions.tabs.iter_mut() {
+                if !tab.kind.captures_exit_hint() {
+                    continue;
+                }
+                targets += 1;
+                tab.pane.signal_term(); // no-op on an already-exited child
+            }
+        }
+        if targets == 0 {
+            return;
+        }
+        // Reader EOF means the exit hint's final chunk is on the grid (see
+        // Pane::reader_finished). A SIGTERM-ignoring child never EOFs; the
+        // deadline bounds the wait and its (possibly truncated) grid is
+        // simply not scanned: a partial hint must never be adopted.
+        let deadline = Instant::now() + TEARDOWN_CAPTURE_GRACE;
+        loop {
+            let all_drained = self
+                .embedded
+                .iter()
+                .filter(|(ws_id, _)| in_scope(ws_id))
+                .flat_map(|(_, s)| s.tabs.iter())
+                .filter(|t| t.kind.captures_exit_hint())
+                .all(|t| t.pane.reader_finished());
+            if all_drained || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let captures: Vec<(String, String, String)> = self
+            .embedded
+            .iter()
+            .filter(|(ws_id, _)| in_scope(ws_id))
+            .flat_map(|(ws_id, s)| {
+                s.tabs
+                    .iter()
+                    .filter(|t| t.kind.captures_exit_hint() && t.pane.reader_finished())
+                    .filter_map(|t| {
+                        t.kind
+                            .capture_exit_hint(&t.pane.screen_contents())
+                            .map(|hint| (ws_id.clone(), t.id.clone(), hint))
+                    })
+            })
+            .collect();
+        let mut changed = false;
+        for (ws_id, tab_id, hint) in &captures {
+            if self.adopt_captured_hint(ws_id, tab_id, hint) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_state();
+        }
+    }
+
     /// Tear down every embedded pane in ONE shared grace period at quit. Dropping
     /// the panes one by one runs a full SIGHUP→250ms→SIGKILL per pane, so quitting
     /// with N sessions that ignore SIGHUP (a Node `claude` does) froze the UI
     /// ~N×250ms. Instead: broadcast SIGHUP to every child, wait once, then
     /// SIGKILL+reap any straggler — the per-pane `Drop` then sees an exited child
-    /// and returns instantly.
+    /// and returns instantly. Capture-kind panes get the SIGTERM exit-hint
+    /// capture first (see [`Self::capture_panes_on_teardown`]), which also
+    /// persists state: nothing else saves after the event loop breaks.
     fn shutdown_panes(&mut self) {
+        self.capture_panes_on_teardown(None);
         let mut any = false;
         for sessions in self.embedded.values_mut() {
             for tab in sessions.tabs.iter_mut() {
@@ -2808,6 +3043,10 @@ impl App {
         };
         // Tear down the embedded pane synchronously (Drop terminates the child),
         // so the worktree dir isn't removed while a claude is running inside it.
+        // Capture first: on a cleanup FAILURE the workspace and its entries
+        // survive, and a live codex/opencode session would otherwise be lost
+        // while its entry persisted.
+        self.capture_panes_on_teardown(Some(ws_id));
         self.embedded.remove(ws_id);
         self.cleanup_inflight.insert(ws_id.to_string());
         self.cleanup_result.remove(ws_id);
@@ -4052,6 +4291,12 @@ async fn run(
         tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
     app.cleanup_tx = Some(cleanup_tx);
 
+    // Codex early-capture pollers → event loop, carrying the captured entry
+    // as `(workspace_id, tab_id, "codex:<uuid>")`.
+    let (codex_capture_tx, mut codex_capture_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, String, String)>();
+    app.codex_capture_tx = Some(codex_capture_tx);
+
     // Redraw coalescing for the wake arm: the visible pane's `output_seq` as of
     // the last draw, when that draw happened, and whether the wake arm proved
     // the next frame would be identical (background-only output: skip it).
@@ -4150,6 +4395,12 @@ async fn run(
                     }
                 }
                 app.request_branch_status_refresh();
+            }
+            Some((ws_id, tab_id, captured)) = codex_capture_rx.recv() => {
+                // `app` holds `codex_capture_tx` for the loop's lifetime, so
+                // recv() can never yield None while the loop runs (same
+                // pattern as the worker arms above).
+                app.apply_codex_capture(&ws_id, &tab_id, &captured);
             }
             maybe_event = input_rx.recv() => {
                 let Some(event) = maybe_event else { break; }; // reader thread ended
@@ -4274,6 +4525,9 @@ async fn run(
                             app.cleanup_workspace_prompt(&workspace_id);
                         }
                         buttons::HitAction::StopSessionFor { workspace_id } => {
+                            // The mouse twin of detach: entries survive, so give
+                            // the capture-kind panes their exit-hint capture too.
+                            app.capture_panes_on_teardown(Some(&workspace_id));
                             app.embedded.remove(&workspace_id);
                             if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
                                 .filter(|s| s.status == SessionStatus::Running)
@@ -5694,6 +5948,33 @@ mod key_tests {
         );
     }
 
+    #[test]
+    fn reap_keeps_a_captured_id_on_a_hintless_exit() {
+        // A codex tab already carrying a captured id (early store capture)
+        // whose process dies without printing a hint: the entry survives
+        // like an exited claude tab's does (the captured session resumes on
+        // reopen); only the dead runtime tab drops. `Ctrl+A x` still
+        // forgets. Pre-clause, the forget arm deleted the good captured id.
+        let mut app = test_app();
+        let id = "codex:019f7db3-4810-7213-83c7-58e1e93baded";
+        app.state.add_embedded_session("w1", id);
+        let mut cx = tab(id, &["-c", "printf 'no hint here\\r\\n'"]);
+        cx.kind = TabKind::Codex;
+        let mut s = WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None };
+        wait_exit(&mut s.tabs[0].pane);
+        wait_drained(&s.tabs[0].pane); // one reap call must not drain-defer
+        app.embedded.insert("w1".to_string(), s);
+
+        app.reap_embedded(Instant::now());
+
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &[id.to_string()],
+            "a captured (resume-eligible) entry survives a hint-less exit"
+        );
+        assert!(!app.embedded.contains_key("w1"), "the dead tab is dropped");
+    }
+
     #[tokio::test]
     async fn reap_skips_capture_on_a_failed_resume_and_heals_fresh() {
         // A captured-resume that fails fast non-zero is healed by the
@@ -5741,6 +6022,267 @@ mod key_tests {
         assert_ne!(
             persisted[0], "codex:019f7db3-4810-7213-83c7-58e1e93baded",
             "the failed tab's hint was not captured"
+        );
+    }
+
+    /// A `sh -c` script that traps SIGTERM, prints an opencode exit hint for
+    /// `ses_id`, and exits. The trap kills the background sleep too: it
+    /// inherited the PTY slave, and reader EOF (the teardown scan gate)
+    /// needs every slave fd closed (the real tools are single processes).
+    /// `sleep & wait` rather than a foreground sleep so the trap runs
+    /// promptly; READY (printed after the trap is installed) gates the
+    /// signal against racing the installation.
+    fn term_hint_script(ses_id: &str) -> String {
+        format!(
+            "trap 'printf \"opencode -s {ses_id}\\r\\n\"; kill $! 2>/dev/null; exit 0' TERM; \
+             printf READY; sleep 60 & wait $!"
+        )
+    }
+
+    #[test]
+    fn teardown_capture_adopts_hint_from_a_sigtermed_pane() {
+        // The quit/detach path for a LIVE opencode tab: SIGTERM makes the
+        // tool print its resumable session id (verified against the real
+        // binary); the teardown drains the reader and adopts the id in the
+        // entry's slot, saving state itself (at quit nothing saves after).
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "opencode:tab-o1");
+        let script = term_hint_script("ses_TESTCAP123");
+        let mut oc = tab("opencode:tab-o1", &["-c", &script]);
+        oc.kind = TabKind::Opencode;
+        wait_screen_contains(&oc.pane, "READY");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![oc], active: 0, last_active: None },
+        );
+
+        app.capture_panes_on_teardown(None);
+
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &["opencode:ses_TESTCAP123".to_string()],
+            "the SIGTERM-printed id replaces the sentinel"
+        );
+    }
+
+    #[test]
+    fn teardown_capture_never_hangs_on_a_term_ignoring_child() {
+        // The drain is ONE shared bounded grace: a child that ignores
+        // SIGTERM (its reader never hits EOF) can't hang quit, its grid is
+        // just not scanned, and the pane is left for the kill machinery.
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "opencode:tab-o1");
+        let mut oc = tab("opencode:tab-o1", &["-c", "trap '' TERM; printf READY; sleep 60"]);
+        oc.kind = TabKind::Opencode;
+        wait_screen_contains(&oc.pane, "READY");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![oc], active: 0, last_active: None },
+        );
+
+        let start = Instant::now();
+        app.capture_panes_on_teardown(None);
+
+        assert!(
+            start.elapsed() < TEARDOWN_CAPTURE_GRACE + Duration::from_secs(1),
+            "bounded: returned once the shared grace elapsed ({:?})",
+            start.elapsed()
+        );
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &["opencode:tab-o1".to_string()],
+            "no drained hint, entry unchanged"
+        );
+        assert!(
+            !app.embedded.get_mut("w1").unwrap().tabs[0].pane.has_exited(),
+            "the TERM-ignoring child is left alive for the SIGHUP/SIGKILL teardown"
+        );
+    }
+
+    #[test]
+    fn teardown_capture_scopes_to_the_given_workspace() {
+        // Detach/stop/cleanup capture ONE workspace: the other workspace's
+        // pane must not be signaled and its entry must not change.
+        let mut app = test_app();
+        app.workspaces.push(Workspace {
+            id: "w2".into(),
+            name: "ws-two".into(),
+            repo_id: "r1".into(),
+            working_dir: "/tmp/alpha".into(),
+            active: false,
+            created_at: 0,
+            worktree_path: None,
+            branch_name: None,
+        });
+        app.state.add_embedded_session("w1", "opencode:tab-o1");
+        app.state.add_embedded_session("w2", "opencode:tab-o2");
+        let s1 = term_hint_script("ses_TESTCAPWONE");
+        let s2 = term_hint_script("ses_TESTCAPWTWO");
+        let mut o1 = tab("opencode:tab-o1", &["-c", &s1]);
+        o1.kind = TabKind::Opencode;
+        let mut o2 = tab("opencode:tab-o2", &["-c", &s2]);
+        o2.kind = TabKind::Opencode;
+        wait_screen_contains(&o1.pane, "READY");
+        wait_screen_contains(&o2.pane, "READY");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![o1], active: 0, last_active: None },
+        );
+        app.embedded.insert(
+            "w2".to_string(),
+            WorkspaceSessions { tabs: vec![o2], active: 0, last_active: None },
+        );
+
+        app.capture_panes_on_teardown(Some("w1"));
+
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &["opencode:ses_TESTCAPWONE".to_string()],
+            "the scoped workspace's hint is captured"
+        );
+        assert_eq!(
+            app.state.embedded_session_ids("w2"),
+            &["opencode:tab-o2".to_string()],
+            "the other workspace's entry is untouched"
+        );
+        assert!(
+            !app.embedded.get_mut("w2").unwrap().tabs[0].pane.has_exited(),
+            "the other workspace's pane was never signaled"
+        );
+    }
+
+    #[test]
+    fn teardown_capture_ignores_non_capture_kinds() {
+        // Claude/shell tabs never print an exit hint: zero capture targets
+        // means an immediate return (quit stays instant) and no signal.
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "claude-1");
+        let cl = tab("claude-1", &["-c", "sleep 60"]);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![cl], active: 0, last_active: None },
+        );
+
+        let start = Instant::now();
+        app.capture_panes_on_teardown(None);
+
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "zero targets: no drain wait at all ({:?})",
+            start.elapsed()
+        );
+        assert!(
+            !app.embedded.get_mut("w1").unwrap().tabs[0].pane.has_exited(),
+            "a claude pane is never SIGTERMed by the capture pass"
+        );
+    }
+
+    #[test]
+    fn teardown_capture_scans_an_already_exited_pane() {
+        // "User exited opencode, quit before the reap's drain-defer fired":
+        // the exited pane's drained grid still holds the hint, and it must
+        // count as a target (not trip the zero-target early return).
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "opencode:tab-o1");
+        let mut oc =
+            tab("opencode:tab-o1", &["-c", "printf 'opencode -s ses_TESTCAP456\\r\\n'"]);
+        oc.kind = TabKind::Opencode;
+        let mut s = WorkspaceSessions { tabs: vec![oc], active: 0, last_active: None };
+        wait_exit(&mut s.tabs[0].pane);
+        wait_screen_contains(&s.tabs[0].pane, "opencode -s ");
+        wait_drained(&s.tabs[0].pane);
+        app.embedded.insert("w1".to_string(), s);
+
+        app.capture_panes_on_teardown(None);
+
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &["opencode:ses_TESTCAP456".to_string()],
+            "the dead-but-drained grid is scanned without any reap"
+        );
+    }
+
+    #[test]
+    fn codex_early_capture_adopts_id_and_updates_the_runtime_tab() {
+        // An early-capture event for a LIVE codex tab: the entry is adopted
+        // in its slot (title moved), the runtime tab is renamed to keep the
+        // SessionTab.id == persisted-entry invariant, and the id-keyed seen
+        // watermark migrates (a reset watermark would read as unseen output
+        // and false-latch "needs you" on a background tab).
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "codex:tab-c1");
+        app.state.set_embedded_session_title("w1", "codex:tab-c1", "build");
+        let mut cx = tab("codex:tab-c1", &["-c", "printf READY; sleep 30"]);
+        cx.kind = TabKind::Codex;
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None },
+        );
+        app.viewed_seq.insert("codex:tab-c1".to_string(), 7);
+
+        let captured = "codex:019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa";
+        app.apply_codex_capture("w1", "codex:tab-c1", captured);
+
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &[captured.to_string()],
+            "the captured id replaces the sentinel in its slot"
+        );
+        assert_eq!(
+            app.state.embedded_session_title("w1", captured),
+            Some("build"),
+            "the user's tab title moves onto the captured id"
+        );
+        assert_eq!(
+            app.embedded["w1"].tabs[0].id, captured,
+            "the runtime tab follows (id == entry invariant)"
+        );
+        assert_eq!(
+            app.viewed_seq.get(captured).copied(),
+            Some(7),
+            "the viewed watermark migrates to the new id"
+        );
+        assert!(
+            !app.viewed_seq.contains_key("codex:tab-c1"),
+            "nothing stays keyed under the old id"
+        );
+    }
+
+    #[test]
+    fn codex_early_capture_guards_stale_events() {
+        let captured = "codex:019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa";
+
+        // (a) The captured id is already persisted in the workspace (a
+        // duplicate would break the id-keyed invariants): no write.
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", captured);
+        app.state.add_embedded_session("w1", "codex:tab-c1");
+        app.apply_codex_capture("w1", "codex:tab-c1", captured);
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &[captured.to_string(), "codex:tab-c1".to_string()],
+            "a duplicate capture is dropped"
+        );
+
+        // (b) The entry was closed/forgotten before the event landed: it
+        // must not resurrect via replace's absent-old append fallback.
+        let mut app = test_app();
+        app.apply_codex_capture("w1", "codex:tab-c1", captured);
+        assert!(
+            app.state.embedded_session_ids("w1").is_empty(),
+            "a late capture for a closed tab does not resurrect it"
+        );
+
+        // (c) Detached before the capture landed: no runtime tab, but the
+        // persisted entry still adopts (the point of early capture is that
+        // the id survives without a live pane).
+        let mut app = test_app();
+        app.state.add_embedded_session("w1", "codex:tab-c1");
+        app.apply_codex_capture("w1", "codex:tab-c1", captured);
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &[captured.to_string()],
+            "a detached tab's entry is still adopted"
         );
     }
 

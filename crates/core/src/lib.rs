@@ -1,3 +1,4 @@
+pub mod codex;
 pub mod config;
 pub mod git;
 pub mod id;
@@ -6,6 +7,7 @@ pub mod session;
 pub mod workspace;
 pub mod worktree;
 
+pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
 pub use git::{
     BranchStatus, FileDiff, PrChecks, PrReview, PrState, PrStatus, branch_status,
