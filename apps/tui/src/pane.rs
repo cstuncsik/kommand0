@@ -55,6 +55,15 @@ pub struct Pane {
     /// right after is the child redrawing in response; the activity tracker
     /// uses this to not count it as work.
     last_input: Option<Instant>,
+    /// Test seam: while `true`, [`Pane::reader_finished`] reports `false`.
+    /// The "child exited but the reader hasn't drained" window cannot be
+    /// held open with real processes on macOS: the kernel revokes the pty
+    /// when the session-leader child exits, so a grandchild's open slave fd
+    /// neither blocks EOF nor reliably delivers buffered output. Tests that
+    /// pin the reap's drain-defer flip this instead; everything else about
+    /// the pane stays real.
+    #[cfg(test)]
+    pub(crate) force_reader_unfinished: bool,
     rows: u16,
     cols: u16,
 }
@@ -183,6 +192,8 @@ impl Pane {
             focus_reporting,
             focus_sent: None,
             last_input: None,
+            #[cfg(test)]
+            force_reader_unfinished: false,
             rows,
             cols,
         })
@@ -507,6 +518,10 @@ impl Pane {
     /// grid: a caller scanning a dead pane's screen (e.g. exit-hint capture)
     /// can trust it is fully drained. `true` also after `Drop` took the handle.
     pub fn reader_finished(&self) -> bool {
+        #[cfg(test)]
+        if self.force_reader_unfinished {
+            return false;
+        }
         self.reader.as_ref().is_none_or(|h| h.is_finished())
     }
 

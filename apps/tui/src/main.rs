@@ -1598,7 +1598,7 @@ impl App {
         {
             return;
         }
-        if !self.adopt_captured_hint(ws_id, tab_id, captured) {
+        if !self.adopt_captured_hint(ws_id, tab_id, captured, false) {
             return;
         }
         if let Some(sessions) = self.embedded.get_mut(ws_id) {
@@ -2229,12 +2229,33 @@ impl App {
     /// already persisted in the workspace (a duplicate breaks the id-keyed
     /// restore/remove invariants); and a tab entry no longer present (the
     /// tab was closed/forgotten, so a late async capture must not resurrect
-    /// it via that same append fallback). On pass the entry is replaced in
+    /// it via that same append fallback). `from_grid` marks a hint scanned
+    /// off a pane's grid (the reap and the teardown capture); those
+    /// additionally refuse to replace a codex entry that is already
+    /// resume-eligible: the existing id is store-verified (early capture /
+    /// quit sweep) and codex never re-keys a live session, so conversation
+    /// text that happens to render `codex resume <uuid>` must not override
+    /// it. Store-sourced codex captures (`from_grid == false`) and opencode
+    /// grid hints stay adoptable over an eligible entry: opencode's exit
+    /// hint is its only authoritative source and legitimately changes when
+    /// the user switches sessions in-tab. On pass the entry is replaced in
     /// its slot (order and the user's tab title survive); the CALLER saves
     /// state.
-    fn adopt_captured_hint(&mut self, ws_id: &str, tab_id: &str, captured: &str) -> bool {
+    fn adopt_captured_hint(
+        &mut self,
+        ws_id: &str,
+        tab_id: &str,
+        captured: &str,
+        from_grid: bool,
+    ) -> bool {
         if captured == tab_id || !self.workspaces.iter().any(|w| w.id == ws_id) {
             return false;
+        }
+        if from_grid && TabKind::from_session_id(tab_id) == TabKind::Codex {
+            let bare = tab_id.strip_prefix(TabKind::Codex.id_prefix()).unwrap_or(tab_id);
+            if TabKind::Codex.resume_args(bare).is_some() {
+                return false; // never downgrade a store-verified codex id
+            }
         }
         let ids = self.state.embedded_session_ids(ws_id);
         if ids.iter().any(|id| id == captured) || !ids.iter().any(|id| id == tab_id) {
@@ -2285,10 +2306,20 @@ impl App {
                         }
                     }
                     // The session id the tool printed at close, if any (None
-                    // for non-capture kinds). One full-grid serialization per
-                    // tab EXIT, not per tick, so the miss-scan pacing concern
-                    // doesn't apply here.
-                    let hint = tab.kind.capture_exit_hint(&tab.pane.screen_contents());
+                    // for non-capture kinds). Scanned only off a DRAINED
+                    // grid: when the grace above expires with the reader
+                    // still running, the partial grid can hold a truncated
+                    // yet shape-valid token, and a partial hint must never
+                    // be adopted (the teardown capture applies the same
+                    // policy); the tab is then reaped hint-less, forget/keep
+                    // per the kind rules below. One full-grid serialization
+                    // per tab EXIT, not per tick, so the miss-scan pacing
+                    // concern doesn't apply here.
+                    let hint = tab
+                        .pane
+                        .reader_finished()
+                        .then(|| tab.kind.capture_exit_hint(&tab.pane.screen_contents()))
+                        .flatten();
                     exited.push((
                         ws_id.clone(),
                         tab.id.clone(),
@@ -2376,9 +2407,10 @@ impl App {
                 // keep the entry with no write (a replace would trip its
                 // old == new debug_assert). Everything else routes through
                 // the shared adopt guards; a rejected hint (duplicate slot,
-                // entry/workspace gone) falls through like a no-hint exit.
+                // entry/workspace gone, a codex grid hint over a
+                // store-verified id) falls through like a no-hint exit.
                 Some(captured) if captured == tab_id => {}
-                Some(captured) if self.adopt_captured_hint(ws_id, tab_id, captured) => {
+                Some(captured) if self.adopt_captured_hint(ws_id, tab_id, captured, true) => {
                     changed = true;
                 }
                 // Forget only what can't resume: a non-resumable tab whose
@@ -2668,7 +2700,7 @@ impl App {
             .collect();
         let mut changed = false;
         for (ws_id, tab_id, hint) in &captures {
-            if self.adopt_captured_hint(ws_id, tab_id, hint) {
+            if self.adopt_captured_hint(ws_id, tab_id, hint, true) {
                 changed = true;
             }
         }
@@ -4776,12 +4808,12 @@ async fn run(
         }
     }
 
-    // The quit window for codex early capture: a queued poller result (or
-    // one that lands during the teardown below) can no longer be received by
-    // the loop, and losing it would leave the tab's `tab-` sentinel forever
-    // (codex prints no hint on SIGTERM). Drain the queue, then give every
-    // codex tab still on its sentinel one final synchronous store scan; both
-    // run BEFORE the teardown, and each adoption persists itself.
+    // The quit window for codex early capture: a queued poller result can no
+    // longer be received by the loop, and losing it would leave the tab's
+    // `tab-` sentinel forever (codex prints no hint on SIGTERM). Drain the
+    // queue, then give every codex tab still on its sentinel one final
+    // synchronous store scan; each adoption persists itself. Repeated after
+    // the teardown below for anything landing during it.
     while let Ok((ws_id, tab_id, captured, generation)) = codex_capture_rx.try_recv() {
         app.apply_codex_capture(&ws_id, &tab_id, &captured, generation);
     }
@@ -4790,6 +4822,18 @@ async fn run(
     }
     // Tear down all embedded panes in one shared grace period (not N×250ms).
     app.shutdown_panes();
+    // The teardown window: shutdown_panes itself takes up to ~1.75s (the
+    // SIGTERM capture grace plus the SIGHUP grace), and a poller event or a
+    // rollout landing DURING it would be lost with the sentinel kept
+    // forever. The panes are dead now, but `embedded` still holds the tabs
+    // (the teardown kills processes, it never clears the map) and the sweep
+    // needs no live pane, so drain and sweep once more before exiting.
+    while let Ok((ws_id, tab_id, captured, generation)) = codex_capture_rx.try_recv() {
+        app.apply_codex_capture(&ws_id, &tab_id, &captured, generation);
+    }
+    if let Some(store) = kommand0_core::codex_sessions_dir() {
+        app.sweep_codex_captures(&store);
+    }
     Ok(())
 }
 
@@ -5666,8 +5710,12 @@ mod key_tests {
         // tab must both converge on the minted id, or the junk would stick
         // across restarts forever.
         let mut app = test_app();
-        // `echo` as the bin: the child prints its own argv into the pane, so
-        // the test can pin that the spawn used the mint's bare uuid.
+        // Pinned bins: never launch the real CLIs (see pick_bin's fallback).
+        // No screen assertions here: that the argv carries the mint's bare
+        // uuid is pinned by session_args_refuses_a_non_uuid_resume_target
+        // and the e2e ARGS asserts; polling this instantly-exiting pane's
+        // grid was flaky under parallel load (the output can vanish with
+        // the PTY before the reader drains).
         app.config.gemini_bin = Some("echo".to_string());
         app.config.claude_bin = Some("echo".to_string());
         app.state.add_embedded_session("w1", "gemini:--yolo");
@@ -5692,18 +5740,6 @@ mod key_tests {
         assert_eq!(s.tabs[1].id, persisted[1]);
         assert!(!s.tabs[0].was_resume, "a junk reopen is a fresh spawn, not a resume");
         assert!(!s.tabs[1].was_resume);
-        // The argv (echoed by the stand-in bin) carried the mint's bare uuid,
-        // so the running session matches the persisted entry.
-        let want = format!("--session-id {g_bare}");
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !s.tabs[0].pane.screen_contents().contains(&want) {
-            assert!(
-                Instant::now() < deadline,
-                "pane never echoed {want}:\n{}",
-                s.tabs[0].pane.screen_contents()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
     }
 
     #[test]
@@ -5968,11 +6004,13 @@ mod key_tests {
 
     #[tokio::test]
     async fn reap_defers_capture_until_the_reader_drains() {
-        // No drain wait before reaping (unlike the fast-path test above): the
-        // child prints the hint and exits in one breath, so try_wait can
-        // report the exit before the reader thread parsed the hint chunk.
-        // Reaped tick-style like the real event loop, the tab must be
-        // DEFERRED until reader EOF and the capture must still land.
+        // "try_wait reports the exit but the reader hasn't drained yet": a
+        // reap in that window must DEFER the tab whole (no scan, no forget,
+        // tab kept), then capture on a later tick once the reader finished.
+        // The window is pinned via the pane's test seam: it cannot be held
+        // open with real processes (macOS revokes the pty when the
+        // session-leader child exits, so a grandchild's slave fd doesn't
+        // block EOF), while everything else here is a real exited pane.
         let mut app = test_app();
         app.config.codex_bin = Some("sh".to_string()); // never launch a real codex
         app.state.add_embedded_session("w1", "codex:tab-c1");
@@ -5981,26 +6019,73 @@ mod key_tests {
             &["-c", "printf 'codex resume 019f7db3-4810-7213-83c7-58e1e93baded\\r\\n'"],
         );
         cx.kind = TabKind::Codex;
-        app.embedded.insert(
-            "w1".to_string(),
-            WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None },
-        );
+        let mut s = WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None };
+        wait_exit(&mut s.tabs[0].pane);
+        wait_screen_contains(&s.tabs[0].pane, "codex resume ");
+        wait_drained(&s.tabs[0].pane);
+        s.tabs[0].pane.force_reader_unfinished = true; // reopen the window
+        app.embedded.insert("w1".to_string(), s);
 
-        let want = vec!["codex:019f7db3-4810-7213-83c7-58e1e93baded".to_string()];
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            app.reap_embedded(Instant::now());
-            if app.state.embedded_session_ids("w1") == want.as_slice() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the captured id never persisted: {:?}",
-                app.state.embedded_session_ids("w1")
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // Reader "still running": one reap must defer (this fails
+        // immediately if the drain-defer is removed: the hint-less exit
+        // would forget the sentinel and drop the tab).
+        app.reap_embedded(Instant::now());
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &["codex:tab-c1".to_string()],
+            "a deferred tab's entry is untouched"
+        );
+        assert_eq!(app.embedded["w1"].tabs.len(), 1, "the undrained tab is not reaped");
+
+        // The reader finishes: the next reap captures.
+        app.embedded.get_mut("w1").unwrap().tabs[0].pane.force_reader_unfinished = false;
+        app.reap_embedded(Instant::now());
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &["codex:019f7db3-4810-7213-83c7-58e1e93baded".to_string()],
+            "the captured id replaces the sentinel once the reader drained"
+        );
         assert!(!app.embedded.contains_key("w1"), "the drained tab was reaped");
+    }
+
+    #[tokio::test]
+    async fn reap_grace_expiry_never_scans_the_undrained_grid() {
+        // A reader still not finished when EXIT_DRAIN_GRACE expires: the tab
+        // is reaped so a pathological reader can't pin it forever, but the
+        // grid is NEVER scanned, even though this one holds a fully valid
+        // hint: an undrained grid can hold a truncated yet shape-valid
+        // token, and a partial hint must never be adopted (the teardown
+        // capture has the same policy). Hint-less, the codex sentinel entry
+        // follows the forget rule. Same pane test seam as the defer test
+        // above (the window can't be held open with real processes).
+        let mut app = test_app();
+        app.config.codex_bin = Some("sh".to_string()); // never launch a real codex
+        app.state.add_embedded_session("w1", "codex:tab-c1");
+        let mut cx = tab(
+            "codex:tab-c1",
+            &["-c", "printf 'codex resume 019f7db3-4810-7213-83c7-58e1e93baded\\r\\n'"],
+        );
+        cx.kind = TabKind::Codex;
+        let mut s = WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None };
+        wait_exit(&mut s.tabs[0].pane);
+        wait_screen_contains(&s.tabs[0].pane, "codex resume ");
+        wait_drained(&s.tabs[0].pane);
+        s.tabs[0].pane.force_reader_unfinished = true; // never "finishes"
+        app.embedded.insert("w1".to_string(), s);
+
+        // First reap stamps exit_seen (= t0) and defers.
+        let t0 = Instant::now();
+        app.reap_embedded(t0);
+        assert_eq!(app.embedded["w1"].tabs.len(), 1, "still deferred inside the grace");
+
+        // Past the grace with the reader still unfinished: reaped WITHOUT a
+        // scan (adopting the grid's valid hint here means the gate is gone).
+        app.reap_embedded(t0 + EXIT_DRAIN_GRACE + Duration::from_millis(1));
+        assert!(!app.embedded.contains_key("w1"), "the tab is reaped at grace expiry");
+        assert!(
+            app.state.embedded_session_ids("w1").is_empty(),
+            "the undrained grid's hint was not adopted; the sentinel is forgotten"
+        );
     }
 
     #[tokio::test]
@@ -6095,6 +6180,46 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn grid_hint_never_downgrades_a_store_verified_codex_id() {
+        // Codex: the persisted id came from its session store (early capture
+        // or the quit sweep), which is authoritative; conversation TEXT that
+        // happens to render `codex resume <other-uuid>` (a quoted
+        // transcript, a help snippet) must not override it at exit. Opencode
+        // has no store capture: its exit hint is the only source and
+        // legitimately changes when the user switches sessions in-tab, so an
+        // eligible opencode entry stays adoptable.
+        let mut app = test_app();
+        let cx_id = "codex:019f7db3-4810-7213-83c7-58e1e93baded";
+        let oc_id = "opencode:ses_065287c2dffe50qgIn97S9Y0Yf";
+        app.state.add_embedded_session("w1", cx_id);
+        app.state.add_embedded_session("w1", oc_id);
+        let mut cx = tab(
+            cx_id,
+            &["-c", "printf 'codex resume 019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa\\r\\n'"],
+        );
+        cx.kind = TabKind::Codex;
+        let mut oc = tab(oc_id, &["-c", "printf 'opencode -s ses_freshB42\\r\\n'"]);
+        oc.kind = TabKind::Opencode;
+        let mut s = WorkspaceSessions { tabs: vec![cx, oc], active: 0, last_active: None };
+        wait_exit(&mut s.tabs[0].pane);
+        wait_exit(&mut s.tabs[1].pane);
+        wait_screen_contains(&s.tabs[0].pane, "codex resume ");
+        wait_screen_contains(&s.tabs[1].pane, "opencode -s ");
+        wait_drained(&s.tabs[0].pane);
+        wait_drained(&s.tabs[1].pane);
+        app.embedded.insert("w1".to_string(), s);
+
+        app.reap_embedded(Instant::now());
+
+        assert_eq!(
+            app.state.embedded_session_ids("w1"),
+            &[cx_id.to_string(), "opencode:ses_freshB42".to_string()],
+            "codex keeps the store-verified id; opencode adopts its new exit hint"
+        );
+        assert!(!app.embedded.contains_key("w1"), "the dead tabs are dropped");
+    }
+
+    #[tokio::test]
     async fn reap_skips_capture_on_a_failed_resume_and_heals_fresh() {
         // A captured-resume that fails fast non-zero is healed by the
         // resume-failure net (same kind, fresh tab- sentinel, in place). The
@@ -6132,6 +6257,10 @@ mod key_tests {
         let s = &app.embedded["w1"];
         assert_eq!(s.tabs.len(), 1, "healed in place, not dropped");
         assert_eq!(s.tabs[0].kind, TabKind::Codex, "the heal respawns the same kind");
+        assert!(
+            s.tabs[0].capture_since.is_some(),
+            "the heal-respawned fresh codex tab re-arms the store-scan cutoff"
+        );
         let persisted = app.state.embedded_session_ids("w1").to_vec();
         assert_eq!(persisted.len(), 1, "one fresh entry, no ghost append: {persisted:?}");
         assert!(
@@ -6422,20 +6551,45 @@ mod key_tests {
         // poller hasn't fired (or whose event was lost with the loop) must
         // still converge via the final synchronous store sweep, or it keeps
         // its `tab-` sentinel forever (codex prints no hint on SIGTERM).
+        // The tabs are built through spawn_tab so the sweep consumes the
+        // PRODUCTION capture_since stamping (fresh spawn: Some; resume:
+        // None), not a hand-set value.
+        let mut app = test_app();
+        app.config.codex_bin = Some("sh".to_string()); // never launch a real codex
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into(); // the spawn cwd must exist
+        }
+        let resumed = "codex:019f7db3-4810-7213-83c7-58e1e93baded";
+        app.state.add_embedded_session("w1", resumed);
+        assert!(app.spawn_tab(TabKind::Codex, "w1", "/tmp", "ws-one", None));
+        assert!(app.spawn_tab(TabKind::Codex, "w1", "/tmp", "ws-one", Some(resumed)));
+        let sentinel = app.embedded["w1"].tabs[0].id.clone();
+        assert!(sentinel.starts_with("codex:tab-"), "fresh mint: {sentinel}");
+        assert!(
+            app.embedded["w1"].tabs[0].capture_since.is_some(),
+            "a fresh codex spawn stamps the store-scan cutoff"
+        );
+        assert!(
+            app.embedded["w1"].tabs[1].capture_since.is_none(),
+            "a resumed codex spawn arms no store capture"
+        );
+
+        // The rollout appears AFTER the spawn (so its timestamp passes the
+        // production cutoff), codex-0.145.0-shaped line 1 for w1's
+        // working_dir (the format is pinned by core's latest_codex_rollout
+        // tests).
         let uuid = "019faaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa";
         let store = tempfile::tempdir().unwrap();
         let day = store
             .path()
             .join(chrono::Local::now().date_naive().format("%Y/%m/%d").to_string());
         std::fs::create_dir_all(&day).unwrap();
-        // A codex-0.145.0-shaped line 1 for w1's working_dir (the format is
-        // pinned by core's latest_codex_rollout tests).
         let line = serde_json::json!({
             "type": "session_meta",
             "payload": {
                 "id": uuid,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
-                "cwd": "/tmp/alpha",
+                "cwd": "/tmp",
                 "originator": "codex-tui",
             }
         });
@@ -6445,22 +6599,12 @@ mod key_tests {
         )
         .unwrap();
 
-        let mut app = test_app();
-        app.state.add_embedded_session("w1", "codex:tab-c1");
-        let mut cx = tab("codex:tab-c1", &["-c", "sleep 30"]);
-        cx.kind = TabKind::Codex;
-        cx.capture_since = Some(SystemTime::now() - Duration::from_secs(5));
-        app.embedded.insert(
-            "w1".to_string(),
-            WorkspaceSessions { tabs: vec![cx], active: 0, last_active: None },
-        );
-
         app.sweep_codex_captures(store.path());
 
         assert_eq!(
             app.state.embedded_session_ids("w1"),
-            &[format!("codex:{uuid}")],
-            "the sweep adopts the rollout id before teardown"
+            &[resumed.to_string(), format!("codex:{uuid}")],
+            "the sweep adopts the rollout id onto the sentinel; the resumed entry is untouched"
         );
         assert_eq!(
             app.embedded["w1"].tabs[0].id,
