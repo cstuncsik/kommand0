@@ -229,16 +229,18 @@ fn main() -> anyhow::Result<()> {
     // KOMMAND0_PROFILE; an invalid name / env conflict aborts) before any
     // state, config, or log access resolves a directory.
     let profile = AppState::init_profile(cli.profile.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
-    AppState::migrate_legacy_profiles()?;
     // Held for the command's duration so a concurrent `profile delete` can't
     // pull this profile's directory out from under us (None under
-    // KOMMAND0_STATE_DIR). Profile subcommands are exempt: they never load
-    // ambient profile state (list is a readdir; rename/delete take their own
-    // exclusive locks on their TARGETS), and kmd's own shared lock on
-    // `default` would otherwise self-conflict with `profile rename default x`
-    // or make a plain `profile delete <other>` hold an unrelated lock.
-    // Exhaustive on purpose: a future subcommand must decide its lock
-    // behavior here, at compile time.
+    // KOMMAND0_STATE_DIR). Taken BEFORE the migration so no delete/rename
+    // window opens between the two; creating locks/ cannot trip the
+    // migration's idempotence guard, which checks profiles/ only. Profile
+    // subcommands are exempt: they never load ambient profile state (list
+    // is a readdir; rename/delete take their own exclusive locks on their
+    // TARGETS), and kmd's own shared lock on `default` would otherwise
+    // self-conflict with `profile rename default x` or make a plain
+    // `profile delete <other>` hold an unrelated lock. Exhaustive on
+    // purpose: a future subcommand must decide its lock behavior here, at
+    // compile time.
     let _profile_lock = match &cli.command {
         Commands::Profile {
             action:
@@ -248,6 +250,7 @@ fn main() -> anyhow::Result<()> {
             kommand0_core::lock::acquire_shared(&profile)?
         }
     };
+    AppState::migrate_legacy_profiles()?;
 
     match cli.command {
         Commands::Repo { action } => match action {
