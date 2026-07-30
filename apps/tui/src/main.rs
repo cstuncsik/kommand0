@@ -7982,12 +7982,19 @@ mod key_tests {
         // would ever clear it.
         app.start_profile_delete("work");
         assert!(!app.profile_delete_inflight, "unwired tx leaves inflight false");
-        // Wired but already inflight: no second worker (channel stays empty).
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Wired but already inflight: the start path must bail BEFORE its
+        // notice-clear + spawn. A surviving sentinel notice proves it
+        // synchronously (the real path clears the notice before spawning).
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.profile_delete_tx = Some(tx);
         app.profile_delete_inflight = true;
+        app.profile_notice = Some(("sentinel".into(), false));
         app.start_profile_delete("work");
-        assert!(rx.try_recv().is_err(), "no worker spawned while inflight");
+        assert_eq!(
+            app.profile_notice.as_ref().map(|(m, _)| m.as_str()),
+            Some("sentinel"),
+            "an inflight start must bail before touching the notice"
+        );
     }
 
     #[test]
@@ -8072,8 +8079,38 @@ mod key_tests {
     async fn quit_is_blocked_while_a_profile_delete_runs() {
         let mut app = test_app();
         app.profile_delete_inflight = true;
+        // A Running session pins the guard's position: it must fire BEFORE
+        // the quit arm's session-stopping side effects.
+        app.state.sessions.push(kommand0_core::Session {
+            id: "s1".into(),
+            workspace_id: "w1".into(),
+            claude_session_id: None,
+            pid: None,
+            status: SessionStatus::Running,
+            created_at: 0,
+            ended_at: None,
+            log_file: "/tmp/s1.log".into(),
+        });
         let out = press(&mut app, KeyCode::Char('q')).await;
         assert_eq!(out, KeyOutcome::Continue, "q must not quit mid-delete");
+        let (msg, _) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("Profile delete in progress"), "{msg}");
+        assert_eq!(
+            app.state.sessions[0].status,
+            SessionStatus::Running,
+            "a blocked quit must not stop sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_a_q_quit_is_blocked_while_a_profile_delete_runs() {
+        // Pins the SECOND quit site's guard call (the embedded prefix `q`).
+        let mut app = test_app();
+        app.profile_delete_inflight = true;
+        app.focus = Focus::Embedded;
+        app.embedded_prefix = true;
+        let out = press(&mut app, KeyCode::Char('q')).await;
+        assert_eq!(out, KeyOutcome::Continue, "prefix q must not quit mid-delete");
         let (msg, _) = app.profile_notice.clone().expect("notice set");
         assert!(msg.contains("Profile delete in progress"), "{msg}");
     }

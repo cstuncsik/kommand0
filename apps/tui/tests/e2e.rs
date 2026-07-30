@@ -1718,6 +1718,37 @@ fn profile_flag_shows_the_label_and_state_lands_in_the_profile_dir() {
     assert!(probe(&lock_path).is_ok(), "instance lock released on exit");
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn palette_deletes_another_profile_end_to_end() {
+    // Full TUI delete round trip: launched on `work`, the palette offers
+    // "Delete profile: other", `y` on the confirm runs the background
+    // delete, the result notice lands in the tree border, and the dir is
+    // gone. The clean `q` exit afterwards pins that the select! arm cleared
+    // the inflight flag (the quit guard released). Debug-gated like the
+    // other cwd-relative-base tests.
+    let mut tui = Tui::launch_legacy_layout(None, &["--profile", "work"]);
+    tui.wait_for("Repos · work");
+
+    // Candidates are snapshotted when the palette OPENS, so seeding the
+    // sibling profile now (after startup created profiles/work) is enough.
+    let other = tui.state_dir.path().join(".kommand0-dev").join("profiles").join("other");
+    std::fs::create_dir_all(&other).unwrap();
+
+    tui.send(":");
+    tui.wait_for("Command palette");
+    tui.send("delete profile other");
+    tui.send("\r");
+    tui.wait_for("Delete Profile"); // the confirm modal
+    tui.send("y");
+
+    tui.wait_for("Deleted profile 'other'"); // the border notice
+    assert!(!other.exists(), "profiles/other removed");
+
+    tui.send("q");
+    tui.wait_exit();
+}
+
 #[test]
 fn embedded_focus_reports_follow_pane_focus() {
     // The stub opts into focus reporting (CSI ?1004h); kommand0 synthesizes
