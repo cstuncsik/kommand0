@@ -146,10 +146,15 @@ pub struct ProfileDeleteSummary {
 }
 
 /// A target profile's state as read for a delete or its preview: split so a
-/// fresh profile (no state.json) is distinguishable from a parsed state.
+/// fresh profile (no state.json) is distinguishable from a parsed state, and
+/// an unparseable file (`Corrupt`, force-overridable) from an environmental
+/// read failure (the `Err` of [`AppState::read_target_state`], never
+/// overridable).
 enum TargetState {
     Absent,
     State(AppState),
+    /// Unparseable state.json; the error carries the `--force` hint.
+    Corrupt(anyhow::Error),
 }
 
 impl AppState {
@@ -732,11 +737,44 @@ impl AppState {
         let mut prune_repos: Vec<String> = Vec::new();
         // Load from the TARGET dir, never ambient state: an ambient load
         // would enumerate (and remove) the CALLER's worktrees.
-        match Self::read_target_state(&dir, name) {
-            Ok(TargetState::Absent) => {} // fresh profile: nothing to clean up
-            Ok(TargetState::State(state)) => {
+        match Self::read_target_state(&dir, name)? {
+            TargetState::Absent => {} // fresh profile: nothing to clean up
+            TargetState::Corrupt(e) => {
+                // Only genuine corruption is force-overridable; read
+                // failures already propagated through the `?` above.
+                if !force {
+                    return Err(e);
+                }
+                warnings.push(
+                    "state.json was corrupt; worktree cleanup skipped, run \
+                     `git worktree prune` in affected repos"
+                        .to_string(),
+                );
+            }
+            TargetState::State(state) => {
                 summary.workspaces = state.workspaces.len();
                 summary.sessions = state.sessions.len();
+                // Roots under which a worktree path means "inside some
+                // profile": the base verbatim and, for a relative base, its
+                // cwd-absolutized form (worktree paths are stored absolute
+                // then; same two-prefix logic as rename).
+                let mut profile_roots: Vec<PathBuf> = vec![base.join("profiles")];
+                if base.is_relative() {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    profile_roots.push(cwd.join(base).join("profiles"));
+                }
+                // Component-wise, never string-prefix (profile `work` must
+                // not claim `work2/…`): the first component under profiles/
+                // names the owning profile.
+                let foreign_profile = |wt: &str| -> Option<String> {
+                    let wt = Path::new(wt);
+                    profile_roots.iter().find_map(|root| {
+                        let rest = wt.strip_prefix(root).ok()?;
+                        let owner = rest.components().next()?;
+                        let owner = owner.as_os_str().to_string_lossy();
+                        (owner != name).then(|| owner.into_owned())
+                    })
+                };
                 // Collect (repo path, worktree path) pairs; fallback
                 // workspaces (no worktree; working_dir is the user's repo
                 // root) are skipped. Paths come from state, never re-derived,
@@ -746,48 +784,55 @@ impl AppState {
                     let Some(wt) = &ws.worktree_path else {
                         continue;
                     };
+                    // A worktree inside ANOTHER profile's dir is never
+                    // removed (a hand-copied profile must not let deleting
+                    // the copy destroy the original's live worktrees).
+                    if let Some(owner) = foreign_profile(wt) {
+                        warnings.push(format!(
+                            "workspace '{}' points at a worktree inside profile '{}' ({wt}); \
+                             not removed",
+                            ws.name.escape_debug(),
+                            owner.escape_debug()
+                        ));
+                        continue;
+                    }
                     match state.repos.iter().find(|r| r.id == ws.repo_id) {
                         Some(repo) => removals.push((repo.path.clone(), wt.clone())),
                         None => warnings.push(format!(
                             "no repo found for workspace '{}'; its worktree {wt} was not \
                              removed, run `git worktree prune` in its repo",
-                            ws.name
+                            ws.name.escape_debug()
                         )),
                     }
                 }
-                removals.sort();
-                removals.dedup();
+                // Dedupe by worktree PATH (two rows can share a path under
+                // different repo ids; one removal, counted once).
+                removals.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+                removals.dedup_by(|a, b| a.1 == b.1);
                 // Deepest path first, so a nested worktree goes before its parent.
                 removals
                     .sort_by_key(|(_, wt)| std::cmp::Reverse(Path::new(wt).components().count()));
                 for (repo_path, wt) in &removals {
                     let _ = worktree::remove_worktree(repo_path, wt);
                     // remove_worktree swallows git failures into a log line;
-                    // count honestly by checking the directory really is gone.
-                    if Path::new(wt).exists() {
-                        warnings.push(format!(
+                    // count honestly by classifying what's left on disk
+                    // (symlink_metadata: a dangling-link or unreadable
+                    // leftover must not count as removed).
+                    match fs::symlink_metadata(wt) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            summary.worktrees_removed += 1;
+                        }
+                        Ok(_) => warnings.push(format!(
                             "couldn't git-remove worktree {wt}; a `git worktree prune` runs in \
                              {repo_path} after delete, and if the directory survives outside \
                              the profile, remove it by hand (git worktree remove --force)"
-                        ));
-                    } else {
-                        summary.worktrees_removed += 1;
+                        )),
+                        Err(e) => warnings.push(format!(
+                            "couldn't verify worktree removal for {wt}: {e}"
+                        )),
                     }
                     prune_repos.push(repo_path.clone());
                 }
-            }
-            Err(e) => {
-                // Only the parse tier is force-overridable (the error built
-                // by read_target_state over a serde failure); read failures
-                // are environmental and stay hard errors.
-                if !(force && e.downcast_ref::<serde_json::Error>().is_some()) {
-                    return Err(e);
-                }
-                warnings.push(format!(
-                    "state.json was corrupt ({}); worktree cleanup skipped, run \
-                     `git worktree prune` in affected repos",
-                    e.root_cause()
-                ));
             }
         }
 
@@ -812,10 +857,11 @@ impl AppState {
                 .output();
             match out {
                 Ok(out) if out.status.success() => {}
+                // git's stderr can echo arbitrary path bytes: never raw.
                 Ok(out) => warnings.push(format!(
                     "couldn't prune worktrees in {repo_path}: {} (run `git worktree prune` \
                      there by hand)",
-                    String::from_utf8_lossy(&out.stderr).trim()
+                    String::from_utf8_lossy(&out.stderr).trim().escape_debug()
                 )),
                 Err(e) => warnings.push(format!(
                     "couldn't prune worktrees in {repo_path}: {e} (run `git worktree prune` \
@@ -850,6 +896,7 @@ impl AppState {
         }
         match Self::read_target_state(&dir, name)? {
             TargetState::Absent => Ok(ProfileDeleteSummary::default()),
+            TargetState::Corrupt(e) => Err(e),
             TargetState::State(state) => Ok(ProfileDeleteSummary {
                 workspaces: state.workspaces.len(),
                 worktrees_removed: state
@@ -863,30 +910,35 @@ impl AppState {
     }
 
     /// Read the TARGET profile's state for a delete or its preview. The
-    /// read/parse split lives here, in exactly one place: an absent
-    /// state.json is a fresh profile (`Absent`); a read error is
-    /// environmental and never force-overridable; a parse error carries the
-    /// `--force` hint (the CLI previews BEFORE prompting, so a corrupt
-    /// profile must surface the hint from the preview, not only from
-    /// delete). `delete_profile_at` recognizes the parse tier by the
-    /// `serde_json::Error` in the chain and, under `force`, downgrades it
-    /// to a warning.
+    /// read/parse split lives here, in exactly one place: `Absent` only for
+    /// a genuinely missing state.json (`symlink_metadata` NotFound; a
+    /// dangling symlink must NOT read as a fresh profile and skip cleanup,
+    /// it falls through to the read, which fails); a read error is
+    /// environmental and never force-overridable; anything unparseable,
+    /// including invalid UTF-8 (hence `read` + `from_slice`, not
+    /// `read_to_string`), is `Corrupt`, carrying the `--force`-hinted error
+    /// (the CLI previews BEFORE prompting, so the hint must surface from
+    /// the preview, not only from delete). The preview maps `Corrupt` to
+    /// `Err`; `delete_profile_at` downgrades it to a warning under `force`.
     fn read_target_state(dir: &Path, name: &str) -> anyhow::Result<TargetState> {
         let path = dir.join(Self::STATE_FILE);
-        if !path.exists() {
-            return Ok(TargetState::Absent);
-        }
-        let data = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        match serde_json::from_str::<Self>(&data) {
-            Ok(state) => Ok(TargetState::State(state)),
-            Err(e) => {
-                let hint = format!(
-                    "profile '{name}' has a corrupt state.json ({e}); re-run with --force to \
-                     delete it anyway (worktree cleanup will be skipped)"
-                );
-                Err(anyhow::Error::new(e).context(hint))
+        if let Err(e) = fs::symlink_metadata(&path) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(TargetState::Absent);
             }
+            return Err(e).with_context(|| format!("failed to stat {}", path.display()));
+        }
+        let data =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        match serde_json::from_slice::<Self>(&data) {
+            Ok(state) => Ok(TargetState::State(state)),
+            // The parse error can echo file content: never let it reach a
+            // terminal raw (mirrors validate_profile_name's rationale).
+            Err(e) => Ok(TargetState::Corrupt(anyhow::anyhow!(
+                "profile '{name}' has a corrupt state.json ({}); re-run with --force to \
+                 delete it anyway (worktree cleanup will be skipped)",
+                e.to_string().escape_debug()
+            ))),
         }
     }
 
@@ -2959,13 +3011,13 @@ mod tests {
         // An instance on the OLD name blocks the rename.
         let held_old = lock::acquire_shared_at(tmp.path(), "work").unwrap();
         let err = AppState::rename_profile_at(tmp.path(), "work", "personal", &nc).unwrap_err();
-        assert!(err.to_string().contains("is using profile"), "old-name lock refused: {err}");
+        assert!(err.to_string().contains("is in use by"), "old-name lock refused: {err}");
         drop(held_old);
 
         // So does an instance already on the NEW name.
         let held_new = lock::acquire_shared_at(tmp.path(), "personal").unwrap();
         let err = AppState::rename_profile_at(tmp.path(), "work", "personal", &nc).unwrap_err();
-        assert!(err.to_string().contains("is using profile"), "new-name lock refused: {err}");
+        assert!(err.to_string().contains("is in use by"), "new-name lock refused: {err}");
         drop(held_new);
 
         // Neither refused attempt moved anything.
@@ -3154,7 +3206,7 @@ mod tests {
 
         let err =
             AppState::delete_profile_at(tmp.path(), "work", DEFAULT_PROFILE, false).unwrap_err();
-        assert!(err.to_string().contains("is using profile"), "{err}");
+        assert!(err.to_string().contains("is in use by"), "{err}");
         assert!(tmp.path().join("profiles").join("work").is_dir(), "dir intact");
     }
 
@@ -3277,6 +3329,55 @@ mod tests {
         assert_eq!(summary.worktrees_removed, 1, "an already-gone dir counts as removed");
         let list = String::from_utf8_lossy(&git(&["worktree", "list"]).stdout).to_string();
         assert!(!list.contains("feat"), "stale registration pruned: {list}");
+    }
+
+    #[test]
+    fn delete_profile_skips_worktrees_inside_other_profiles() {
+        // A hand-copied profile's state can point at worktrees inside a
+        // SIBLING profile's dir: deleting the copy must never remove them.
+        // `work2` pins the component-wise match (a string-prefix check on
+        // `profiles/work` would claim `profiles/work2/…`).
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join("profiles").join("work");
+        let other_wt = tmp.path().join("profiles").join("other").join("worktrees").join("x");
+        fs::create_dir_all(&other_wt).unwrap();
+        let work2_wt = tmp.path().join("profiles").join("work2").join("worktrees").join("y");
+        fs::create_dir_all(&work2_wt).unwrap();
+        let mut state = AppState::default();
+        state.repos.push(RepoEntry {
+            id: "r1".into(),
+            name: "r".into(),
+            path: "/tmp".into(),
+        });
+        for (id, wt) in [("w1", &other_wt), ("w2", &work2_wt)] {
+            state.workspaces.push(Workspace {
+                id: id.into(),
+                name: format!("{id}-ws"),
+                repo_id: "r1".into(),
+                working_dir: wt.to_string_lossy().into_owned(),
+                active: true,
+                created_at: 0,
+                worktree_path: Some(wt.to_string_lossy().into_owned()),
+                branch_name: None,
+            });
+        }
+        state.save_to(&profile).unwrap();
+
+        let (summary, warnings) =
+            AppState::delete_profile_at(tmp.path(), "work", DEFAULT_PROFILE, false).unwrap();
+        assert!(!profile.exists(), "the copy itself is deleted");
+        assert_eq!(summary.worktrees_removed, 0, "no foreign worktree removed");
+        assert!(other_wt.is_dir(), "sibling profile's worktree untouched");
+        assert!(work2_wt.is_dir(), "prefix-sharing profile's worktree untouched");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("inside profile 'other'")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("inside profile 'work2'")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

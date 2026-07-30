@@ -81,7 +81,9 @@ pub(crate) fn acquire_exclusive_at(base: &Path, name: &str) -> anyhow::Result<Pr
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(lock) => Ok(ProfileLock { _lock: lock }),
         Err((_, e)) if e == Errno::EWOULDBLOCK => {
-            bail!("a running kommand0/kmd instance is using profile '{name}'")
+            bail!(
+                "profile '{name}' is in use by a running instance or another profile operation"
+            )
         }
         Err((_, e)) => {
             Err(anyhow::anyhow!(e)).with_context(|| format!("failed to lock profile '{name}'"))
@@ -114,10 +116,10 @@ mod tests {
         // separate open in the SAME process still conflicts, the platform
         // assumption the whole design rests on (pinned on macOS and Linux CI).
         let err = acquire_exclusive_at(tmp.path(), "work").unwrap_err();
-        assert!(err.to_string().contains("is using profile"), "got: {err}");
+        assert!(err.to_string().contains("is in use by"), "got: {err}");
         drop(s1);
         let err = acquire_exclusive_at(tmp.path(), "work").unwrap_err();
-        assert!(err.to_string().contains("is using profile"), "one shared holder suffices: {err}");
+        assert!(err.to_string().contains("is in use by"), "one shared holder suffices: {err}");
         drop(s2);
         let _x = acquire_exclusive_at(tmp.path(), "work")
             .expect("exclusive succeeds once every shared guard dropped");

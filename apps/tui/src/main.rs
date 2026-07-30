@@ -149,6 +149,20 @@ fn profile_delete_notice(
     }
 }
 
+/// Map a delete preview onto the confirm modal's target. Pure: a silently
+/// swapped pair of counts here would ship wrong confirm numbers.
+fn profile_delete_target(
+    name: String,
+    s: kommand0_core::ProfileDeleteSummary,
+) -> modal::DeleteTarget {
+    modal::DeleteTarget::Profile {
+        name,
+        workspaces: s.workspaces,
+        worktrees: s.worktrees_removed,
+        sessions: s.sessions,
+    }
+}
+
 /// Palette candidates for deleting profiles: one per name in `profiles`,
 /// EXCLUDING the TUI's own (`own`), so self-delete is structurally
 /// unreachable here (core's own-profile guard is the backstop). Pure, so
@@ -622,7 +636,7 @@ pub(crate) struct App {
 
     /// A profile delete is running on the background thread (gates
     /// re-triggering; at most one at a time).
-    pub(crate) profile_delete_inflight: bool,
+    profile_delete_inflight: bool,
     /// Profile-delete worker → event-loop channel carrying `(name, result)`.
     profile_delete_tx: Option<tokio::sync::mpsc::UnboundedSender<ProfileDeleteMsg>>,
     /// One-line profile-delete outcome `(message, is_error)` shown in the
@@ -1490,7 +1504,12 @@ impl App {
         // 4) Delete a profile (every enumerated profile except the TUI's
         //    own; empty under KOMMAND0_STATE_DIR, where no profiles tree
         //    exists).
-        let profiles = AppState::list_profiles().unwrap_or_default();
+        let profiles = AppState::list_profiles().unwrap_or_else(|e| {
+            // Degrade to no entries, but leave a trace: a silently absent
+            // action is indistinguishable from "no other profiles".
+            tracing::warn!("couldn't enumerate profiles for the palette: {e}");
+            Vec::new()
+        });
         let own = self.profile_label.as_deref().unwrap_or(DEFAULT_PROFILE);
         out.extend(profile_delete_candidates(&profiles, own));
 
@@ -1531,12 +1550,7 @@ impl App {
                 match AppState::profile_delete_preview(&name) {
                     Ok(s) => {
                         self.modal = modal::ModalState::ConfirmDelete {
-                            target: modal::DeleteTarget::Profile {
-                                name,
-                                workspaces: s.workspaces,
-                                worktrees: s.worktrees_removed,
-                                sessions: s.sessions,
-                            },
+                            target: profile_delete_target(name, s),
                         };
                     }
                     Err(e) => {
@@ -2636,6 +2650,18 @@ impl App {
         });
     }
 
+    /// While a profile delete runs, quitting would kill the worker mid
+    /// `remove_dir_all` (the flock dies with the process, but half a
+    /// profile would remain): the quit paths block and notice instead.
+    /// Returns true when quit must be blocked.
+    fn quit_blocked_by_profile_delete(&mut self) -> bool {
+        if self.profile_delete_inflight {
+            self.profile_notice = Some(("profile delete in progress".to_string(), true));
+            return true;
+        }
+        false
+    }
+
     /// Run a profile delete off the render loop. Core enforces every guard
     /// (own-profile check, exclusive instance lock, target-dir-only loads);
     /// the TUI always passes `force = false`, so a corrupt target bails and
@@ -2835,6 +2861,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             // with CTRL) from being read as a tab command after the prefix.
             match key.code {
                 KeyCode::Char('q') => {
+                    if app.quit_blocked_by_profile_delete() {
+                        return Ok(KeyOutcome::Continue);
+                    }
                     return Ok(KeyOutcome::Quit);
                 }
                 KeyCode::Char('t') if !ctrl => {
@@ -3341,6 +3370,11 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             use keymap::Action;
             match action {
                 Action::Quit => {
+                    // Before the session-stopping side effects: a blocked
+                    // quit must leave them untouched.
+                    if app.quit_blocked_by_profile_delete() {
+                        return Ok(KeyOutcome::Continue);
+                    }
                     let running_ids: Vec<String> = app
                         .state
                         .sessions
@@ -4004,11 +4038,13 @@ async fn run(
             }
             Some((name, result)) = profile_delete_rx.recv() => {
                 app.profile_delete_inflight = false;
-                // The notice only counts warnings; the log carries the texts.
-                if let Ok((_, warnings)) = &result {
-                    for w in warnings {
+                // The notice is one line and any-key-cleared; the log keeps
+                // the full warning texts and the failure.
+                match &result {
+                    Ok((_, warnings)) => for w in warnings {
                         tracing::warn!("profile delete: {w}");
-                    }
+                    },
+                    Err(e) => tracing::warn!("profile delete '{name}' failed: {e}"),
                 }
                 app.profile_notice = Some(profile_delete_notice(&name, &result));
             }
@@ -6273,6 +6309,59 @@ mod key_tests {
         let (msg, is_error) = profile_delete_notice("work", &Err("boom".into()));
         assert_eq!(msg, "Couldn't delete profile 'work': boom");
         assert!(is_error);
+    }
+
+    #[test]
+    fn profile_delete_target_maps_preview_fields() {
+        // Distinct values so any silently swapped pair fails.
+        let target = profile_delete_target(
+            "work".into(),
+            kommand0_core::ProfileDeleteSummary {
+                workspaces: 2,
+                worktrees_removed: 1,
+                sessions: 3,
+            },
+        );
+        match target {
+            modal::DeleteTarget::Profile { name, workspaces, worktrees, sessions } => {
+                assert_eq!(
+                    (name.as_str(), workspaces, worktrees, sessions),
+                    ("work", 2, 1, 3)
+                );
+            }
+            _ => panic!("expected a Profile target"),
+        }
+    }
+
+    #[tokio::test]
+    async fn any_key_clears_the_profile_notice() {
+        let mut app = test_app();
+        app.profile_notice = Some(("Deleted profile 'work'".into(), false));
+        press(&mut app, KeyCode::Down).await;
+        assert!(app.profile_notice.is_none(), "next key clears the notice");
+    }
+
+    #[tokio::test]
+    async fn profile_notice_takes_precedence_over_config_warning() {
+        let mut app = test_app();
+        app.config_warning = Some("bad config".into());
+        app.profile_notice = Some(("Deleted profile 'work'".into(), false));
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Deleted profile 'work'"), "notice shown:\n{text}");
+        assert!(
+            !text.contains("bad config"),
+            "config warning hidden while the notice is up:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quit_is_blocked_while_a_profile_delete_runs() {
+        let mut app = test_app();
+        app.profile_delete_inflight = true;
+        let out = press(&mut app, KeyCode::Char('q')).await;
+        assert_eq!(out, KeyOutcome::Continue, "q must not quit mid-delete");
+        let (msg, _) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("profile delete in progress"), "{msg}");
     }
 
     #[tokio::test]

@@ -237,9 +237,16 @@ fn main() -> anyhow::Result<()> {
     // exclusive locks on their TARGETS), and kmd's own shared lock on
     // `default` would otherwise self-conflict with `profile rename default x`
     // or make a plain `profile delete <other>` hold an unrelated lock.
+    // Exhaustive on purpose: a future subcommand must decide its lock
+    // behavior here, at compile time.
     let _profile_lock = match &cli.command {
-        Commands::Profile { .. } => None,
-        _ => kommand0_core::lock::acquire_shared(&profile)?,
+        Commands::Profile {
+            action:
+                ProfileAction::List | ProfileAction::Rename { .. } | ProfileAction::Delete { .. },
+        } => None,
+        Commands::Repo { .. } | Commands::Workspace { .. } | Commands::Session { .. } => {
+            kommand0_core::lock::acquire_shared(&profile)?
+        }
     };
 
     match cli.command {

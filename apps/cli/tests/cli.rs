@@ -837,7 +837,7 @@ fn profile_rename_unavailable_with_state_dir_env() {
     );
 }
 
-/// Hold a flock on `<base>/locks/<name>.lock` from the test process — what a
+/// Hold a flock on `<base>/locks/<name>.lock` from the test process: what a
 /// running instance (shared) or an in-flight delete/rename (exclusive) holds.
 #[cfg(debug_assertions)]
 fn hold_lock(base: &Path, name: &str, exclusive: bool) -> nix::fcntl::Flock<std::fs::File> {
@@ -1005,7 +1005,7 @@ fn profile_delete_refused_while_lock_held() {
     let out = kmd_at(tmp.path(), &[], &["profile", "delete", "work", "--force"]);
     assert!(!out.status.success(), "must refuse while an instance runs");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("is using profile"),
+        String::from_utf8_lossy(&out.stderr).contains("is in use by"),
         "clear error: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -1068,7 +1068,7 @@ fn profile_rename_refused_while_lock_held() {
     let out = kmd_at(tmp.path(), &[], &["profile", "rename", "work", "personal"]);
     assert!(!out.status.success(), "must refuse while an instance runs");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("is using profile"),
+        String::from_utf8_lossy(&out.stderr).contains("is in use by"),
         "clear error: {}",
         String::from_utf8_lossy(&out.stderr)
     );
