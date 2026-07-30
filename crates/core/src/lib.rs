@@ -1,6 +1,7 @@
 pub mod config;
 pub mod git;
 pub mod id;
+pub mod lock;
 pub mod repo;
 pub mod session;
 pub mod workspace;
