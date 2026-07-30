@@ -42,46 +42,16 @@ const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// git status.
 const PR_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Carries a status-refresh result to the event loop, sending on drop so the
-/// loop always gets a message (and clears `status_inflight`) even if the worker
-/// thread panics before finishing.
-struct StatusRefreshGuard {
-    tx: tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::BranchStatus>>,
-    result: Option<HashMap<String, kommand0_core::BranchStatus>>,
+/// Carries a background worker's result to the event loop, sending on drop
+/// so the loop always gets a message (and clears the matching `*_inflight`
+/// flag) even if the worker thread panics before finishing. Shared by the
+/// status/PR refreshes, cleanup, and profile delete.
+struct SendOnDrop<T> {
+    tx: tokio::sync::mpsc::UnboundedSender<T>,
+    payload: Option<T>,
 }
 
-impl Drop for StatusRefreshGuard {
-    fn drop(&mut self) {
-        if let Some(map) = self.result.take() {
-            let _ = self.tx.send(map);
-        }
-    }
-}
-
-/// Carries a PR-status refresh result (`ws_id` → [`kommand0_core::PrStatus`]) to
-/// the event loop, sending on drop so a worker panic still clears
-/// `pr_status_inflight`.
-struct PrStatusRefreshGuard {
-    tx: tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::PrStatus>>,
-    result: Option<HashMap<String, kommand0_core::PrStatus>>,
-}
-
-impl Drop for PrStatusRefreshGuard {
-    fn drop(&mut self) {
-        if let Some(map) = self.result.take() {
-            let _ = self.tx.send(map);
-        }
-    }
-}
-
-/// Carries a cleanup result `(workspace_id, Ok(()) | Err(msg))` to the event
-/// loop, sending on drop so a worker panic still clears `cleanup_inflight`.
-struct CleanupGuard {
-    tx: tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>,
-    payload: Option<(String, Result<(), String>)>,
-}
-
-impl Drop for CleanupGuard {
+impl<T> Drop for SendOnDrop<T> {
     fn drop(&mut self) {
         if let Some(p) = self.payload.take() {
             let _ = self.tx.send(p);
@@ -94,21 +64,6 @@ impl Drop for CleanupGuard {
 /// core's result, stringly on the error side (it crosses a thread).
 type ProfileDeleteMsg =
     (String, Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>);
-
-/// Carries a profile-delete result to the event loop, sending on drop so a
-/// worker panic still clears `profile_delete_inflight`.
-struct ProfileDeleteGuard {
-    tx: tokio::sync::mpsc::UnboundedSender<ProfileDeleteMsg>,
-    payload: Option<ProfileDeleteMsg>,
-}
-
-impl Drop for ProfileDeleteGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.payload.take() {
-            let _ = self.tx.send(p);
-        }
-    }
-}
 
 /// The `(message, is_error)` notice for a finished profile delete: clean,
 /// with warnings (their full texts go to the log), or failed. Each names the
@@ -2904,13 +2859,13 @@ impl App {
         }
         self.status_inflight = true;
         std::thread::spawn(move || {
-            // The guard sends `result` on drop — including on panic — so the
+            // The guard sends `payload` on drop (including on panic) so the
             // event loop always clears `status_inflight`.
-            let mut guard = StatusRefreshGuard {
+            let mut guard = SendOnDrop {
                 tx,
-                result: Some(HashMap::new()),
+                payload: Some(HashMap::new()),
             };
-            let map = guard.result.as_mut().expect("result present until drop");
+            let map = guard.payload.as_mut().expect("payload present until drop");
             for (id, dir) in targets {
                 if let Some(status) = kommand0_core::branch_status(&dir) {
                     map.insert(id, status);
@@ -2958,13 +2913,13 @@ impl App {
         }
         self.pr_status_inflight = true;
         std::thread::spawn(move || {
-            // The guard sends `result` on drop — including on panic — so the
+            // The guard sends `payload` on drop (including on panic) so the
             // event loop always clears `pr_status_inflight`.
-            let mut guard = PrStatusRefreshGuard {
+            let mut guard = SendOnDrop {
                 tx,
-                result: Some(HashMap::new()),
+                payload: Some(HashMap::new()),
             };
-            let map = guard.result.as_mut().expect("result present until drop");
+            let map = guard.payload.as_mut().expect("payload present until drop");
             for (repo_path, workspaces) in by_repo {
                 let prs = kommand0_core::pr_statuses(&repo_path);
                 for (ws_id, branch) in workspaces {
@@ -3321,7 +3276,7 @@ impl App {
         self.cleanup_result.remove(ws_id);
         let id = ws_id.to_string();
         std::thread::spawn(move || {
-            let mut guard = CleanupGuard {
+            let mut guard = SendOnDrop {
                 tx,
                 payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
             };
@@ -3359,7 +3314,7 @@ impl App {
         // Owned String: a borrowed &str can't cross the 'static spawn boundary.
         let name = name.to_string();
         self.profile_delete_join = Some(std::thread::spawn(move || {
-            let mut guard = ProfileDeleteGuard {
+            let mut guard = SendOnDrop {
                 tx,
                 payload: Some((
                     name.clone(),
