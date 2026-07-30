@@ -770,6 +770,15 @@ impl AppState {
                     let wt = Path::new(wt);
                     profile_roots.iter().find_map(|root| {
                         let rest = wt.strip_prefix(root).ok()?;
+                        // A `..`/`.` below profiles/ makes the owner
+                        // unknowable from components (`work/../other/x`
+                        // resolves outside `work`): treat as foreign.
+                        if rest
+                            .components()
+                            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                        {
+                            return Some("?".into());
+                        }
                         let owner = rest.components().next()?;
                         let owner = owner.as_os_str().to_string_lossy();
                         (owner != name).then(|| owner.into_owned())
@@ -3343,13 +3352,18 @@ mod tests {
         fs::create_dir_all(&other_wt).unwrap();
         let work2_wt = tmp.path().join("profiles").join("work2").join("worktrees").join("y");
         fs::create_dir_all(&work2_wt).unwrap();
+        // A dot-dot path whose FIRST component is the target profile itself:
+        // component-naive ownership would claim it as `work`'s own, but it
+        // resolves into `other`. Must be skipped as foreign too.
+        let dotdot_wt = tmp.path().join("profiles").join("work").join("..").join("other").join("z");
+        fs::create_dir_all(tmp.path().join("profiles").join("other").join("z")).unwrap();
         let mut state = AppState::default();
         state.repos.push(RepoEntry {
             id: "r1".into(),
             name: "r".into(),
             path: "/tmp".into(),
         });
-        for (id, wt) in [("w1", &other_wt), ("w2", &work2_wt)] {
+        for (id, wt) in [("w1", &other_wt), ("w2", &work2_wt), ("w3", &dotdot_wt)] {
             state.workspaces.push(Workspace {
                 id: id.into(),
                 name: format!("{id}-ws"),
@@ -3369,7 +3383,11 @@ mod tests {
         assert_eq!(summary.worktrees_removed, 0, "no foreign worktree removed");
         assert!(other_wt.is_dir(), "sibling profile's worktree untouched");
         assert!(work2_wt.is_dir(), "prefix-sharing profile's worktree untouched");
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            tmp.path().join("profiles").join("other").join("z").is_dir(),
+            "dot-dot-reached dir untouched"
+        );
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(
             warnings.iter().any(|w| w.contains("inside profile 'other'")),
             "{warnings:?}"
@@ -3377,6 +3395,10 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.contains("inside profile 'work2'")),
             "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("inside profile '?'")),
+            "dot-dot path skipped with unknown owner: {warnings:?}"
         );
     }
 
