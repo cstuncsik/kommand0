@@ -1339,6 +1339,26 @@ fn profile_flag_shows_the_label_and_state_lands_in_the_profile_dir() {
     let mut tui = Tui::launch_legacy_layout(None, &["--profile", "work"]);
     tui.wait_for("Repos · work");
 
+    // The running TUI holds a SHARED instance lock on its profile: an
+    // exclusive probe from the test process must be refused while it runs.
+    let lock_path =
+        tui.state_dir.path().join(".kommand0-dev").join("locks").join("work.lock");
+    let probe = |path: &std::path::Path| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+    };
+    match probe(&lock_path) {
+        Err((_, e)) => {
+            assert_eq!(e, nix::errno::Errno::EWOULDBLOCK, "held shared by the TUI");
+        }
+        Ok(_) => panic!("the TUI's shared instance lock must refuse an exclusive probe"),
+    }
+
     // Add a repo so the profile's state file actually gets written.
     let repo = tui.state_dir.path().join("proj-tui");
     std::fs::create_dir_all(&repo).unwrap();
@@ -1361,6 +1381,9 @@ fn profile_flag_shows_the_label_and_state_lands_in_the_profile_dir() {
 
     tui.send("q");
     tui.wait_exit();
+
+    // Release-on-exit: the fd closed with the process, so the probe succeeds.
+    assert!(probe(&lock_path).is_ok(), "instance lock released on exit");
 }
 
 #[test]

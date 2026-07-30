@@ -29,6 +29,8 @@ pub(crate) enum PaletteAction {
     NewSession { ws_id: String },
     /// Switch to session tab `index` of an already-open workspace.
     JumpTab { ws_id: String, index: usize },
+    /// Delete a profile (never the TUI's own: the candidates exclude it).
+    DeleteProfile { name: String },
 }
 
 /// One palette entry: the display label + muted detail, the text the query is
