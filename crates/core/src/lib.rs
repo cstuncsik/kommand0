@@ -603,12 +603,17 @@ impl AppState {
                 .output();
             match out {
                 Ok(out) if out.status.success() => {}
+                // State-authored paths (and git's echo of them): never raw.
                 Ok(out) => warnings.push(format!(
-                    "couldn't repair worktree {worktree}: {} (rerun `git worktree repair` in {repo_path})",
-                    String::from_utf8_lossy(&out.stderr).trim()
+                    "couldn't repair worktree {}: {} (rerun `git worktree repair` in {})",
+                    worktree.escape_debug(),
+                    String::from_utf8_lossy(&out.stderr).trim().escape_debug(),
+                    repo_path.escape_debug()
                 )),
                 Err(e) => warnings.push(format!(
-                    "couldn't repair worktree {worktree}: {e} (rerun `git worktree repair` in {repo_path})"
+                    "couldn't repair worktree {}: {e} (rerun `git worktree repair` in {})",
+                    worktree.escape_debug(),
+                    repo_path.escape_debug()
                 )),
             }
         }
@@ -677,6 +682,17 @@ impl AppState {
     /// CLI case (`kmd --profile Work profile delete work`, no other
     /// instance) proceeds harmlessly (this path never loads ambient state
     /// and the process exits).
+    ///
+    /// Two accepted limitations. Legacy-root worktrees (outside profiles/)
+    /// carry no cross-profile ownership check, so a hand-copied profile
+    /// sharing legacy-root paths can remove the original's worktrees;
+    /// scanning sibling profiles' states for path uniqueness is a
+    /// deliberate non-goal. And deleting `Work` AS `work` on a
+    /// case-insensitive filesystem (no instance running, so the lock can't
+    /// refuse) reaches the same directory but misclassifies the profile's
+    /// own in-profile worktrees as foreign (`Work` != `work`), skipping
+    /// their git-side removal and leaving stale registrations for a manual
+    /// `git worktree prune`; the concurrent case is covered by the lock.
     pub fn delete_profile(
         name: &str,
         force: bool,
@@ -715,20 +731,7 @@ impl AppState {
         // Existence/symlink checks AFTER the lock: the second of two racing
         // deletes gets a clean "not found" instead of a remove_dir_all error.
         let dir = base.join("profiles").join(name);
-        match fs::symlink_metadata(&dir) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                bail!("profile '{name}' not found at {}", dir.display())
-            }
-            Err(e) => {
-                return Err(e).with_context(|| format!("failed to stat {}", dir.display()));
-            }
-            Ok(m) if m.is_symlink() => bail!(
-                "profile '{name}' at {} is a symlink; refusing to delete through it",
-                dir.display()
-            ),
-            Ok(m) if !m.is_dir() => bail!("profile '{name}' not found at {}", dir.display()),
-            Ok(_) => {}
-        }
+        Self::check_profile_dir(&dir, name)?;
 
         let mut summary = ProfileDeleteSummary::default();
         let mut warnings: Vec<String> = Vec::new();
@@ -766,6 +769,13 @@ impl AppState {
                 // names the owning profile.
                 let foreign_profile = |wt: &str| -> Option<String> {
                     let wt = Path::new(wt);
+                    // A `..` ANYWHERE makes ownership unknowable lexically:
+                    // `<base>/tmp/../profiles/live/x` evades the prefix
+                    // match below yet resolves into a profile. RootDir is
+                    // fine (every absolute path starts with it).
+                    if wt.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                        return Some("?".into());
+                    }
                     profile_roots.iter().find_map(|root| {
                         let rest = wt.strip_prefix(root).ok()?;
                         // A `..`/`.` below profiles/ makes the owner
@@ -796,19 +806,21 @@ impl AppState {
                     // the copy destroy the original's live worktrees).
                     if let Some(owner) = foreign_profile(wt) {
                         warnings.push(format!(
-                            "workspace '{}' points at a worktree inside profile '{}' ({wt}); \
+                            "workspace '{}' points at a worktree inside profile '{}' ({}); \
                              not removed",
                             ws.name.escape_debug(),
-                            owner.escape_debug()
+                            owner.escape_debug(),
+                            wt.escape_debug()
                         ));
                         continue;
                     }
                     match state.repos.iter().find(|r| r.id == ws.repo_id) {
                         Some(repo) => removals.push((repo.path.clone(), wt.clone())),
                         None => warnings.push(format!(
-                            "no repo found for workspace '{}'; its worktree {wt} was not \
+                            "no repo found for workspace '{}'; its worktree {} was not \
                              removed, run `git worktree prune` in its repo",
-                            ws.name.escape_debug()
+                            ws.name.escape_debug(),
+                            wt.escape_debug()
                         )),
                     }
                 }
@@ -830,12 +842,15 @@ impl AppState {
                             summary.worktrees_removed += 1;
                         }
                         Ok(_) => warnings.push(format!(
-                            "couldn't git-remove worktree {wt}; a `git worktree prune` runs in \
-                             {repo_path} after delete, and if the directory survives outside \
-                             the profile, remove it by hand (git worktree remove --force)"
+                            "couldn't git-remove worktree {}; a `git worktree prune` runs in \
+                             {} after delete, and if the directory survives outside \
+                             the profile, remove it by hand (git worktree remove --force)",
+                            wt.escape_debug(),
+                            repo_path.escape_debug()
                         )),
                         Err(e) => warnings.push(format!(
-                            "couldn't verify worktree removal for {wt}: {e}"
+                            "couldn't verify worktree removal for {}: {e}",
+                            wt.escape_debug()
                         )),
                     }
                     prune_repos.push(repo_path.clone());
@@ -866,13 +881,15 @@ impl AppState {
                 Ok(out) if out.status.success() => {}
                 // git's stderr can echo arbitrary path bytes: never raw.
                 Ok(out) => warnings.push(format!(
-                    "couldn't prune worktrees in {repo_path}: {} (run `git worktree prune` \
+                    "couldn't prune worktrees in {}: {} (run `git worktree prune` \
                      there by hand)",
+                    repo_path.escape_debug(),
                     String::from_utf8_lossy(&out.stderr).trim().escape_debug()
                 )),
                 Err(e) => warnings.push(format!(
-                    "couldn't prune worktrees in {repo_path}: {e} (run `git worktree prune` \
-                     there by hand)"
+                    "couldn't prune worktrees in {}: {e} (run `git worktree prune` \
+                     there by hand)",
+                    repo_path.escape_debug()
                 )),
             }
         }
@@ -893,14 +910,31 @@ impl AppState {
         Self::profile_delete_preview_at(&Self::base_dir(), name)
     }
 
+    /// The target-dir gate shared by delete and its preview: the profile
+    /// dir must exist, be a real directory, and not be a symlink (refuse
+    /// `remove_dir_all` through a link; the preview refuses identically so
+    /// a prompt never promises what the delete would then refuse).
+    fn check_profile_dir(dir: &Path, name: &str) -> anyhow::Result<()> {
+        match fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("profile '{name}' not found at {}", dir.display())
+            }
+            Err(e) => Err(e).with_context(|| format!("failed to stat {}", dir.display())),
+            Ok(m) if m.is_symlink() => bail!(
+                "profile '{name}' at {} is a symlink; refusing to delete through it",
+                dir.display()
+            ),
+            Ok(m) if !m.is_dir() => bail!("profile '{name}' not found at {}", dir.display()),
+            Ok(_) => Ok(()),
+        }
+    }
+
     /// [`Self::profile_delete_preview`] against an explicit base dir (the
     /// test seam).
     fn profile_delete_preview_at(base: &Path, name: &str) -> anyhow::Result<ProfileDeleteSummary> {
         Self::validate_profile_name(name).map_err(|e| anyhow::anyhow!(e))?;
         let dir = base.join("profiles").join(name);
-        if !dir.is_dir() {
-            bail!("profile '{name}' not found at {}", dir.display());
-        }
+        Self::check_profile_dir(&dir, name)?;
         match Self::read_target_state(&dir, name)? {
             TargetState::Absent => Ok(ProfileDeleteSummary::default()),
             TargetState::Corrupt(e) => Err(e),
@@ -3214,6 +3248,10 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
         assert!(real.join("state.json").exists(), "link target intact");
+        // The preview shares the gate: it must refuse the link the same way
+        // rather than promising counts delete would then refuse.
+        let err = AppState::profile_delete_preview_at(tmp.path(), "linked").unwrap_err();
+        assert!(err.to_string().contains("symlink"), "preview refuses too: {err}");
     }
 
     #[test]
@@ -3366,13 +3404,19 @@ mod tests {
         // resolves into `other`. Must be skipped as foreign too.
         let dotdot_wt = tmp.path().join("profiles").join("work").join("..").join("other").join("z");
         fs::create_dir_all(tmp.path().join("profiles").join("other").join("z")).unwrap();
+        // A dot-dot path that never even MATCHES the profiles/ prefix
+        // lexically (`tmp/../profiles/live/x`), yet resolves into one: the
+        // whole-path `..` check must catch it before the prefix loop.
+        let evasive_wt = tmp.path().join("tmp").join("..").join("profiles").join("live").join("x");
+        let live_wt = tmp.path().join("profiles").join("live").join("x");
+        fs::create_dir_all(&live_wt).unwrap();
         let mut state = AppState::default();
         state.repos.push(RepoEntry {
             id: "r1".into(),
             name: "r".into(),
             path: "/tmp".into(),
         });
-        for (id, wt) in [("w1", &other_wt), ("w2", &work2_wt), ("w3", &dotdot_wt)] {
+        for (id, wt) in [("w1", &other_wt), ("w2", &work2_wt), ("w3", &dotdot_wt), ("w4", &evasive_wt)] {
             state.workspaces.push(Workspace {
                 id: id.into(),
                 name: format!("{id}-ws"),
@@ -3396,7 +3440,8 @@ mod tests {
             tmp.path().join("profiles").join("other").join("z").is_dir(),
             "dot-dot-reached dir untouched"
         );
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(live_wt.is_dir(), "prefix-evading dot-dot dir untouched");
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
         assert!(
             warnings.iter().any(|w| w.contains("inside profile 'other'")),
             "{warnings:?}"
@@ -3405,9 +3450,10 @@ mod tests {
             warnings.iter().any(|w| w.contains("inside profile 'work2'")),
             "{warnings:?}"
         );
-        assert!(
-            warnings.iter().any(|w| w.contains("inside profile '?'")),
-            "dot-dot path skipped with unknown owner: {warnings:?}"
+        assert_eq!(
+            warnings.iter().filter(|w| w.contains("inside profile '?'")).count(),
+            2,
+            "both dot-dot paths skipped with unknown owner: {warnings:?}"
         );
     }
 
