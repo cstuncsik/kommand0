@@ -1,0 +1,24 @@
+apps/tui/src/main.rs
+  s_397ff314c4e8b5::t_a2c10e59cd423b 45-51,54
+  s_397ff314c4e8b5::t_110c0db1ed47da 2864,2866,2868
+  s_397ff314c4e8b5::t_b4cbeea1a2ca24 2918,2920,2922
+  s_397ff314c4e8b5::t_dabc69125f76ca 3317
+  s_397ff314c4e8b5::t_98973ae4d187b1 3279
+  s_397ff314c4e8b5::t_46a486fa77cac7 2862,2916
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "c70ed9dc9390009e091f7472919322a67d0bbceb",
+  "prompts": {},
+  "sessions": {
+    "s_397ff314c4e8b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3c55c174-8780-4c86-9d5b-a60d5a4fc9f0",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
