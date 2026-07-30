@@ -18,6 +18,57 @@ All notable changes to kommand0 are documented here. The format is based on
   instance is using it** (flock-based instance locks; instances started by
   older versions are not detected).
 
+## [0.24.1] - 2026-07-29
+
+## [0.24.0] - 2026-07-29
+
+### Added
+
+- **Codex, gemini and opencode session tabs**: `Ctrl+A e`/`g`/`o` (and the
+  "New codex/gemini/opencode" palette entries) open an embedded `codex`,
+  `gemini` or `opencode` alongside the Claude and shell tabs. New config
+  fields `codex_bin`/`codex_args`, `gemini_bin`/`gemini_args` and
+  `opencode_bin`/`opencode_args` mirror claude's pair, with `KOMMAND0_CODEX_BIN`,
+  `KOMMAND0_GEMINI_BIN` and `KOMMAND0_OPENCODE_BIN` env overrides taking
+  precedence. Gemini tabs resume their conversation when the workspace
+  reopens (like Claude tabs). Codex and opencode tabs capture the session id
+  their CLI prints when a session closes and resume it on reopen; quitting
+  kommand0 (or detaching a workspace) now gracefully terminates them first
+  and captures the id opencode prints on SIGTERM, and codex session ids are
+  captured from codex's own session store right after the tab starts, so a
+  codex tab still open at quit, or lost to a kommand0 crash, resumes too.
+  Anything uncaptured still reopens fresh.
+
+### Fixed
+
+- The right pane's border title and the status bar's mode badge now name the
+  active tab's kind (previously always "claude", wrong for shell tabs).
+- Reopening a claude or gemini tab whose persisted entry isn't a kommand0-minted
+  uuid (hand-edited or corrupt `state.json`) now persists the fresh session's id
+  in the entry's place, instead of keeping the junk entry forever.
+
+## [0.23.1] - 2026-07-25
+
+### Changed
+
+- README: added a Troubleshooting section (missing PR status, embedded pane not
+  opening, tmux Shift+Enter and clipboard, empty tree from a different
+  profile/state dir, what to include in bug reports) and fixed the dead Claude
+  Code CLI docs link.
+
+## [0.23.0] - 2026-07-23
+
+### Added
+
+- **`Ctrl+A d` detaches a workspace's sessions from inside the pane**: kills
+  the embedded processes to free memory but keeps every session entry, so
+  reopening the workspace restores the full tab row (Claude tabs resume their
+  conversation, shell tabs respawn fresh). The in-pane counterpart of closing
+  the pane with `x` from the tree; `Ctrl+A x` still closes-and-forgets the
+  active tab.
+
+## [0.22.0] - 2026-07-22
+
 ## [0.21.0] - 2026-07-21
 
 ### Added
@@ -671,7 +722,12 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.24.1...HEAD
+[0.24.1]: https://github.com/cstuncsik/kommand0/compare/v0.24.0...v0.24.1
+[0.24.0]: https://github.com/cstuncsik/kommand0/compare/v0.23.1...v0.24.0
+[0.23.1]: https://github.com/cstuncsik/kommand0/compare/v0.23.0...v0.23.1
+[0.23.0]: https://github.com/cstuncsik/kommand0/compare/v0.22.0...v0.23.0
+[0.22.0]: https://github.com/cstuncsik/kommand0/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/cstuncsik/kommand0/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/cstuncsik/kommand0/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/cstuncsik/kommand0/compare/v0.19.0...v0.19.1

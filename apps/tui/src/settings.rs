@@ -27,6 +27,12 @@ pub(crate) enum Field {
     ClaudeArgs,
     ClaudeBin,
     Shell,
+    CodexArgs,
+    CodexBin,
+    GeminiArgs,
+    GeminiBin,
+    OpencodeArgs,
+    OpencodeBin,
     Notify,
     Theme,
     StatusRefreshSecs,
@@ -38,6 +44,12 @@ pub(crate) const FIELDS: &[Field] = &[
     Field::ClaudeArgs,
     Field::ClaudeBin,
     Field::Shell,
+    Field::CodexArgs,
+    Field::CodexBin,
+    Field::GeminiArgs,
+    Field::GeminiBin,
+    Field::OpencodeArgs,
+    Field::OpencodeBin,
     Field::Notify,
     Field::Theme,
     Field::StatusRefreshSecs,
@@ -51,6 +63,12 @@ impl Field {
             Field::ClaudeArgs => "claude_args",
             Field::ClaudeBin => "claude_bin",
             Field::Shell => "shell",
+            Field::CodexArgs => "codex_args",
+            Field::CodexBin => "codex_bin",
+            Field::GeminiArgs => "gemini_args",
+            Field::GeminiBin => "gemini_bin",
+            Field::OpencodeArgs => "opencode_args",
+            Field::OpencodeBin => "opencode_bin",
             Field::Notify => "notify",
             Field::Theme => "theme",
             Field::StatusRefreshSecs => "status_refresh_secs",
@@ -58,14 +76,20 @@ impl Field {
         }
     }
 
-    /// The current value as the edit-seed string; `""` = unset. `claude_args`
-    /// is shell-quoted so an embedded-space arg survives an open→commit
-    /// round-trip exactly.
+    /// The current value as the edit-seed string; `""` = unset. The `*_args`
+    /// fields are shell-quoted so an embedded-space arg survives an
+    /// open→commit round-trip exactly.
     pub(crate) fn current(self, cfg: &Config) -> String {
         match self {
             Field::ClaudeArgs => shell_words::join(&cfg.claude_args),
             Field::ClaudeBin => cfg.claude_bin.clone().unwrap_or_default(),
             Field::Shell => cfg.shell.clone().unwrap_or_default(),
+            Field::CodexArgs => shell_words::join(&cfg.codex_args),
+            Field::CodexBin => cfg.codex_bin.clone().unwrap_or_default(),
+            Field::GeminiArgs => shell_words::join(&cfg.gemini_args),
+            Field::GeminiBin => cfg.gemini_bin.clone().unwrap_or_default(),
+            Field::OpencodeArgs => shell_words::join(&cfg.opencode_args),
+            Field::OpencodeBin => cfg.opencode_bin.clone().unwrap_or_default(),
             Field::Notify => cfg.notify.clone().unwrap_or_default(),
             Field::Theme => cfg.theme.clone().unwrap_or_default(),
             Field::StatusRefreshSecs => {
@@ -85,11 +109,16 @@ impl Field {
             return Ok(None);
         }
         match self {
-            Field::ClaudeArgs => {
-                let args = shell_words::split(raw).map_err(|e| format!("claude_args: {e}"))?;
+            Field::ClaudeArgs | Field::CodexArgs | Field::GeminiArgs | Field::OpencodeArgs => {
+                let args =
+                    shell_words::split(raw).map_err(|e| format!("{}: {e}", self.key()))?;
                 Ok(Some(serde_json::json!(args)))
             }
-            Field::ClaudeBin | Field::Shell => Ok(Some(serde_json::json!(raw))),
+            Field::ClaudeBin
+            | Field::Shell
+            | Field::CodexBin
+            | Field::GeminiBin
+            | Field::OpencodeBin => Ok(Some(serde_json::json!(raw))),
             Field::Notify => {
                 if NOTIFY_VALUES.contains(&raw) {
                     Ok(Some(serde_json::json!(raw)))
@@ -126,17 +155,21 @@ impl Field {
         let as_string = |v: Option<&serde_json::Value>| {
             v.and_then(|v| v.as_str()).map(str::to_string)
         };
+        let as_args = |v: Option<&serde_json::Value>| -> Vec<String> {
+            v.and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+                .unwrap_or_default()
+        };
         match self {
-            Field::ClaudeArgs => {
-                cfg.claude_args = value
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()
-                    })
-                    .unwrap_or_default();
-            }
+            Field::ClaudeArgs => cfg.claude_args = as_args(value),
             Field::ClaudeBin => cfg.claude_bin = as_string(value),
             Field::Shell => cfg.shell = as_string(value),
+            Field::CodexArgs => cfg.codex_args = as_args(value),
+            Field::CodexBin => cfg.codex_bin = as_string(value),
+            Field::GeminiArgs => cfg.gemini_args = as_args(value),
+            Field::GeminiBin => cfg.gemini_bin = as_string(value),
+            Field::OpencodeArgs => cfg.opencode_args = as_args(value),
+            Field::OpencodeBin => cfg.opencode_bin = as_string(value),
             Field::Notify => cfg.notify = as_string(value),
             Field::Theme => cfg.theme = as_string(value),
             Field::StatusRefreshSecs => cfg.status_refresh_secs = value.and_then(|v| v.as_u64()),
@@ -251,6 +284,12 @@ mod tests {
             (Field::ClaudeArgs, r#"--model opus --append-system-prompt "be terse""#),
             (Field::ClaudeBin, "claude-dev"),
             (Field::Shell, "tmux"),
+            (Field::CodexArgs, "--sandbox workspace-write"),
+            (Field::CodexBin, "codex-dev"),
+            (Field::GeminiArgs, "--approval-mode auto_edit"),
+            (Field::GeminiBin, "gemini-dev"),
+            (Field::OpencodeArgs, "--model anthropic/claude"),
+            (Field::OpencodeBin, "opencode-dev"),
             (Field::Notify, "bell"),
             (Field::Theme, "high-contrast"),
             (Field::StatusRefreshSecs, "5"),

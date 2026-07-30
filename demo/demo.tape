@@ -16,14 +16,14 @@ Set CursorBlink false
 
 # --- setup (hidden): point kommand0 at the seeded demo env + stub claude ---
 Hide
-Type "export KOMMAND0_STATE_DIR=$PWD/demo/.work/state KOMMAND0_CLAUDE_BIN=$PWD/demo/claude-demo"
+Type `export KOMMAND0_STATE_DIR="$PWD/demo/.work/state" KOMMAND0_CLAUDE_BIN="$PWD/demo/claude-demo"`
 Enter
 Type "clear"
 Enter
 Show
 
 # --- launch ---
-Type "$PWD/target/release/kommand0"
+Type `"$PWD/target/release/kommand0"`
 Enter
 Sleep 2.5
 
@@ -56,10 +56,10 @@ Ctrl+A
 Type "t"
 Sleep 1.2
 
-# Command palette again — run an action on any workspace (here: open a PR).
+# Command palette again — actions too (here: narrow to archiving a workspace).
 Type ":"
 Sleep 0.8
-Type "pr payments"
+Type "archive search"
 Sleep 2
 Escape
 Sleep 1

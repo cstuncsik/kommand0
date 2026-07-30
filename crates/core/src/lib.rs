@@ -1,3 +1,4 @@
+pub mod codex;
 pub mod config;
 pub mod git;
 pub mod id;
@@ -7,6 +8,7 @@ pub mod session;
 pub mod workspace;
 pub mod worktree;
 
+pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
 pub use git::{
     BranchStatus, FileDiff, PrChecks, PrReview, PrState, PrStatus, branch_status,
@@ -129,10 +131,6 @@ pub const PROFILE_ENV: &str = "KOMMAND0_PROFILE";
 /// crates, and "which dir" is already ambient state (the env override is read
 /// the same way).
 static PROFILE: OnceLock<String> = OnceLock::new();
-
-/// Prefix marking a persisted embedded-session entry as a shell tab. The one
-/// place the sentinel shape is built/inspected.
-const SHELL_SESSION_PREFIX: &str = "shell:";
 
 /// Counts from a profile delete (or its preview). Named struct so three
 /// adjacent usizes can't be swapped silently. For a preview,
@@ -1168,26 +1166,29 @@ impl AppState {
         }
     }
 
-    /// A fresh Claude session id (UUID v4) to assign to a new embedded session.
-    pub fn new_claude_session_id() -> String {
-        uuid::Uuid::new_v4().to_string()
+    /// Mint a persisted embedded-session entry: `prefix` + a fresh UUID v4.
+    /// `""` yields a bare claude id; kind prefixes (`shell:` etc.) live in the
+    /// TUI. The entry is also the tab's runtime id, so close/reap removal needs
+    /// no translation. UUIDs contain no ':', so a prefixed sentinel can never
+    /// collide with a bare claude id.
+    pub fn new_prefixed_session_id(prefix: &str) -> String {
+        format!("{prefix}{}", uuid::Uuid::new_v4())
     }
 
-    /// Mint a persisted embedded-session entry for a shell tab. The entry is also
-    /// the tab's runtime id, so close/reap removal needs no translation. UUIDs
-    /// contain no ':', so a sentinel can never collide with a Claude session id.
-    pub fn new_shell_session_id() -> String {
-        format!("{SHELL_SESSION_PREFIX}{}", uuid::Uuid::new_v4())
+    /// Whether `bare` (a persisted entry with its kind prefix stripped) is a
+    /// canonical session uuid: lowercase hyphenated, exactly as
+    /// [`Self::new_prefixed_session_id`] writes it (captured codex ids share
+    /// the shape, v7 instead of v4). Only these may reach a resume argv: a
+    /// hand-edited entry must not smuggle flags into the spawn, and
+    /// `parse_str`'s looser spellings (uppercase, braced, urn, bare 32-hex)
+    /// never came from a mint or a codex exit hint.
+    pub fn is_valid_session_uuid(bare: &str) -> bool {
+        uuid::Uuid::parse_str(bare).is_ok_and(|u| u.hyphenated().to_string() == bare)
     }
 
-    /// Whether a persisted embedded-session entry denotes a shell tab.
-    pub fn is_shell_session_id(id: &str) -> bool {
-        id.starts_with(SHELL_SESSION_PREFIX)
-    }
-
-    /// The stored session entries (Claude session ids, or `shell:<uuid>`
-    /// sentinels for shell tabs) for a workspace's session tabs, in tab
-    /// order (empty slice when none).
+    /// The stored session entries (prefixed sentinels: `shell:<uuid>`,
+    /// `codex:tab-<uuid>`, …; a bare uuid is claude's) for a workspace's
+    /// session tabs, in tab order (empty slice when none).
     pub fn embedded_session_ids(&self, workspace_id: &str) -> &[String] {
         self.embedded_sessions
             .get(workspace_id)
@@ -1204,7 +1205,7 @@ impl AppState {
     }
 
     /// Forget a single session entry for a workspace (its tab was closed, its
-    /// shell exited, or its resume failed because the Claude session was
+    /// non-resumable tab exited, or its resume failed because the session was
     /// purged). Removes the workspace entry when its last id is gone. Preserves
     /// the order of the rest.
     pub fn remove_embedded_session(&mut self, workspace_id: &str, session_id: &str) {
@@ -2174,7 +2175,7 @@ mod tests {
         let mut state = AppState::default();
         assert!(state.embedded_session_ids("w1").is_empty());
 
-        let id = AppState::new_claude_session_id();
+        let id = AppState::new_prefixed_session_id("");
         state.add_embedded_session("w1", &id);
         assert_eq!(state.embedded_session_ids("w1"), std::slice::from_ref(&id));
         state.save_to(tmp.path()).unwrap();
@@ -2187,25 +2188,33 @@ mod tests {
     }
 
     #[test]
-    fn new_claude_session_id_is_a_unique_uuid() {
-        let a = AppState::new_claude_session_id();
-        let b = AppState::new_claude_session_id();
-        assert_ne!(a, b);
-        assert!(uuid::Uuid::parse_str(&a).is_ok(), "should be a valid UUID: {a}");
+    fn new_prefixed_session_id_mints_prefix_plus_uuid() {
+        let a = AppState::new_prefixed_session_id("shell:");
+        let b = AppState::new_prefixed_session_id("shell:");
+        assert!(a.starts_with("shell:"), "sentinel carries the prefix: {a}");
+        assert_ne!(a, b, "each mint is unique");
+        assert!(
+            uuid::Uuid::parse_str(a.strip_prefix("shell:").unwrap()).is_ok(),
+            "the tail is a valid UUID: {a}"
+        );
+        // An empty prefix mints a bare (claude) id.
+        let bare = AppState::new_prefixed_session_id("");
+        assert!(uuid::Uuid::parse_str(&bare).is_ok(), "should be a valid UUID: {bare}");
     }
 
     #[test]
-    fn shell_session_id_mint_and_classify() {
-        let a = AppState::new_shell_session_id();
-        let b = AppState::new_shell_session_id();
-        assert!(a.starts_with("shell:"), "sentinel carries the prefix: {a}");
-        assert_ne!(a, b, "each mint is unique");
-        assert!(AppState::is_shell_session_id(&a));
-        assert!(
-            !AppState::is_shell_session_id(&AppState::new_claude_session_id()),
-            "a Claude session id is never a shell sentinel"
-        );
-        assert!(!AppState::is_shell_session_id("plain-id"));
+    fn is_valid_session_uuid_accepts_only_uuids() {
+        assert!(AppState::is_valid_session_uuid(&AppState::new_prefixed_session_id("")));
+        assert!(AppState::is_valid_session_uuid("12345678-1234-4123-8123-123456789abc"));
+        assert!(!AppState::is_valid_session_uuid("--yolo"));
+        assert!(!AppState::is_valid_session_uuid("plain-id"));
+        assert!(!AppState::is_valid_session_uuid(""));
+        // Canonical minted form only: uuid::parse_str's looser spellings never
+        // came from a kommand0 mint, so they stay junk.
+        assert!(!AppState::is_valid_session_uuid("12345678-1234-4123-8123-123456789ABC"));
+        assert!(!AppState::is_valid_session_uuid("{12345678-1234-4123-8123-123456789abc}"));
+        assert!(!AppState::is_valid_session_uuid("urn:uuid:12345678-1234-4123-8123-123456789abc"));
+        assert!(!AppState::is_valid_session_uuid("12345678123441238123123456789abc"));
     }
 
     #[test]
