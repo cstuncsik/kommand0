@@ -872,6 +872,11 @@ pub(crate) struct App {
     profile_delete_inflight: bool,
     /// Profile-delete worker → event-loop channel carrying `(name, result)`.
     profile_delete_tx: Option<tokio::sync::mpsc::UnboundedSender<ProfileDeleteMsg>>,
+    /// The delete worker's handle, joined after the event loop ends so no
+    /// exit path kills the worker mid-`remove_dir_all`. A finished worker's
+    /// handle stays until the next delete overwrites it (joining a finished
+    /// thread returns immediately).
+    profile_delete_join: Option<std::thread::JoinHandle<()>>,
     /// One-line profile-delete outcome `(message, is_error)` shown in the
     /// tree's bottom border; cleared on the next key press.
     pub(crate) profile_notice: Option<(String, bool)>,
@@ -975,6 +980,7 @@ impl App {
             cleanup_tx: None,
             profile_delete_inflight: false,
             profile_delete_tx: None,
+            profile_delete_join: None,
             profile_notice: None,
             codex_capture_tx: None,
             config: Config::default(),
@@ -3330,7 +3336,7 @@ impl App {
     /// Returns true when quit must be blocked.
     fn quit_blocked_by_profile_delete(&mut self) -> bool {
         if self.profile_delete_inflight {
-            self.profile_notice = Some(("profile delete in progress".to_string(), true));
+            self.profile_notice = Some(("Profile delete in progress".to_string(), true));
             return true;
         }
         false
@@ -3352,7 +3358,7 @@ impl App {
         self.profile_notice = None;
         // Owned String: a borrowed &str can't cross the 'static spawn boundary.
         let name = name.to_string();
-        std::thread::spawn(move || {
+        self.profile_delete_join = Some(std::thread::spawn(move || {
             let mut guard = ProfileDeleteGuard {
                 tx,
                 payload: Some((
@@ -3363,7 +3369,7 @@ impl App {
             let result = kommand0_core::AppState::delete_profile(&name, false)
                 .map_err(|e| e.to_string());
             guard.payload = Some((name, result));
-        });
+        }));
     }
 
     /// Whether any of a workspace's session tabs needs the user's attention.
@@ -3515,10 +3521,14 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     // Any key dismisses a pane selection highlight (it may be about to change
     // what the pane shows; the copy already happened on mouse-up).
     app.pane_selection = None;
-    // Any key also dismisses a profile-delete notice (vim-statusline
-    // semantics, no timers). A notice set later in THIS key's handling
-    // (palette dispatch) survives until the next press.
-    app.profile_notice = None;
+    // A TREE-focused key dismisses a profile-delete notice (vim-statusline
+    // semantics, no timers). Keys forwarded to an embedded pane must not
+    // wipe an unseen result (and the blocked-quit notice must survive
+    // embedded typing). A notice set later in THIS key's handling (palette
+    // dispatch, the quit guard) survives until the next tree press.
+    if app.focus == Focus::Tree {
+        app.profile_notice = None;
+    }
     // Embedded pane owns the keyboard: every key forwards to the real claude
     // (incl. Ctrl+C, Tab, q, slash commands). kommand0 commands are reached via a
     // tmux-style prefix (Ctrl+A) so there's always a reliable way out:
@@ -4415,21 +4425,24 @@ async fn main() -> anyhow::Result<()> {
         Ok(name) => name,
         Err(e) => die(&e),
     };
+    // Announce this instance: a shared flock on the profile's lock file,
+    // held until the process exits (any exit path closes the fd), so a
+    // `profile delete`/`rename` elsewhere refuses while we run. None under
+    // KOMMAND0_STATE_DIR. Taken BEFORE the migration so no delete/rename
+    // window opens between the two; creating locks/ cannot trip the
+    // migration's idempotence guard, which checks profiles/ only. Also
+    // before init_logging so a refusal fails fast, pre-alt-screen, without
+    // recreating state dirs.
+    let _profile_lock = match kommand0_core::lock::acquire_shared(&profile) {
+        Ok(l) => l,
+        Err(e) => die(&e.to_string()),
+    };
     // Must run BEFORE init_logging(): that create_dir_all's the state dir,
     // which would create profiles/… first and trip the migration guard —
     // reordering this after init_logging silently orphans pre-profiles state.
     if let Err(e) = AppState::migrate_legacy_profiles() {
         die(&e.to_string());
     }
-    // Announce this instance: a shared flock on the profile's lock file,
-    // held until the process exits (any exit path closes the fd), so a
-    // `profile delete`/`rename` elsewhere refuses while we run. None under
-    // KOMMAND0_STATE_DIR. Before init_logging so a refusal fails fast,
-    // pre-alt-screen, without recreating state dirs.
-    let _profile_lock = match kommand0_core::lock::acquire_shared(&profile) {
-        Ok(l) => l,
-        Err(e) => die(&e.to_string()),
-    };
     init_logging();
     tracing::info!("kommand0 started");
     let mut terminal = ratatui::init();
@@ -5013,6 +5026,14 @@ async fn run(
                 }
             }
         }
+    }
+
+    // A profile delete still in flight (the quit guard covers key-driven
+    // quits, but the input channel can close under it) must finish before
+    // any teardown: exiting mid-remove_dir_all would leave half a profile.
+    // A finished worker joins immediately.
+    if let Some(handle) = app.profile_delete_join.take() {
+        let _ = handle.join();
     }
 
     // The quit window for codex early capture: a queued poller result can no
@@ -8021,7 +8042,17 @@ mod key_tests {
         let mut app = test_app();
         app.profile_notice = Some(("Deleted profile 'work'".into(), false));
         press(&mut app, KeyCode::Down).await;
-        assert!(app.profile_notice.is_none(), "next key clears the notice");
+        assert!(app.profile_notice.is_none(), "next tree key clears the notice");
+
+        // A key while an embedded pane owns the keyboard is FORWARDED, not
+        // seen by the tree: it must not wipe an unseen result.
+        app.profile_notice = Some(("Deleted profile 'work'".into(), false));
+        app.focus = Focus::Embedded;
+        press(&mut app, KeyCode::Char('x')).await;
+        assert!(
+            app.profile_notice.is_some(),
+            "an embedded-focused key must not clear the notice"
+        );
     }
 
     #[tokio::test]
@@ -8044,7 +8075,7 @@ mod key_tests {
         let out = press(&mut app, KeyCode::Char('q')).await;
         assert_eq!(out, KeyOutcome::Continue, "q must not quit mid-delete");
         let (msg, _) = app.profile_notice.clone().expect("notice set");
-        assert!(msg.contains("profile delete in progress"), "{msg}");
+        assert!(msg.contains("Profile delete in progress"), "{msg}");
     }
 
     #[tokio::test]
