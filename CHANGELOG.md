@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Profile delete** from the CLI (`kmd profile delete <name> [--force]`) and
+  the TUI palette ("Delete profile: <name>" with confirmation), removing the
+  profile's git worktrees (branches kept) and its directory; plus
+  `kmd profile list`.
+
 ### Fixed
 
 - **Deleting or renaming a profile now refuses while a running kommand0/kmd

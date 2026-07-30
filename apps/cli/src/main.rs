@@ -43,6 +43,8 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ProfileAction {
+    /// List profiles
+    List,
     /// Rename a profile directory, rewriting workspace/session paths,
     /// repairing git worktree links, and migrating Claude Code session stores
     Rename {
@@ -50,6 +52,15 @@ enum ProfileAction {
         old: String,
         /// New profile name
         new: String,
+    },
+    /// Delete a profile: remove its git worktrees, then its directory
+    Delete {
+        /// Profile name
+        name: String,
+        /// Skip confirmation; also delete when state.json is corrupt
+        /// (worktree cleanup is skipped then)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -217,8 +228,19 @@ fn main() -> anyhow::Result<()> {
     // Resolve + record the profile (--profile, else an inherited
     // KOMMAND0_PROFILE; an invalid name / env conflict aborts) before any
     // state, config, or log access resolves a directory.
-    AppState::init_profile(cli.profile.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+    let profile = AppState::init_profile(cli.profile.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
     AppState::migrate_legacy_profiles()?;
+    // Held for the command's duration so a concurrent `profile delete` can't
+    // pull this profile's directory out from under us (None under
+    // KOMMAND0_STATE_DIR). Profile subcommands are exempt: they never load
+    // ambient profile state (list is a readdir; rename/delete take their own
+    // exclusive locks on their TARGETS), and kmd's own shared lock on
+    // `default` would otherwise self-conflict with `profile rename default x`
+    // or make a plain `profile delete <other>` hold an unrelated lock.
+    let _profile_lock = match &cli.command {
+        Commands::Profile { .. } => None,
+        _ => kommand0_core::lock::acquire_shared(&profile)?,
+    };
 
     match cli.command {
         Commands::Repo { action } => match action {
@@ -635,6 +657,45 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Profile { action } => match action {
+            ProfileAction::List => {
+                // Bare sorted names, nothing when empty: scriptable (delete
+                // by name needs the raw list).
+                for name in AppState::list_profiles()? {
+                    println!("{name}");
+                }
+            }
+            ProfileAction::Delete { name, force } => {
+                if !force {
+                    let stdin = std::io::stdin();
+                    if !stdin.is_terminal() {
+                        eprintln!("error: refusing to delete without --force in non-interactive mode");
+                        std::process::exit(1);
+                    }
+                    // Counts read from the TARGET profile dir; surfaces
+                    // not-found/corrupt BEFORE the prompt (the corrupt error
+                    // carries the --force hint).
+                    let s = AppState::profile_delete_preview(&name)?;
+                    print!(
+                        "Delete profile '{name}' ({} workspace(s), {} worktree(s), {} session(s))? [y/N] ",
+                        s.workspaces, s.worktrees_removed, s.sessions
+                    );
+                    std::io::stdout().flush()?;
+                    let mut input = String::new();
+                    stdin.read_line(&mut input)?;
+                    if !matches!(input.trim(), "y" | "Y") {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+                let (s, warnings) = AppState::delete_profile(&name, force)?;
+                for w in &warnings {
+                    eprintln!("warning: {w}");
+                }
+                println!(
+                    "Deleted profile: {name} ({} workspace(s), {} worktree(s) removed, {} session(s))",
+                    s.workspaces, s.worktrees_removed, s.sessions
+                );
+            }
             ProfileAction::Rename { old, new } => {
                 let (rewritten, migrated, warnings) = AppState::rename_profile(&old, &new)?;
                 for w in &warnings {
