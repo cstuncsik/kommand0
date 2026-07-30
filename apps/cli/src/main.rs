@@ -214,6 +214,29 @@ fn wants_checkout(answer: &str) -> bool {
     !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no")
 }
 
+/// Shared gate for the destructive `[y/N]` prompts: refuses (exit 1) when
+/// stdin is not a tty, else prints `prompt()` and returns whether the user
+/// confirmed with y/Y (anything else cancels). The prompt is lazy so a
+/// caller can defer work (the profile-delete preview) until after the tty
+/// check, exactly as the inline blocks did. The existing-branch checkout
+/// offer stays separate on purpose: it defaults to YES (non-destructive),
+/// the opposite polarity.
+fn confirm_or_exit(
+    action: &str,
+    prompt: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<bool> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        eprintln!("error: refusing to {action} without --force in non-interactive mode");
+        std::process::exit(1);
+    }
+    print!("{} [y/N] ", prompt()?);
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    stdin.read_line(&mut input)?;
+    Ok(matches!(input.trim(), "y" | "Y"))
+}
+
 fn main() -> anyhow::Result<()> {
     // Surface core's diagnostics (e.g. a failed worktree removal on delete/
     // cleanup) on stderr — fine for a CLI (no alt-screen to corrupt).
@@ -274,27 +297,20 @@ fn main() -> anyhow::Result<()> {
                 let repo = state.resolve_repo(&name)?.clone();
                 let ws_count = state.workspaces.iter().filter(|w| w.repo_id == repo.id).count();
 
-                if !force {
-                    let stdin = std::io::stdin();
-                    if !stdin.is_terminal() {
-                        eprintln!("error: refusing to delete without --force in non-interactive mode");
-                        std::process::exit(1);
-                    }
-                    if ws_count > 0 {
-                        print!(
-                            "Delete repo '{}' and its {} workspace(s)? [y/N] ",
-                            repo.name, ws_count
-                        );
-                    } else {
-                        print!("Delete repo '{}'? [y/N] ", repo.name);
-                    }
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    stdin.read_line(&mut input)?;
-                    if !matches!(input.trim(), "y" | "Y") {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                if !force
+                    && !confirm_or_exit("delete", || {
+                        Ok(if ws_count > 0 {
+                            format!(
+                                "Delete repo '{}' and its {} workspace(s)?",
+                                repo.name, ws_count
+                            )
+                        } else {
+                            format!("Delete repo '{}'?", repo.name)
+                        })
+                    })?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
 
                 state.delete_repo(&name)?;
@@ -417,20 +433,11 @@ fn main() -> anyhow::Result<()> {
                 println!("Created: {}", format_timestamp(ws.created_at));
             }
             WorkspaceAction::Delete { name, force } => {
-                if !force {
-                    let stdin = std::io::stdin();
-                    if !stdin.is_terminal() {
-                        eprintln!("error: refusing to delete without --force in non-interactive mode");
-                        std::process::exit(1);
-                    }
-                    print!("Delete workspace '{name}'? [y/N] ");
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    stdin.read_line(&mut input)?;
-                    if !matches!(input.trim(), "y" | "Y") {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                if !force
+                    && !confirm_or_exit("delete", || Ok(format!("Delete workspace '{name}'?")))?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
                 let mut state = AppState::load()?;
                 let ws = state.delete_workspace(&name)?;
@@ -482,20 +489,15 @@ fn main() -> anyhow::Result<()> {
                     .map(|r| r.path.clone())
                     .ok_or_else(|| anyhow::anyhow!("repo not found for workspace '{name}'"))?;
 
-                if !force {
-                    let stdin = std::io::stdin();
-                    if !stdin.is_terminal() {
-                        eprintln!("error: refusing to clean up without --force in non-interactive mode");
-                        std::process::exit(1);
-                    }
-                    print!("Clean up '{name}' (remove worktree, delete branch {branch})? [y/N] ");
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    stdin.read_line(&mut input)?;
-                    if !matches!(input.trim(), "y" | "Y") {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                if !force
+                    && !confirm_or_exit("clean up", || {
+                        Ok(format!(
+                            "Clean up '{name}' (remove worktree, delete branch {branch})?"
+                        ))
+                    })?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
 
                 match cleanup_merged_workspace(&repo, &worktree, &branch) {
@@ -675,27 +677,20 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             ProfileAction::Delete { name, force } => {
-                if !force {
-                    let stdin = std::io::stdin();
-                    if !stdin.is_terminal() {
-                        eprintln!("error: refusing to delete without --force in non-interactive mode");
-                        std::process::exit(1);
-                    }
-                    // Counts read from the TARGET profile dir; surfaces
-                    // not-found/corrupt BEFORE the prompt (the corrupt error
-                    // carries the --force hint).
-                    let s = AppState::profile_delete_preview(&name)?;
-                    print!(
-                        "Delete profile '{name}' ({} workspace(s), {} worktree(s), {} session(s))? [y/N] ",
-                        s.workspaces, s.worktrees_removed, s.sessions
-                    );
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    stdin.read_line(&mut input)?;
-                    if !matches!(input.trim(), "y" | "Y") {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                if !force
+                    && !confirm_or_exit("delete", || {
+                        // Counts read from the TARGET profile dir; surfaces
+                        // not-found/corrupt BEFORE the prompt (the corrupt
+                        // error carries the --force hint).
+                        let s = AppState::profile_delete_preview(&name)?;
+                        Ok(format!(
+                            "Delete profile '{name}' ({} workspace(s), {} worktree(s), {} session(s))?",
+                            s.workspaces, s.worktrees_removed, s.sessions
+                        ))
+                    })?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
                 let (s, warnings) = AppState::delete_profile(&name, force)?;
                 for w in &warnings {
