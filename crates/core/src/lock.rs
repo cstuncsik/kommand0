@@ -76,7 +76,6 @@ pub(crate) fn acquire_shared_at(base: &Path, name: &str) -> anyhow::Result<Profi
 /// Take `name`'s lock EXCLUSIVE (a delete/rename claiming sole ownership).
 /// Fails fast while any instance holds it shared (or another exclusive op
 /// holds it).
-#[allow(dead_code)] // wired into rename/delete by the follow-up commits
 pub(crate) fn acquire_exclusive_at(base: &Path, name: &str) -> anyhow::Result<ProfileLock> {
     let file = open_lock_file(base, name)?;
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {

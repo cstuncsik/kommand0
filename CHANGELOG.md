@@ -5,6 +5,12 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deleting or renaming a profile now refuses while a running kommand0/kmd
+  instance is using it** (flock-based instance locks; instances started by
+  older versions are not detected).
+
 ## [0.21.0] - 2026-07-21
 
 ### Added

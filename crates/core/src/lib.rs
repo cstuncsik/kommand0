@@ -408,9 +408,10 @@ impl AppState {
     /// profile dir) are left alone. Errors when `KOMMAND0_STATE_DIR` is set
     /// (non-empty): that override targets one exact directory — there is no
     /// profiles tree to rename in. Renaming `default` is allowed — the next
-    /// plain run just starts a fresh default. Renaming a profile while any
-    /// kommand0/kmd instance is running on it is unsupported (nothing locks
-    /// the directory).
+    /// plain run just starts a fresh default. Refuses while a running
+    /// kommand0/kmd instance is using either name (flock-based instance
+    /// locks; instances started by pre-lock versions hold no lock and are
+    /// not detected).
     pub fn rename_profile(old: &str, new: &str) -> anyhow::Result<(usize, usize, Vec<String>)> {
         if Self::state_dir_override().is_some() {
             bail!(
@@ -462,6 +463,14 @@ impl AppState {
         if old == new {
             bail!("old and new profile names are the same: '{old}'");
         }
+        // Refuse while any instance runs on either name; deterministic
+        // (sorted) order so the failure is the same whichever rename wins a
+        // race (both locks are non-blocking, so deadlock is impossible
+        // anyway). Held bindings: the locks must cover the whole rename
+        // (see lock.rs).
+        let (first, second) = if old < new { (old, new) } else { (new, old) };
+        let _lock_first = lock::acquire_exclusive_at(base, first)?;
+        let _lock_second = lock::acquire_exclusive_at(base, second)?;
         let src = base.join("profiles").join(old);
         let dst = base.join("profiles").join(new);
         if !src.is_dir() {
@@ -2648,6 +2657,29 @@ mod tests {
             "rename + rewrite completed: {:?}",
             renamed.workspaces
         );
+    }
+
+    #[test]
+    fn rename_profile_refused_while_lock_held() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("profiles").join("work")).unwrap();
+        let nc = tmp.path().join("nc");
+
+        // An instance on the OLD name blocks the rename.
+        let held_old = lock::acquire_shared_at(tmp.path(), "work").unwrap();
+        let err = AppState::rename_profile_at(tmp.path(), "work", "personal", &nc).unwrap_err();
+        assert!(err.to_string().contains("is using profile"), "old-name lock refused: {err}");
+        drop(held_old);
+
+        // So does an instance already on the NEW name.
+        let held_new = lock::acquire_shared_at(tmp.path(), "personal").unwrap();
+        let err = AppState::rename_profile_at(tmp.path(), "work", "personal", &nc).unwrap_err();
+        assert!(err.to_string().contains("is using profile"), "new-name lock refused: {err}");
+        drop(held_new);
+
+        // Neither refused attempt moved anything.
+        assert!(tmp.path().join("profiles").join("work").is_dir(), "src untouched");
+        assert!(!tmp.path().join("profiles").join("personal").exists(), "dst never created");
     }
 
     /// The claude store slug rule (`path.replace(/[^a-zA-Z0-9]/g, "-")` — a
