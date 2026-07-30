@@ -4393,7 +4393,7 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => die(&e.to_string()),
     };
     // Must run BEFORE init_logging(): that create_dir_all's the state dir,
-    // which would create profiles/… first and trip the migration guard —
+    // which would create profiles/… first and trip the migration guard;
     // reordering this after init_logging silently orphans pre-profiles state.
     if let Err(e) = AppState::migrate_legacy_profiles() {
         die(&e.to_string());
