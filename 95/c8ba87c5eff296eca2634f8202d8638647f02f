@@ -1,0 +1,30 @@
+crates/core/src/lock.rs
+  s_397ff314c4e8b5::t_39febd13c238de 79
+  s_397ff314c4e8b5::t_0ac09c858f450f 1-23,25-78,80-114,116-145
+  s_397ff314c4e8b5::t_62ddfb381f8f93 24
+  s_397ff314c4e8b5::t_4deb4b264e494b 115
+crates/core/src/lib.rs
+  s_397ff314c4e8b5::t_540f7d686dd7bf 4
+crates/core/Cargo.toml
+  s_397ff314c4e8b5::t_497eb8f245dd76 14
+Cargo.toml
+  s_397ff314c4e8b5::t_35a6934a95c00d 26
+Cargo.lock
+  s_397ff314c4e8b5::t_1f4b3d5e34e6a4 929
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "95c8ba87c5eff296eca2634f8202d8638647f02f",
+  "prompts": {},
+  "sessions": {
+    "s_397ff314c4e8b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3c55c174-8780-4c86-9d5b-a60d5a4fc9f0",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
