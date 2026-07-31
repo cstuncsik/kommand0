@@ -926,6 +926,7 @@ dependencies = [
  "chrono",
  "dirs",
  "glob",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "tempfile",

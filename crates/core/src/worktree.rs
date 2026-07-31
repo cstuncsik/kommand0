@@ -438,14 +438,16 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<()> {
         return Ok(());
     }
 
+    // `--` so a state-authored path can never parse as an option.
     let output = Command::new("git")
         .args([
             "-C",
             repo_path,
             "worktree",
             "remove",
-            worktree_path,
             "--force",
+            "--",
+            worktree_path,
         ])
         .output();
 

@@ -42,51 +42,86 @@ const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// git status.
 const PR_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Carries a status-refresh result to the event loop, sending on drop so the
-/// loop always gets a message (and clears `status_inflight`) even if the worker
-/// thread panics before finishing.
-struct StatusRefreshGuard {
-    tx: tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::BranchStatus>>,
-    result: Option<HashMap<String, kommand0_core::BranchStatus>>,
+/// Carries a background worker's result to the event loop, sending on drop
+/// so the loop always gets a message (and clears the matching `*_inflight`
+/// flag) even if the worker thread panics before finishing. Shared by the
+/// status/PR refreshes, cleanup, and profile delete.
+struct SendOnDrop<T> {
+    tx: tokio::sync::mpsc::UnboundedSender<T>,
+    payload: Option<T>,
 }
 
-impl Drop for StatusRefreshGuard {
-    fn drop(&mut self) {
-        if let Some(map) = self.result.take() {
-            let _ = self.tx.send(map);
-        }
-    }
-}
-
-/// Carries a PR-status refresh result (`ws_id` → [`kommand0_core::PrStatus`]) to
-/// the event loop, sending on drop so a worker panic still clears
-/// `pr_status_inflight`.
-struct PrStatusRefreshGuard {
-    tx: tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::PrStatus>>,
-    result: Option<HashMap<String, kommand0_core::PrStatus>>,
-}
-
-impl Drop for PrStatusRefreshGuard {
-    fn drop(&mut self) {
-        if let Some(map) = self.result.take() {
-            let _ = self.tx.send(map);
-        }
-    }
-}
-
-/// Carries a cleanup result `(workspace_id, Ok(()) | Err(msg))` to the event
-/// loop, sending on drop so a worker panic still clears `cleanup_inflight`.
-struct CleanupGuard {
-    tx: tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>,
-    payload: Option<(String, Result<(), String>)>,
-}
-
-impl Drop for CleanupGuard {
+impl<T> Drop for SendOnDrop<T> {
     fn drop(&mut self) {
         if let Some(p) = self.payload.take() {
             let _ = self.tx.send(p);
         }
     }
+}
+
+/// What the profile-delete worker sends back: the profile NAME (read well
+/// after the palette interaction, so the notice can say which profile) and
+/// core's result, stringly on the error side (it crosses a thread).
+type ProfileDeleteMsg =
+    (String, Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>);
+
+/// The `(message, is_error)` notice for a finished profile delete: clean,
+/// with warnings (their full texts go to the log), or failed. Each names the
+/// profile. Pure, so the three wordings are unit-testable.
+fn profile_delete_notice(
+    name: &str,
+    result: &Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>,
+) -> (String, bool) {
+    match result {
+        Ok((s, warnings)) if warnings.is_empty() => (
+            format!(
+                "Deleted profile '{name}' ({} workspace(s), {} worktree(s) removed, {} session(s))",
+                s.workspaces, s.worktrees_removed, s.sessions
+            ),
+            false,
+        ),
+        Ok((s, warnings)) => (
+            format!(
+                "Deleted profile '{name}' with {} warning(s), see kommand0.log ({} worktree(s) removed)",
+                warnings.len(),
+                s.worktrees_removed
+            ),
+            false,
+        ),
+        Err(e) => (format!("Couldn't delete profile '{name}': {e}"), true),
+    }
+}
+
+/// Map a delete preview onto the confirm modal's target. Pure: a silently
+/// swapped pair of counts here would ship wrong confirm numbers.
+fn profile_delete_target(
+    name: String,
+    s: kommand0_core::ProfileDeleteSummary,
+) -> modal::DeleteTarget {
+    modal::DeleteTarget::Profile {
+        name,
+        workspaces: s.workspaces,
+        worktrees: s.worktrees_removed,
+        sessions: s.sessions,
+    }
+}
+
+/// Palette candidates for deleting profiles: one per name in `profiles`,
+/// EXCLUDING the TUI's own (`own`), so self-delete is structurally
+/// unreachable here (core's own-profile guard is the backstop). Pure, so
+/// it's testable while the ambient `list_profiles()` is empty under the
+/// unit harness's `KOMMAND0_STATE_DIR`.
+fn profile_delete_candidates(profiles: &[String], own: &str) -> Vec<palette::Candidate> {
+    profiles
+        .iter()
+        .filter(|name| name.as_str() != own)
+        .map(|name| palette::Candidate {
+            label: format!("Delete profile: {name}"),
+            detail: "profile".into(),
+            match_text: format!("delete profile {name}"),
+            action: palette::PaletteAction::DeleteProfile { name: name.clone() },
+        })
+        .collect()
 }
 
 /// Claude's message when a `--resume <id>` target no longer exists. Interactive
@@ -787,6 +822,20 @@ pub(crate) struct App {
     /// Cleanup worker → event-loop channel carrying `(workspace_id, result)`.
     cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>>,
 
+    /// A profile delete is running on the background thread (gates
+    /// re-triggering; at most one at a time).
+    profile_delete_inflight: bool,
+    /// Profile-delete worker → event-loop channel carrying `(name, result)`.
+    profile_delete_tx: Option<tokio::sync::mpsc::UnboundedSender<ProfileDeleteMsg>>,
+    /// The delete worker's handle, joined after the event loop ends so no
+    /// exit path kills the worker mid-`remove_dir_all`. A finished worker's
+    /// handle stays until the next delete overwrites it (joining a finished
+    /// thread returns immediately).
+    profile_delete_join: Option<std::thread::JoinHandle<()>>,
+    /// One-line profile-delete outcome `(message, is_error)` shown in the
+    /// tree's bottom border; cleared on the next key press.
+    pub(crate) profile_notice: Option<(String, bool)>,
+
     /// Codex early-capture poller → event-loop channel carrying
     /// `(workspace_id, tab_id, captured entry, spawn generation)`. `None`
     /// when not wired (unit tests), which also disables the pollers
@@ -884,6 +933,10 @@ impl App {
             cleanup_inflight: HashSet::new(),
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
+            profile_delete_inflight: false,
+            profile_delete_tx: None,
+            profile_delete_join: None,
+            profile_notice: None,
             codex_capture_tx: None,
             config: Config::default(),
             config_path: Config::effective_path(),
@@ -1848,6 +1901,18 @@ impl App {
             }
         }
 
+        // 4) Delete a profile (every enumerated profile except the TUI's
+        //    own; empty under KOMMAND0_STATE_DIR, where no profiles tree
+        //    exists).
+        let profiles = AppState::list_profiles().unwrap_or_else(|e| {
+            // Degrade to no entries, but leave a trace: a silently absent
+            // action is indistinguishable from "no other profiles".
+            tracing::warn!("couldn't enumerate profiles for the palette: {e}");
+            Vec::new()
+        });
+        let own = self.profile_label.as_deref().unwrap_or(DEFAULT_PROFILE);
+        out.extend(profile_delete_candidates(&profiles, own));
+
         out
     }
 
@@ -1872,6 +1937,26 @@ impl App {
             JumpTab { ws_id, index } => {
                 if self.reveal_workspace(&ws_id) {
                     self.select_session_tab(&ws_id, index);
+                }
+            }
+            DeleteProfile { name } => {
+                if self.profile_delete_inflight {
+                    return;
+                }
+                // A one-shot small file read at user-action time (same class
+                // as the synchronous state ops in key handling). A corrupt
+                // target lands on the Err arm: the TUI is bail-only, the CLI
+                // owns the --force recovery path.
+                match AppState::profile_delete_preview(&name) {
+                    Ok(s) => {
+                        self.modal = modal::ModalState::ConfirmDelete {
+                            target: profile_delete_target(name, s),
+                        };
+                    }
+                    Err(e) => {
+                        self.profile_notice =
+                            Some((format!("Can't delete profile '{name}': {e}"), true));
+                    }
                 }
             }
         }
@@ -2774,13 +2859,13 @@ impl App {
         }
         self.status_inflight = true;
         std::thread::spawn(move || {
-            // The guard sends `result` on drop — including on panic — so the
+            // The guard sends `payload` on drop (including on panic) so the
             // event loop always clears `status_inflight`.
-            let mut guard = StatusRefreshGuard {
+            let mut guard = SendOnDrop {
                 tx,
-                result: Some(HashMap::new()),
+                payload: Some(HashMap::new()),
             };
-            let map = guard.result.as_mut().expect("result present until drop");
+            let map = guard.payload.as_mut().expect("payload present until drop");
             for (id, dir) in targets {
                 if let Some(status) = kommand0_core::branch_status(&dir) {
                     map.insert(id, status);
@@ -2828,13 +2913,13 @@ impl App {
         }
         self.pr_status_inflight = true;
         std::thread::spawn(move || {
-            // The guard sends `result` on drop — including on panic — so the
+            // The guard sends `payload` on drop (including on panic) so the
             // event loop always clears `pr_status_inflight`.
-            let mut guard = PrStatusRefreshGuard {
+            let mut guard = SendOnDrop {
                 tx,
-                result: Some(HashMap::new()),
+                payload: Some(HashMap::new()),
             };
-            let map = guard.result.as_mut().expect("result present until drop");
+            let map = guard.payload.as_mut().expect("payload present until drop");
             for (repo_path, workspaces) in by_repo {
                 let prs = kommand0_core::pr_statuses(&repo_path);
                 for (ws_id, branch) in workspaces {
@@ -3191,13 +3276,55 @@ impl App {
         self.cleanup_result.remove(ws_id);
         let id = ws_id.to_string();
         std::thread::spawn(move || {
-            let mut guard = CleanupGuard {
+            let mut guard = SendOnDrop {
                 tx,
                 payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
             };
             let result = kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch);
             guard.payload = Some((id, result));
         });
+    }
+
+    /// While a profile delete runs, quitting would kill the worker mid
+    /// `remove_dir_all` (the flock dies with the process, but half a
+    /// profile would remain): the quit paths block and notice instead.
+    /// Returns true when quit must be blocked.
+    fn quit_blocked_by_profile_delete(&mut self) -> bool {
+        if self.profile_delete_inflight {
+            self.profile_notice = Some(("Profile delete in progress".to_string(), true));
+            return true;
+        }
+        false
+    }
+
+    /// Run a profile delete off the render loop. Core enforces every guard
+    /// (own-profile check, exclusive instance lock, target-dir-only loads);
+    /// the TUI always passes `force = false`, so a corrupt target bails and
+    /// the notice points at the CLI's recovery path. No state reload after:
+    /// the deleted profile is never the TUI's own.
+    fn start_profile_delete(&mut self, name: &str) {
+        if self.profile_delete_inflight {
+            return;
+        }
+        let Some(tx) = self.profile_delete_tx.clone() else {
+            return; // not wired (unit tests)
+        };
+        self.profile_delete_inflight = true;
+        self.profile_notice = None;
+        // Owned String: a borrowed &str can't cross the 'static spawn boundary.
+        let name = name.to_string();
+        self.profile_delete_join = Some(std::thread::spawn(move || {
+            let mut guard = SendOnDrop {
+                tx,
+                payload: Some((
+                    name.clone(),
+                    Err("the profile delete was interrupted".to_string()),
+                )),
+            };
+            let result = kommand0_core::AppState::delete_profile(&name, false)
+                .map_err(|e| e.to_string());
+            guard.payload = Some((name, result));
+        }));
     }
 
     /// Whether any of a workspace's session tabs needs the user's attention.
@@ -3349,6 +3476,14 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     // Any key dismisses a pane selection highlight (it may be about to change
     // what the pane shows; the copy already happened on mouse-up).
     app.pane_selection = None;
+    // A TREE-focused key dismisses a profile-delete notice (vim-statusline
+    // semantics, no timers). Keys forwarded to an embedded pane must not
+    // wipe an unseen result (and the blocked-quit notice must survive
+    // embedded typing). A notice set later in THIS key's handling (palette
+    // dispatch, the quit guard) survives until the next tree press.
+    if app.focus == Focus::Tree {
+        app.profile_notice = None;
+    }
     // Embedded pane owns the keyboard: every key forwards to the real claude
     // (incl. Ctrl+C, Tab, q, slash commands). kommand0 commands are reached via a
     // tmux-style prefix (Ctrl+A) so there's always a reliable way out:
@@ -3365,6 +3500,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             // with CTRL) from being read as a tab command after the prefix.
             match key.code {
                 KeyCode::Char('q') => {
+                    if app.quit_blocked_by_profile_delete() {
+                        return Ok(KeyOutcome::Continue);
+                    }
                     return Ok(KeyOutcome::Quit);
                 }
                 KeyCode::Char('t') if !ctrl => {
@@ -3707,6 +3845,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         app.rebuild_tree();
                         app.update_active_session();
                     }
+                    modal::DeleteTarget::Profile { name, .. } => {
+                        app.start_profile_delete(&name);
+                    }
                 }
             }
             modal::ModalResult::SubmitWorkspace(repo_id, name, branch) => {
@@ -3893,6 +4034,11 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             use keymap::Action;
             match action {
                 Action::Quit => {
+                    // Before the session-stopping side effects: a blocked
+                    // quit must leave them untouched.
+                    if app.quit_blocked_by_profile_delete() {
+                        return Ok(KeyOutcome::Continue);
+                    }
                     let running_ids: Vec<String> = app
                         .state
                         .sessions
@@ -4234,8 +4380,20 @@ async fn main() -> anyhow::Result<()> {
         Ok(name) => name,
         Err(e) => die(&e),
     };
+    // Announce this instance: a shared flock on the profile's lock file,
+    // held until the process exits (any exit path closes the fd), so a
+    // `profile delete`/`rename` elsewhere refuses while we run. None under
+    // KOMMAND0_STATE_DIR. Taken BEFORE the migration so no delete/rename
+    // window opens between the two; creating locks/ cannot trip the
+    // migration's idempotence guard, which checks profiles/ only. Also
+    // before init_logging so a refusal fails fast, pre-alt-screen, without
+    // recreating state dirs.
+    let _profile_lock = match kommand0_core::lock::acquire_shared(&profile) {
+        Ok(l) => l,
+        Err(e) => die(&e.to_string()),
+    };
     // Must run BEFORE init_logging(): that create_dir_all's the state dir,
-    // which would create profiles/… first and trip the migration guard —
+    // which would create profiles/… first and trip the migration guard;
     // reordering this after init_logging silently orphans pre-profiles state.
     if let Err(e) = AppState::migrate_legacy_profiles() {
         die(&e.to_string());
@@ -4430,6 +4588,11 @@ async fn run(
         tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
     app.cleanup_tx = Some(cleanup_tx);
 
+    // Profile-delete worker → event loop, carrying `(profile name, result)`.
+    let (profile_delete_tx, mut profile_delete_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ProfileDeleteMsg>();
+    app.profile_delete_tx = Some(profile_delete_tx);
+
     // Codex early-capture pollers → event loop, carrying the captured entry
     // as `(workspace_id, tab_id, "codex:<uuid>", spawn generation)`.
     let (codex_capture_tx, mut codex_capture_rx) =
@@ -4534,6 +4697,18 @@ async fn run(
                     }
                 }
                 app.request_branch_status_refresh();
+            }
+            Some((name, result)) = profile_delete_rx.recv() => {
+                app.profile_delete_inflight = false;
+                // The notice is one line and any-key-cleared; the log keeps
+                // the full warning texts and the failure.
+                match &result {
+                    Ok((_, warnings)) => for w in warnings {
+                        tracing::warn!("profile delete: {w}");
+                    },
+                    Err(e) => tracing::warn!("profile delete '{name}' failed: {e}"),
+                }
+                app.profile_notice = Some(profile_delete_notice(&name, &result));
             }
             Some((ws_id, tab_id, captured, generation)) = codex_capture_rx.recv() => {
                 // `app` holds `codex_capture_tx` for the loop's lifetime, so
@@ -4806,6 +4981,14 @@ async fn run(
                 }
             }
         }
+    }
+
+    // A profile delete still in flight (the quit guard covers key-driven
+    // quits, but the input channel can close under it) must finish before
+    // any teardown: exiting mid-remove_dir_all would leave half a profile.
+    // A finished worker joins immediately.
+    if let Some(handle) = app.profile_delete_join.take() {
+        let _ = handle.join();
     }
 
     // The quit window for codex early capture: a queued poller result can no
@@ -7709,6 +7892,201 @@ mod key_tests {
         app.profile_label = Some("work".into());
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Repos · work"), "tree title carries the profile:\n{text}");
+    }
+
+    #[test]
+    fn profile_delete_candidates_exclude_own_profile() {
+        let profiles = vec!["default".to_string(), "work".to_string()];
+        let cands = profile_delete_candidates(&profiles, "work");
+        assert_eq!(cands.len(), 1, "own profile excluded");
+        assert_eq!(cands[0].label, "Delete profile: default");
+        assert_eq!(cands[0].detail, "profile");
+        assert_eq!(cands[0].match_text, "delete profile default");
+        assert_eq!(
+            cands[0].action,
+            palette::PaletteAction::DeleteProfile { name: "default".into() }
+        );
+    }
+
+    #[test]
+    fn dispatch_delete_profile_preview_error_sets_notice() {
+        // Under the unit harness (KOMMAND0_STATE_DIR set) the ambient preview
+        // bails, so the dispatch lands on the Err arm: a notice, no modal.
+        let mut app = test_app();
+        app.dispatch_palette_action(palette::PaletteAction::DeleteProfile {
+            name: "ghost".into(),
+        });
+        let (msg, is_error) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.starts_with("Can't delete profile 'ghost'"), "prefix only: {msg}");
+        assert!(is_error);
+        assert!(!app.modal.is_active(), "no confirm modal on a failed preview");
+    }
+
+    #[tokio::test]
+    async fn profile_notice_renders_in_tree_border() {
+        let mut app = test_app();
+        app.profile_notice = Some(("Deleted profile 'work'".into(), false));
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Deleted profile 'work'"), "notice in the tree border:\n{text}");
+    }
+
+    #[test]
+    fn start_profile_delete_inflight_and_tx_guards() {
+        let mut app = test_app();
+        // Unwired channel (unit tests): never flips inflight, since nothing
+        // would ever clear it.
+        app.start_profile_delete("work");
+        assert!(!app.profile_delete_inflight, "unwired tx leaves inflight false");
+        // Wired but already inflight: the start path must bail BEFORE its
+        // notice-clear + spawn. A surviving sentinel notice proves it
+        // synchronously (the real path clears the notice before spawning).
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.profile_delete_tx = Some(tx);
+        app.profile_delete_inflight = true;
+        app.profile_notice = Some(("sentinel".into(), false));
+        app.start_profile_delete("work");
+        assert_eq!(
+            app.profile_notice.as_ref().map(|(m, _)| m.as_str()),
+            Some("sentinel"),
+            "an inflight start must bail before touching the notice"
+        );
+    }
+
+    #[test]
+    fn profile_delete_notice_covers_all_variants() {
+        let s = kommand0_core::ProfileDeleteSummary {
+            workspaces: 2,
+            worktrees_removed: 1,
+            sessions: 3,
+        };
+        let (msg, is_error) = profile_delete_notice("work", &Ok((s, vec![])));
+        assert_eq!(
+            msg,
+            "Deleted profile 'work' (2 workspace(s), 1 worktree(s) removed, 3 session(s))"
+        );
+        assert!(!is_error);
+        let (msg, is_error) =
+            profile_delete_notice("work", &Ok((s, vec!["w1".into(), "w2".into()])));
+        assert_eq!(
+            msg,
+            "Deleted profile 'work' with 2 warning(s), see kommand0.log (1 worktree(s) removed)"
+        );
+        assert!(!is_error);
+        let (msg, is_error) = profile_delete_notice("work", &Err("boom".into()));
+        assert_eq!(msg, "Couldn't delete profile 'work': boom");
+        assert!(is_error);
+    }
+
+    #[test]
+    fn profile_delete_target_maps_preview_fields() {
+        // Distinct values so any silently swapped pair fails.
+        let target = profile_delete_target(
+            "work".into(),
+            kommand0_core::ProfileDeleteSummary {
+                workspaces: 2,
+                worktrees_removed: 1,
+                sessions: 3,
+            },
+        );
+        match target {
+            modal::DeleteTarget::Profile { name, workspaces, worktrees, sessions } => {
+                assert_eq!(
+                    (name.as_str(), workspaces, worktrees, sessions),
+                    ("work", 2, 1, 3)
+                );
+            }
+            _ => panic!("expected a Profile target"),
+        }
+    }
+
+    #[tokio::test]
+    async fn any_key_clears_the_profile_notice() {
+        let mut app = test_app();
+        app.profile_notice = Some(("Deleted profile 'work'".into(), false));
+        press(&mut app, KeyCode::Down).await;
+        assert!(app.profile_notice.is_none(), "next tree key clears the notice");
+
+        // A key while an embedded pane owns the keyboard is FORWARDED, not
+        // seen by the tree: it must not wipe an unseen result.
+        app.profile_notice = Some(("Deleted profile 'work'".into(), false));
+        app.focus = Focus::Embedded;
+        press(&mut app, KeyCode::Char('x')).await;
+        assert!(
+            app.profile_notice.is_some(),
+            "an embedded-focused key must not clear the notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_notice_takes_precedence_over_config_warning() {
+        let mut app = test_app();
+        app.config_warning = Some("bad config".into());
+        app.profile_notice = Some(("Deleted profile 'work'".into(), false));
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Deleted profile 'work'"), "notice shown:\n{text}");
+        assert!(
+            !text.contains("bad config"),
+            "config warning hidden while the notice is up:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quit_is_blocked_while_a_profile_delete_runs() {
+        let mut app = test_app();
+        app.profile_delete_inflight = true;
+        // A Running session pins the guard's position: it must fire BEFORE
+        // the quit arm's session-stopping side effects.
+        app.state.sessions.push(kommand0_core::Session {
+            id: "s1".into(),
+            workspace_id: "w1".into(),
+            claude_session_id: None,
+            pid: None,
+            status: SessionStatus::Running,
+            created_at: 0,
+            ended_at: None,
+            log_file: "/tmp/s1.log".into(),
+        });
+        let out = press(&mut app, KeyCode::Char('q')).await;
+        assert_eq!(out, KeyOutcome::Continue, "q must not quit mid-delete");
+        let (msg, _) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("Profile delete in progress"), "{msg}");
+        assert_eq!(
+            app.state.sessions[0].status,
+            SessionStatus::Running,
+            "a blocked quit must not stop sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_a_q_quit_is_blocked_while_a_profile_delete_runs() {
+        // Pins the SECOND quit site's guard call (the embedded prefix `q`).
+        let mut app = test_app();
+        app.profile_delete_inflight = true;
+        app.focus = Focus::Embedded;
+        app.embedded_prefix = true;
+        let out = press(&mut app, KeyCode::Char('q')).await;
+        assert_eq!(out, KeyOutcome::Continue, "prefix q must not quit mid-delete");
+        let (msg, _) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("Profile delete in progress"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn confirm_profile_delete_dispatches_the_background_delete() {
+        // Pins the ConfirmDelete match arm: a `_ =>` fallback would compile
+        // and ship the feature dead.
+        let mut app = test_app();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.profile_delete_tx = Some(tx);
+        app.modal = modal::ModalState::ConfirmDelete {
+            target: modal::DeleteTarget::Profile {
+                name: "work".into(),
+                workspaces: 0,
+                worktrees: 0,
+                sessions: 0,
+            },
+        };
+        press(&mut app, KeyCode::Char('y')).await;
+        assert!(app.profile_delete_inflight, "y on the confirm starts the delete");
     }
 
     #[test]

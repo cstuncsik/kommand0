@@ -11,11 +11,13 @@ use super::theme::Theme;
 
 /// What kind of delete is being confirmed. The workspace target carries the
 /// id (the delete key: names are only unique per repo) plus name + repo for
-/// the confirm text.
+/// the confirm text. The profile target carries the preview counts
+/// (`worktrees` = worktree-backed workspaces at preview time).
 #[derive(Clone)]
 pub(crate) enum DeleteTarget {
     Workspace { id: String, name: String, repo: String },
     Repo { id: String, name: String, workspace_count: usize },
+    Profile { name: String, workspaces: usize, worktrees: usize, sessions: usize },
 }
 
 /// The confirm-delete modal's (title, message) for a target. The workspace
@@ -42,6 +44,12 @@ fn delete_confirm_text(target: &DeleteTarget) -> (String, String) {
                 )
             }
         }
+        DeleteTarget::Profile { name, workspaces, worktrees, sessions } => (
+            " Delete Profile ".to_string(),
+            format!(
+                "Delete profile '{name}' ({workspaces} workspace(s), {worktrees} worktree(s), {sessions} session(s))?"
+            ),
+        ),
     }
 }
 
@@ -1222,6 +1230,18 @@ mod tests {
         });
         assert_eq!(title, " Delete Workspace ");
         assert_eq!(msg, "Delete workspace 'dev' (repo r)?");
+    }
+
+    #[test]
+    fn profile_delete_confirm_names_the_counts() {
+        let (title, msg) = delete_confirm_text(&DeleteTarget::Profile {
+            name: "work".into(),
+            workspaces: 2,
+            worktrees: 1,
+            sessions: 3,
+        });
+        assert_eq!(title, " Delete Profile ");
+        assert_eq!(msg, "Delete profile 'work' (2 workspace(s), 1 worktree(s), 3 session(s))?");
     }
 
     #[test]

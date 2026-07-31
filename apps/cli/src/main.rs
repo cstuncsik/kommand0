@@ -43,6 +43,8 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ProfileAction {
+    /// List profiles
+    List,
     /// Rename a profile directory, rewriting workspace/session paths,
     /// repairing git worktree links, and migrating Claude Code session stores
     Rename {
@@ -50,6 +52,15 @@ enum ProfileAction {
         old: String,
         /// New profile name
         new: String,
+    },
+    /// Delete a profile: remove its git worktrees, then its directory
+    Delete {
+        /// Profile name
+        name: String,
+        /// Skip confirmation; also delete when state.json is corrupt
+        /// (worktree cleanup is skipped then)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -203,6 +214,29 @@ fn wants_checkout(answer: &str) -> bool {
     !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no")
 }
 
+/// Shared gate for the destructive `[y/N]` prompts: refuses (exit 1) when
+/// stdin is not a tty, else prints `prompt()` and returns whether the user
+/// confirmed with y/Y (anything else cancels). The prompt is lazy so a
+/// caller can defer work (the profile-delete preview) until after the tty
+/// check, exactly as the inline blocks did. The existing-branch checkout
+/// offer stays separate on purpose: it defaults to YES (non-destructive),
+/// the opposite polarity.
+fn confirm_or_exit(
+    action: &str,
+    prompt: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<bool> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        eprintln!("error: refusing to {action} without --force in non-interactive mode");
+        std::process::exit(1);
+    }
+    print!("{} [y/N] ", prompt()?);
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    stdin.read_line(&mut input)?;
+    Ok(matches!(input.trim(), "y" | "Y"))
+}
+
 fn main() -> anyhow::Result<()> {
     // Surface core's diagnostics (e.g. a failed worktree removal on delete/
     // cleanup) on stderr — fine for a CLI (no alt-screen to corrupt).
@@ -217,7 +251,28 @@ fn main() -> anyhow::Result<()> {
     // Resolve + record the profile (--profile, else an inherited
     // KOMMAND0_PROFILE; an invalid name / env conflict aborts) before any
     // state, config, or log access resolves a directory.
-    AppState::init_profile(cli.profile.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+    let profile = AppState::init_profile(cli.profile.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+    // Held for the command's duration so a concurrent `profile delete` can't
+    // pull this profile's directory out from under us (None under
+    // KOMMAND0_STATE_DIR). Taken BEFORE the migration so no delete/rename
+    // window opens between the two; creating locks/ cannot trip the
+    // migration's idempotence guard, which checks profiles/ only. Profile
+    // subcommands are exempt: they never load ambient profile state (list
+    // is a readdir; rename/delete take their own exclusive locks on their
+    // TARGETS), and kmd's own shared lock on `default` would otherwise
+    // self-conflict with `profile rename default x` or make a plain
+    // `profile delete <other>` hold an unrelated lock. Exhaustive on
+    // purpose: a future subcommand must decide its lock behavior here, at
+    // compile time.
+    let _profile_lock = match &cli.command {
+        Commands::Profile {
+            action:
+                ProfileAction::List | ProfileAction::Rename { .. } | ProfileAction::Delete { .. },
+        } => None,
+        Commands::Repo { .. } | Commands::Workspace { .. } | Commands::Session { .. } => {
+            kommand0_core::lock::acquire_shared(&profile)?
+        }
+    };
     AppState::migrate_legacy_profiles()?;
 
     match cli.command {
@@ -242,27 +297,20 @@ fn main() -> anyhow::Result<()> {
                 let repo = state.resolve_repo(&name)?.clone();
                 let ws_count = state.workspaces.iter().filter(|w| w.repo_id == repo.id).count();
 
-                if !force {
-                    let stdin = std::io::stdin();
-                    if !stdin.is_terminal() {
-                        eprintln!("error: refusing to delete without --force in non-interactive mode");
-                        std::process::exit(1);
-                    }
-                    if ws_count > 0 {
-                        print!(
-                            "Delete repo '{}' and its {} workspace(s)? [y/N] ",
-                            repo.name, ws_count
-                        );
-                    } else {
-                        print!("Delete repo '{}'? [y/N] ", repo.name);
-                    }
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    stdin.read_line(&mut input)?;
-                    if !matches!(input.trim(), "y" | "Y") {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                if !force
+                    && !confirm_or_exit("delete", || {
+                        Ok(if ws_count > 0 {
+                            format!(
+                                "Delete repo '{}' and its {} workspace(s)?",
+                                repo.name, ws_count
+                            )
+                        } else {
+                            format!("Delete repo '{}'?", repo.name)
+                        })
+                    })?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
 
                 state.delete_repo(&name)?;
@@ -385,20 +433,11 @@ fn main() -> anyhow::Result<()> {
                 println!("Created: {}", format_timestamp(ws.created_at));
             }
             WorkspaceAction::Delete { name, force } => {
-                if !force {
-                    let stdin = std::io::stdin();
-                    if !stdin.is_terminal() {
-                        eprintln!("error: refusing to delete without --force in non-interactive mode");
-                        std::process::exit(1);
-                    }
-                    print!("Delete workspace '{name}'? [y/N] ");
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    stdin.read_line(&mut input)?;
-                    if !matches!(input.trim(), "y" | "Y") {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                if !force
+                    && !confirm_or_exit("delete", || Ok(format!("Delete workspace '{name}'?")))?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
                 let mut state = AppState::load()?;
                 let ws = state.delete_workspace(&name)?;
@@ -450,20 +489,15 @@ fn main() -> anyhow::Result<()> {
                     .map(|r| r.path.clone())
                     .ok_or_else(|| anyhow::anyhow!("repo not found for workspace '{name}'"))?;
 
-                if !force {
-                    let stdin = std::io::stdin();
-                    if !stdin.is_terminal() {
-                        eprintln!("error: refusing to clean up without --force in non-interactive mode");
-                        std::process::exit(1);
-                    }
-                    print!("Clean up '{name}' (remove worktree, delete branch {branch})? [y/N] ");
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    stdin.read_line(&mut input)?;
-                    if !matches!(input.trim(), "y" | "Y") {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                if !force
+                    && !confirm_or_exit("clean up", || {
+                        Ok(format!(
+                            "Clean up '{name}' (remove worktree, delete branch {branch})?"
+                        ))
+                    })?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
 
                 match cleanup_merged_workspace(&repo, &worktree, &branch) {
@@ -635,6 +669,38 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Profile { action } => match action {
+            ProfileAction::List => {
+                // Bare sorted names, nothing when empty: scriptable (delete
+                // by name needs the raw list).
+                for name in AppState::list_profiles()? {
+                    println!("{name}");
+                }
+            }
+            ProfileAction::Delete { name, force } => {
+                if !force
+                    && !confirm_or_exit("delete", || {
+                        // Counts read from the TARGET profile dir; surfaces
+                        // not-found/corrupt BEFORE the prompt (the corrupt
+                        // error carries the --force hint).
+                        let s = AppState::profile_delete_preview(&name)?;
+                        Ok(format!(
+                            "Delete profile '{name}' ({} workspace(s), {} worktree(s), {} session(s))?",
+                            s.workspaces, s.worktrees_removed, s.sessions
+                        ))
+                    })?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+                let (s, warnings) = AppState::delete_profile(&name, force)?;
+                for w in &warnings {
+                    eprintln!("warning: {w}");
+                }
+                println!(
+                    "Deleted profile: {name} ({} workspace(s), {} worktree(s) removed, {} session(s))",
+                    s.workspaces, s.worktrees_removed, s.sessions
+                );
+            }
             ProfileAction::Rename { old, new } => {
                 let (rewritten, migrated, warnings) = AppState::rename_profile(&old, &new)?;
                 for w in &warnings {
