@@ -2194,7 +2194,6 @@ impl App {
             session_id,
             input: current,
             cursor,
-            error: None,
         };
     }
 
@@ -8199,6 +8198,87 @@ mod key_tests {
             error: None,
         };
         insta::assert_snapshot!(render_to_string(&mut app, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn add_workspace_modal_wraps_long_error() {
+        let mut app = test_app();
+        // Mirrors the real chain for a branch already checked out elsewhere;
+        // the informative tail is the worktree path. Sized to wrap well past one
+        // line while leaving a row of slack in the flex region at 100x30.
+        let error = "couldn't check out branch \"feat/x\": git worktree add failed: \
+            fatal: 'feat/x' is already used by worktree at '/Users/u/Library/Application \
+            Support/kommand0/worktrees/feat-x'";
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "r1".to_string(),
+            repo_name: "demo".to_string(),
+            input: String::new(),
+            cursor: 0,
+            branch: "feat/x".to_string(),
+            branch_cursor: "feat/x".len(),
+            field: modal::AddWorkspaceField::Branch,
+            error: Some(error.to_string()),
+        };
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("feat-x'"), "wrapped error shows the path tail:\n{text}");
+        assert!(text.contains("Enter: submit"), "footer still renders:\n{text}");
+
+        // Squeeze: on a short terminal the flex region shrinks and the error
+        // bottom-clips, but the fields and footer must survive.
+        let text = render_to_string(&mut app, 100, 20);
+        assert!(text.contains("couldn't check out"), "error head visible when squeezed:\n{text}");
+        assert!(text.contains("Enter: submit"), "footer survives the squeeze:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn confirm_delete_profile_message_wraps() {
+        // The profile message carries the workspace/worktree/session counts;
+        // it exceeds the modal's inner width and must wrap, not clip.
+        let mut app = test_app();
+        app.modal = modal::ModalState::ConfirmDelete {
+            target: modal::DeleteTarget::Profile {
+                name: "personal".to_string(),
+                workspaces: 2,
+                worktrees: 1,
+                sessions: 3,
+            },
+        };
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("session(s))?"), "wrapped message shows the counts tail:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn add_repo_modal_wraps_long_error() {
+        let mut app = test_app();
+        app.modal = modal::ModalState::AddRepo {
+            input: "/bad/path".to_string(),
+            cursor: 0,
+            error: Some(
+                "path does not exist or is not a directory: /Users/u/projects/some/missing-dir"
+                    .to_string(),
+            ),
+            completions: Vec::new(),
+            completion_index: None,
+        };
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("missing-dir"), "wrapped error shows the path tail:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn add_repo_completions_fill_the_error_region() {
+        // Completions reuse the error's flex region when there is no error,
+        // one row taller than before (the always-blank error row is gone).
+        let mut app = test_app();
+        app.modal = modal::ModalState::AddRepo {
+            input: "/tmp/".to_string(),
+            cursor: "/tmp/".len(),
+            error: None,
+            completions: vec!["/tmp/one".into(), "/tmp/two".into(), "/tmp/three".into()],
+            completion_index: Some(0),
+        };
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("/tmp/three"), "last completion visible:\n{text}");
+        assert!(text.contains("Tab: complete"), "footer coexists with completions:\n{text}");
     }
 
     #[tokio::test]

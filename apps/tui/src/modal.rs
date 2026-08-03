@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -103,7 +103,6 @@ pub(crate) enum ModalState {
         session_id: String,
         input: String,
         cursor: usize,
-        error: Option<String>,
     },
     ConfirmCleanup {
         ws_id: String,
@@ -357,10 +356,7 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
             session_id,
             input,
             cursor,
-            error,
         } => {
-            *error = None;
-
             match key.code {
                 KeyCode::Esc => {
                     *modal = ModalState::None;
@@ -522,10 +518,7 @@ pub(crate) fn handle_modal_paste(modal: &mut ModalState, text: &str) {
                 AddWorkspaceField::Branch => (branch, branch_cursor),
             }
         }
-        ModalState::RenameSession { input, cursor, error, .. } => {
-            *error = None;
-            (input, cursor)
-        }
+        ModalState::RenameSession { input, cursor, .. } => (input, cursor),
         ModalState::None
         | ModalState::ConfirmDelete { .. }
         | ModalState::ConfirmCleanup { .. }
@@ -700,8 +693,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             let inner = Layout::vertical([
                 Constraint::Length(2), // padding + label
                 Constraint::Length(1), // input field
-                Constraint::Length(1), // error line
-                Constraint::Min(1),   // completions
+                Constraint::Min(1),   // error (wraps) or completions
                 Constraint::Length(1), // footer
             ])
             .split(Rect::new(
@@ -735,20 +727,19 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[1],
             );
 
-            // Error
+            // Error or completions (mutually exclusive: any key clears the error)
             if let Some(err) = error {
                 frame.render_widget(
-                    Paragraph::new(err.as_str()).style(Style::default().fg(th.error)),
+                    Paragraph::new(err.as_str())
+                        .style(Style::default().fg(th.error))
+                        .wrap(Wrap { trim: true }),
                     inner[2],
                 );
-            }
-
-            // Completions
-            if !completions.is_empty() {
+            } else if !completions.is_empty() {
                 let comp_lines: Vec<Line> = completions
                     .iter()
                     .enumerate()
-                    .take(inner[3].height as usize)
+                    .take(inner[2].height as usize)
                     .map(|(i, path)| {
                         let selected = *completion_index == Some(i);
                         let style = if selected {
@@ -759,7 +750,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                         Line::styled(format!("  {path}"), style)
                     })
                     .collect();
-                frame.render_widget(Paragraph::new(comp_lines), inner[3]);
+                frame.render_widget(Paragraph::new(comp_lines), inner[2]);
             }
 
             // Footer
@@ -772,7 +763,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                     Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(": cancel"),
                 ])),
-                inner[4],
+                inner[3],
             );
         }
         ModalState::AddWorkspace {
@@ -793,8 +784,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 Constraint::Length(1), // name input
                 Constraint::Length(1), // branch label
                 Constraint::Length(1), // branch input
-                Constraint::Length(1), // error
-                Constraint::Min(0),    // spacer
+                Constraint::Min(1),   // error (wraps; doubles as spacer)
                 Constraint::Length(1), // footer
             ])
             .split(Rect::new(
@@ -859,7 +849,9 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
 
             if let Some(err) = error {
                 frame.render_widget(
-                    Paragraph::new(err.as_str()).style(Style::default().fg(th.error)),
+                    Paragraph::new(err.as_str())
+                        .style(Style::default().fg(th.error))
+                        .wrap(Wrap { trim: true }),
                     inner[4],
                 );
             }
@@ -873,7 +865,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                     Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(": cancel"),
                 ])),
-                inner[6],
+                inner[5],
             );
         }
         ModalState::ConfirmDelete { target } => {
@@ -904,7 +896,8 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 Paragraph::new(Line::styled(
                     message,
                     Style::default().fg(th.text),
-                )),
+                ))
+                .wrap(Wrap { trim: true }),
                 inner[0],
             );
 
@@ -919,7 +912,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             );
         }
         ModalState::RenameSession {
-            input, cursor, error, ..
+            input, cursor, ..
         } => {
             let area = centered_rect(50, 25, frame.area());
             frame.render_widget(Clear, area);
@@ -927,7 +920,6 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             let inner = Layout::vertical([
                 Constraint::Length(2), // label
                 Constraint::Length(1), // input
-                Constraint::Length(1), // error
                 Constraint::Min(0),   // spacer
                 Constraint::Length(1), // footer
             ])
@@ -959,13 +951,6 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[1],
             );
 
-            if let Some(err) = error {
-                frame.render_widget(
-                    Paragraph::new(err.as_str()).style(Style::default().fg(th.error)),
-                    inner[2],
-                );
-            }
-
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("Enter", Style::default().fg(th.accent)),
@@ -973,7 +958,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                     Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(": cancel"),
                 ])),
-                inner[4],
+                inner[3],
             );
         }
         ModalState::ConfirmCleanup {
@@ -1079,7 +1064,8 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 Paragraph::new(Line::styled(
                     format!("Branch '{name}' already exists."),
                     Style::default().fg(th.text),
-                )),
+                ))
+                .wrap(Wrap { trim: true }),
                 inner[0],
             );
 
@@ -1317,20 +1303,18 @@ mod tests {
     }
 
     #[test]
-    fn paste_into_rename_session_inserts_and_clears_error() {
+    fn paste_into_rename_session_inserts_at_cursor() {
         let mut modal = ModalState::RenameSession {
             ws_id: "w".into(),
             session_id: "s".into(),
             input: "ab".into(),
             cursor: 1,
-            error: Some("stale".into()),
         };
         handle_modal_paste(&mut modal, "/x\n");
         match modal {
-            ModalState::RenameSession { input, cursor, error, .. } => {
+            ModalState::RenameSession { input, cursor, .. } => {
                 assert_eq!(input, "a/xb", "text lands at the cursor, newline stripped");
                 assert_eq!(cursor, 3);
-                assert!(error.is_none(), "paste clears the error like typing does");
             }
             _ => panic!("modal changed variant"),
         }

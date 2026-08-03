@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Long error messages in the Add-Workspace and Add-Repository modals now wrap
+  across multiple lines instead of being clipped to one row, so failures like
+  "branch is already used by worktree at <path>" show the full reason.
+- Confirm-modal messages (delete workspace/repo/profile, branch checkout) wrap
+  instead of clipping, so the profile-delete preview counts stay visible.
+
 ## [0.25.0] - 2026-07-31
 
 ### Added
