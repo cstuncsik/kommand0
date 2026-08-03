@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "kommand0-cli"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -920,12 +920,13 @@ dependencies = [
 
 [[package]]
 name = "kommand0-core"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "chrono",
  "dirs",
  "glob",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -937,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "kommand0-tui"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "base64",

@@ -265,18 +265,32 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else {
         " Repos ".to_string()
     };
-    // A present-but-invalid config surfaces in the bottom border.
-    let warn = app.config_warning.clone();
+    // The bottom border carries at most one line: a profile-delete notice
+    // (accent for success, error styling for a failure; cleared on the next
+    // key press) takes precedence over the config warning while set.
+    let bottom = match &app.profile_notice {
+        Some((msg, is_error)) => Some((
+            format!(" {msg} "),
+            if *is_error {
+                Style::default().fg(th.error).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.accent)
+            },
+        )),
+        None => app.config_warning.as_ref().map(|w| {
+            (
+                format!(" ⚠ {w} "),
+                Style::default().fg(th.error).add_modifier(Modifier::BOLD),
+            )
+        }),
+    };
     let tree_block = |title: String, border_style: Style| {
         let mut b = Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_style(border_style);
-        if let Some(w) = &warn {
-            b = b.title_bottom(Line::styled(
-                format!(" ⚠ {w} "),
-                Style::default().fg(th.error).add_modifier(Modifier::BOLD),
-            ));
+        if let Some((text, style)) = &bottom {
+            b = b.title_bottom(Line::styled(text.clone(), *style));
         }
         b
     };

@@ -1671,6 +1671,26 @@ fn profile_flag_shows_the_label_and_state_lands_in_the_profile_dir() {
     let mut tui = Tui::launch_legacy_layout(None, &["--profile", "work"]);
     tui.wait_for("Repos · work");
 
+    // The running TUI holds a SHARED instance lock on its profile: an
+    // exclusive probe from the test process must be refused while it runs.
+    let lock_path =
+        tui.state_dir.path().join(".kommand0-dev").join("locks").join("work.lock");
+    let probe = |path: &std::path::Path| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+    };
+    match probe(&lock_path) {
+        Err((_, e)) => {
+            assert_eq!(e, nix::errno::Errno::EWOULDBLOCK, "held shared by the TUI");
+        }
+        Ok(_) => panic!("the TUI's shared instance lock must refuse an exclusive probe"),
+    }
+
     // Add a repo so the profile's state file actually gets written.
     let repo = tui.state_dir.path().join("proj-tui");
     std::fs::create_dir_all(&repo).unwrap();
@@ -1690,6 +1710,40 @@ fn profile_flag_shows_the_label_and_state_lands_in_the_profile_dir() {
             .exists(),
         "state landed under profiles/work/"
     );
+
+    tui.send("q");
+    tui.wait_exit();
+
+    // Release-on-exit: the fd closed with the process, so the probe succeeds.
+    assert!(probe(&lock_path).is_ok(), "instance lock released on exit");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn palette_deletes_another_profile_end_to_end() {
+    // Full TUI delete round trip: launched on `work`, the palette offers
+    // "Delete profile: other", `y` on the confirm runs the background
+    // delete, the result notice lands in the tree border, and the dir is
+    // gone. The clean `q` exit afterwards pins that the select! arm cleared
+    // the inflight flag (the quit guard released). Debug-gated like the
+    // other cwd-relative-base tests.
+    let mut tui = Tui::launch_legacy_layout(None, &["--profile", "work"]);
+    tui.wait_for("Repos · work");
+
+    // Candidates are snapshotted when the palette OPENS, so seeding the
+    // sibling profile now (after startup created profiles/work) is enough.
+    let other = tui.state_dir.path().join(".kommand0-dev").join("profiles").join("other");
+    std::fs::create_dir_all(&other).unwrap();
+
+    tui.send(":");
+    tui.wait_for("Command palette");
+    tui.send("delete profile other");
+    tui.send("\r");
+    tui.wait_for("Delete Profile"); // the confirm modal
+    tui.send("y");
+
+    tui.wait_for("Deleted profile 'other'"); // the border notice
+    assert!(!other.exists(), "profiles/other removed");
 
     tui.send("q");
     tui.wait_exit();

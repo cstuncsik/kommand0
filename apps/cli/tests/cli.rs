@@ -836,3 +836,269 @@ fn profile_rename_unavailable_with_state_dir_env() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Hold a flock on `<base>/locks/<name>.lock` from the test process: what a
+/// running instance (shared) or an in-flight delete/rename (exclusive) holds.
+#[cfg(debug_assertions)]
+fn hold_lock(base: &Path, name: &str, exclusive: bool) -> nix::fcntl::Flock<std::fs::File> {
+    use nix::fcntl::{Flock, FlockArg};
+    let dir = base.join("locks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(format!("{name}.lock")))
+        .unwrap();
+    let arg =
+        if exclusive { FlockArg::LockExclusiveNonblock } else { FlockArg::LockSharedNonblock };
+    Flock::lock(file, arg).map_err(|(_, e)| e).unwrap()
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_delete_force_removes_dir_and_worktrees_keeps_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("a.txt"), "1").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "init"]);
+
+    let add =
+        kmd_at(tmp.path(), &[], &["--profile", "work", "repo", "add", repo.to_str().unwrap()]);
+    assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+    let create = kmd_at(
+        tmp.path(),
+        &[],
+        &["--profile", "work", "workspace", "create", "feat", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(create.status.success(), "create: {}", String::from_utf8_lossy(&create.stderr));
+
+    let out = kmd_at(tmp.path(), &[], &["profile", "delete", "work", "--force"]);
+    assert!(out.status.success(), "delete: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("Deleted profile: work"), "summary printed: {}", stdout(&out));
+    assert!(
+        !tmp.path().join(".kommand0-dev").join("profiles").join("work").exists(),
+        "profile dir gone"
+    );
+    let list = Command::new("git").args(["worktree", "list"]).current_dir(&repo).output().unwrap();
+    let list = String::from_utf8_lossy(&list.stdout).to_string();
+    assert!(!list.contains("profiles/work/"), "worktree deregistered: {list}");
+    let branches = Command::new("git").args(["branch"]).current_dir(&repo).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).contains("feat"),
+        "branch kept: {}",
+        String::from_utf8_lossy(&branches.stdout)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_delete_refuses_without_force_non_interactive() {
+    // A spawned kmd has no tty, so the no-force path exits 1 before touching
+    // anything (this gate is also why the corrupt no-force flow is
+    // core-tested only: the tty check fires first here).
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join(".kommand0-dev").join("profiles").join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let out = kmd_at(tmp.path(), &[], &["profile", "delete", "work"]);
+    assert_eq!(out.status.code(), Some(1), "refusal exit code");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("refusing to delete without --force"),
+        "clear error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(work.exists(), "untouched");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_delete_refuses_active_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dev = tmp.path().join(".kommand0-dev");
+    std::fs::create_dir_all(dev.join("profiles").join("default")).unwrap();
+    std::fs::create_dir_all(dev.join("profiles").join("work")).unwrap();
+
+    let refuse = |args: &[&str], env: &[(&str, &str)]| {
+        let out = kmd_at(tmp.path(), env, args);
+        assert!(!out.status.success(), "must refuse: {args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("cannot delete the active profile"),
+            "honest message for {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    // Plain kmd's own profile IS default.
+    refuse(&["profile", "delete", "default", "--force"], &[]);
+    // Self-aliased via the flag.
+    refuse(&["--profile", "work", "profile", "delete", "work", "--force"], &[]);
+    // Self-aliased via the env var (the embedded-session case).
+    refuse(&["profile", "delete", "work", "--force"], &[("KOMMAND0_PROFILE", "work")]);
+    assert!(dev.join("profiles").join("work").exists(), "nothing deleted");
+
+    // The positive: deleting `default` from ANOTHER profile is allowed (the
+    // next plain run just starts a fresh default).
+    let out = kmd_at(
+        tmp.path(),
+        &[],
+        &["--profile", "other", "profile", "delete", "default", "--force"],
+    );
+    assert!(out.status.success(), "delete default: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!dev.join("profiles").join("default").exists(), "default gone");
+}
+
+#[test]
+fn profile_delete_unavailable_with_state_dir_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = kmd(tmp.path(), &[], &["profile", "delete", "x", "--force"]);
+    assert!(!out.status.success(), "env-mode delete must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unavailable when KOMMAND0_STATE_DIR"),
+        "clear error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_delete_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = kmd_at(tmp.path(), &[], &["profile", "delete", "ghost", "--force"]);
+    assert!(!out.status.success(), "missing profile must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not found"),
+        "clear error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_delete_force_on_corrupt_state_warns_prune() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join(".kommand0-dev").join("profiles").join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("state.json"), "{ not json").unwrap();
+
+    let out = kmd_at(tmp.path(), &[], &["profile", "delete", "work", "--force"]);
+    assert!(out.status.success(), "forced delete: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("git worktree prune"),
+        "prune hint on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!work.exists(), "dir gone");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_delete_refused_while_lock_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dev = tmp.path().join(".kommand0-dev");
+    std::fs::create_dir_all(dev.join("profiles").join("work")).unwrap();
+    let _held = hold_lock(&dev, "work", false); // a running instance (shared)
+
+    let out = kmd_at(tmp.path(), &[], &["profile", "delete", "work", "--force"]);
+    assert!(!out.status.success(), "must refuse while an instance runs");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is in use by"),
+        "clear error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dev.join("profiles").join("work").exists(), "dir intact");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn kmd_refuses_startup_while_profile_locked_exclusively() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dev = tmp.path().join(".kommand0-dev");
+    let _held = hold_lock(&dev, "default", true); // a delete/rename in progress
+
+    let out = kmd_at(tmp.path(), &[], &["repo", "list"]);
+    assert!(!out.status.success(), "startup must refuse");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is locked"),
+        "clear error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn env_mode_skips_locking() {
+    // KOMMAND0_STATE_DIR (the exact-dir escape hatch) must never touch the
+    // locks: an exclusive lock at the cwd base doesn't stop an env-mode run.
+    // Pins the hermeticity contract the unit/e2e harnesses lean on.
+    let tmp = tempfile::tempdir().unwrap();
+    let dev = tmp.path().join(".kommand0-dev");
+    let _held = hold_lock(&dev, "default", true);
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    let out = kmd_at(
+        tmp.path(),
+        &[("KOMMAND0_STATE_DIR", state.to_str().unwrap())],
+        &["repo", "list"],
+    );
+    assert!(
+        out.status.success(),
+        "env mode ignores locks: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Env-mode `profile list` is honestly empty (no profiles tree), exit 0.
+    let out = kmd(&state, &[], &["profile", "list"]);
+    assert!(out.status.success(), "env-mode list: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).is_empty(), "no profiles tree in env mode: {}", stdout(&out));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_rename_refused_while_lock_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dev = tmp.path().join(".kommand0-dev");
+    std::fs::create_dir_all(dev.join("profiles").join("work")).unwrap();
+    let _held = hold_lock(&dev, "work", false);
+
+    let out = kmd_at(tmp.path(), &[], &["profile", "rename", "work", "personal"]);
+    assert!(!out.status.success(), "must refuse while an instance runs");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is in use by"),
+        "clear error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dev.join("profiles").join("work").exists(), "nothing moved");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_rename_default_still_works() {
+    // Pins the no-self-conflict rule: profile subcommands skip the startup
+    // shared lock, so plain `kmd profile rename default x` keeps working. A
+    // regression here means someone re-added the startup lock to them.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".kommand0-dev").join("profiles").join("default"))
+        .unwrap();
+    let out = kmd_at(tmp.path(), &[], &["profile", "rename", "default", "x"]);
+    assert!(out.status.success(), "rename default: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(tmp.path().join(".kommand0-dev").join("profiles").join("x").exists(), "moved");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn profile_list_prints_sorted_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profiles = tmp.path().join(".kommand0-dev").join("profiles");
+    std::fs::create_dir_all(profiles.join("bravo")).unwrap();
+    std::fs::create_dir_all(profiles.join("alpha")).unwrap();
+    std::fs::write(profiles.join("stray.txt"), "x").unwrap();
+
+    let out = kmd_at(tmp.path(), &[], &["profile", "list"]);
+    assert!(out.status.success(), "list: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "alpha\nbravo\n", "bare sorted names, dirs only");
+}
