@@ -7824,6 +7824,59 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn add_workspace_modal_wraps_long_error() {
+        let mut app = test_app();
+        // Mirrors the real chain for a branch already checked out elsewhere;
+        // the informative tail is the worktree path.
+        let error = "couldn't check out branch \"feat/x\": git worktree add failed: \
+            fatal: 'feat/x' is already used by worktree at '/Users/u/Library/Application \
+            Support/kommand0/profiles/personal/worktrees/19f8a4cca76-47fb-0/feat-x'";
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "r1".to_string(),
+            repo_name: "demo".to_string(),
+            input: String::new(),
+            cursor: 0,
+            branch: "feat/x".to_string(),
+            branch_cursor: "feat/x".len(),
+            field: modal::AddWorkspaceField::Branch,
+            error: Some(error.to_string()),
+        };
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("feat-x'"), "wrapped error shows the path tail:\n{text}");
+        assert!(text.contains("Enter: submit"), "footer still renders:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn add_repo_modal_wraps_long_error_and_still_lists_completions() {
+        let mut app = test_app();
+        app.modal = modal::ModalState::AddRepo {
+            input: "/bad/path".to_string(),
+            cursor: 0,
+            error: Some(
+                "path does not exist or is not a directory: /Users/u/projects/some/missing-dir"
+                    .to_string(),
+            ),
+            completions: Vec::new(),
+            completion_index: None,
+        };
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("missing-dir"), "wrapped error shows the path tail:\n{text}");
+
+        // Completions reuse the same flex region once the error is cleared,
+        // one row taller than before (the always-blank error row is gone).
+        app.modal = modal::ModalState::AddRepo {
+            input: "/tmp/".to_string(),
+            cursor: "/tmp/".len(),
+            error: None,
+            completions: vec!["/tmp/one".into(), "/tmp/two".into(), "/tmp/three".into()],
+            completion_index: Some(0),
+        };
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("/tmp/three"), "last completion visible:\n{text}");
+        assert!(text.contains("Tab: complete"), "footer coexists with completions:\n{text}");
+    }
+
+    #[tokio::test]
     async fn snapshot_narrow_terminal() {
         let mut app = test_app();
         insta::assert_snapshot!(render_to_string(&mut app, 50, 12));
