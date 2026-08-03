@@ -1,0 +1,56 @@
+CHANGELOG.md
+  s_397ff314c4e8b5::t_9011f14d026d8f 16-22
+  s_397ff314c4e8b5::t_c46248ed1ba258 23-28
+  s_397ff314c4e8b5::t_66f0191f5fbd06 14-15
+  s_397ff314c4e8b5::t_7be406e85d732d 29-30
+Cargo.lock
+  s_eacb4c6abfd23d::t_012306be1ab8f0 909,923,929,941
+Cargo.toml
+  s_eacb4c6abfd23d::t_d47476e2a1125d 6,26
+apps/cli/src/main.rs
+  s_eacb4c6abfd23d::t_f82f9ea138eb2f 46-47,56-64,217-239,254-275,300-313,436-440,492-500,672-703
+apps/cli/tests/cli.rs
+  s_eacb4c6abfd23d::t_a48a6ee1be02e9 839-1104
+apps/tui/src/main.rs
+  s_eacb4c6abfd23d::t_dcde0a2c31db4f 45-51,54,56-57,62-91,95-106,109-124,825-838,936-939,1904-1915,1942-1961,2862,2864,2866,2868,2916,2918,2920,2922,3279,3288-3329,3479-3486,3503-3505,3848-3850,4037-4041,4383-4394,4396,4591-4595,4701-4712,4986-4993,7897-8091
+apps/tui/src/modal.rs
+  s_eacb4c6abfd23d::t_089ddb9c1354c7 14-15,20,47-52,1234-1245
+apps/tui/src/palette.rs
+  s_eacb4c6abfd23d::t_4e04f09d616d89 34-35
+apps/tui/src/render.rs
+  s_eacb4c6abfd23d::t_dbbcadd0754cd3 268-286,292-293
+apps/tui/tests/e2e.rs
+  s_eacb4c6abfd23d::t_8a090206cf3d02 1674-1693,1716-1749
+crates/core/Cargo.toml
+  s_eacb4c6abfd23d::t_cbc0a3aa940ce1 14
+crates/core/src/lib.rs
+  s_eacb4c6abfd23d::t_6b1523cb7810f4 5,135-157,432-435,487-494,606,608-611,614-616,669-1026,3057-3521
+crates/core/src/lock.rs
+  s_eacb4c6abfd23d::t_defda34c6bf7f4 1-146
+crates/core/src/worktree.rs
+  s_eacb4c6abfd23d::t_9b6d9c1b2d4fc7 441,449-450
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "c7cd56203cb6b6b95b1175fa629581aafa8e7f9d",
+  "prompts": {},
+  "sessions": {
+    "s_397ff314c4e8b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3c55c174-8780-4c86-9d5b-a60d5a4fc9f0",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    },
+    "s_eacb4c6abfd23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22f29cde-c3b2-49d6-9d06-5c7177b1a99b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
