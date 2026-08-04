@@ -14,6 +14,9 @@ All notable changes to kommand0 are documented here. The format is based on
   "branch is already used by worktree at <path>" show the full reason.
 - Confirm-modal messages (delete workspace/repo/profile, branch checkout) wrap
   instead of clipping, so the profile-delete preview counts stay visible.
+- The CI-pending PR glyph is now `○` instead of `◍`, which many terminal fonts
+  render oversized via font fallback, making it look bigger than the other
+  tree-row icons.
 
 ## [0.25.0] - 2026-07-31
 

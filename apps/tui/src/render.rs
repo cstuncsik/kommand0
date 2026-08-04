@@ -15,7 +15,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 
 /// Compact tree-row glyph for a PR: state first (merged/closed short-circuit),
 /// else the CI outcome of an open PR. `●` merged · `✕` closed · `✓` passing ·
-/// `✗` failing · `◍` pending · `◇` no checks.
+/// `✗` failing · `○` pending · `◇` no checks.
 fn pr_glyph(pr: &PrStatus) -> char {
     match pr.state {
         PrState::Merged => '\u{25CF}', // ●
@@ -23,7 +23,7 @@ fn pr_glyph(pr: &PrStatus) -> char {
         PrState::Open => match pr.checks {
             PrChecks::Passing => '\u{2713}', // ✓
             PrChecks::Failing => '\u{2717}', // ✗
-            PrChecks::Pending => '\u{25CD}', // ◍
+            PrChecks::Pending => '\u{25CB}', // ○ (25CD ◍ falls back to a wide glyph in many fonts)
             PrChecks::None => '\u{25C7}',    // ◇
         },
     }
@@ -1896,7 +1896,7 @@ mod tests {
         // Open PRs surface the CI outcome.
         assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Passing, PrReview::None)), '\u{2713}');
         assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Failing, PrReview::None)), '\u{2717}');
-        assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Pending, PrReview::None)), '\u{25CD}');
+        assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Pending, PrReview::None)), '\u{25CB}');
         assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::None, PrReview::None)), '\u{25C7}');
     }
 
