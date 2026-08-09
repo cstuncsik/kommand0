@@ -757,6 +757,14 @@ pub(crate) struct App {
     /// which pane renders (keys, mouse Down, overlays, reap, background
     /// cleanup) clears it.
     pub(crate) pane_selection: Option<mouse::PaneSelection>,
+    /// Most recent unshifted vertical wheel tick. A trackpad can't scroll
+    /// perfectly vertically, so horizontal drift ticks arrive interleaved with
+    /// the vertical stream — [`Self::hscroll_switch_tab`] treats a tilt inside
+    /// this stamp's window as drift, not a tab-switch gesture.
+    last_vscroll_at: Option<Instant>,
+    /// When the wheel last switched a session tab; rate-limits the gesture so
+    /// a trackpad swipe's tick *stream* flips one tab, not one per tick.
+    last_tab_switch_at: Option<Instant>,
     pub(crate) hit_regions: Vec<buttons::HitRegion>,
     pub(crate) pending_button_action: Option<buttons::HitAction>,
     pub(crate) modal: modal::ModalState,
@@ -908,6 +916,8 @@ impl App {
             mouse_pos: None,
             dragging_divider: false,
             pane_selection: None,
+            last_vscroll_at: None,
+            last_tab_switch_at: None,
             hit_regions: Vec::new(),
             pending_button_action: None,
             modal: modal::ModalState::default(),
@@ -2059,16 +2069,38 @@ impl App {
     /// expected). Returns whether the event was consumed.
     fn hscroll_switch_tab(&mut self, mouse: MouseEvent) -> bool {
         use ratatui::crossterm::event::MouseEventKind;
+        // Trackpad windows: a tilt within TILT_SUPPRESS of a vertical tick is
+        // diagonal drift (fingers never move purely vertically), and a swipe
+        // emits a tick stream, so at most one switch per SWITCH_COOLDOWN. Both
+        // are far below a deliberate gesture-to-gesture gap; discrete tilt-wheel
+        // clicks are unaffected.
+        const TILT_SUPPRESS: Duration = Duration::from_millis(200);
+        const SWITCH_COOLDOWN: Duration = Duration::from_millis(200);
+        let within = |at: Option<Instant>, window| at.is_some_and(|t| t.elapsed() < window);
         let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
         let prev = match mouse.kind {
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                if within(self.last_vscroll_at, TILT_SUPPRESS) =>
+            {
+                // Consume the drift tick: switching is wrong mid-vscroll, and
+                // forwarding it would jitter a mouse-mode child sideways.
+                return mouse::contains(self.right_pane_area, mouse.column, mouse.row);
+            }
             MouseEventKind::ScrollLeft => true,
             MouseEventKind::ScrollRight => false,
             MouseEventKind::ScrollUp if shift => true,
             MouseEventKind::ScrollDown if shift => false,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.last_vscroll_at = Some(Instant::now());
+                return false;
+            }
             _ => return false,
         };
         if !mouse::contains(self.right_pane_area, mouse.column, mouse.row) {
             return false;
+        }
+        if within(self.last_tab_switch_at, SWITCH_COOLDOWN) {
+            return true;
         }
         // Consumed from here even with no sessions: reachable only via hover
         // (Embedded focus implies live tabs), where today's behavior is
@@ -2076,6 +2108,7 @@ impl App {
         // identical and keeps the gesture single-sited.
         if let Some(s) = self.selected_sessions_mut() {
             if prev { s.prev() } else { s.next() }
+            self.last_tab_switch_at = Some(Instant::now());
         }
         // A tab switch invalidates a lingering selection highlight and a
         // half-typed Ctrl+A prefix, matching the sibling switch routes: the
@@ -9383,6 +9416,15 @@ mod key_tests {
         MouseEvent { kind, column, row, modifiers: KeyModifiers::SHIFT }
     }
 
+    /// Back-date the trackpad drift/cooldown stamps so the next wheel tick
+    /// reads as a fresh gesture — tests fire ticks far faster than fingers.
+    /// (`checked_sub` can only fail right after boot; `None` = expired too.)
+    fn expire_wheel_windows(app: &mut App) {
+        let past = Instant::now().checked_sub(Duration::from_secs(60));
+        app.last_vscroll_at = past;
+        app.last_tab_switch_at = past;
+    }
+
     /// App with workspace w1 selected and one embedded tab running `cmd`;
     /// right pane at (30,0) 70x30 → content cells start at screen (31, 2).
     fn app_with_pane(cmd: &str) -> App {
@@ -9682,10 +9724,43 @@ mod key_tests {
         // tab we left, exactly like the key route.
         app.embedded.get_mut("w1").unwrap().select_last_active();
         assert_eq!(app.embedded["w1"].active, 0, "last-active bookkeeping holds");
+        expire_wheel_windows(&mut app);
         mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollLeft, 50, 10));
         assert_eq!(app.embedded["w1"].active, 2, "tilt left = prev, wrapping at the start");
+        expire_wheel_windows(&mut app);
         mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
         assert_eq!(app.embedded["w1"].active, 0, "next wraps at the end");
+    }
+
+    #[test]
+    fn tilt_during_vertical_scroll_is_drift_not_a_switch() {
+        // A trackpad can't scroll purely vertically: a tilt tick arriving
+        // right after a vertical one is finger drift, not a gesture.
+        let mut app = app_with_pane("sleep 30");
+        app.embedded.get_mut("w1").unwrap().tabs.push(tab("b", &["-c", "sleep 30"]));
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollDown, 50, 10));
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 0, "mid-vscroll tilt must not flip tabs");
+        // The same tilt once the window has passed is deliberate again.
+        expire_wheel_windows(&mut app);
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 1, "a quiet-period tilt still switches");
+    }
+
+    #[test]
+    fn tilt_stream_switches_once_per_cooldown() {
+        // A trackpad swipe emits a tick stream; without a cooldown one swipe
+        // would spin through every tab (with wrap).
+        let mut app = app_with_pane("sleep 30");
+        let s = app.embedded.get_mut("w1").unwrap();
+        s.tabs.push(tab("b", &["-c", "sleep 30"]));
+        s.tabs.push(tab("c", &["-c", "sleep 30"]));
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 1, "one swipe = one switch");
+        expire_wheel_windows(&mut app);
+        mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollRight, 50, 10));
+        assert_eq!(app.embedded["w1"].active, 2, "the next swipe advances again");
     }
 
     #[test]
@@ -9706,6 +9781,7 @@ mod key_tests {
             app.embedded["w1"].tabs[0].pane.last_input_at().is_none(),
             "the shifted wheel was intercepted, not forwarded"
         );
+        expire_wheel_windows(&mut app);
         mouse::handle_mouse(&mut app, ms(MouseEventKind::ScrollUp, 50, 10));
         assert_eq!(app.embedded["w1"].active, 0, "shift+up = prev tab");
         assert!(app.embedded["w1"].tabs[0].pane.last_input_at().is_none());
@@ -9757,6 +9833,7 @@ mod key_tests {
             "the tilt was intercepted before the mouse-mode child"
         );
         assert!(!app.embedded_prefix, "a tab switch drops the half-typed prefix");
+        expire_wheel_windows(&mut app);
         app.handle_embedded_mouse(ms(MouseEventKind::ScrollDown, 50, 10));
         assert_eq!(app.embedded["w1"].active, 0, "focused shift+down = next, wrapping");
         assert!(app.embedded["w1"].tabs[0].pane.last_input_at().is_none());

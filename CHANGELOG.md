@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Trackpad vertical scrolling over an embedded pane no longer switches session
+  tabs: horizontal ticks arriving mid-vertical-scroll are treated as finger
+  drift and ignored. Wheel tab-switching is also rate-limited (one switch per
+  200ms), so a horizontal trackpad swipe flips one tab instead of spinning
+  through all of them.
+
 ## [0.25.2] - 2026-08-04
 
 ## [0.25.1] - 2026-08-03
