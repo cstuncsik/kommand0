@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.25.3] - 2026-08-09
+
 ### Fixed
 
 - Trackpad vertical scrolling over an embedded pane no longer switches session
@@ -747,7 +749,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.25.2...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.25.3...HEAD
+[0.25.3]: https://github.com/cstuncsik/kommand0/compare/v0.25.2...v0.25.3
 [0.25.2]: https://github.com/cstuncsik/kommand0/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/cstuncsik/kommand0/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/cstuncsik/kommand0/compare/v0.24.1...v0.25.0
