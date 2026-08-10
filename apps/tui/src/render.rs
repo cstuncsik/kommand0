@@ -15,7 +15,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 
 /// Compact tree-row glyph for a PR: state first (merged/closed short-circuit),
 /// else the CI outcome of an open PR. `●` merged · `✕` closed · `✓` passing ·
-/// `✗` failing · `◍` pending · `◇` no checks.
+/// `✗` failing · `○` pending · `◇` no checks.
 fn pr_glyph(pr: &PrStatus) -> char {
     match pr.state {
         PrState::Merged => '\u{25CF}', // ●
@@ -23,7 +23,7 @@ fn pr_glyph(pr: &PrStatus) -> char {
         PrState::Open => match pr.checks {
             PrChecks::Passing => '\u{2713}', // ✓
             PrChecks::Failing => '\u{2717}', // ✗
-            PrChecks::Pending => '\u{25CD}', // ◍
+            PrChecks::Pending => '\u{25CB}', // ○ (25CD ◍ falls back to a wide glyph in many fonts)
             PrChecks::None => '\u{25C7}',    // ◇
         },
     }
@@ -156,8 +156,18 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let th = app.theme;
     let (mode, mode_color) = match app.focus {
-        Focus::Tree => (" TREE ", th.accent),
-        Focus::Embedded => (" CLAUDE ", th.active),
+        Focus::Tree => (" TREE ".to_string(), th.accent),
+        Focus::Embedded => {
+            // Name the active tab's kind (claude/shell/codex/...); the
+            // fallback covers the transient frame where the pane is gone.
+            let label = app
+                .selected_workspace()
+                .and_then(|ws| app.embedded.get(&ws.id))
+                .and_then(|s| s.active_tab())
+                .map(|t| t.kind.label())
+                .unwrap_or("claude");
+            (format!(" {} ", label.to_uppercase()), th.active)
+        }
     };
     let context = match app.tree_items.get(app.selected_index) {
         Some(TreeNode::Workspace { ws, .. }) => ws.name.clone(),
@@ -219,7 +229,10 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         // the prefix accepts instead of the resting hint. Pure render: no
         // state lives here.
         Focus::Embedded if app.embedded_prefix => {
-            "Ctrl+A … t tree · c new · s shell · r rename · x close · [ ] tabs · l last · 1-9"
+            // Tab-creation keys lead (per-kind, matching the help overlay); the
+            // line right-truncates on narrow terminals, so the tail carries the
+            // keys that also appear in the resting hint or the border title.
+            "Ctrl+A … c claude · e codex · g gemini · o opencode · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9"
         }
         Focus::Embedded => "Ctrl+A t / Ctrl+] tree · Ctrl+A q quit",
     };
@@ -252,18 +265,32 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else {
         " Repos ".to_string()
     };
-    // A present-but-invalid config surfaces in the bottom border.
-    let warn = app.config_warning.clone();
+    // The bottom border carries at most one line: a profile-delete notice
+    // (accent for success, error styling for a failure; cleared on the next
+    // key press) takes precedence over the config warning while set.
+    let bottom = match &app.profile_notice {
+        Some((msg, is_error)) => Some((
+            format!(" {msg} "),
+            if *is_error {
+                Style::default().fg(th.error).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.accent)
+            },
+        )),
+        None => app.config_warning.as_ref().map(|w| {
+            (
+                format!(" ⚠ {w} "),
+                Style::default().fg(th.error).add_modifier(Modifier::BOLD),
+            )
+        }),
+    };
     let tree_block = |title: String, border_style: Style| {
         let mut b = Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_style(border_style);
-        if let Some(w) = &warn {
-            b = b.title_bottom(Line::styled(
-                format!(" ⚠ {w} "),
-                Style::default().fg(th.error).add_modifier(Modifier::BOLD),
-            ));
+        if let Some((text, style)) = &bottom {
+            b = b.title_bottom(Line::styled(text.clone(), *style));
         }
         b
     };
@@ -649,7 +676,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     }
     // Snapshot what we need (incl. the session id, to look up its title) so we
     // can mutate app.hit_regions afterward.
-    let snapshot: Vec<(usize, bool, bool, String, bool)> = match app.embedded.get(ws_id) {
+    let snapshot: Vec<(usize, bool, bool, String, &'static str)> = match app.embedded.get(ws_id) {
         Some(s) => s
             .tabs
             .iter()
@@ -660,7 +687,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
                     i == s.active,
                     app.waiting_response.contains(&t.id),
                     t.id.clone(),
-                    matches!(t.kind, super::TabKind::Shell),
+                    t.kind.marker(),
                 )
             })
             .collect(),
@@ -675,7 +702,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     let mut regions: Vec<(Rect, HitAction)> = Vec::new();
     let mut x = strip.x;
     let right = strip.x + strip.width;
-    for (i, is_active, producing, id, is_shell) in &snapshot {
+    for (i, is_active, producing, id, marker) in &snapshot {
         // Producing replaces the number with the spinner (unchanged); a user
         // title, when set, is appended so the tab is identifiable by name too.
         let glyph = if *producing {
@@ -683,8 +710,9 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
         } else {
             (i + 1).to_string()
         };
-        // A `$` suffix marks a shell tab (vs a Claude tab).
-        let marker = if *is_shell { "$" } else { "" };
+        // A one-char suffix marks the tab's kind (`$` shell; claude is
+        // unmarked): see `TabKind::marker`.
+        let marker = *marker;
         let label = match app.state.embedded_session_title(ws_id, id) {
             Some(title) if !title.is_empty() => {
                 if UnicodeWidthStr::width(title) > MAX_TITLE_COLS {
@@ -764,9 +792,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             th.muted
         };
+        // Title the border with the ACTIVE tab's kind (a shell/codex/... tab
+        // is not claude).
+        let kind_label = app
+            .embedded
+            .get(ws_id)
+            .and_then(|s| s.active_tab())
+            .map(|t| t.kind.label())
+            .unwrap_or("claude");
         let mut block = Block::default()
             .title(format!(
-                " {ws_name} — claude · Ctrl+A: c new · [ ] switch · r rename · x close · t tree · q quit "
+                " {ws_name} — {kind_label} · Ctrl+A: c claude · e codex · g gemini · o opencode · s shell · [ ] switch · r rename · x close · t tree · q quit "
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border));
@@ -1860,7 +1896,7 @@ mod tests {
         // Open PRs surface the CI outcome.
         assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Passing, PrReview::None)), '\u{2713}');
         assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Failing, PrReview::None)), '\u{2717}');
-        assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Pending, PrReview::None)), '\u{25CD}');
+        assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::Pending, PrReview::None)), '\u{25CB}');
         assert_eq!(pr_glyph(&pr(PrState::Open, PrChecks::None, PrReview::None)), '\u{25C7}');
     }
 

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake codex for the exit-hint capture e2e: prints its argv (so the test can
+# assert bare vs resume spawns), waits for one byte, then prints the session
+# id line codex prints when a session closes, and exits immediately (no
+# sleep), so the reap's drain-defer (wait for reader EOF) is exercised for real.
+stty -echo 2>/dev/null
+printf '\033[?1049h\033[2J\033[H'   # alt-screen + clear
+printf 'ARGS:[%s]\r\n' "$*"
+printf 'HINT-STUB-READY\r\n'
+read -r -n1
+printf 'codex resume 019f7db3-4810-7213-83c7-58e1e93baded\r\n'
+exit 0

@@ -14,6 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use super::TabKind;
 use super::modal::{render_input_with_cursor, sanitize_paste};
 use super::theme::Theme;
 
@@ -26,9 +27,12 @@ pub(crate) enum PaletteAction {
     Cleanup { ws_id: String },
     /// Archive an active workspace, or re-activate an archived one.
     ArchiveToggle { ws_id: String },
-    NewSession { ws_id: String },
+    /// Open a new session tab of `kind` for the workspace.
+    NewSession { ws_id: String, kind: TabKind },
     /// Switch to session tab `index` of an already-open workspace.
     JumpTab { ws_id: String, index: usize },
+    /// Delete a profile (never the TUI's own: the candidates exclude it).
+    DeleteProfile { name: String },
 }
 
 /// One palette entry: the display label + muted detail, the text the query is
