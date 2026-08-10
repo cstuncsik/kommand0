@@ -27,7 +27,7 @@ use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 ///
 /// Termination note: portable-pty's cloned `ChildKiller` only delivers SIGHUP
 /// to the child pid (no escalation), so a child that ignores SIGHUP (e.g. a
-/// Node-based `claude`) would survive — and the child's *descendants* (a shell's
+/// Node-based `claude`) would survive, and the child's *descendants* (a shell's
 /// foreground dev server, a server claude spawned) live in other process groups
 /// the kernel won't clean up either. The pane therefore guarantees teardown
 /// itself: it captures the child's process group and the PTY's foreground group
@@ -488,6 +488,12 @@ impl Pane {
     /// own group and the PTY's current foreground group (a shell's running job,
     /// e.g. a dev server). Both kernel facts vanish once the child exits, so
     /// this runs at the START of a teardown, while the child is still alive.
+    /// Never capture earlier (e.g. at spawn): the recycled-pgid race between
+    /// capture and SIGKILL is accepted BECAUSE the window is one short
+    /// teardown; pgids held for the pane's whole life would make it unbounded.
+    /// Known ceilings: a job the user backgrounded (`Ctrl+Z`, `&`) has its own
+    /// pgid and is not sampled here, and a descendant that `setsid`s itself
+    /// escapes entirely; both would need a process-table walk.
     /// No-op if already captured (`signal_hangup` before `force_kill_and_reap`).
     fn capture_kill_groups(&mut self) {
         if !self.kill_groups.is_empty() {
@@ -508,37 +514,39 @@ impl Pane {
         self.kill_groups = groups;
     }
 
-    /// Best-effort gentle hangup to every captured group, so a job that handles
-    /// SIGHUP (and one under a shell that doesn't forward it, like bash) gets a
-    /// chance to shut down before the SIGKILL escalation.
-    fn hangup_captured_groups(&self) {
+    /// Best-effort signal to every captured group (a group already gone is
+    /// simply ESRCH).
+    fn signal_captured_groups(&self, sig: nix::sys::signal::Signal) {
         for &pgid in &self.kill_groups {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pgid),
-                nix::sys::signal::Signal::SIGHUP,
-            );
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), sig);
         }
     }
 
-    /// SIGKILL every captured process group (no-op for groups already gone).
-    fn kill_captured_groups(&self) {
-        for &pgid in &self.kill_groups {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pgid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
+    /// Gentle hangup to every captured group, so a job that handles SIGHUP
+    /// (and one under a shell that doesn't forward it, like bash) gets a
+    /// chance to shut down before the SIGKILL escalation.
+    fn hangup_captured_groups(&self) {
+        self.signal_captured_groups(nix::sys::signal::Signal::SIGHUP);
+    }
+
+    /// SIGKILL every captured process group, then forget them: the kill is
+    /// single-fire per capture, so a later teardown pass over the same pane
+    /// (Drop after the quit path) can never re-signal a pgid the kernel may
+    /// have recycled since.
+    fn kill_captured_groups(&mut self) {
+        self.signal_captured_groups(nix::sys::signal::Signal::SIGKILL);
+        self.kill_groups.clear();
     }
 
     /// Guaranteed teardown: SIGHUP, a bounded grace poll, then SIGKILL for a
-    /// child that ignores the hangup — delivered to the child pid AND to the
+    /// child that ignores the hangup, delivered to the child pid AND to the
     /// captured process groups, so a shell's foreground job (a dev server)
     /// dies with the pane instead of surviving the shell. Returns once the
     /// child is gone (or the grace+SIGKILL has been delivered).
     pub fn terminate(&mut self) {
         if matches!(self.child.try_wait(), Ok(Some(_))) {
             // Already exited: only groups captured by an earlier teardown are
-            // safe to signal — fresh kernel state died with the child.
+            // safe to signal; fresh kernel state died with the child.
             self.kill_captured_groups();
             return;
         }
@@ -595,7 +603,12 @@ impl Pane {
     /// every pane first and waits once, instead of a full grace poll per pane.
     pub fn signal_hangup(&mut self) {
         if matches!(self.child.try_wait(), Ok(Some(_))) {
-            return; // already exited
+            // A capture-kind child already obeyed the SIGTERM: its groups (a
+            // server it spawned) have not seen a gentle signal yet, and the
+            // exit hint is drained by now, so pass the HUP on before the
+            // force-kill escalation.
+            self.hangup_captured_groups();
+            return;
         }
         self.capture_kill_groups();
         let _ = self.killer.kill(); // SIGHUP (gentle)
@@ -614,7 +627,7 @@ impl Pane {
         }
         // This is the teardown start for capture-kind panes: the child may obey
         // the SIGTERM and exit during the capture grace, taking the group facts
-        // with it — capture now so the later escalation can still clean up.
+        // with it; capture now so the later escalation can still clean up.
         self.capture_kill_groups();
         if let Some(pid) = self.child.process_id() {
             let _ = nix::sys::signal::kill(
@@ -630,7 +643,7 @@ impl Pane {
     pub fn force_kill_and_reap(&mut self) {
         // Group kill first and unconditionally: on the quit path the shell
         // often exits within the shared grace while its HUP-ignoring job
-        // survives — the job must die even though the child is already gone.
+        // survives; the job must die even though the child is already gone.
         self.kill_captured_groups();
         if matches!(self.child.try_wait(), Ok(Some(_))) {
             return; // already gone
@@ -849,7 +862,7 @@ mod tests {
 
     // A dev server started from the embedded shell must not outlive the pane:
     // the shell dies on the HUP, but its foreground job sits in its OWN process
-    // group and may ignore SIGHUP (node CLIs do) — signalling only the shell
+    // group and may ignore SIGHUP (node CLIs do); signalling only the shell
     // pid used to leave it running. `set -m` gives the job its own group +
     // the terminal, like an interactive shell; the trailing `:` stops bash
     // exec-ing the job in place of itself.
@@ -857,7 +870,7 @@ mod tests {
     fn terminate_kills_hup_ignoring_foreground_job() {
         let mut pane = Pane::spawn(
             "bash",
-            &["-c", "set -m; sh -c 'trap \"\" HUP; echo UP $$; sleep 300'; :"],
+            &["-c", "set -m; sh -c 'trap \"\" HUP; echo UP $$ OK; sleep 300'; :"],
             &tmp(),
             24,
             200,
@@ -866,22 +879,19 @@ mod tests {
         let pid = wait_for_pid(&pane);
         pane.kill();
         let died = wait_for_death(pid, Duration::from_secs(5));
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
+        kill_leftovers(pid);
         assert!(died, "HUP-ignoring foreground job survived pane teardown");
     }
 
     // The claude-tab shape: the pane child spawns a server that shares the
     // child's own process group. Both ignore SIGHUP, so the child needs the
-    // SIGKILL escalation — which must take the whole group with it, not just
+    // SIGKILL escalation, which must take the whole group with it, not just
     // the child pid.
     #[test]
     fn terminate_kills_grandchild_in_childs_group() {
         let mut pane = Pane::spawn(
             "sh",
-            &["-c", "trap '' HUP; sh -c 'trap \"\" HUP; echo UP $$; sleep 300' & wait"],
+            &["-c", "trap '' HUP; sh -c 'trap \"\" HUP; echo UP $$ OK; sleep 300' & wait"],
             &tmp(),
             24,
             200,
@@ -890,10 +900,7 @@ mod tests {
         let pid = wait_for_pid(&pane);
         pane.kill();
         let died = wait_for_death(pid, Duration::from_secs(5));
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
+        kill_leftovers(pid);
         assert!(died, "grandchild in the child's group survived pane teardown");
     }
 
@@ -904,7 +911,7 @@ mod tests {
     fn quit_path_kills_hup_ignoring_foreground_job() {
         let mut pane = Pane::spawn(
             "bash",
-            &["-c", "set -m; sh -c 'trap \"\" HUP; echo UP $$; sleep 300'; :"],
+            &["-c", "set -m; sh -c 'trap \"\" HUP; echo UP $$ OK; sleep 300'; :"],
             &tmp(),
             24,
             200,
@@ -920,21 +927,71 @@ mod tests {
         }
         pane.force_kill_and_reap();
         let died = wait_for_death(pid, Duration::from_secs(5));
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
+        kill_leftovers(pid);
         assert!(died, "HUP-ignoring job survived the quit teardown");
+    }
+
+    // The capture-kind quit shape: the child obeys SIGTERM and exits during
+    // the capture grace while its HUP-and-TERM-ignoring server (sharing the
+    // child's group; sh scripts don't give `&` jobs their own) lives on.
+    // Returns once the child is gone, with the server still up.
+    fn capture_kind_after_sigterm() -> (Pane, i32) {
+        let mut pane = Pane::spawn(
+            "sh",
+            &["-c", "trap 'exit 0' TERM; sh -c 'trap \"\" HUP TERM; echo UP $$ OK; sleep 300' & wait"],
+            &tmp(),
+            24,
+            200,
+        )
+        .unwrap();
+        let pid = wait_for_pid(&pane);
+        pane.signal_term();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pane.has_exited() {
+            assert!(Instant::now() < deadline, "child did not exit on SIGTERM");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (pane, pid)
+    }
+
+    // The capture-kind quit path (signal_term -> capture grace -> signal_hangup
+    // -> force_kill_and_reap): the groups captured by signal_term must still
+    // die even though the child was already gone at every later stage.
+    #[test]
+    fn quit_path_kills_group_after_child_obeys_sigterm() {
+        let (mut pane, pid) = capture_kind_after_sigterm();
+        pane.signal_hangup();
+        pane.force_kill_and_reap();
+        let died = wait_for_death(pid, Duration::from_secs(5));
+        kill_leftovers(pid);
+        assert!(died, "server survived the capture-kind quit teardown");
+    }
+
+    // Same capture, torn down by Drop's terminate(): the already-exited branch
+    // must SIGKILL the captured groups too.
+    #[test]
+    fn terminate_after_capture_exit_kills_captured_group() {
+        let (mut pane, pid) = capture_kind_after_sigterm();
+        pane.terminate();
+        let died = wait_for_death(pid, Duration::from_secs(5));
+        kill_leftovers(pid);
+        assert!(died, "server survived terminate() after the capture exit");
     }
 
     fn wait_for_pid(pane: &Pane) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let s = pane.screen_contents();
-            if let Some(line) = s.lines().find(|l| l.contains("UP "))
-                && let Some(pid) = line.split_whitespace().nth(1).and_then(|p| p.parse().ok())
-            {
-                return pid;
+            // Whole-line shape "UP <pid> OK": the trailing OK proves the grid
+            // wasn't sampled mid-render with the pid cut short.
+            for line in s.lines() {
+                let mut words = line.split_whitespace();
+                if words.next() == Some("UP")
+                    && let Some(pid) = words.next().and_then(|p| p.parse().ok())
+                    && words.next() == Some("OK")
+                {
+                    return pid;
+                }
             }
             assert!(Instant::now() < deadline, "server never printed pid; screen:\n{s}");
             std::thread::sleep(Duration::from_millis(50));
@@ -950,6 +1007,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    // Failure-path cleanup: SIGKILL the leaked job's whole group first (a
+    // shell may fork `sleep` rather than exec it), then the pid itself.
+    fn kill_leftovers(pid: i32) {
+        let p = nix::unistd::Pid::from_raw(pid);
+        if let Ok(pgid) = nix::unistd::getpgid(Some(p)) {
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        }
+        let _ = nix::sys::signal::kill(p, nix::sys::signal::Signal::SIGKILL);
     }
 
     #[test]
