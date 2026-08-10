@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dev servers no longer outlive their pane**: closing a session tab, a
+  workspace, or the app now SIGKILLs the pane's process groups (the shell's
+  foreground job and the child's own group) after the SIGHUP grace, so a
+  `npm run dev`-style server that ignores the hangup can't keep running (and
+  holding its port) from a closed worktree session.
+
 ## [0.21.0] - 2026-07-21
 
 ### Added
