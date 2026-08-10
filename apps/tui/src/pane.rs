@@ -172,33 +172,11 @@ impl Pane {
                     Ok(0) => break, // EOF: child exited / pty closed
                     Ok(n) => {
                         if let Ok(mut p) = parser_t.lock() {
-                            // While scrolled back, hold the view still: vt100
-                            // measures the offset from the live bottom, so a
-                            // growing history would drag the view along with
-                            // the stream. The history length isn't exposed;
-                            // set_scrollback clamps, so probe it with MAX and
-                            // restore (O(1), and under the same lock the
-                            // renderer takes, so no torn frame).
-                            let offset = p.screen().scrollback();
-                            let before = if offset > 0 {
-                                let s = p.screen_mut();
-                                s.set_scrollback(usize::MAX);
-                                let len = s.scrollback();
-                                s.set_scrollback(offset);
-                                len
-                            } else {
-                                0
-                            };
+                            // A scrolled-back view stays anchored on its own:
+                            // vt100 moves the offset with each row that enters
+                            // history (clamped at capacity), so plain process()
+                            // is correct even while the user is reading back.
                             p.process(&buf[..n]);
-                            if offset > 0 {
-                                let s = p.screen_mut();
-                                s.set_scrollback(usize::MAX);
-                                let len = s.scrollback();
-                                // saturating: entering the alt screen mid-chunk
-                                // swaps in a historyless grid (len 0 < before);
-                                // the set_scrollback clamp then floors it at 0.
-                                s.set_scrollback(offset + len.saturating_sub(before));
-                            }
                         }
                         if let Some(on) = scan_focus_reporting(&mut focus_tail, &buf[..n]) {
                             focus_t.store(on, Ordering::Relaxed);
@@ -253,13 +231,20 @@ impl Pane {
         Ok(())
     }
 
-    /// Write raw bytes to the child's stdin. Input while scrolled back snaps
+    /// Write user input to the child's stdin. Input while scrolled back snaps
     /// the view to the live screen first, like a real terminal (a no-op at
     /// offset 0, which covers mouse-mode and alt-screen children).
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
         if let Ok(mut p) = self.parser.lock() {
             p.screen_mut().set_scrollback(0);
         }
+        self.send_raw(bytes)
+    }
+
+    /// Write bytes to the child's stdin without touching the view: synthesized
+    /// reports (focus in/out) must not yank a scrolled-back reader to the
+    /// bottom the way real user input does.
+    fn send_raw(&mut self, bytes: &[u8]) -> Result<()> {
         self.last_input = Some(Instant::now());
         self.writer.write_all(bytes).context("pty write failed")?;
         self.writer.flush().context("pty flush failed")?;
@@ -284,7 +269,7 @@ impl Pane {
             return;
         }
         if self.focus_sent != Some(focused) {
-            let _ = self.send(if focused { b"\x1b[I" } else { b"\x1b[O" });
+            let _ = self.send_raw(if focused { b"\x1b[I" } else { b"\x1b[O" });
             self.focus_sent = Some(focused);
         }
     }
@@ -315,9 +300,9 @@ impl Pane {
 
     /// Forward a mouse event to the child if it has enabled mouse reporting
     /// (and a mode that wants this event). `col`/`row` are 0-based cells within
-    /// the child's screen. A wheel tick the child doesn't take (a plain shell)
-    /// scrolls the pane's local view instead — see [`Pane::scroll_view`].
-    /// Returns whether the event was consumed.
+    /// the child's screen. A wheel tick over a child with mouse mode off (a
+    /// plain shell) scrolls the pane's local view instead, see
+    /// [`Pane::scroll_view`]. Returns whether the event was consumed.
     pub fn send_mouse(
         &mut self,
         kind: MouseEventKind,
@@ -340,41 +325,55 @@ impl Pane {
                 let _ = self.send(&bytes);
                 true
             }
-            None => self.scroll_view(kind),
+            // Only a child with mouse mode OFF gets the local-scroll fallback:
+            // encode_mouse also declines for a mouse-mode child it can't
+            // encode for (utf8 encoding, X10 coords past 222), and stealing
+            // that child's wheel would scroll its view out from under it.
+            None if mode == MouseProtocolMode::None => self.scroll_view(kind),
+            None => false,
         }
     }
 
     /// Local scrolling for a child that never enabled mouse reporting: wheel
     /// ticks move the view through the emulator's scrollback instead of being
     /// dropped (the shell-running-a-dev-server case). In the alternate screen
-    /// there is no scrollback, so the wheel converts to arrow keys instead
-    /// (the alternateScroll convention) — pagers in a shell tab still scroll.
-    /// Reached only for events `encode_mouse` declined, so a wheel tick here
-    /// implies the child's mouse mode is off.
+    /// there is no scrollback, so the wheel converts to cursor keys instead
+    /// (the alternateScroll convention, honoring DECCKM), and pagers in a
+    /// shell tab still scroll. Callers gate on mouse mode being off.
     fn scroll_view(&mut self, kind: MouseEventKind) -> bool {
         let up = match kind {
             MouseEventKind::ScrollUp => true,
             MouseEventKind::ScrollDown => false,
             _ => return false,
         };
-        let alt = self
-            .parser
-            .lock()
-            .map(|p| p.screen().alternate_screen())
-            .unwrap_or(false);
-        if alt {
-            let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-            let _ = self.send(&arrow.repeat(WHEEL_STEP));
-            return true;
-        }
-        if let Ok(mut p) = self.parser.lock() {
-            let screen = p.screen_mut();
-            let next = if up {
-                screen.scrollback() + WHEEL_STEP
-            } else {
-                screen.scrollback().saturating_sub(WHEEL_STEP)
+        // Decide and (for the normal screen) apply under one lock, so a mode
+        // flip between the check and the action can't misroute the tick. The
+        // alt-screen write happens after the guard drops: send() re-locks.
+        let alt_app_cursor = {
+            let Ok(mut p) = self.parser.lock() else {
+                return false;
             };
-            screen.set_scrollback(next); // clamped to the stored history
+            let screen = p.screen_mut();
+            if screen.alternate_screen() {
+                Some(screen.application_cursor())
+            } else {
+                let next = if up {
+                    screen.scrollback() + WHEEL_STEP
+                } else {
+                    screen.scrollback().saturating_sub(WHEEL_STEP)
+                };
+                screen.set_scrollback(next); // clamped to the stored history
+                None
+            }
+        };
+        if let Some(app_cursor) = alt_app_cursor {
+            let arrow: &[u8] = match (app_cursor, up) {
+                (false, true) => b"\x1b[A",
+                (false, false) => b"\x1b[B",
+                (true, true) => b"\x1bOA", // DECCKM: SS3 cursor keys
+                (true, false) => b"\x1bOB",
+            };
+            let _ = self.send(&arrow.repeat(WHEEL_STEP));
         }
         true
     }
@@ -423,12 +422,34 @@ impl Pane {
         (self.rows, self.cols)
     }
 
-    /// Plain-text snapshot of the emulated screen (for tests/logging).
+    /// Plain-text snapshot of the current VIEW (for tests/logging): follows
+    /// the scrollback offset, i.e. it shows whatever the user has wheeled to.
+    /// Machine scans that need the real bottom use [`Pane::live_contents`].
     pub fn screen_contents(&self) -> String {
         self.parser
             .lock()
             .map(|p| p.screen().contents())
             .unwrap_or_default()
+    }
+
+    /// Plain-text snapshot of the LIVE screen regardless of any scrollback
+    /// offset: exit hints and session-id scans read the tail of the real
+    /// screen, which must not change because the user wheeled up to read
+    /// history on a dying pane. Saves and restores the offset under the lock,
+    /// so a scrolled-back view is undisturbed.
+    pub fn live_contents(&self) -> String {
+        let Ok(mut p) = self.parser.lock() else {
+            return String::new();
+        };
+        let offset = p.screen().scrollback();
+        if offset == 0 {
+            return p.screen().contents();
+        }
+        let s = p.screen_mut();
+        s.set_scrollback(0);
+        let out = s.contents();
+        s.set_scrollback(offset);
+        out
     }
 
     /// Text of the inclusive selection between two pane-local `(row, col)`
@@ -452,7 +473,7 @@ impl Pane {
     }
 
     /// Screen-relative cursor position, or `None` when hidden. The cursor
-    /// lives on the live screen, so it is also hidden while scrolled back —
+    /// lives on the live screen, so it is also hidden while scrolled back:
     /// its coordinates would land on unrelated history rows.
     pub fn cursor(&self) -> Option<(u16, u16)> {
         let p = self.parser.lock().ok()?;
@@ -1300,6 +1321,15 @@ mod tests {
         }
     }
 
+    /// A file the child polls for, gating its next output burst on the test
+    /// (deterministic phasing, no sleep races). Pid-scoped; a stale file from
+    /// a recycled pid is removed so the gate starts closed.
+    fn flag_path(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("kmd-pane-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
     #[test]
     fn wheel_scrolls_history_for_mouse_less_child_and_input_snaps_back() {
         // A plain shell never enables mouse reporting; the wheel must scroll a
@@ -1307,13 +1337,34 @@ mod tests {
         // case: long output, then trying to read the beginning).
         let mut pane = Pane::spawn("sh", &["-c", "seq 1 40; sleep 30"], &tmp(), 5, 20).unwrap();
         assert!(wait_until(&pane, "40"), "screen:\n{}", pane.screen_contents());
+        // One tick moves exactly WHEEL_STEP rows (the live grid ends with
+        // 37..40 plus the blank cursor row left by the trailing newline).
+        wheel(&mut pane, MouseEventKind::ScrollUp, 1);
+        assert_eq!(pane.screen_contents(), "34\n35\n36\n37\n38", "one tick = WHEEL_STEP rows");
         // Scroll well past the top: the offset clamps to the stored history,
         // so the view lands on the very first lines.
         wheel(&mut pane, MouseEventKind::ScrollUp, 40);
         let top = pane.screen_contents();
         assert_eq!(top, "1\n2\n3\n4\n5", "view at the top of history:\n{top}");
-        // The live cursor is off-view while scrolled back — don't draw it.
+        // The live cursor is off-view while scrolled back: don't draw it, in
+        // cursor() or in blit's render path (no reversed cursor cell).
         assert_eq!(pane.cursor(), None, "cursor hidden while scrolled back");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
+        pane.blit(&mut buf, Rect::new(0, 0, 20, 5), None);
+        assert_eq!(buf[(0, 0)].symbol(), "1", "blit renders the scrolled-back view");
+        for y in 0..5u16 {
+            for x in 0..20u16 {
+                assert!(
+                    !buf[(x, y)].style().add_modifier.contains(Modifier::REVERSED),
+                    "no cursor cell while scrolled back (found at {x},{y})"
+                );
+            }
+        }
+        // Non-wheel events fall through untouched: nothing scrolls, nothing
+        // is sent (a plain shell has had no input at all yet).
+        assert!(!pane.send_mouse(MouseEventKind::ScrollLeft, KeyModifiers::NONE, 0, 0));
+        assert_eq!(pane.screen_contents(), top, "tilt must not move the view");
+        assert!(pane.last_input_at().is_none(), "tilt must not reach the child");
         // Scrolling down past the bottom clamps back to the live screen.
         wheel(&mut pane, MouseEventKind::ScrollDown, 100);
         assert!(pane.screen_contents().contains("40"));
@@ -1321,6 +1372,13 @@ mod tests {
         // Typing while scrolled back snaps to the live screen first.
         wheel(&mut pane, MouseEventKind::ScrollUp, 40);
         assert_eq!(pane.screen_contents(), "1\n2\n3\n4\n5");
+        // The machine-scan view is the live screen even while scrolled back.
+        assert!(
+            pane.live_contents().contains("40"),
+            "live_contents reads the real bottom:\n{}",
+            pane.live_contents()
+        );
+        assert_eq!(pane.screen_contents(), "1\n2\n3\n4\n5", "probe must not move the view");
         pane.send_key(k(KeyCode::Char('x'))).unwrap();
         assert!(
             pane.screen_contents().contains("40"),
@@ -1330,25 +1388,31 @@ mod tests {
         pane.kill();
     }
 
-    #[test]
-    fn output_while_scrolled_back_keeps_the_view_anchored() {
-        // vt100 measures the scroll offset from the live bottom, so a growing
-        // history would drag the view along with the stream; the reader thread
-        // compensates so the view holds still while new output lands.
-        let mut pane = Pane::spawn(
-            "sh",
-            &["-c", "seq 1 40; sleep 1; seq 41 80; sleep 30"],
-            &tmp(),
-            5,
-            20,
-        )
-        .unwrap();
-        assert!(wait_until(&pane, "40"), "screen:\n{}", pane.screen_contents());
-        wheel(&mut pane, MouseEventKind::ScrollUp, 40);
+    /// Shared body: print `1..=first`, scroll back 2 ticks (an unclamped
+    /// offset of 6 rows), release the child's file-gated second burst up to
+    /// `last`, and assert the view held still while it landed. vt100 anchors
+    /// natively (it moves the offset with each row entering history, clamped
+    /// at capacity); the pin here is that the reader thread does nothing to
+    /// disturb that. The file gate makes the phases deterministic: the first
+    /// screen can't scroll away before wait_until sees it, and seq0 is
+    /// captured before the burst can start.
+    fn assert_anchored_during_burst(name: &str, first: u32, last: u32) {
+        let flag = flag_path(name);
+        let script = format!(
+            "seq 1 {first}; while [ ! -e '{}' ]; do sleep 0.05; done; seq {} {last}; sleep 30",
+            flag.display(),
+            first + 1,
+        );
+        let mut pane = Pane::spawn("sh", &["-c", &script], &tmp(), 5, 20).unwrap();
+        assert!(wait_until(&pane, &first.to_string()), "screen:\n{}", pane.screen_contents());
+        wheel(&mut pane, MouseEventKind::ScrollUp, 2);
+        // The live grid ends with first-3..=first plus the blank cursor row
+        // from the trailing newline; 6 rows up shows first-9..=first-5.
         let before = pane.screen_contents();
-        assert_eq!(before, "1\n2\n3\n4\n5");
-        // Wait for the second burst, then let the reader settle.
+        let expect: Vec<String> = (first - 9..=first - 5).map(|n| n.to_string()).collect();
+        assert_eq!(before, expect.join("\n"), "2 ticks = 6 rows up");
         let seq0 = pane.output_seq();
+        std::fs::write(&flag, b"").unwrap(); // release the second burst
         let deadline = Instant::now() + Duration::from_secs(5);
         while pane.output_seq() == seq0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -1358,8 +1422,24 @@ mod tests {
         assert_eq!(pane.screen_contents(), before, "view anchored during output");
         // Snapping back shows the new tail.
         pane.send_key(k(KeyCode::Char('x'))).unwrap();
-        assert!(wait_until(&pane, "80"), "screen:\n{}", pane.screen_contents());
+        assert!(wait_until(&pane, &last.to_string()), "screen:\n{}", pane.screen_contents());
         pane.kill();
+        let _ = std::fs::remove_file(&flag);
+    }
+
+    #[test]
+    fn output_while_scrolled_back_keeps_the_view_anchored() {
+        assert_anchored_during_burst("anchor", 40, 80);
+    }
+
+    #[test]
+    fn view_stays_anchored_at_scrollback_capacity() {
+        // 2100 lines overfill the 2000-line cap first: at capacity every new
+        // row pops the oldest, and vt100 still moves the offset so the view
+        // holds. A manual offset fixup is exactly what would drift here (PR
+        // #110's review); this also pins the crate's at-capacity behavior
+        // against future vt100 bumps.
+        assert_anchored_during_burst("anchor-cap", 2100, 2140);
     }
 
     #[test]
@@ -1367,17 +1447,41 @@ mod tests {
         // The alternate screen has no scrollback; the wheel converts to arrow
         // keys (the alternateScroll convention) so pagers in a shell tab
         // still scroll. The pty echoes our arrows back as ^[[A (ECHOCTL).
-        let mut pane =
-            Pane::spawn("sh", &["-c", "printf '\\033[?1049h'; sleep 30"], &tmp(), 5, 40).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pane.output_seq() == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(pane.output_seq() > 0, "child produced no output");
+        let mut pane = Pane::spawn(
+            "sh",
+            &["-c", "printf '\\033[?1049hREADY'; sleep 30"],
+            &tmp(),
+            5,
+            40,
+        )
+        .unwrap();
+        assert!(wait_until(&pane, "READY"), "screen:\n{}", pane.screen_contents());
         wheel(&mut pane, MouseEventKind::ScrollUp, 1);
         assert!(
             wait_until(&pane, "^[[A"),
             "arrows echoed in the alt screen:\n{}",
+            pane.screen_contents()
+        );
+        pane.kill();
+    }
+
+    #[test]
+    fn wheel_in_alternate_screen_honors_application_cursor_keys() {
+        // DECCKM (?1h) switches cursor keys to SS3; a pager/editor in that
+        // mode expects ESC O A, not CSI A. ECHOCTL echoes it as ^[OA.
+        let mut pane = Pane::spawn(
+            "sh",
+            &["-c", "printf '\\033[?1049h\\033[?1hREADY'; sleep 30"],
+            &tmp(),
+            5,
+            40,
+        )
+        .unwrap();
+        assert!(wait_until(&pane, "READY"), "screen:\n{}", pane.screen_contents());
+        wheel(&mut pane, MouseEventKind::ScrollDown, 1);
+        assert!(
+            wait_until(&pane, "^[OB"),
+            "SS3 arrows echoed under DECCKM:\n{}",
             pane.screen_contents()
         );
         pane.kill();

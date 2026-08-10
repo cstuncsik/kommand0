@@ -2435,7 +2435,7 @@ impl App {
                     let hint = tab
                         .pane
                         .reader_finished()
-                        .then(|| tab.kind.capture_exit_hint(&tab.pane.screen_contents()))
+                        .then(|| tab.kind.capture_exit_hint(&tab.pane.live_contents()))
                         .flatten();
                     exited.push((
                         ws_id.clone(),
@@ -2457,8 +2457,9 @@ impl App {
                     // kind rides the fast-exit net above. Require BOTH the
                     // marker and this tab's (random uuid) session id, so a
                     // resumed conversation that merely mentions the phrase
-                    // can't be mistaken for a real miss.
-                    let screen = tab.pane.screen_contents();
+                    // can't be mistaken for a real miss. live_contents: the
+                    // scan reads the real screen, not a scrolled-back view.
+                    let screen = tab.pane.live_contents();
                     if screen.contains(RESUME_MISS_MARKER) && screen.contains(&tab.id) {
                         resume_missed.push((ws_id.clone(), tab.id.clone()));
                     }
@@ -2810,7 +2811,7 @@ impl App {
                     .filter(|t| t.kind.captures_exit_hint() && t.pane.reader_finished())
                     .filter_map(|t| {
                         t.kind
-                            .capture_exit_hint(&t.pane.screen_contents())
+                            .capture_exit_hint(&t.pane.live_contents())
                             .map(|hint| (ws_id.clone(), t.id.clone(), hint))
                     })
             })
@@ -9662,8 +9663,10 @@ mod key_tests {
 
     #[test]
     fn scroll_over_content_with_mouseless_child_sends_nothing() {
-        // The forward branch is taken, but send_mouse gates on the child's
-        // mouse mode: a plain sleep never opted in, so nothing is written.
+        // The forward branch is taken; for a mouse-less child send_mouse
+        // consumes the wheel LOCALLY (scrolls the pane's view), so no bytes
+        // reach the child. ScrollDown at offset 0 is a view no-op; the pin
+        // here is that nothing is written to the child's stdin.
         let mut app = app_with_pane("sleep 30");
         mouse::handle_mouse(&mut app, m(MouseEventKind::ScrollDown, 50, 10));
         assert!(app.embedded["w1"].tabs[0].pane.last_input_at().is_none());
