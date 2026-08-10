@@ -1,0 +1,34 @@
+apps/tui/src/pane.rs
+  s_0460b0c86d8b5c::t_3d5d056e3a686c 882,903,930
+  s_0460b0c86d8b5c::t_1d01e853ff41e0 549
+  s_0460b0c86d8b5c::t_166bef7e9f5fe1 542
+  s_0460b0c86d8b5c::t_02cea293ab390c 985-994
+  s_0460b0c86d8b5c::t_1231616a74d45f 630
+  s_0460b0c86d8b5c::t_621ca08f78ce49 30
+  s_0460b0c86d8b5c::t_a47d10d25f5b18 1012-1021
+  s_0460b0c86d8b5c::t_eea367c6e487f1 646
+  s_0460b0c86d8b5c::t_1c33250adea98f 491-496
+  s_0460b0c86d8b5c::t_63f2d6bd1df99b 517-519,521,525-538
+  s_0460b0c86d8b5c::t_c4188ad864d41b 865
+  s_0460b0c86d8b5c::t_19fc520b0f299e 894
+  s_0460b0c86d8b5c::t_338d2111e2361f 873,914
+  s_0460b0c86d8b5c::t_46d89a58797f29 934-980
+  s_0460b0c86d8b5c::t_3004b98fff93ef 888
+  s_0460b0c86d8b5c::t_9c4b2ee7a3600d 606-611
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "b557d5e49bfec87d5e633ddbc13452d0dbb599b6",
+  "prompts": {},
+  "sessions": {
+    "s_0460b0c86d8b5c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "05cb6773-500a-4483-95ff-93b24585ec6a",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
