@@ -30,6 +30,7 @@ kommand0-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+chrono.workspace = true
 insta = "1"
 
 # `cargo binstall kommand0-tui` (use `--git <repo>` until/unless published to

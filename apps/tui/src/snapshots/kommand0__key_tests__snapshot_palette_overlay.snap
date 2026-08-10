@@ -1,5 +1,6 @@
 ---
 source: apps/tui/src/main.rs
+assertion_line: 6403
 expression: "render_to_string(&mut app, 100, 30)"
 ---
 ┌ Repos ────────────────── + ┐┌ Repo: alpha ───────────────────────────────────────────────────────┐
@@ -14,9 +15,9 @@ expression: "render_to_string(&mut app, 100, 30)"
 │                   │   Clean up — ws-one  —  alpha                            │                   │
 │                   │   Archive — ws-one  —  alpha                             │                   │
 │                   │   New session — ws-one  —  alpha                         │                   │
-│                   │                                                          │                   │
-│                   │                                                          │                   │
-│                   │                                                          │                   │
+│                   │   New codex — ws-one  —  alpha                           │                   │
+│                   │   New gemini — ws-one  —  alpha                          │                   │
+│                   │   New opencode — ws-one  —  alpha                        │                   │
 │                   │                                                          │                   │
 │                   │                                                          │                   │
 │                   │                                                          │                   │

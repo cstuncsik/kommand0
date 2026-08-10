@@ -17,7 +17,7 @@ without leaving the keyboard. A `kmd` CLI mirrors the core actions for scripting
 ## Prerequisites
 
 - Rust toolchain (edition 2024)
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed and authenticated
+- [Claude Code CLI](https://code.claude.com/docs) installed and authenticated
 - Git on PATH
 - macOS or Linux
 
@@ -125,14 +125,14 @@ cargo run -p kommand0-tui   # from a checkout
 
 - **Two-pane layout**: Tree (repos/workspaces) on the left; the embedded Claude pane or workspace details on the right
 - **Embedded Claude**: opening a workspace launches a real interactive `claude` in a pseudo-terminal, composited into the right pane — full fidelity (its own input box, slash commands, `/model`, colours), not a reimplemented chat UI
-- **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9), and `Ctrl+A l` toggles back to the last-active tab (tmux-style). Open a new **Claude** tab with `Ctrl+A c` (or the `[+]` tab), or a **shell** tab with `Ctrl+A s`: a `$SHELL` session in the worktree, for running anything (codex, lazygit, or `tmux`/`zellij` for splits inside the pane). Shell tabs are marked `$` and reopen as fresh shells; Claude tabs resume their conversation on reopen
+- **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9), and `Ctrl+A l` toggles back to the last-active tab (tmux-style). Open a new **Claude Code** tab with `Ctrl+A c` (or the `[+]` tab), a **codex** tab with `Ctrl+A e`, a **gemini** tab with `Ctrl+A g`, an **opencode** tab with `Ctrl+A o`, or a **shell** tab with `Ctrl+A s`: a `$SHELL` session in the worktree, for running anything (lazygit, or `tmux`/`zellij` for splits inside the pane). Tabs are marked by kind (codex `>`, gemini `✦`, opencode `○`, shell `$`). All four agent tabs resume their conversation on reopen; shell tabs reopen as fresh shells
 - **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items and scroll the tree; inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive. Horizontal scroll (tilt wheel) or Shift+scroll over the content pane switches session tabs
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead. With the Branch field blank, if the workspace **name** matches an existing branch (local or `origin`), a prompt offers to check it out instead of forking
 - **Filter & archive**: press `/` to live-filter the workspace tree by name or branch (matched repos auto-expand, `Esc` clears); press `A` to archive/activate a workspace — so the tree stays navigable as you accumulate repos and workspaces
 - **Git worktrees**: each workspace gets an isolated git worktree branch
 - **Branch/diff status**: each workspace shows its git branch and how far it is ahead/behind its upstream plus whether it has uncommitted changes — a compact `↑2↓1*` segment in the tree row and full detail (`Branch:` / `Changes:`) in the detail pane. Computed off the render loop (never blocks keystrokes), refreshed every couple of seconds and on workspace create/close
-- **PR/CI status**: each own-branch workspace surfaces its GitHub PR at a glance — a compact `#12 ✓` in the tree row (`✓` checks passing · `✗` failing · `◍` pending · `⬤` merged · `✕` closed) and a full `PR #12 · open · CI passing · approved` line + URL in the detail pane. One read-only `gh pr list` per repo, off the render loop, refreshed periodically. Requires `gh` installed and authenticated; nothing shows without it. Press `p` to open the PR in your browser
+- **PR/CI status**: each own-branch workspace surfaces its GitHub PR at a glance — a compact `#12 ✓` in the tree row (`✓` checks passing · `✗` failing · `○` pending · `⬤` merged · `✕` closed) and a full `PR #12 · open · CI passing · approved` line + URL in the detail pane. One read-only `gh pr list` per repo, off the render loop, refreshed periodically. Requires `gh` installed and authenticated; nothing shows without it. Press `p` to open the PR in your browser
 - **Review a workspace's diff**: press `v` on a workspace to open a two-pane dialog (GitHub-style) — a file tree with collapsible folders on the left, the selected file's diff on the right (`git diff <default>...HEAD`, the committed changes a PR would show, coloured by add / remove / hunk). `Tab` switches focus between the panes; click or select a file. In the file pane `j`/`k` move, `Enter`/`l`/`h` expand/collapse folders; in the diff pane `j`/`k`, `PgUp`/`PgDn`, `g`/`G` scroll; `Esc`/`v`/`q` close. Rebindable as `review-diff`
 - **Clean up merged workspaces**: press `c` (or click `[Clean up]`) to remove a workspace's worktree and delete its branch once its PR is merged. Behind a confirmation, and it only proceeds when it's provably safe — the PR is `MERGED` (per `gh`), the worktree is clean, and the branch has no commits beyond what the PR merged (squash-safe); otherwise it refuses and tells you why. On success the workspace is dropped from the tree
 - **Status bar**: bottom row shows the current mode (TREE / CLAUDE), the selected repo/workspace, the live-session count (and how many are active / waiting), and context key hints
@@ -162,16 +162,20 @@ cargo run -p kommand0-tui   # from a checkout
 | `w` | Tree | Add workspace to selected repo (modal) |
 | `d` / `D` | Tree | Delete / force-delete selected |
 | _typing_ | Embedded | Goes straight to the embedded Claude |
-| `Ctrl+A` then `c` | Embedded | New Claude session tab |
+| `Ctrl+A` then `c` | Embedded | New Claude Code session tab |
+| `Ctrl+A` then `e` | Embedded | New codex session tab (marked `>`) |
+| `Ctrl+A` then `g` | Embedded | New gemini session tab (marked `✦`) |
+| `Ctrl+A` then `o` | Embedded | New opencode session tab (marked `○`) |
 | `Ctrl+A` then `s` | Embedded | New shell tab (`$SHELL` / `shell` config; reopens fresh) |
 | `Ctrl+A` then `[` / `]` | Embedded | Previous / next tab |
 | `Ctrl+A` then `1`–`9` | Embedded | Jump to tab N |
 | `Ctrl+A` then `l` | Embedded | Jump to the last-active tab |
 | `Ctrl+A` then `r` | Embedded | Rename the active tab |
 | `Ctrl+A` then `x` | Embedded | Close the active tab |
+| `Ctrl+A` then `d` | Embedded | Detach: kill the panes (interrupts a running turn), sessions stay resumable |
 | `Ctrl+A` then `t` | Embedded | Back to tree (also `Tab` / `Esc`) |
 | `Ctrl+A` then `q` | Embedded | Quit kommand0 |
-| `Ctrl+A` then `Ctrl+A` | Embedded | Send a literal `Ctrl+A` to Claude |
+| `Ctrl+A` then `Ctrl+A` | Embedded | Send a literal `Ctrl+A` to the embedded tool |
 | `,` | Tree | Settings page: edit the simple `config.json` fields in-app (`j`/`k` select, `Enter` edit/save, blank = default, `Esc` close) |
 | `?` | Tree | Toggle help overlay |
 | `q` | Tree | Quit |
@@ -241,6 +245,12 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 {
   "claude_args": ["--model", "sonnet"],
   "claude_bin": "/usr/local/bin/claude",
+  "codex_args": ["--model", "o3"],
+  "codex_bin": "/usr/local/bin/codex",
+  "gemini_args": ["--model", "gemini-2.5-pro"],
+  "gemini_bin": "/usr/local/bin/gemini",
+  "opencode_args": ["--model", "anthropic/claude-sonnet-4-5"],
+  "opencode_bin": "/usr/local/bin/opencode",
   "status_refresh_secs": 2,
   "tree_width_pct": 30,
   "keybindings": { "quit": ["ctrl+q"], "open": ["o"] },
@@ -260,8 +270,36 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `theme_colors` — per-role overrides applied on top of `theme`: `"<role>": "<color>"`. Roles: `accent`, `selected`, `active`, `attention`, `dirty`, `error`, `muted`, `text`, `inverse`. Colors: a named color (`cyan`, `light-red`, `darkgray`), an `#rrggbb` hex, a 0–255 palette index, or `reset`/`default` (the terminal's own default color — not the role's built-in). Unknown roles / unparseable colors are warned (tree border + log), not fatal.
 - `notify` — alert when a backgrounded session goes quiet with unseen output (the same "needs you" edge as the magenta dot): `"off"` (default), `"bell"` (terminal bell), `"desktop"` (an OS notification — `osascript` on macOS, `notify-send` on Linux; silently skipped if unavailable), or `"both"`. Fires once per rising edge (the latch means it won't repeat until you view the session and it comes back). Unknown values warn and fall back to `off`.
 - `shell` — command for a shell session tab (`Ctrl+A s`); defaults to `$SHELL`, then `/bin/sh`. Can be any command — e.g. `"tmux"` to open a tmux session (with its own splits) directly. The `KOMMAND0_SHELL` env var takes precedence.
+- `codex_bin`/`codex_args`, `gemini_bin`/`gemini_args`, `opencode_bin`/`opencode_args`: the same binary-override + extra-args pair for the codex (`Ctrl+A e`), gemini (`Ctrl+A g`) and opencode (`Ctrl+A o`) session tabs (also in the command palette). The `KOMMAND0_CODEX_BIN`/`KOMMAND0_GEMINI_BIN`/`KOMMAND0_OPENCODE_BIN` env vars take precedence over the config bins. Gemini tabs resume their conversation when a workspace reopens (kommand0 manages `--session-id`/`--resume`, so don't put those in `gemini_args`); codex and opencode tabs capture the session id their CLI prints when a session closes and resume it on reopen. Quitting kommand0 (or detaching a workspace) terminates codex/opencode tabs gracefully and captures the id opencode prints on SIGTERM, and codex session ids are also captured from codex's own session store right after the tab starts, so a codex tab still open at quit (or lost to a crash) resumes too; anything uncaptured reopens fresh.
 
-The config is read once at startup, so hand-edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border. The simple fields above (everything except `keybindings` and `theme_colors`) can also be edited in-app on the settings page (`,`): each save rewrites only that key — preserving any hand-edited or unknown keys — and `theme`, `tree_width_pct`, and `notify` apply immediately, while `claude_args`/`claude_bin`/`shell` apply to the next tab you open.
+The config is read once at startup, so hand-edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border. The simple fields above (everything except `keybindings` and `theme_colors`) can also be edited in-app on the settings page (`,`): each save rewrites only that key — preserving any hand-edited or unknown keys — and `theme`, `tree_width_pct`, and `notify` apply immediately, while `shell` and the per-tool `*_bin`/`*_args` fields apply to the next tab you open.
+
+## Troubleshooting
+
+**No PR/CI status in the tree.** PR status needs the [GitHub CLI](https://cli.github.com):
+`gh` installed and authenticated (`gh auth status` to check, `gh auth login` to fix).
+Without it the tree simply omits the PR segment, nothing else breaks.
+
+**The embedded pane won't open (or exits immediately).** The `claude` binary
+isn't on PATH, or the one found isn't the Claude Code CLI. Install it, or point
+`claude_bin` in `config.json` (or the `KOMMAND0_CLAUDE_BIN` env var) at the right
+binary. `kommand0.log` in the state directory has the spawn error.
+
+**Shift+Enter submits instead of inserting a newline.** You're under tmux without
+extended keys, see [Terminals & tmux](#terminals--tmux) for the two-line
+`tmux.conf` fix. `Alt+Enter` inserts a newline everywhere, no config needed.
+
+**Drag-copying from an embedded pane never reaches the clipboard under tmux.**
+tmux drops OSC 52 from applications by default; add `set -s set-clipboard on` to
+`tmux.conf` (details in [Terminals & tmux](#terminals--tmux)).
+
+**The tree is empty but you had repos.** You're looking at a different state
+directory: another `--profile`, an inherited `KOMMAND0_PROFILE`/`KOMMAND0_STATE_DIR`,
+or a debug build (`cargo run`), which keeps its state in `.kommand0-dev/` relative
+to the current directory instead of the platform data dir. See [State](#state).
+
+**Reporting a bug?** Include `kommand0 --version` and the tail of `kommand0.log`
+from the state directory (see [State](#state) for where that is).
 
 ## Releasing
 

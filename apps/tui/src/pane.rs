@@ -39,7 +39,9 @@ const WHEEL_STEP: usize = 3;
 /// a child that ignores SIGHUP (e.g. a Node-based `claude`) would survive. The
 /// pane therefore guarantees teardown itself: SIGHUP, a brief grace poll, then
 /// SIGKILL by pid (see [`Pane::terminate`]). SIGKILL closes the PTY slave, which
-/// gives the reader thread EOF so the detached thread ends.
+/// gives the reader thread EOF so the detached thread ends. Teardown capture
+/// may first SIGTERM a capture-kind child ([`Pane::signal_term`]) and drain the
+/// reader for its exit hint; the SIGHUP-then-SIGKILL guarantee still runs after.
 pub struct Pane {
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
@@ -62,6 +64,15 @@ pub struct Pane {
     /// right after is the child redrawing in response; the activity tracker
     /// uses this to not count it as work.
     last_input: Option<Instant>,
+    /// Test seam: while `true`, [`Pane::reader_finished`] reports `false`.
+    /// The "child exited but the reader hasn't drained" window cannot be
+    /// held open with real processes on macOS: the kernel revokes the pty
+    /// when the session-leader child exits, so a grandchild's open slave fd
+    /// neither blocks EOF nor reliably delivers buffered output. Tests that
+    /// pin the reap's drain-defer flip this instead; everything else about
+    /// the pane stays real.
+    #[cfg(test)]
+    pub(crate) force_reader_unfinished: bool,
     rows: u16,
     cols: u16,
 }
@@ -216,6 +227,8 @@ impl Pane {
             focus_reporting,
             focus_sent: None,
             last_input: None,
+            #[cfg(test)]
+            force_reader_unfinished: false,
             rows,
             cols,
         })
@@ -580,6 +593,19 @@ impl Pane {
         matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
+    /// Whether the reader thread has finished. PTY EOF arrives only after the
+    /// child has exited AND every buffered chunk of its output was read, so a
+    /// finished reader guarantees the final chunk is already parsed into the
+    /// grid: a caller scanning a dead pane's screen (e.g. exit-hint capture)
+    /// can trust it is fully drained. `true` also after `Drop` took the handle.
+    pub fn reader_finished(&self) -> bool {
+        #[cfg(test)]
+        if self.force_reader_unfinished {
+            return false;
+        }
+        self.reader.as_ref().is_none_or(|h| h.is_finished())
+    }
+
     /// Send the gentle hangup (SIGHUP) without waiting. Pairs with
     /// [`Pane::force_kill_and_reap`] for a batched quit teardown that signals
     /// every pane first and waits once, instead of a full grace poll per pane.
@@ -588,6 +614,24 @@ impl Pane {
             return; // already exited
         }
         let _ = self.killer.kill(); // SIGHUP (gentle)
+    }
+
+    /// Send SIGTERM by pid without waiting (no reap loop). portable-pty's
+    /// cloned killer only delivers SIGHUP, and opencode prints its resumable
+    /// session id on SIGTERM, not SIGHUP, so the teardown exit-hint capture
+    /// needs the explicit signal. The caller drains the reader afterwards;
+    /// the SIGHUP-then-SIGKILL guarantee ([`Pane::terminate`]) still runs
+    /// later for a child that ignores this.
+    pub fn signal_term(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return; // already exited
+        }
+        if let Some(pid) = self.child.process_id() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
     }
 
     /// SIGKILL a child that's still alive (by pid) and briefly reap it, so a
@@ -1113,6 +1157,26 @@ mod tests {
     }
 
     #[test]
+    fn signal_term_delivers_sigterm() {
+        // The teardown-capture contract: signal_term must deliver SIGTERM
+        // (not SIGHUP/SIGKILL), the trap below only fires on TERM. `sleep 60
+        // & wait $!` rather than a bare sleep: a foreground sleep defers the
+        // trap until sleep exits, a waited background child runs it promptly.
+        // READY gates the signal so it can't race the trap installation.
+        let mut pane = Pane::spawn(
+            "sh",
+            &["-c", "trap 'printf TERMED; exit 0' TERM; printf READY; sleep 60 & wait $!"],
+            &tmp(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_until(&pane, "READY"), "screen:\n{}", pane.screen_contents());
+        pane.signal_term();
+        assert!(wait_until(&pane, "TERMED"), "screen:\n{}", pane.screen_contents());
+    }
+
+    #[test]
     fn try_wait_reports_signal_exit_as_none() {
         // A signal-killed child has no meaningful exit code: try_wait yields
         // Some(None), not Some(Some(1)) — callers rely on this to avoid treating
@@ -1129,6 +1193,25 @@ mod tests {
             assert!(Instant::now() < deadline, "child did not exit after kill");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn reader_finished_means_exited_and_fully_drained() {
+        // The contract exit-hint capture rests on: PTY EOF comes only after
+        // the child exited and all buffered output was read, so a finished
+        // reader implies the final chunk is already on the grid.
+        let mut pane = Pane::spawn("sh", &["-c", "printf DRAINED"], &tmp(), 5, 20).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pane.reader_finished() {
+            assert!(Instant::now() < deadline, "reader never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pane.has_exited(), "EOF only after the child exited");
+        assert!(
+            pane.screen_contents().contains("DRAINED"),
+            "finished reader implies a drained grid:\n{}",
+            pane.screen_contents()
+        );
     }
 
     #[test]
