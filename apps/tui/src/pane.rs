@@ -23,6 +23,15 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+/// Lines of history kept per pane for the local scrollback view (wheel
+/// scrolling over a child that never enabled mouse reporting, e.g. a shell
+/// running a dev server). Bounds memory: cells are 32 bytes, so a full
+/// 200-col history caps near 13 MB per pane, typical widths well under that.
+const SCROLLBACK_LINES: usize = 2000;
+
+/// Rows moved per wheel tick, matching common terminal defaults.
+const WHEEL_STEP: usize = 3;
+
 /// A child process running in a pseudo-terminal, with its screen emulated.
 ///
 /// Termination note: portable-pty does not put the child in its own process
@@ -138,7 +147,7 @@ impl Pane {
             .context("clone pty reader failed")?;
         let writer = pair.master.take_writer().context("take pty writer failed")?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let output_seq = Arc::new(AtomicU64::new(0));
         let focus_reporting = Arc::new(AtomicBool::new(false));
         let parser_t = parser.clone();
@@ -152,7 +161,33 @@ impl Pane {
                     Ok(0) => break, // EOF: child exited / pty closed
                     Ok(n) => {
                         if let Ok(mut p) = parser_t.lock() {
+                            // While scrolled back, hold the view still: vt100
+                            // measures the offset from the live bottom, so a
+                            // growing history would drag the view along with
+                            // the stream. The history length isn't exposed;
+                            // set_scrollback clamps, so probe it with MAX and
+                            // restore (O(1), and under the same lock the
+                            // renderer takes, so no torn frame).
+                            let offset = p.screen().scrollback();
+                            let before = if offset > 0 {
+                                let s = p.screen_mut();
+                                s.set_scrollback(usize::MAX);
+                                let len = s.scrollback();
+                                s.set_scrollback(offset);
+                                len
+                            } else {
+                                0
+                            };
                             p.process(&buf[..n]);
+                            if offset > 0 {
+                                let s = p.screen_mut();
+                                s.set_scrollback(usize::MAX);
+                                let len = s.scrollback();
+                                // saturating: entering the alt screen mid-chunk
+                                // swaps in a historyless grid (len 0 < before);
+                                // the set_scrollback clamp then floors it at 0.
+                                s.set_scrollback(offset + len.saturating_sub(before));
+                            }
                         }
                         if let Some(on) = scan_focus_reporting(&mut focus_tail, &buf[..n]) {
                             focus_t.store(on, Ordering::Relaxed);
@@ -205,8 +240,13 @@ impl Pane {
         Ok(())
     }
 
-    /// Write raw bytes to the child's stdin.
+    /// Write raw bytes to the child's stdin. Input while scrolled back snaps
+    /// the view to the live screen first, like a real terminal (a no-op at
+    /// offset 0, which covers mouse-mode and alt-screen children).
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Ok(mut p) = self.parser.lock() {
+            p.screen_mut().set_scrollback(0);
+        }
         self.last_input = Some(Instant::now());
         self.writer.write_all(bytes).context("pty write failed")?;
         self.writer.flush().context("pty flush failed")?;
@@ -260,9 +300,11 @@ impl Pane {
         }
     }
 
-    /// Forward a mouse event to the child, but only if it has enabled mouse
-    /// reporting (and a mode that wants this event). `col`/`row` are 0-based cells
-    /// within the child's screen. Returns whether anything was sent.
+    /// Forward a mouse event to the child if it has enabled mouse reporting
+    /// (and a mode that wants this event). `col`/`row` are 0-based cells within
+    /// the child's screen. A wheel tick the child doesn't take (a plain shell)
+    /// scrolls the pane's local view instead — see [`Pane::scroll_view`].
+    /// Returns whether the event was consumed.
     pub fn send_mouse(
         &mut self,
         kind: MouseEventKind,
@@ -285,8 +327,43 @@ impl Pane {
                 let _ = self.send(&bytes);
                 true
             }
-            None => false,
+            None => self.scroll_view(kind),
         }
+    }
+
+    /// Local scrolling for a child that never enabled mouse reporting: wheel
+    /// ticks move the view through the emulator's scrollback instead of being
+    /// dropped (the shell-running-a-dev-server case). In the alternate screen
+    /// there is no scrollback, so the wheel converts to arrow keys instead
+    /// (the alternateScroll convention) — pagers in a shell tab still scroll.
+    /// Reached only for events `encode_mouse` declined, so a wheel tick here
+    /// implies the child's mouse mode is off.
+    fn scroll_view(&mut self, kind: MouseEventKind) -> bool {
+        let up = match kind {
+            MouseEventKind::ScrollUp => true,
+            MouseEventKind::ScrollDown => false,
+            _ => return false,
+        };
+        let alt = self
+            .parser
+            .lock()
+            .map(|p| p.screen().alternate_screen())
+            .unwrap_or(false);
+        if alt {
+            let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
+            let _ = self.send(&arrow.repeat(WHEEL_STEP));
+            return true;
+        }
+        if let Ok(mut p) = self.parser.lock() {
+            let screen = p.screen_mut();
+            let next = if up {
+                screen.scrollback() + WHEEL_STEP
+            } else {
+                screen.scrollback().saturating_sub(WHEEL_STEP)
+            };
+            screen.set_scrollback(next); // clamped to the stored history
+        }
+        true
     }
 
     /// Whether the child has enabled ANY mouse reporting mode. Drives the
@@ -361,11 +438,13 @@ impl Pane {
         screen.contents_between(start.0, start.1, end.0, end.1.saturating_add(1))
     }
 
-    /// Screen-relative cursor position, or `None` when hidden.
+    /// Screen-relative cursor position, or `None` when hidden. The cursor
+    /// lives on the live screen, so it is also hidden while scrolled back —
+    /// its coordinates would land on unrelated history rows.
     pub fn cursor(&self) -> Option<(u16, u16)> {
         let p = self.parser.lock().ok()?;
         let screen = p.screen();
-        if screen.hide_cursor() {
+        if screen.hide_cursor() || screen.scrollback() > 0 {
             None
         } else {
             let (row, col) = screen.cursor_position();
@@ -384,7 +463,9 @@ impl Pane {
         let screen = parser.screen();
         let (srows, scols) = screen.size();
         let buf_area = buf.area;
-        let cursor = if screen.hide_cursor() {
+        // The cursor belongs to the live screen; scrolled back it would land
+        // on unrelated history rows, so treat it as hidden (like cursor()).
+        let cursor = if screen.hide_cursor() || screen.scrollback() > 0 {
             None
         } else {
             Some(screen.cursor_position()) // (row, col)
@@ -1128,6 +1209,95 @@ mod tests {
                 .unwrap();
         assert!(wait_until(&mousey, "M"));
         assert!(mousey.wants_mouse(), "?1000h child holds mouse mode");
+    }
+
+    fn wheel(pane: &mut Pane, kind: MouseEventKind, ticks: u32) {
+        for _ in 0..ticks {
+            pane.send_mouse(kind, KeyModifiers::NONE, 0, 0);
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_history_for_mouse_less_child_and_input_snaps_back() {
+        // A plain shell never enables mouse reporting; the wheel must scroll a
+        // local view into history instead of being dropped (the dev-server
+        // case: long output, then trying to read the beginning).
+        let mut pane = Pane::spawn("sh", &["-c", "seq 1 40; sleep 30"], &tmp(), 5, 20).unwrap();
+        assert!(wait_until(&pane, "40"), "screen:\n{}", pane.screen_contents());
+        // Scroll well past the top: the offset clamps to the stored history,
+        // so the view lands on the very first lines.
+        wheel(&mut pane, MouseEventKind::ScrollUp, 40);
+        let top = pane.screen_contents();
+        assert_eq!(top, "1\n2\n3\n4\n5", "view at the top of history:\n{top}");
+        // The live cursor is off-view while scrolled back — don't draw it.
+        assert_eq!(pane.cursor(), None, "cursor hidden while scrolled back");
+        // Scrolling down past the bottom clamps back to the live screen.
+        wheel(&mut pane, MouseEventKind::ScrollDown, 100);
+        assert!(pane.screen_contents().contains("40"));
+        assert!(pane.cursor().is_some(), "cursor back on the live screen");
+        // Typing while scrolled back snaps to the live screen first.
+        wheel(&mut pane, MouseEventKind::ScrollUp, 40);
+        assert_eq!(pane.screen_contents(), "1\n2\n3\n4\n5");
+        pane.send_key(k(KeyCode::Char('x'))).unwrap();
+        assert!(
+            pane.screen_contents().contains("40"),
+            "input snaps the view to the bottom:\n{}",
+            pane.screen_contents()
+        );
+        pane.kill();
+    }
+
+    #[test]
+    fn output_while_scrolled_back_keeps_the_view_anchored() {
+        // vt100 measures the scroll offset from the live bottom, so a growing
+        // history would drag the view along with the stream; the reader thread
+        // compensates so the view holds still while new output lands.
+        let mut pane = Pane::spawn(
+            "sh",
+            &["-c", "seq 1 40; sleep 1; seq 41 80; sleep 30"],
+            &tmp(),
+            5,
+            20,
+        )
+        .unwrap();
+        assert!(wait_until(&pane, "40"), "screen:\n{}", pane.screen_contents());
+        wheel(&mut pane, MouseEventKind::ScrollUp, 40);
+        let before = pane.screen_contents();
+        assert_eq!(before, "1\n2\n3\n4\n5");
+        // Wait for the second burst, then let the reader settle.
+        let seq0 = pane.output_seq();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.output_seq() == seq0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.output_seq() > seq0, "second burst never arrived");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(pane.screen_contents(), before, "view anchored during output");
+        // Snapping back shows the new tail.
+        pane.send_key(k(KeyCode::Char('x'))).unwrap();
+        assert!(wait_until(&pane, "80"), "screen:\n{}", pane.screen_contents());
+        pane.kill();
+    }
+
+    #[test]
+    fn wheel_in_alternate_screen_sends_arrow_keys() {
+        // The alternate screen has no scrollback; the wheel converts to arrow
+        // keys (the alternateScroll convention) so pagers in a shell tab
+        // still scroll. The pty echoes our arrows back as ^[[A (ECHOCTL).
+        let mut pane =
+            Pane::spawn("sh", &["-c", "printf '\\033[?1049h'; sleep 30"], &tmp(), 5, 40).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.output_seq() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.output_seq() > 0, "child produced no output");
+        wheel(&mut pane, MouseEventKind::ScrollUp, 1);
+        assert!(
+            wait_until(&pane, "^[[A"),
+            "arrows echoed in the alt screen:\n{}",
+            pane.screen_contents()
+        );
+        pane.kill();
     }
 
     #[test]

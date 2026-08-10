@@ -5,6 +5,17 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The embedded pane is scrollable when the child doesn't take the mouse**:
+  panes now keep 2000 lines of history, and the wheel scrolls that view for a
+  mouse-less child (e.g. a shell running a dev server) — previously wheel
+  ticks were dropped and scrolled-off output was discarded, so long output
+  couldn't be read back even after the process stopped. The view stays
+  anchored while new output streams, typing/pasting snaps back to the live
+  screen, and in the alternate screen the wheel converts to arrow keys so
+  pagers scroll too.
+
 ## [0.21.0] - 2026-07-21
 
 ### Added
