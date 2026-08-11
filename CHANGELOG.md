@@ -15,6 +15,11 @@ All notable changes to kommand0 are documented here. The format is based on
   anchored while new output streams, typing/pasting snaps back to the live
   screen, and in the alternate screen the wheel converts to arrow keys
   (honoring application cursor mode) so pagers scroll too.
+- **Dev servers no longer outlive their pane**: closing a session tab, a
+  workspace, or the app now SIGKILLs the pane's process groups (the shell's
+  foreground job and the child's own group) after the SIGHUP grace, so a
+  `npm run dev`-style server that ignores the hangup can't keep running (and
+  holding its port) from a closed worktree session.
 
 ## [0.25.3] - 2026-08-09
 
