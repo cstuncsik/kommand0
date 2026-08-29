@@ -1,0 +1,20 @@
+crates/core/src/sort.rs
+  s_78744dba5109cc::t_1718d18ba43151 9-11,90-104,115,126,173-176,179,182,186-206
+  s_78744dba5109cc::t_731a1a9b34b979 207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c6066dcf590bbc85acbbb512e7ea87151ba3297b",
+  "prompts": {},
+  "sessions": {
+    "s_78744dba5109cc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f7f032d8-7977-4422-b41d-ade25fa74d90",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
