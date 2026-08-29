@@ -29,6 +29,86 @@ fn pr_glyph(pr: &PrStatus) -> char {
     }
 }
 
+/// The `?` overlay's glyph legend, grouped by where the glyph appears.
+///
+/// The PR rows are built by calling [`pr_glyph`] / [`pr_glyph_color`] on a real
+/// [`PrStatus`], so they can never drift from what the tree actually draws.
+/// The rest are hand-listed against their draw sites (the workspace dot is
+/// inline in the tree loop, the buttons in the icon clusters).
+pub(crate) fn icon_legend(th: Theme) -> Vec<help::IconSection> {
+    let pr = |state: PrState, checks: PrChecks, description: &'static str| {
+        let status = PrStatus {
+            number: 0,
+            state,
+            checks,
+            review: PrReview::None,
+            url: String::new(),
+        };
+        help::IconRow {
+            glyph: pr_glyph(&status).to_string(),
+            color: pr_glyph_color(&status, th),
+            description,
+        }
+    };
+    let row = |glyph: &str, color: Color, description: &'static str| help::IconRow {
+        glyph: glyph.to_string(),
+        color,
+        description,
+    };
+
+    vec![
+        help::IconSection {
+            title: "Icons · workspace dot",
+            rows: vec![
+                row("\u{25CF}", th.attention, "Needs you: unseen output"),
+                row("\u{25CF}\u{25CB}", th.active, "Pulsing: producing right now"),
+                row("\u{25CF}", th.active, "Active workspace"),
+                row("\u{25CB}", th.muted, "Archived workspace"),
+            ],
+        },
+        help::IconSection {
+            title: "Icons · pull request",
+            rows: vec![
+                pr(PrState::Merged, PrChecks::None, "PR merged"),
+                pr(PrState::Closed, PrChecks::None, "PR closed without merging"),
+                pr(PrState::Open, PrChecks::Passing, "PR open, checks passing"),
+                pr(PrState::Open, PrChecks::Failing, "PR open, checks failing"),
+                pr(PrState::Open, PrChecks::Pending, "PR open, checks running"),
+                pr(PrState::Open, PrChecks::None, "PR open, no checks"),
+            ],
+        },
+        help::IconSection {
+            title: "Icons · tree structure",
+            rows: vec![
+                row("\u{25BE}", th.text, "Repo expanded"),
+                row("\u{203A}", th.text, "Repo collapsed"),
+                row("\u{2191}\u{2193}", th.text, "Active sort (ws = workspaces)"),
+            ],
+        },
+        help::IconSection {
+            title: "Icons · row buttons (clickable)",
+            rows: vec![
+                row("\u{2715}", th.accent, "Delete repo / close session"),
+                row("+", th.accent, "Add a workspace to the repo"),
+                row("\u{276F}", th.accent, "Open the session"),
+                row("\u{25B6}", th.accent, "Start / resume the session"),
+                row("\u{25A0}", th.accent, "Stop the running session"),
+                row("\u{21BA}", th.accent, "Retry after a failed start"),
+            ],
+        },
+        help::IconSection {
+            title: "Icons · session tabs",
+            rows: vec![
+                row("1 2", th.muted, "Tab number; spinner = producing"),
+                row("$", th.muted, "Shell tab (claude is unmarked)"),
+                row(">", th.muted, "Codex tab"),
+                row("\u{2726}", th.muted, "Gemini tab"),
+                row("\u{25CB}", th.muted, "Opencode tab"),
+            ],
+        },
+    ]
+}
+
 /// Colour for a PR's tree-row glyph. Merged uses the theme accent; closed/no-CI
 /// are muted; open-PR CI states use fixed green/red/yellow (like the diff view),
 /// which read the same across themes.
@@ -128,7 +208,15 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // keymap so the overlay reflects the user's config.
     if app.show_help {
         let tree_rows = app.keymap.help_rows();
-        help::render_help_overlay(frame, app.focus, &mut app.help_scroll, &tree_rows, app.theme);
+        let icons = icon_legend(app.theme);
+        help::render_help_overlay(
+            frame,
+            app.focus,
+            &mut app.help_scroll,
+            &tree_rows,
+            &icons,
+            app.theme,
+        );
     }
 
     // Settings page (full-screen config editor).
@@ -1900,6 +1988,56 @@ mod tests {
 
     fn pr(state: PrState, checks: PrChecks, review: PrReview) -> PrStatus {
         PrStatus { number: 12, state, checks, review, url: "https://x/12".into() }
+    }
+
+    /// Every glyph `pr_glyph` can return must appear in the legend, so a new
+    /// PR/CI state can't ship without a row explaining it.
+    #[test]
+    fn the_legend_covers_every_pr_glyph() {
+        let legend = icon_legend(Theme::default());
+        let listed: Vec<&str> = legend
+            .iter()
+            .flat_map(|s| s.rows.iter())
+            .map(|r| r.glyph.as_str())
+            .collect();
+        for state in [PrState::Merged, PrState::Closed, PrState::Open] {
+            for checks in
+                [PrChecks::Passing, PrChecks::Failing, PrChecks::Pending, PrChecks::None]
+            {
+                let g = pr_glyph(&pr(state, checks, PrReview::None)).to_string();
+                assert!(listed.contains(&g.as_str()), "{state:?}/{checks:?} glyph {g} is unlisted");
+            }
+        }
+    }
+
+    /// The help overlay's scroll clamp counts logical lines, so a wrapping row
+    /// makes the tail unreachable. Legend rows must stay within the width the
+    /// keybinding rows already establish.
+    #[test]
+    fn legend_rows_are_no_wider_than_the_keybinding_rows() {
+        // "    " + 16-wide key column + " " + the longest description.
+        let budget = 4 + 16 + 1 + 33;
+        for section in icon_legend(Theme::default()) {
+            for row in &section.rows {
+                // "    " + 4-wide glyph column + " " + description.
+                let width = 4 + 4 + 1 + UnicodeWidthStr::width(row.description);
+                assert!(width <= budget, "{:?} is {width} cols, over {budget}", row.description);
+            }
+            let w = UnicodeWidthStr::width(section.title) + 2;
+            assert!(w <= budget, "title {:?} is {w} cols", section.title);
+        }
+    }
+
+    /// The glyph column is 4 display columns; a wider glyph would push the
+    /// descriptions out of alignment.
+    #[test]
+    fn legend_glyphs_fit_their_column() {
+        for section in icon_legend(Theme::default()) {
+            for row in &section.rows {
+                let w = UnicodeWidthStr::width(row.glyph.as_str());
+                assert!(w <= 4, "glyph {:?} is {w} cols, over 4", row.glyph);
+            }
+        }
     }
 
     #[test]

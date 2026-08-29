@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
@@ -11,6 +11,23 @@ use super::theme::Theme;
 struct KeyBinding {
     keys: &'static str,
     description: &'static str,
+}
+
+/// One legend row: the glyph exactly as the UI draws it, in the colour the UI
+/// draws it. The colour is half the meaning (the same `\u{25CF}` is "needs you"
+/// in one colour and "producing" in another), so the overlay renders it rather
+/// than describing it in words.
+pub struct IconRow {
+    pub glyph: String,
+    pub color: Color,
+    pub description: &'static str,
+}
+
+/// A titled group of [`IconRow`]s. Built by `render.rs`, which owns the glyph
+/// and colour choices, so the legend can't drift from what is on screen.
+pub struct IconSection {
+    pub title: &'static str,
+    pub rows: Vec<IconRow>,
 }
 
 const EMBEDDED_BINDINGS: &[KeyBinding] = &[
@@ -109,12 +126,15 @@ fn focus_to_section(focus: Focus) -> &'static str {
 }
 
 /// Render the help overlay. `tree_rows` are the live tree-pane bindings
-/// (`(keys, description)`) from the keymap, so the overlay reflects any rebinds.
+/// (`(keys, description)`) from the keymap, so the overlay reflects any rebinds;
+/// `icon_sections` is the glyph legend, built from the same helpers that draw
+/// the glyphs.
 pub fn render_help_overlay(
     frame: &mut ratatui::Frame,
     focus: Focus,
     scroll: &mut u16,
     tree_rows: &[(String, &'static str)],
+    icon_sections: &[IconSection],
     theme: Theme,
 ) {
     let th = theme;
@@ -145,22 +165,24 @@ pub fn render_help_overlay(
     let tree: Vec<(&str, &str)> = tree_rows.iter().map(|(k, d)| (k.as_str(), *d)).collect();
     let embedded: Vec<(&str, &str)> =
         EMBEDDED_BINDINGS.iter().map(|b| (b.keys, b.description)).collect();
-    let sections: [(&str, &[(&str, &str)]); 2] =
-        [("Tree Pane", &tree), ("Embedded claude", &embedded)];
 
-    for (title, bindings) in sections {
-        let is_active = title == current_section;
-        let title_style = if is_active {
-            Style::default()
-                .fg(th.accent)
-                .add_modifier(Modifier::BOLD)
+    // A section title is bold, and highlighted when it's the pane you're in.
+    // The icon sections are never a focus target, so they never highlight.
+    let section_title = |title: &str| {
+        let style = if title == current_section {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
+        Line::styled(format!("  {title}"), style)
+    };
 
-        lines.push(Line::styled(format!("  {title}"), title_style));
-
-        let style = if is_active {
+    // Keybindings first, then the glyph legend. The legend is reference
+    // material you look up once; the keybindings are what `?` is usually for,
+    // so ~26 legend rows must not push the Embedded section out of easy reach.
+    for (title, bindings) in [("Tree Pane", &tree), ("Embedded claude", &embedded)] {
+        lines.push(section_title(title));
+        let style = if title == current_section {
             Style::default().fg(th.accent)
         } else {
             Style::default().fg(th.text)
@@ -170,6 +192,20 @@ pub fn render_help_overlay(
                 Span::styled(format!("    {keys:<16}"), style),
                 Span::raw(" "),
                 Span::styled(*description, style),
+            ]));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    for section in icon_sections {
+        lines.push(section_title(section.title));
+        for row in &section.rows {
+            lines.push(Line::from(vec![
+                // The glyph keeps its own colour; the description does not, or
+                // a red `✗` would drag its text red too.
+                Span::styled(format!("    {:<4}", row.glyph), Style::default().fg(row.color)),
+                Span::raw(" "),
+                Span::styled(row.description, Style::default().fg(th.text)),
             ]));
         }
         lines.push(Line::raw(""));

@@ -5,6 +5,17 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Icon legend**: the `?` overlay gained an Icons section explaining every
+  glyph in the UI (workspace dot, PR/CI glyphs, tree carets and sort tag, the
+  clickable row buttons, and the session-tab markers), each rendered in the
+  colour it actually appears in, because colour is half the meaning: the same
+  `●` is "needs you", "producing" or "active" depending on it. The same
+  content is in the README for browsing outside the app. The legend sits after
+  the keybinding sections so it doesn't push them out of reach, and its PR rows
+  are built by calling the real glyph helpers, so they can't drift.
+
 ## [0.26.1] - 2026-08-29
 
 ### Changed
