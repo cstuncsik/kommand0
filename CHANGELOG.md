@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **CI/release run `actions/checkout@v7`** (was `@v4`), clearing the "Node.js 20
+  is deprecated" annotation on every job. No workflow uses
+  `pull_request_target` or `workflow_run`, so v7's fork-PR checkout block
+  doesn't apply here. `rustsec/audit-check@v2` still runs on Node 20: its
+  `main` is on Node 24, but upstream hasn't tagged a release with it.
+
 ## [0.26.0] - 2026-08-29
 
 ### Added
