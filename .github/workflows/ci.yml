@@ -30,6 +30,14 @@ jobs:
   audit:
     name: Security audit
     runs-on: ubuntu-latest # advisory DB is OS-independent — one runner suffices
+    # The repo's default token is read-only, but audit-check publishes its
+    # findings as a check run: without `checks: write` it 403s ("Resource not
+    # accessible by integration") the moment it has anything to report, failing
+    # the job for a permissions reason rather than a security one. Scoped to
+    # this job so the rest of CI keeps the read-only default.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v7
 

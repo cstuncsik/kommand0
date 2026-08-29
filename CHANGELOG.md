@@ -5,6 +5,23 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Security audit job no longer fails on a permissions error.** The repo's
+  default workflow token is read-only, but `rustsec/audit-check` publishes its
+  findings as a check run, so the first advisory to actually match 403'd with
+  "Resource not accessible by integration" and failed the job for a permissions
+  reason rather than a security one. Only post-merge `push` runs were affected:
+  on `pull_request` the action skips the Checks API. The audit job now grants
+  itself `checks: write`; the rest of CI keeps the read-only default.
+
+### Changed
+
+- **Bumped `lru` 0.18.0 to 0.18.3** (transitive, via `ratatui-core`), clearing
+  RUSTSEC-2026-0253: `LruCache::pop()` was not panic-safe and could leave
+  dangling pointers behind. Reaching it needs `catch_unwind` around a panicking
+  key `Drop`, which this project does not do.
+
 ## [0.27.0] - 2026-08-29
 
 ### Added
