@@ -40,6 +40,7 @@ mod tests {
             id: "repo1".to_string(),
             name: "myapp".to_string(),
             path: "/tmp/myapp".to_string(),
+            added_at: None,
         };
         state.repos.push(repo);
         state.save_to(tmp.path()).unwrap();
@@ -149,6 +150,7 @@ mod tests {
             id: "r1".to_string(),
             name: "some/name".to_string(),
             path: "/opt/repos/foo".to_string(),
+            added_at: None,
         });
         // When input contains '/', path is checked first
         let repo = state.resolve_repo("/opt/repos/foo").unwrap();
@@ -193,8 +195,8 @@ mod tests {
     fn list_workspaces_by_repo() {
         let tmp = TempDir::new().unwrap();
         let mut state = AppState::default();
-        state.repos.push(RepoEntry { id: "r1".to_string(), name: "app1".to_string(), path: "/tmp/app1".to_string() });
-        state.repos.push(RepoEntry { id: "r2".to_string(), name: "app2".to_string(), path: "/tmp/app2".to_string() });
+        state.repos.push(RepoEntry { id: "r1".to_string(), name: "app1".to_string(), path: "/tmp/app1".to_string(), added_at: None });
+        state.repos.push(RepoEntry { id: "r2".to_string(), name: "app2".to_string(), path: "/tmp/app2".to_string(), added_at: None });
         state.save_to(tmp.path()).unwrap();
         state.create_workspace_with_base(Some("ws-a"), "app1", tmp.path()).unwrap();
         state.create_workspace_with_base(Some("ws-b"), "app2", tmp.path()).unwrap();

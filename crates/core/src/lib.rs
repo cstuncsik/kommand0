@@ -5,6 +5,7 @@ pub mod id;
 pub mod lock;
 pub mod repo;
 pub mod session;
+pub mod sort;
 pub mod workspace;
 pub mod worktree;
 
@@ -17,6 +18,7 @@ pub use git::{
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
 pub use session::{Session, SessionStatus};
+pub use sort::{SortMode, sort_repos, sort_workspaces};
 pub use workspace::Workspace;
 
 use std::collections::HashMap;
@@ -55,6 +57,13 @@ pub struct AppState {
     /// outlives its session.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub embedded_titles: HashMap<String, HashMap<String, String>>,
+    /// How the repo rows are ordered on screen. The saved manual order is
+    /// `repos` itself; this is the optional built-in sort layered over it.
+    #[serde(default)]
+    pub repo_sort: SortMode,
+    /// The same, for the workspace rows inside each repo.
+    #[serde(default)]
+    pub workspace_sort: SortMode,
 }
 
 /// A `state.json` with no `version` field predates schema versioning; that shape
@@ -63,6 +72,14 @@ pub struct AppState {
 /// v1 and today.
 fn legacy_state_version() -> u32 {
     1
+}
+
+/// Wall-clock unix seconds, for the `*_at` stamps.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_secs()
 }
 
 impl Default for AppState {
@@ -76,6 +93,8 @@ impl Default for AppState {
             sessions: Vec::new(),
             embedded_sessions: HashMap::new(),
             embedded_titles: HashMap::new(),
+            repo_sort: SortMode::default(),
+            workspace_sort: SortMode::default(),
         }
     }
 }
@@ -1197,6 +1216,10 @@ impl AppState {
                 &baseline.embedded_titles,
                 disk.embedded_titles,
             ),
+            // View settings, not shared data: the side that just toggled wins
+            // rather than a stale on-disk value clobbering the live tree.
+            repo_sort: self.repo_sort,
+            workspace_sort: self.workspace_sort,
         }
     }
 
@@ -1321,6 +1344,70 @@ impl AppState {
         }
     }
 
+    /// Freeze the on-screen repo order into the saved manual order and switch
+    /// the built-in sort off. A no-op when already manual.
+    ///
+    /// This is what makes "sort, then nudge one item" work: the hand-arranged
+    /// order the user lands on starts from what they were looking at, not from
+    /// whatever the manual order was before they sorted.
+    pub fn materialize_repo_order(&mut self) {
+        if self.repo_sort.is_sorted() {
+            sort::sort_repos(&mut self.repos, self.repo_sort);
+            self.repo_sort = SortMode::Manual;
+        }
+    }
+
+    /// The workspace counterpart of [`Self::materialize_repo_order`].
+    ///
+    /// `workspaces` is one flat vector across every repo, but the tree only
+    /// ever compares workspaces within a repo, so sorting it whole leaves each
+    /// repo's slice in exactly the order that was on screen.
+    pub fn materialize_workspace_order(&mut self) {
+        if self.workspace_sort.is_sorted() {
+            sort::sort_workspaces(&mut self.workspaces, self.workspace_sort);
+            self.workspace_sort = SortMode::Manual;
+        }
+    }
+
+    /// Swap two repos in the saved manual order, materializing a live sort
+    /// first. Returns false if either id is unknown.
+    ///
+    /// Takes a *pair* rather than a direction because only the caller knows
+    /// what is on screen — a `/` filter can hide the storage neighbour, and
+    /// moving an item past a row the user cannot see is indistinguishable
+    /// from doing nothing.
+    pub fn swap_repos(&mut self, a: &str, b: &str) -> bool {
+        self.materialize_repo_order();
+        let (Some(i), Some(j)) = (
+            self.repos.iter().position(|r| r.id == a),
+            self.repos.iter().position(|r| r.id == b),
+        ) else {
+            return false;
+        };
+        self.repos.swap(i, j);
+        true
+    }
+
+    /// Swap two workspaces **of the same repo** in the saved manual order.
+    ///
+    /// Workspaces of different repos interleave freely in the flat vector, so a
+    /// cross-repo swap would silently reorder both repos; that is rejected
+    /// rather than performed.
+    pub fn swap_workspaces(&mut self, a: &str, b: &str) -> bool {
+        self.materialize_workspace_order();
+        let (Some(i), Some(j)) = (
+            self.workspaces.iter().position(|w| w.id == a),
+            self.workspaces.iter().position(|w| w.id == b),
+        ) else {
+            return false;
+        };
+        if self.workspaces[i].repo_id != self.workspaces[j].repo_id {
+            return false;
+        }
+        self.workspaces.swap(i, j);
+        true
+    }
+
     /// Add a repo, saving state to a custom base directory.
     pub fn add_repo_with_base(&mut self, path: &str, base: &Path) -> anyhow::Result<RepoEntry> {
         let dir = Path::new(path);
@@ -1347,6 +1434,7 @@ impl AppState {
             id,
             name,
             path: canonical_str,
+            added_at: Some(now_secs()),
         };
 
         self.repos.push(entry.clone());
@@ -1908,6 +1996,157 @@ mod tests {
         }
     }
 
+    /// Repos/workspaces for the ordering tests: `repos_named` builds the manual
+    /// order, `order` reads back what the tree would show.
+    fn repos_named(names: &[&str]) -> Vec<RepoEntry> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| RepoEntry {
+                id: n.to_string(),
+                name: n.to_string(),
+                path: format!("/tmp/{n}"),
+                // Added in listed order, one second apart.
+                added_at: Some(100 + i as u64),
+            })
+            .collect()
+    }
+
+    fn repo_order(state: &AppState) -> Vec<String> {
+        let mut repos = state.repos.clone();
+        sort::sort_repos(&mut repos, state.repo_sort);
+        repos.into_iter().map(|r| r.name).collect()
+    }
+
+    fn ws_order(state: &AppState, repo_id: &str) -> Vec<String> {
+        let mut list: Vec<Workspace> =
+            state.workspaces.iter().filter(|w| w.repo_id == repo_id).cloned().collect();
+        sort::sort_workspaces(&mut list, state.workspace_sort);
+        list.into_iter().map(|w| w.name).collect()
+    }
+
+    #[test]
+    fn swap_repos_reorders_the_manual_order() {
+        let mut state = AppState { repos: repos_named(&["a", "b", "c"]), ..Default::default() };
+        assert!(state.swap_repos("c", "b"));
+        assert_eq!(repo_order(&state), ["a", "c", "b"]);
+        // Non-adjacent is fine: under a filter the visible neighbour may be
+        // several storage slots away.
+        assert!(state.swap_repos("a", "b"));
+        assert_eq!(repo_order(&state), ["b", "c", "a"]);
+    }
+
+    #[test]
+    fn swap_repos_rejects_unknown_ids() {
+        let mut state = AppState { repos: repos_named(&["a", "b"]), ..Default::default() };
+        assert!(!state.swap_repos("a", "ghost"));
+        assert!(!state.swap_repos("ghost", "b"));
+        assert_eq!(repo_order(&state), ["a", "b"], "a rejected swap changes nothing");
+    }
+
+    #[test]
+    fn sorting_is_a_view_and_turning_it_off_restores_the_manual_order() {
+        let mut state = AppState { repos: repos_named(&["zulu", "alpha"]), ..Default::default() };
+        assert_eq!(repo_order(&state), ["zulu", "alpha"]);
+
+        state.repo_sort = state.repo_sort.cycle_name();
+        assert_eq!(repo_order(&state), ["alpha", "zulu"], "name asc");
+        state.repo_sort = state.repo_sort.cycle_name();
+        assert_eq!(repo_order(&state), ["zulu", "alpha"], "name desc");
+
+        state.repo_sort = state.repo_sort.cycle_name();
+        assert_eq!(state.repo_sort, SortMode::Manual);
+        assert_eq!(repo_order(&state), ["zulu", "alpha"], "back to the saved order");
+    }
+
+    #[test]
+    fn moving_while_sorted_freezes_the_visible_order_and_drops_the_sort() {
+        // The headline flow: sort newest-first, nudge one item, and the result
+        // is a NEW manual order that outlives the sort.
+        let mut state =
+            AppState { repos: repos_named(&["first", "second", "third"]), ..Default::default() };
+        state.repo_sort = SortMode::AddedDesc;
+        assert_eq!(repo_order(&state), ["third", "second", "first"]);
+
+        assert!(state.swap_repos("first", "second"));
+        assert_eq!(state.repo_sort, SortMode::Manual, "the move takes over from the sort");
+        assert_eq!(repo_order(&state), ["third", "first", "second"]);
+
+        // A round trip through the name sort comes back to the edited order.
+        state.repo_sort = SortMode::NameAsc;
+        assert_eq!(repo_order(&state), ["first", "second", "third"]);
+        state.repo_sort = SortMode::Manual;
+        assert_eq!(repo_order(&state), ["third", "first", "second"]);
+    }
+
+    #[test]
+    fn swap_workspaces_refuses_to_cross_repos() {
+        // r1 and r2 workspaces interleave in the flat vector, so the neighbour
+        // is the nearest sibling, not the adjacent index.
+        let mut state = AppState::default();
+        let mut a = ws("w1", "alpha");
+        let mut b = ws("w2", "bravo");
+        let mut other = ws("x1", "other");
+        a.repo_id = "r1".into();
+        other.repo_id = "r2".into();
+        b.repo_id = "r1".into();
+        state.workspaces = vec![a, other, b];
+
+        assert!(state.swap_workspaces("w2", "w1"));
+        assert_eq!(ws_order(&state, "r1"), ["bravo", "alpha"]);
+        assert_eq!(ws_order(&state, "r2"), ["other"], "the other repo is untouched");
+
+        assert!(!state.swap_workspaces("w1", "x1"), "cross-repo swap is rejected");
+        assert_eq!(ws_order(&state, "r1"), ["bravo", "alpha"]);
+        assert_eq!(ws_order(&state, "r2"), ["other"]);
+    }
+
+    #[test]
+    fn workspace_sort_by_date_then_a_move_freezes_it() {
+        let mut state = AppState::default();
+        let mut old = ws("w1", "old");
+        let mut new = ws("w2", "new");
+        old.created_at = 100;
+        new.created_at = 200;
+        state.workspaces = vec![old, new];
+
+        state.workspace_sort = SortMode::AddedDesc;
+        assert_eq!(ws_order(&state, "r"), ["new", "old"]);
+
+        assert!(state.swap_workspaces("w2", "w1"));
+        assert_eq!(state.workspace_sort, SortMode::Manual);
+        assert_eq!(ws_order(&state, "r"), ["old", "new"]);
+    }
+
+    #[test]
+    fn sort_settings_survive_a_save_and_reload() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState { repos: repos_named(&["b", "a"]), ..Default::default() };
+        state.repo_sort = SortMode::NameAsc;
+        state.workspace_sort = SortMode::AddedDesc;
+        state.save_to(tmp.path()).unwrap();
+
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert_eq!(loaded.repo_sort, SortMode::NameAsc);
+        assert_eq!(loaded.workspace_sort, SortMode::AddedDesc);
+        assert_eq!(loaded.repos[0].added_at, Some(100), "added_at round-trips");
+        assert_eq!(repo_order(&loaded), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_state_file_without_the_ordering_fields_loads_as_manual() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("state.json"),
+            r#"{"repos":[{"id":"r","name":"repo","path":"/tmp/repo"}],"workspaces":[],"sessions":[]}"#,
+        )
+        .unwrap();
+        let loaded = AppState::load_from(tmp.path()).unwrap();
+        assert_eq!(loaded.repo_sort, SortMode::Manual);
+        assert_eq!(loaded.workspace_sort, SortMode::Manual);
+        assert_eq!(loaded.repos[0].added_at, None, "an untimed repo stays untimed");
+    }
+
     /// Init a real git repo at `tmp/<name>` (identity + initial commit, branch
     /// main) and return its path.
     fn init_git_repo(tmp: &TempDir, name: &str) -> std::path::PathBuf {
@@ -2005,6 +2244,7 @@ mod tests {
                 id: "r".into(),
                 name: "repo".into(),
                 path: repo_dir.to_string_lossy().into_owned(),
+                added_at: None,
             }],
             ..Default::default()
         };
@@ -2193,6 +2433,7 @@ mod tests {
             id: "abc123".to_string(),
             name: "my-repo".to_string(),
             path: "/tmp/my-repo".to_string(),
+            added_at: None,
         });
         state.save_to(tmp.path()).unwrap();
 
@@ -2562,6 +2803,7 @@ mod tests {
             id: "r1".into(),
             name: "x".into(),
             path: "/tmp/x".into(),
+            added_at: None,
         });
         state.save_to(tmp.path()).unwrap();
         state.save_to(tmp.path()).unwrap(); // a second save must not leave temp debris
@@ -2754,6 +2996,7 @@ mod tests {
             id: "r1".to_string(),
             name: "my-repo".to_string(),
             path: "/tmp/my-repo".to_string(),
+            added_at: None,
         });
         state.save_to(tmp.path()).unwrap();
         fs::create_dir_all(tmp.path().join("worktrees").join("ws")).unwrap();
@@ -3012,6 +3255,7 @@ mod tests {
             id: "gone".into(),
             name: "gone".into(),
             path: tmp.path().join("no-such-repo").to_string_lossy().into_owned(),
+            added_at: None,
         });
         state.workspaces.push(Workspace {
             id: "w1".into(),
@@ -3335,6 +3579,7 @@ mod tests {
             id: "r1".into(),
             name: "gone".into(),
             path: tmp.path().join("no-such-repo").to_string_lossy().into_owned(),
+            added_at: None,
         });
         state.workspaces.push(Workspace {
             id: "w1".into(),
@@ -3415,6 +3660,7 @@ mod tests {
             id: "r1".into(),
             name: "r".into(),
             path: "/tmp".into(),
+            added_at: None,
         });
         for (id, wt) in [("w1", &other_wt), ("w2", &work2_wt), ("w3", &dotdot_wt), ("w4", &evasive_wt)] {
             state.workspaces.push(Workspace {

@@ -33,6 +33,7 @@ mod tests {
             id: "repo1".to_string(),
             name: "myapp".to_string(),
             path: "/tmp/myapp".to_string(),
+            added_at: None,
         });
         state.workspaces.push(crate::Workspace {
             id: "ws1".to_string(),

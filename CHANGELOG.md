@@ -5,6 +5,24 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Reorderable repos and workspaces**: the tree no longer forces
+  order-of-addition. `K`/`J` move the selected repo (or workspace, within its
+  own repo) and save that order; `s` toggles a name sort and `t` a
+  date-added sort, each cycling ascending → descending → off, applying to
+  whichever level the cursor is on. Both sorts are a *view* over the saved
+  manual order: turning one off restores it, and moving an item while a sort
+  is live freezes what is on screen as the new saved order. The active sorts
+  show in the tree title, the command palette can set either level's order
+  directly, and all four actions are rebindable (`move-item-up`,
+  `move-item-down`, `sort-by-name`, `sort-by-added`). Repos now record an
+  `added_at` timestamp; repos tracked before this release have none and sort
+  as the oldest.
+- **`kmd repo move|sort` and `kmd workspace move|sort`**: the CLI mirrors the
+  same ordering, and `repo list` / `workspace list` print the active sort's
+  view. `move` with no room left reports it and exits 0 rather than failing.
+
 ## [0.25.4] - 2026-08-11
 
 ### Fixed

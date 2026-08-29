@@ -257,13 +257,27 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     // Tree title doubles as the `/` filter box when filtering (which then
     // transiently replaces a profile label).
+    // A live sort is invisible otherwise — the rows just look wrong-order — so
+    // each active one is named in the title. Empty while both are manual.
+    // The repo one goes bare (the pane is titled "Repos"); the workspace one is
+    // tagged, or two identical arrows would be indistinguishable.
+    let sorts: String = [
+        ("", app.state.repo_sort.indicator()),
+        ("ws ", app.state.workspace_sort.indicator()),
+    ]
+    .iter()
+    .filter(|(_, i)| !i.is_empty())
+    .map(|(tag, i)| format!("{tag}{i}"))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let sorts = if sorts.is_empty() { String::new() } else { format!(" · {sorts}") };
     let title = if app.filter_input || !app.filter_query.is_empty() {
         let cursor = if app.filter_input { "\u{2588}" } else { "" };
         format!(" Repos · /{}{} ", app.filter_query, cursor)
     } else if let Some(p) = &app.profile_label {
-        format!(" Repos · {p} ")
+        format!(" Repos · {p}{sorts} ")
     } else {
-        " Repos ".to_string()
+        format!(" Repos{sorts} ")
     };
     // The bottom border carries at most one line: a profile-delete notice
     // (accent for success, error styling for a failure; cleared on the next

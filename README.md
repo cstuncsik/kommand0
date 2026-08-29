@@ -81,6 +81,8 @@ cargo install --path apps/cli   # kmd (the CLI)
 kmd repo add /path/to/your/repo
 kmd repo list
 kmd repo delete <name-or-path> [--force]
+kmd repo move <name-or-path> up|down    # reorder the saved order
+kmd repo sort [manual|name-asc|name-desc|added-asc|added-desc]   # omit to show
 
 # Workspaces
 kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--fork] [--no-worktree]
@@ -91,6 +93,8 @@ kmd workspace cleanup <name> [--force] # remove a merged worktree + branch
 kmd workspace archive <name>
 kmd workspace activate <name>
 kmd workspace delete <name> [--force]
+kmd workspace move <name> up|down      # reorder within its own repo
+kmd workspace sort [manual|name-asc|name-desc|added-asc|added-desc]
 
 # Sessions
 kmd session start <workspace>
@@ -130,6 +134,7 @@ cargo run -p kommand0-tui   # from a checkout
 - **Mouse support**: click tree items and scroll the tree; inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive. Horizontal scroll (tilt wheel) or Shift+scroll over the content pane switches session tabs
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead. With the Branch field blank, if the workspace **name** matches an existing branch (local or `origin`), a prompt offers to check it out instead of forking
 - **Filter & archive**: press `/` to live-filter the workspace tree by name or branch (matched repos auto-expand, `Esc` clears); press `A` to archive/activate a workspace — so the tree stays navigable as you accumulate repos and workspaces
+- **Ordering**: repos and workspaces start in the order you added them. `K`/`J` move the selected one; `s` and `t` toggle a name or date-added sort (ascending → descending → off) for whichever level the cursor is on. The sorts are a view — turn one off and the hand-arranged order comes back, and moving an item while sorted keeps what you were looking at as the new saved order
 - **Git worktrees**: each workspace gets an isolated git worktree branch
 - **Branch/diff status**: each workspace shows its git branch and how far it is ahead/behind its upstream plus whether it has uncommitted changes — a compact `↑2↓1*` segment in the tree row and full detail (`Branch:` / `Changes:`) in the detail pane. Computed off the render loop (never blocks keystrokes), refreshed every couple of seconds and on workspace create/close
 - **PR/CI status**: each own-branch workspace surfaces its GitHub PR at a glance — a compact `#12 ✓` in the tree row (`✓` checks passing · `✗` failing · `○` pending · `⬤` merged · `✕` closed) and a full `PR #12 · open · CI passing · approved` line + URL in the detail pane. One read-only `gh pr list` per repo, off the render loop, refreshed periodically. Requires `gh` installed and authenticated; nothing shows without it. Press `p` to open the PR in your browser
@@ -152,6 +157,9 @@ cargo run -p kommand0-tui   # from a checkout
 | `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it — clean up, archive/activate, new session, or jump to a session tab |
 | `n` / `N` | Tree | Jump to + open the next / previous workspace that needs you (cycles the "N waiting") |
 | `A` | Tree | Archive / activate the selected workspace |
+| `K` / `J` | Tree | Move the selected repo (or workspace, within its repo) up / down in the saved order |
+| `s` | Tree | Sort by name: ascending, descending, off. Applies to the selected row's level (repos or workspaces) |
+| `t` | Tree | Sort by date added, same three states. Turning a sort off restores the hand-arranged order |
 | `Enter` | Tree | Activate the selection: open the workspace / expand the repo |
 | `e` / `r` / `R` | Tree | Open the embedded Claude pane for the workspace |
 | `x` / `Delete` | Tree | Close the embedded Claude pane |
@@ -265,7 +273,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `claude_bin` — override the `claude` binary (the `KOMMAND0_CLAUDE_BIN` env var still takes precedence).
 - `status_refresh_secs` — how often the background git-status refresh runs (default 2; floored at 1).
 - `tree_width_pct` — the tree (left) pane width as a percent of the terminal (default 30; clamped to 15–60). This is the persistent baseline; the live `<`/`>` keys adjust a per-session value seeded from it (and reset to it next launch). You can also drag the border between the tree and content panes with the mouse to resize it live.
-- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `widen-tree`, `shrink-tree`, `activate`, `open`, `close`, `review-diff`, `open-pr-web`, `cleanup`, `filter`, `palette`, `next-waiting`, `prev-waiting`, `archive`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `settings`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
+- `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `widen-tree`, `shrink-tree`, `activate`, `open`, `close`, `review-diff`, `open-pr-web`, `cleanup`, `filter`, `palette`, `next-waiting`, `prev-waiting`, `archive`, `move-item-up`, `move-item-down`, `sort-by-name`, `sort-by-added`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `settings`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
 - `theme` — a built-in palette for the app chrome: `"default"` or `"high-contrast"` (the embedded `claude` pane keeps its own colours either way). Unknown names warn and fall back to default.
 - `theme_colors` — per-role overrides applied on top of `theme`: `"<role>": "<color>"`. Roles: `accent`, `selected`, `active`, `attention`, `dirty`, `error`, `muted`, `text`, `inverse`. Colors: a named color (`cyan`, `light-red`, `darkgray`), an `#rrggbb` hex, a 0–255 palette index, or `reset`/`default` (the terminal's own default color — not the role's built-in). Unknown roles / unparseable colors are warned (tree border + log), not fatal.
 - `notify` — alert when a backgrounded session goes quiet with unseen output (the same "needs you" edge as the magenta dot): `"off"` (default), `"bell"` (terminal bell), `"desktop"` (an OS notification — `osascript` on macOS, `notify-send` on Linux; silently skipped if unavailable), or `"both"`. Fires once per rising edge (the latch means it won't repeat until you view the session and it comes back). Unknown values warn and fall back to `off`.

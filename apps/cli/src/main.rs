@@ -1,11 +1,68 @@
 use std::io::{IsTerminal, Write};
 use std::os::unix::process::CommandExt; // for Command::process_group
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use kommand0_core::workspace::format_timestamp;
 use kommand0_core::{
-    AppState, SessionStatus, Workspace, branch_status, cleanup_merged_workspace,
+    AppState, SessionStatus, SortMode, Workspace, branch_status, cleanup_merged_workspace,
 };
+
+/// Clap mirror of [`SortMode`] — keeps clap out of the core crate while giving
+/// `--help` the possible values. Both derive the same kebab-case names.
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum SortArg {
+    /// The saved hand-arranged order (what `move` edits)
+    Manual,
+    NameAsc,
+    NameDesc,
+    AddedAsc,
+    AddedDesc,
+}
+
+impl From<SortArg> for SortMode {
+    fn from(a: SortArg) -> Self {
+        match a {
+            SortArg::Manual => SortMode::Manual,
+            SortArg::NameAsc => SortMode::NameAsc,
+            SortArg::NameDesc => SortMode::NameDesc,
+            SortArg::AddedAsc => SortMode::AddedAsc,
+            SortArg::AddedDesc => SortMode::AddedDesc,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Direction {
+    Up,
+    Down,
+}
+
+impl Direction {
+    fn word(self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+        }
+    }
+
+    /// What "can't go further this way" is called, for the no-op message.
+    fn edge(self) -> &'static str {
+        match self {
+            Direction::Up => "first",
+            Direction::Down => "last",
+        }
+    }
+}
+
+/// The adjacent index in `direction`, or `None` at either end. Unlike the TUI
+/// there is no filter here, so the neighbour is simply the next entry.
+fn neighbour(index: usize, direction: Direction, len: usize) -> Option<usize> {
+    let next = match direction {
+        Direction::Up => index.checked_sub(1)?,
+        Direction::Down => index + 1,
+    };
+    (next < len).then_some(next)
+}
 
 #[derive(Parser)]
 #[command(name = "kmd", version, about = "Keyboard-first local orchestrator for parallel coding sessions")]
@@ -81,6 +138,18 @@ enum RepoAction {
         #[arg(long)]
         force: bool,
     },
+    /// Move a repo one place up or down in the saved order
+    Move {
+        /// Repo reference (name, path, or ID)
+        name: String,
+        /// Which way to move it
+        direction: Direction,
+    },
+    /// Show or set how repos are ordered (a sort is a view over the saved order)
+    Sort {
+        /// The mode to switch to; omit to print the current one
+        mode: Option<SortArg>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -148,6 +217,18 @@ enum WorkspaceAction {
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
+    },
+    /// Move a workspace one place up or down within its own repo
+    Move {
+        /// Workspace name or ID
+        name: String,
+        /// Which way to move it
+        direction: Direction,
+    },
+    /// Show or set how workspaces are ordered within each repo
+    Sort {
+        /// The mode to switch to; omit to print the current one
+        mode: Option<SortArg>,
     },
 }
 
@@ -287,7 +368,10 @@ fn main() -> anyhow::Result<()> {
                 if state.repos.is_empty() {
                     println!("No repos tracked. Use `kmd repo add <path>` to add one.");
                 } else {
-                    for repo in &state.repos {
+                    // Same view the TUI tree shows, so `move up` means up here too.
+                    let mut repos = state.repos.clone();
+                    kommand0_core::sort_repos(&mut repos, state.repo_sort);
+                    for repo in &repos {
                         println!("{}  {}  {}", repo.id, repo.name, repo.path);
                     }
                 }
@@ -315,6 +399,37 @@ fn main() -> anyhow::Result<()> {
 
                 state.delete_repo(&name)?;
                 println!("Deleted repo: {} ({} workspace(s) removed)", repo.name, ws_count);
+            }
+            RepoAction::Move { name, direction } => {
+                let mut state = AppState::load()?;
+                let repo = state.resolve_repo(&name)?.clone();
+                // Freeze any active sort first, so "up" means up in the order
+                // `repo list` just printed rather than in a stale saved one.
+                state.materialize_repo_order();
+                let from = state
+                    .repos
+                    .iter()
+                    .position(|r| r.id == repo.id)
+                    .expect("resolve_repo returned a tracked repo");
+                let Some(target) = neighbour(from, direction, state.repos.len()) else {
+                    println!("'{}' is already {}.", repo.name, direction.edge());
+                    return Ok(());
+                };
+                let other = state.repos[target].id.clone();
+                state.swap_repos(&repo.id, &other);
+                state.save()?;
+                println!("Moved repo '{}' {}.", repo.name, direction.word());
+            }
+            RepoAction::Sort { mode } => {
+                let mut state = AppState::load()?;
+                match mode {
+                    Some(mode) => {
+                        state.repo_sort = mode.into();
+                        state.save()?;
+                        println!("Repos now sorted by {}.", state.repo_sort.label());
+                    }
+                    None => println!("Repos are sorted by {}.", state.repo_sort.label()),
+                }
             }
         },
         Commands::Workspace { action } => match action {
@@ -393,7 +508,9 @@ fn main() -> anyhow::Result<()> {
             }
             WorkspaceAction::List { all, repo } => {
                 let state = AppState::load()?;
-                let workspaces = state.list_workspaces(all, repo.as_deref())?;
+                let mut workspaces: Vec<Workspace> =
+                    state.list_workspaces(all, repo.as_deref())?.into_iter().cloned().collect();
+                kommand0_core::sort_workspaces(&mut workspaces, state.workspace_sort);
                 if workspaces.is_empty() {
                     println!("No workspaces found.");
                 } else {
@@ -401,7 +518,7 @@ fn main() -> anyhow::Result<()> {
                         "{:<12} {:<20} {:<20} {:<10}",
                         "ID", "NAME", "REPO", "STATUS"
                     );
-                    for ws in workspaces {
+                    for ws in &workspaces {
                         let repo_name = state
                             .repos
                             .iter()
@@ -414,6 +531,41 @@ fn main() -> anyhow::Result<()> {
                             ws.id, ws.name, repo_name, status
                         );
                     }
+                }
+            }
+            WorkspaceAction::Move { name, direction } => {
+                let mut state = AppState::load()?;
+                let ws = state.show_workspace(&name)?.clone();
+                state.materialize_workspace_order();
+                // Workspaces of different repos interleave in the flat vector,
+                // so the neighbour is the next *sibling*, not the next entry.
+                let siblings: Vec<String> = state
+                    .workspaces
+                    .iter()
+                    .filter(|w| w.repo_id == ws.repo_id)
+                    .map(|w| w.id.clone())
+                    .collect();
+                let rank = siblings
+                    .iter()
+                    .position(|id| *id == ws.id)
+                    .expect("the workspace is its own sibling");
+                let Some(target) = neighbour(rank, direction, siblings.len()) else {
+                    println!("'{}' is already its repo's {}.", ws.name, direction.edge());
+                    return Ok(());
+                };
+                state.swap_workspaces(&ws.id, &siblings[target]);
+                state.save()?;
+                println!("Moved workspace '{}' {}.", ws.name, direction.word());
+            }
+            WorkspaceAction::Sort { mode } => {
+                let mut state = AppState::load()?;
+                match mode {
+                    Some(mode) => {
+                        state.workspace_sort = mode.into();
+                        state.save()?;
+                        println!("Workspaces now sorted by {}.", state.workspace_sort.label());
+                    }
+                    None => println!("Workspaces are sorted by {}.", state.workspace_sort.label()),
                 }
             }
             WorkspaceAction::Show { name } => {
