@@ -1,0 +1,24 @@
+CHANGELOG.md
+  s_78744dba5109cc::t_a2c98bd561de79 8-12,15
+  s_78744dba5109cc::t_be43e387b8fa3b 13-14
+.github/workflows/release.yml
+  s_78744dba5109cc::t_9aaca341176364 35,137,183
+.github/workflows/ci.yml
+  s_78744dba5109cc::t_9aaca341176364 17,34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cddfe3d2455ddc0833fd002594a321b4a73058ed",
+  "prompts": {},
+  "sessions": {
+    "s_78744dba5109cc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f7f032d8-7977-4422-b41d-ade25fa74d90",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
