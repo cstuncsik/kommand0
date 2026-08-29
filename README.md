@@ -188,6 +188,61 @@ cargo run -p kommand0-tui   # from a checkout
 | `?` | Tree | Toggle help overlay |
 | `q` | Tree | Quit |
 
+### Icons
+
+Colour carries meaning here: the same `●` is three different things depending on how it is coloured, so the `?` overlay renders every glyph in its real colour. The table below names the colour instead.
+
+**Workspace dot** (left of each workspace)
+
+| Glyph | Colour | Meaning |
+|-------|--------|---------|
+| `●` | attention | Needs you: the session produced output you haven't seen and went quiet |
+| `●` ↔ `○` | active, pulsing | Producing right now (in step with the activity spinner) |
+| `●` | active | Active workspace, nothing pending |
+| `○` | muted | Archived workspace |
+
+**Pull request / CI** (right of a workspace with a PR)
+
+| Glyph | Colour | Meaning |
+|-------|--------|---------|
+| `●` | accent | PR merged |
+| `✕` | muted | PR closed without merging |
+| `✓` | green | PR open, checks passing |
+| `✗` | red | PR open, checks failing |
+| `○` | yellow | PR open, checks still running |
+| `◇` | muted | PR open, no checks configured |
+
+State wins over CI: a merged or closed PR shows its own glyph regardless of the check outcome.
+
+**Tree structure**
+
+| Glyph | Meaning |
+|-------|---------|
+| `▾` / `›` | Repo expanded / collapsed |
+| `↑name` `↓added` | The active sort, in the tree title (`ws` prefix = the workspace sort) |
+
+**Row buttons** (clickable)
+
+| Glyph | Meaning |
+|-------|---------|
+| `✕` | Delete the repo, or close the session |
+| `+` | Add a workspace to the repo |
+| `❯` | Open the session |
+| `▶` | Start / resume the session |
+| `■` | Stop the running session |
+| `↺` | Retry after a failed start |
+
+**Session tabs**
+
+| Glyph | Meaning |
+|-------|---------|
+| `1` `2` … | Tab number; a braille spinner replaces it while that tab is producing |
+| _(none)_ | Claude tab |
+| `$` | Shell tab |
+| `>` | Codex tab |
+| `✦` | Gemini tab |
+| `○` | Opencode tab |
+
 ## Terminals & tmux
 
 Shift+Enter (a newline in an embedded session, without submitting) needs a terminal that reports modified keys distinctly. Outside tmux, kommand0 uses the kitty keyboard protocol. tmux never passes that protocol through, but it can deliver the same keys via xterm's modifyOtherKeys — kommand0 requests it automatically when tmux is configured for CSI u delivery. Add these two lines to `tmux.conf` and restart tmux:
