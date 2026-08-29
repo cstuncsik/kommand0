@@ -6,8 +6,9 @@
 //! an optional **built-in sort** ([`SortMode`]), applied at render time only:
 //! turning a sort off falls straight back to the saved manual order.
 //!
-//! Every sort is *stable*, so the manual order is the tie-break — equal names
-//! (or equal timestamps) keep the order the user arranged by hand.
+//! The name sorts are *stable*, so the manual order is the tie-break — equally
+//! named entries keep the order the user arranged by hand. The date sorts
+//! break ties by position instead: see [`sort_desc_by_key`].
 
 use std::cmp::Reverse;
 
@@ -86,6 +87,21 @@ fn name_key(name: &str) -> String {
     name.to_lowercase()
 }
 
+/// Descending by `key`, with ties broken by *reverse* position.
+///
+/// The timestamps are whole seconds, so anything added in a burst — a setup
+/// script running `kmd repo add a && kmd repo add b` — shares a stamp. A plain
+/// stable sort would leave those in insertion order, making "newest first"
+/// show the oldest first. Falling back to reverse position instead recovers
+/// what the missing sub-second resolution would have said.
+///
+/// Only the date sorts want this. A name tie means the names really are equal,
+/// and there the manual order is the right answer, so those stay plain-stable.
+fn sort_desc_by_key<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K) {
+    items.reverse();
+    items.sort_by_key(|t| Reverse(key(t)));
+}
+
 /// Order `repos` in place for `mode` (a no-op for [`SortMode::Manual`]).
 ///
 /// A repo added before `added_at` existed has `None`, which sorts as the
@@ -96,7 +112,7 @@ pub fn sort_repos(repos: &mut [RepoEntry], mode: SortMode) {
         SortMode::NameAsc => repos.sort_by_key(|r| name_key(&r.name)),
         SortMode::NameDesc => repos.sort_by_key(|r| Reverse(name_key(&r.name))),
         SortMode::AddedAsc => repos.sort_by_key(|r| r.added_at),
-        SortMode::AddedDesc => repos.sort_by_key(|r| Reverse(r.added_at)),
+        SortMode::AddedDesc => sort_desc_by_key(repos, |r| r.added_at),
     }
 }
 
@@ -107,7 +123,7 @@ pub fn sort_workspaces(workspaces: &mut [Workspace], mode: SortMode) {
         SortMode::NameAsc => workspaces.sort_by_key(|w| name_key(&w.name)),
         SortMode::NameDesc => workspaces.sort_by_key(|w| Reverse(name_key(&w.name))),
         SortMode::AddedAsc => workspaces.sort_by_key(|w| w.created_at),
-        SortMode::AddedDesc => workspaces.sort_by_key(|w| Reverse(w.created_at)),
+        SortMode::AddedDesc => sort_desc_by_key(workspaces, |w| w.created_at),
     }
 }
 
@@ -154,17 +170,39 @@ mod tests {
     }
 
     #[test]
-    fn sorts_are_stable_so_manual_order_breaks_ties() {
-        // Two repos share a name and a timestamp: whichever the user placed
-        // first must stay first, in both directions.
-        let mut repos = vec![repo("dup", Some(5)), repo("dup", Some(5))];
+    fn name_ties_keep_the_manual_order() {
+        // Two repos share a name: whichever the user placed first stays first,
+        // in both directions.
+        let mut repos = vec![repo("dup", Some(5)), repo("dup", Some(6))];
         repos[0].id = "first".into();
         repos[1].id = "second".into();
-        for mode in [SortMode::NameAsc, SortMode::NameDesc, SortMode::AddedAsc, SortMode::AddedDesc] {
+        for mode in [SortMode::NameAsc, SortMode::NameDesc] {
             let mut copy = repos.clone();
             sort_repos(&mut copy, mode);
-            assert_eq!(copy[0].id, "first", "{mode:?} reordered equal keys");
+            assert_eq!(copy[0].id, "first", "{mode:?} reordered equal names");
         }
+    }
+
+    #[test]
+    fn same_second_additions_still_order_newest_first() {
+        // Timestamps are whole seconds, so a scripted burst of `repo add`
+        // shares one. Ascending keeps insertion order (the oldest really is
+        // first); descending must flip it, not repeat it.
+        let mut repos = vec![repo("a", Some(5)), repo("b", Some(5)), repo("c", Some(5))];
+        sort_repos(&mut repos, SortMode::AddedAsc);
+        assert_eq!(names(&repos), ["a", "b", "c"], "oldest first = insertion order");
+
+        let mut repos = vec![repo("a", Some(5)), repo("b", Some(5)), repo("c", Some(5))];
+        sort_repos(&mut repos, SortMode::AddedDesc);
+        assert_eq!(names(&repos), ["c", "b", "a"], "newest first = reverse insertion order");
+    }
+
+    #[test]
+    fn a_real_timestamp_still_outranks_position() {
+        // The position fallback must not override an actual difference.
+        let mut repos = vec![repo("old", Some(1)), repo("new", Some(9)), repo("mid", Some(5))];
+        sort_repos(&mut repos, SortMode::AddedDesc);
+        assert_eq!(names(&repos), ["new", "mid", "old"]);
     }
 
     #[test]
