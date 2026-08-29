@@ -1102,3 +1102,162 @@ fn profile_list_prints_sorted_names() {
     assert!(out.status.success(), "list: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout(&out), "alpha\nbravo\n", "bare sorted names, dirs only");
 }
+
+/// A state dir tracking three empty git repos, added in the given order.
+/// Returns `(state_dir, paths)`.
+fn state_with_repos(root: &Path, names: &[&str]) -> std::path::PathBuf {
+    let state_dir = root.join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    for name in names {
+        let repo = root.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let add = kmd(&state_dir, &[], &["repo", "add", repo.to_str().unwrap()]);
+        assert!(add.status.success(), "repo add: {}", String::from_utf8_lossy(&add.stderr));
+    }
+    state_dir
+}
+
+/// Repo names in the order `kmd repo list` printed them (`id  name  path`).
+fn listed_repos(state: &Path) -> Vec<String> {
+    let out = kmd(state, &[], &["repo", "list"]);
+    assert!(out.status.success(), "repo list: {}", String::from_utf8_lossy(&out.stderr));
+    stdout(&out)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn repo_list_defaults_to_the_order_repos_were_added() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = state_with_repos(tmp.path(), &["zulu", "alpha", "mike"]);
+    assert_eq!(listed_repos(&state), ["zulu", "alpha", "mike"]);
+}
+
+#[test]
+fn repo_sort_switches_the_listed_order_and_reports_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = state_with_repos(tmp.path(), &["zulu", "alpha", "mike"]);
+
+    assert!(kmd(&state, &[], &["repo", "sort", "name-asc"]).status.success());
+    assert_eq!(listed_repos(&state), ["alpha", "mike", "zulu"]);
+    assert!(kmd(&state, &[], &["repo", "sort", "name-desc"]).status.success());
+    assert_eq!(listed_repos(&state), ["zulu", "mike", "alpha"]);
+
+    // With no argument it reports rather than changes.
+    let shown = stdout(&kmd(&state, &[], &["repo", "sort"]));
+    assert!(shown.contains("Z→A"), "reports the current mode: {shown}");
+    assert_eq!(listed_repos(&state), ["zulu", "mike", "alpha"], "unchanged by a bare `sort`");
+
+    // Date-added sorts use the add order, which survives a name sort.
+    assert!(kmd(&state, &[], &["repo", "sort", "added-desc"]).status.success());
+    assert_eq!(listed_repos(&state), ["mike", "alpha", "zulu"]);
+}
+
+#[test]
+fn repo_move_while_sorted_freezes_the_listed_order_and_drops_the_sort() {
+    // The headline flow, through the CLI: sort, nudge one repo, and that
+    // becomes the saved order a later `sort manual` returns to.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = state_with_repos(tmp.path(), &["zulu", "alpha", "mike"]);
+
+    assert!(kmd(&state, &[], &["repo", "sort", "name-asc"]).status.success());
+    assert_eq!(listed_repos(&state), ["alpha", "mike", "zulu"]);
+
+    let moved = kmd(&state, &[], &["repo", "move", "alpha", "down"]);
+    assert!(moved.status.success(), "move: {}", String::from_utf8_lossy(&moved.stderr));
+    assert_eq!(listed_repos(&state), ["mike", "alpha", "zulu"]);
+    let shown = stdout(&kmd(&state, &[], &["repo", "sort"]));
+    assert!(shown.contains("manual"), "the move took over from the sort: {shown}");
+
+    // A round trip through a sort comes back to the edited order.
+    assert!(kmd(&state, &[], &["repo", "sort", "name-desc"]).status.success());
+    assert_eq!(listed_repos(&state), ["zulu", "mike", "alpha"]);
+    assert!(kmd(&state, &[], &["repo", "sort", "manual"]).status.success());
+    assert_eq!(listed_repos(&state), ["mike", "alpha", "zulu"]);
+}
+
+#[test]
+fn repo_move_at_the_edge_says_so_and_changes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = state_with_repos(tmp.path(), &["zulu", "alpha"]);
+    let out = kmd(&state, &[], &["repo", "move", "zulu", "up"]);
+    assert!(out.status.success(), "a no-op move is not an error");
+    assert!(stdout(&out).contains("already first"), "says why: {}", stdout(&out));
+    assert_eq!(listed_repos(&state), ["zulu", "alpha"]);
+}
+
+#[test]
+fn repo_move_rejects_an_unknown_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = state_with_repos(tmp.path(), &["zulu"]);
+    let out = kmd(&state, &[], &["repo", "move", "ghost", "up"]);
+    assert!(!out.status.success(), "an unknown repo is an error");
+}
+
+#[test]
+fn workspace_move_stays_inside_its_own_repo() {
+    // Two repos, with the second repo's workspace created BETWEEN the first
+    // repo's two — so the flat storage order interleaves them.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = state_with_repos(tmp.path(), &["r1", "r2"]);
+    for (name, repo) in [("zebra", "r1"), ("middle", "r2"), ("apple", "r1")] {
+        let out = kmd(&state, &[], &["workspace", "create", name, "--repo", repo]);
+        assert!(out.status.success(), "create {name}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let listed = |state: &Path| -> Vec<String> {
+        stdout(&kmd(state, &[], &["workspace", "list"]))
+            .lines()
+            .skip(1) // header
+            .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+            .collect()
+    };
+    assert_eq!(listed(&state), ["zebra", "middle", "apple"]);
+
+    // apple's only r1 sibling is zebra, two slots away in storage: moving it up
+    // must swap with zebra and step over middle (r2) entirely.
+    let out = kmd(&state, &[], &["workspace", "move", "apple", "up"]);
+    assert!(out.status.success(), "move: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("Moved workspace"), "actually moved: {}", stdout(&out));
+    assert_eq!(listed(&state), ["apple", "middle", "zebra"], "r2's middle stayed put");
+
+    // Now apple IS r1's first, so there is nowhere further up to go.
+    let out = kmd(&state, &[], &["workspace", "move", "apple", "up"]);
+    assert!(out.status.success());
+    assert!(stdout(&out).contains("already its repo's first"), "{}", stdout(&out));
+
+    // middle is r2's only workspace, so it can never move.
+    let out = kmd(&state, &[], &["workspace", "move", "middle", "up"]);
+    assert!(out.status.success());
+    assert!(stdout(&out).contains("already its repo's first"), "{}", stdout(&out));
+}
+
+#[test]
+fn workspace_sort_reorders_the_list_and_is_independent_of_the_repo_sort() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = state_with_repos(tmp.path(), &["r1"]);
+    for name in ["zebra", "apple"] {
+        assert!(
+            kmd(&state, &[], &["workspace", "create", name, "--repo", "r1"]).status.success()
+        );
+    }
+    let listed = |state: &Path| -> Vec<String> {
+        stdout(&kmd(state, &[], &["workspace", "list"]))
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+            .collect()
+    };
+    assert_eq!(listed(&state), ["zebra", "apple"]);
+
+    assert!(kmd(&state, &[], &["workspace", "sort", "name-asc"]).status.success());
+    assert_eq!(listed(&state), ["apple", "zebra"]);
+
+    // The repo sort is a separate setting and stays untouched.
+    let shown = stdout(&kmd(&state, &[], &["repo", "sort"]));
+    assert!(shown.contains("manual"), "repo sort untouched: {shown}");
+}

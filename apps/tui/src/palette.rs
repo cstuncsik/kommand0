@@ -19,7 +19,8 @@ use super::modal::{render_input_with_cursor, sanitize_paste};
 use super::theme::Theme;
 
 /// What running a palette entry does. Dispatched by the app once the palette
-/// closes; every variant carries the workspace it targets.
+/// closes. Most variants carry the workspace they target; the profile and
+/// ordering entries are app-wide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PaletteAction {
     /// Reveal + open the workspace's embedded session (the original jump).
@@ -33,6 +34,9 @@ pub(crate) enum PaletteAction {
     JumpTab { ws_id: String, index: usize },
     /// Delete a profile (never the TUI's own: the candidates exclude it).
     DeleteProfile { name: String },
+    /// Set the repo (`workspaces: false`) or workspace order outright — the
+    /// palette's direct jump, versus the keys' asc/desc/off cycle.
+    SetSort { workspaces: bool, mode: kommand0_core::SortMode },
 }
 
 /// One palette entry: the display label + muted detail, the text the query is

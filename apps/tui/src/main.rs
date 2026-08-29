@@ -111,6 +111,33 @@ fn profile_delete_target(
 /// unreachable here (core's own-profile guard is the backstop). Pure, so
 /// it's testable while the ambient `list_profiles()` is empty under the
 /// unit harness's `KOMMAND0_STATE_DIR`.
+/// Palette entries for the two orderings, one per mode per level. Verb-tagged
+/// so typing "sort" (or "order") narrows to exactly these.
+fn sort_candidates() -> Vec<palette::Candidate> {
+    use kommand0_core::SortMode;
+    use palette::{Candidate, PaletteAction};
+    const MODES: &[SortMode] = &[
+        SortMode::Manual,
+        SortMode::NameAsc,
+        SortMode::NameDesc,
+        SortMode::AddedAsc,
+        SortMode::AddedDesc,
+    ];
+    let mut out = Vec::with_capacity(MODES.len() * 2);
+    for workspaces in [false, true] {
+        let level = if workspaces { "workspaces" } else { "repos" };
+        for &mode in MODES {
+            out.push(Candidate {
+                label: format!("Sort {level} by {}", mode.label()),
+                detail: "order".to_string(),
+                match_text: format!("sort order {level} {}", mode.label()),
+                action: PaletteAction::SetSort { workspaces, mode },
+            });
+        }
+    }
+    out
+}
+
 fn profile_delete_candidates(profiles: &[String], own: &str) -> Vec<palette::Candidate> {
     profiles
         .iter()
@@ -296,6 +323,17 @@ pub(crate) enum TreeNode {
     Hint {
         text: String,
     },
+}
+
+/// A tree row's stable identity — the repo or workspace id — used to keep the
+/// cursor on the same item across a rebuild that reorders rows. `None` for a
+/// hint row, which has no identity and is never selected.
+fn node_key(node: &TreeNode) -> Option<&str> {
+    match node {
+        TreeNode::Repo { id, .. } => Some(id),
+        TreeNode::Workspace { ws, .. } => Some(&ws.id),
+        TreeNode::Hint { .. } => None,
+    }
 }
 
 /// A visible row of the two-pane diff dialog's left file tree (flattened from the
@@ -967,16 +1005,23 @@ impl App {
         self.tree_items.clear();
         let q = self.filter_query.to_lowercase();
         let filtering = !q.is_empty();
-        for repo in &self.repos {
+        // The built-in sorts are a *view*: applied here and nowhere else, so
+        // `self.repos` / `self.workspaces` keep the hand-arranged order that
+        // gets persisted and that turning a sort off falls back to.
+        let mut repos = self.repos.clone();
+        kommand0_core::sort_repos(&mut repos, self.state.repo_sort);
+        for repo in &repos {
             // When a repo's name matches, show all its workspaces; otherwise only
             // those whose name/branch matches. No filter => all of them.
             let repo_matches = filtering && repo.name.to_lowercase().contains(&q);
-            let repo_workspaces: Vec<&Workspace> = self
+            let mut repo_workspaces: Vec<Workspace> = self
                 .workspaces
                 .iter()
                 .filter(|w| w.repo_id == repo.id)
                 .filter(|w| !filtering || repo_matches || ws_matches_query(w, &q))
+                .cloned()
                 .collect();
+            kommand0_core::sort_workspaces(&mut repo_workspaces, self.state.workspace_sort);
 
             // A filtered-out repo (no matching workspaces, name doesn't match) is
             // omitted entirely so search narrows across collapsed repos too.
@@ -996,7 +1041,7 @@ impl App {
             if filtering {
                 for ws in &repo_workspaces {
                     self.tree_items.push(TreeNode::Workspace {
-                        ws: (*ws).clone(),
+                        ws: ws.clone(),
                         repo_name: repo.name.clone(),
                     });
                 }
@@ -1008,7 +1053,7 @@ impl App {
                 let all_archived = repo_workspaces.iter().all(|w| !w.active);
                 for ws in &repo_workspaces {
                     self.tree_items.push(TreeNode::Workspace {
-                        ws: (*ws).clone(),
+                        ws: ws.clone(),
                         repo_name: repo.name.clone(),
                     });
                 }
@@ -1019,6 +1064,103 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Move the selected repo (or workspace, within its own repo) one row up
+    /// (`-1`) or down (`+1`) and persist the new order.
+    ///
+    /// The neighbour comes from the *rendered* tree, not from the stored
+    /// vector: under a `/` filter the stored neighbour may be hidden, and
+    /// swapping past a row the user can't see would look like nothing
+    /// happened. Core freezes any live sort into the manual order first, so
+    /// the nudge starts from what is on screen.
+    pub(crate) fn move_selected(&mut self, delta: isize) {
+        let Some(target) = self.visible_sibling(self.selected_index, delta) else {
+            return; // no neighbour on screen — already at that end
+        };
+        let moved = match (&self.tree_items[self.selected_index], &self.tree_items[target]) {
+            (TreeNode::Repo { id: a, .. }, TreeNode::Repo { id: b, .. }) => {
+                let (a, b) = (a.clone(), b.clone());
+                self.state.swap_repos(&a, &b)
+            }
+            (TreeNode::Workspace { ws: a, .. }, TreeNode::Workspace { ws: b, .. }) => {
+                let (a, b) = (a.id.clone(), b.id.clone());
+                self.state.swap_workspaces(&a, &b)
+            }
+            _ => false,
+        };
+        if !moved {
+            return;
+        }
+        self.repos = self.state.repos.clone();
+        self.workspaces = self.state.workspaces.clone();
+        self.save_state();
+        self.rebuild_tree_keeping_selection();
+    }
+
+    /// The nearest row in direction `delta` that `index` can trade places with:
+    /// the next repo row for a repo, or the next workspace row of the *same*
+    /// repo for a workspace (a repo header in between ends the run). `None`
+    /// when there is none, or when `index` is a hint row.
+    fn visible_sibling(&self, index: usize, delta: isize) -> Option<usize> {
+        let want_repo = match self.tree_items.get(index)? {
+            TreeNode::Repo { .. } => true,
+            TreeNode::Workspace { .. } => false,
+            TreeNode::Hint { .. } => return None,
+        };
+        let mut i = index;
+        loop {
+            i = i.checked_add_signed(delta)?;
+            match self.tree_items.get(i)? {
+                TreeNode::Repo { .. } if want_repo => return Some(i),
+                // A repo header ends the workspace run we're moving inside.
+                TreeNode::Repo { .. } => return None,
+                TreeNode::Workspace { .. } if !want_repo => return Some(i),
+                // Skip over other repos' workspaces and hint rows.
+                TreeNode::Workspace { .. } | TreeNode::Hint { .. } => {}
+            }
+        }
+    }
+
+    /// Cycle a built-in sort (asc → desc → off) for the level the cursor is on:
+    /// a workspace row cycles the workspace order, anything else the repo order.
+    /// The two sorts are mutually exclusive — turning one on turns the other off.
+    pub(crate) fn cycle_sort(&mut self, by_name: bool) {
+        let on_workspace =
+            matches!(self.tree_items.get(self.selected_index), Some(TreeNode::Workspace { .. }));
+        let mode = if on_workspace {
+            &mut self.state.workspace_sort
+        } else {
+            &mut self.state.repo_sort
+        };
+        *mode = if by_name { mode.cycle_name() } else { mode.cycle_added() };
+        self.save_state();
+        self.rebuild_tree_keeping_selection();
+    }
+
+    /// Set one level's sort outright (the palette's direct-jump entries).
+    pub(crate) fn set_sort(&mut self, workspaces: bool, mode: kommand0_core::SortMode) {
+        if workspaces {
+            self.state.workspace_sort = mode;
+        } else {
+            self.state.repo_sort = mode;
+        }
+        self.save_state();
+        self.rebuild_tree_keeping_selection();
+    }
+
+    /// Rebuild after an order change, keeping the cursor on the same item —
+    /// its row index moved, so a plain rebuild would leave the cursor behind on
+    /// whatever slid into its place.
+    fn rebuild_tree_keeping_selection(&mut self) {
+        let key = self.tree_items.get(self.selected_index).and_then(node_key).map(str::to_string);
+        self.rebuild_tree();
+        if let Some(key) = key
+            && let Some(i) = self.tree_items.iter().position(|n| node_key(n) == Some(key.as_str()))
+        {
+            self.selected_index = i;
+        }
+        self.clamp_selection();
     }
 
     /// Apply the current filter: rebuild and land selection on the first match
@@ -1923,6 +2065,10 @@ impl App {
         let own = self.profile_label.as_deref().unwrap_or(DEFAULT_PROFILE);
         out.extend(profile_delete_candidates(&profiles, own));
 
+        // 5) Set either level's order outright. The keys cycle asc/desc/off;
+        //    these jump straight to one mode, including back to manual.
+        out.extend(sort_candidates());
+
         out
     }
 
@@ -1949,6 +2095,7 @@ impl App {
                     self.select_session_tab(&ws_id, index);
                 }
             }
+            SetSort { workspaces, mode } => self.set_sort(workspaces, mode),
             DeleteProfile { name } => {
                 if self.profile_delete_inflight {
                     return;
@@ -4155,6 +4302,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         app.archive_toggle(&ws_id);
                     }
                 }
+                Action::MoveItemUp => app.move_selected(-1),
+                Action::MoveItemDown => app.move_selected(1),
+                Action::SortByName => app.cycle_sort(true),
+                Action::SortByAdded => app.cycle_sort(false),
                 Action::AddRepo => {
                     app.modal = modal::ModalState::AddRepo {
                         input: String::new(),
@@ -5107,11 +5258,13 @@ mod key_tests {
             id: "r1".into(),
             name: "alpha".into(),
             path: "/tmp/alpha".into(),
+            added_at: None,
         });
         state.repos.push(RepoEntry {
             id: "r2".into(),
             name: "beta".into(),
             path: "/tmp/beta".into(),
+            added_at: None,
         });
         state.workspaces.push(Workspace {
             id: "w1".into(),
@@ -5139,6 +5292,276 @@ mod key_tests {
 
     async fn press(app: &mut App, code: KeyCode) -> KeyOutcome {
         handle_key(app, key(code)).await.unwrap()
+    }
+
+    /// Repo names in tree order, ignoring workspace/hint rows.
+    fn tree_repos(app: &App) -> Vec<String> {
+        app.tree_items
+            .iter()
+            .filter_map(|n| match n {
+                TreeNode::Repo { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Workspace names in tree order.
+    fn tree_workspaces(app: &App) -> Vec<String> {
+        app.tree_items
+            .iter()
+            .filter_map(|n| match n {
+                TreeNode::Workspace { ws, .. } => Some(ws.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn s_cycles_the_repo_name_sort_through_off() {
+        // test_app seeds alpha then beta, so the manual order is already A→Z:
+        // rename so a sort is observable.
+        let mut app = test_app();
+        app.state.repos[0].name = "zulu".into();
+        app.repos = app.state.repos.clone();
+        app.rebuild_tree();
+        assert_eq!(tree_repos(&app), ["zulu", "beta"], "manual order");
+
+        press(&mut app, KeyCode::Char('s')).await;
+        assert_eq!(tree_repos(&app), ["beta", "zulu"], "asc");
+        press(&mut app, KeyCode::Char('s')).await;
+        assert_eq!(tree_repos(&app), ["zulu", "beta"], "desc");
+        press(&mut app, KeyCode::Char('s')).await;
+        assert_eq!(app.state.repo_sort, kommand0_core::SortMode::Manual);
+        assert_eq!(tree_repos(&app), ["zulu", "beta"], "off — the saved order");
+    }
+
+    #[tokio::test]
+    async fn t_sorts_by_date_added_and_is_exclusive_with_s() {
+        let mut app = test_app();
+        app.state.repos[0].added_at = Some(100); // alpha, older
+        app.state.repos[1].added_at = Some(200); // beta, newer
+        app.repos = app.state.repos.clone();
+
+        press(&mut app, KeyCode::Char('t')).await;
+        assert_eq!(tree_repos(&app), ["alpha", "beta"], "oldest first");
+        press(&mut app, KeyCode::Char('t')).await;
+        assert_eq!(tree_repos(&app), ["beta", "alpha"], "newest first");
+
+        // The name toggle takes over rather than stacking on the date sort.
+        press(&mut app, KeyCode::Char('s')).await;
+        assert_eq!(app.state.repo_sort, kommand0_core::SortMode::NameAsc);
+    }
+
+    #[tokio::test]
+    async fn shift_j_k_move_the_selected_repo_and_carry_the_cursor() {
+        let mut app = test_app();
+        app.selected_index = 0; // alpha
+        press(&mut app, KeyCode::Char('J')).await;
+        assert_eq!(tree_repos(&app), ["beta", "alpha"]);
+        assert_eq!(app.state.repos[1].name, "alpha", "the saved order moved too");
+        assert!(
+            matches!(&app.tree_items[app.selected_index], TreeNode::Repo { id, .. } if id == "r1"),
+            "the cursor followed the item it moved"
+        );
+
+        press(&mut app, KeyCode::Char('K')).await;
+        assert_eq!(tree_repos(&app), ["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn moving_at_the_edge_does_nothing() {
+        let mut app = test_app();
+        app.selected_index = 0; // alpha, already first
+        press(&mut app, KeyCode::Char('K')).await;
+        assert_eq!(tree_repos(&app), ["alpha", "beta"]);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[tokio::test]
+    async fn moving_while_sorted_freezes_the_visible_order() {
+        // The headline flow: sort, nudge, and the nudged order is what "off"
+        // returns to from then on.
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('s')).await; // name asc: alpha, beta
+        press(&mut app, KeyCode::Char('s')).await; // name desc: beta, alpha
+        assert_eq!(tree_repos(&app), ["beta", "alpha"]);
+
+        app.selected_index = 0; // beta
+        press(&mut app, KeyCode::Char('J')).await;
+        assert_eq!(app.state.repo_sort, kommand0_core::SortMode::Manual, "the move wins");
+        assert_eq!(tree_repos(&app), ["alpha", "beta"]);
+
+        // Round-trip through a sort and back: the edited manual order survives.
+        press(&mut app, KeyCode::Char('s')).await; // asc
+        press(&mut app, KeyCode::Char('s')).await; // desc
+        press(&mut app, KeyCode::Char('s')).await; // off
+        assert_eq!(tree_repos(&app), ["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn the_sort_toggle_follows_the_selected_row_s_level() {
+        let mut app = test_app();
+        app.state.workspaces.push(Workspace {
+            id: "w2".into(),
+            name: "aardvark".into(),
+            repo_id: "r1".into(),
+            working_dir: "/tmp/alpha".into(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+            branch_name: None,
+        });
+        app.workspaces = app.state.workspaces.clone();
+        app.expanded.insert("r1".into());
+        app.rebuild_tree();
+        assert_eq!(tree_workspaces(&app), ["ws-one", "aardvark"], "manual order");
+
+        // On a repo row, `s` is the repo sort.
+        app.selected_index = 0;
+        press(&mut app, KeyCode::Char('s')).await;
+        assert_eq!(app.state.repo_sort, kommand0_core::SortMode::NameAsc);
+        assert_eq!(app.state.workspace_sort, kommand0_core::SortMode::Manual);
+
+        // On a workspace row, the same key is the workspace sort.
+        let ws_row = app
+            .tree_items
+            .iter()
+            .position(|n| matches!(n, TreeNode::Workspace { .. }))
+            .expect("a workspace row");
+        app.selected_index = ws_row;
+        press(&mut app, KeyCode::Char('s')).await;
+        assert_eq!(app.state.workspace_sort, kommand0_core::SortMode::NameAsc);
+        assert_eq!(app.state.repo_sort, kommand0_core::SortMode::NameAsc, "repo sort untouched");
+        assert_eq!(tree_workspaces(&app), ["aardvark", "ws-one"]);
+    }
+
+    #[tokio::test]
+    async fn moving_under_a_filter_swaps_the_rows_that_are_on_screen() {
+        // Storage order is alpha, beta, alpaca. The filter "alp" hides beta,
+        // which sits *between* the two visible rows: moving alpaca up must put
+        // it above alpha, not silently trade places with the hidden beta.
+        let mut app = test_app();
+        app.state.repos.push(RepoEntry {
+            id: "r3".into(),
+            name: "alpaca".into(),
+            path: "/tmp/alpaca".into(),
+            added_at: None,
+        });
+        // A repo with no matching workspaces is dropped from a filtered tree,
+        // so give alpaca one.
+        app.state.workspaces.push(Workspace {
+            id: "w3".into(),
+            name: "ws-three".into(),
+            repo_id: "r3".into(),
+            working_dir: "/tmp/alpaca".into(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+            branch_name: None,
+        });
+        app.repos = app.state.repos.clone();
+        app.workspaces = app.state.workspaces.clone();
+        app.filter_query = "alp".into();
+        app.rebuild_tree();
+        assert_eq!(tree_repos(&app), ["alpha", "alpaca"], "beta is filtered out");
+
+        app.selected_index = app
+            .tree_items
+            .iter()
+            .position(|n| matches!(n, TreeNode::Repo { id, .. } if id == "r3"))
+            .expect("alpaca row");
+        press(&mut app, KeyCode::Char('K')).await;
+        assert_eq!(tree_repos(&app), ["alpaca", "alpha"], "swapped with what was on screen");
+
+        // Clearing the filter shows where the hidden repo actually ended up.
+        app.filter_query.clear();
+        app.rebuild_tree();
+        assert_eq!(tree_repos(&app), ["alpaca", "beta", "alpha"]);
+    }
+
+    #[tokio::test]
+    async fn a_repo_move_skips_over_the_workspaces_between_repo_rows() {
+        // alpha is expanded, so its workspace row sits between the two repo
+        // headers: moving alpha down must land past beta, not inside itself.
+        let mut app = test_app();
+        app.expanded.insert("r1".into());
+        app.rebuild_tree();
+        app.selected_index = 0; // alpha
+        press(&mut app, KeyCode::Char('J')).await;
+        assert_eq!(tree_repos(&app), ["beta", "alpha"]);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_cannot_be_moved_out_of_its_repo() {
+        let mut app = test_app();
+        app.state.workspaces.push(Workspace {
+            id: "x1".into(),
+            name: "other".into(),
+            repo_id: "r2".into(),
+            working_dir: "/tmp/beta".into(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+            branch_name: None,
+        });
+        app.workspaces = app.state.workspaces.clone();
+        app.expanded.insert("r1".into());
+        app.expanded.insert("r2".into());
+        app.rebuild_tree();
+
+        // ws-one is r1's only workspace; the next workspace row below belongs
+        // to r2, with a repo header in between.
+        let ws_one = app
+            .tree_items
+            .iter()
+            .position(|n| matches!(n, TreeNode::Workspace { ws, .. } if ws.id == "w1"))
+            .expect("ws-one row");
+        app.selected_index = ws_one;
+        press(&mut app, KeyCode::Char('J')).await;
+        assert_eq!(tree_workspaces(&app), ["ws-one", "other"], "unchanged");
+        assert_eq!(app.selected_index, ws_one, "and the cursor stayed put");
+    }
+
+    #[tokio::test]
+    async fn moving_a_workspace_stays_inside_its_repo() {
+        let mut app = test_app();
+        app.state.workspaces.push(Workspace {
+            id: "w2".into(),
+            name: "ws-two".into(),
+            repo_id: "r1".into(),
+            working_dir: "/tmp/alpha".into(),
+            active: true,
+            created_at: 0,
+            worktree_path: None,
+            branch_name: None,
+        });
+        // A workspace of the OTHER repo sits between them in the flat vector.
+        app.state.workspaces.insert(
+            1,
+            Workspace {
+                id: "x1".into(),
+                name: "other".into(),
+                repo_id: "r2".into(),
+                working_dir: "/tmp/beta".into(),
+                active: true,
+                created_at: 0,
+                worktree_path: None,
+                branch_name: None,
+            },
+        );
+        app.workspaces = app.state.workspaces.clone();
+        app.expanded.insert("r1".into());
+        app.expanded.insert("r2".into());
+        app.rebuild_tree();
+
+        let ws_two = app
+            .tree_items
+            .iter()
+            .position(|n| matches!(n, TreeNode::Workspace { ws, .. } if ws.id == "w2"))
+            .expect("ws-two row");
+        app.selected_index = ws_two;
+        press(&mut app, KeyCode::Char('K')).await;
+        assert_eq!(tree_workspaces(&app), ["ws-two", "ws-one", "other"]);
     }
 
     #[test]
@@ -5476,6 +5899,7 @@ mod key_tests {
             id: "real".into(),
             name: "real".into(),
             path: dir.path().to_string_lossy().into_owned(),
+            added_at: None,
         };
         app.state.repos.push(repo.clone());
         app.repos.push(repo);
