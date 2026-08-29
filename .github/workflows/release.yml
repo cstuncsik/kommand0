@@ -32,7 +32,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }} # consumed by the Linux job
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history so the bump commit pushes cleanly
 
@@ -134,7 +134,7 @@ jobs:
     # distributed, so build for max compatibility, not the newest runner.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.release.outputs.tag }} # the tag the macOS job cut + pushed
 
@@ -180,7 +180,7 @@ jobs:
       # configures a global git auth header with the default GITHUB_TOKEN, which
       # overrides the PAT in our clone URL and gets a 403 pushing to the *tap*
       # repo (the GITHUB_TOKEN can't write there).
-      - uses: actions/checkout@v4 # for scripts/render-homebrew-formula.sh
+      - uses: actions/checkout@v7 # for scripts/render-homebrew-formula.sh
         with:
           persist-credentials: false
 
