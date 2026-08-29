@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_78744dba5109cc::t_787163a2c5cf98 33-40
+CHANGELOG.md
+  s_78744dba5109cc::t_5d4863c8a58635 8-24
+Cargo.lock
+  s_78744dba5109cc::t_cb5012edc8bfc9 1040,1042
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a11a7e9044a95d6f1ba0abf0a245e77d6e2b703a",
+  "prompts": {},
+  "sessions": {
+    "s_78744dba5109cc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f7f032d8-7977-4422-b41d-ade25fa74d90",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
