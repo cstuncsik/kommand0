@@ -5,6 +5,16 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **`rustsec/audit-check` is pinned to a Node 24 commit**, clearing the last
+  "Node.js 20 is deprecated" warning in CI. Upstream has not tagged a release
+  since moving to Node 24, so the pin is a SHA: it is `v2.0.0` plus two doc
+  commits and the Node 24 bump, with `dist/index.js` untouched, so the action
+  code is identical to the tag. Revert to a tag when one ships.
+- Reworded the code comments added in 0.26.0 and 0.27.0 to drop em dashes,
+  matching the project's writing conventions. No behaviour change.
+
 ## [0.27.1] - 2026-08-29
 
 ### Fixed

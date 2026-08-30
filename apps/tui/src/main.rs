@@ -325,7 +325,7 @@ pub(crate) enum TreeNode {
     },
 }
 
-/// A tree row's stable identity — the repo or workspace id — used to keep the
+/// A tree row's stable identity (the repo or workspace id), used to keep the
 /// cursor on the same item across a rebuild that reorders rows. `None` for a
 /// hint row, which has no identity and is never selected.
 fn node_key(node: &TreeNode) -> Option<&str> {
@@ -1076,7 +1076,7 @@ impl App {
     /// the nudge starts from what is on screen.
     pub(crate) fn move_selected(&mut self, delta: isize) {
         let Some(target) = self.visible_sibling(self.selected_index, delta) else {
-            return; // no neighbour on screen — already at that end
+            return; // no neighbour on screen, already at that end
         };
         let moved = match (&self.tree_items[self.selected_index], &self.tree_items[target]) {
             (TreeNode::Repo { id: a, .. }, TreeNode::Repo { id: b, .. }) => {
@@ -1124,7 +1124,7 @@ impl App {
 
     /// Cycle a built-in sort (asc → desc → off) for the level the cursor is on:
     /// a workspace row cycles the workspace order, anything else the repo order.
-    /// The two sorts are mutually exclusive — turning one on turns the other off.
+    /// The two sorts are mutually exclusive: turning one on turns the other off.
     pub(crate) fn cycle_sort(&mut self, by_name: bool) {
         let on_workspace =
             matches!(self.tree_items.get(self.selected_index), Some(TreeNode::Workspace { .. }));
@@ -1149,7 +1149,7 @@ impl App {
         self.rebuild_tree_keeping_selection();
     }
 
-    /// Rebuild after an order change, keeping the cursor on the same item —
+    /// Rebuild after an order change, keeping the cursor on the same item:
     /// its row index moved, so a plain rebuild would leave the cursor behind on
     /// whatever slid into its place.
     fn rebuild_tree_keeping_selection(&mut self) {
@@ -5332,7 +5332,7 @@ mod key_tests {
         assert_eq!(tree_repos(&app), ["zulu", "beta"], "desc");
         press(&mut app, KeyCode::Char('s')).await;
         assert_eq!(app.state.repo_sort, kommand0_core::SortMode::Manual);
-        assert_eq!(tree_repos(&app), ["zulu", "beta"], "off — the saved order");
+        assert_eq!(tree_repos(&app), ["zulu", "beta"], "off, the saved order");
     }
 
     #[tokio::test]

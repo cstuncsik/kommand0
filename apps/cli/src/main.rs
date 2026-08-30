@@ -7,7 +7,7 @@ use kommand0_core::{
     AppState, SessionStatus, SortMode, Workspace, branch_status, cleanup_merged_workspace,
 };
 
-/// Clap mirror of [`SortMode`] — keeps clap out of the core crate while giving
+/// Clap mirror of [`SortMode`]: keeps clap out of the core crate while giving
 /// `--help` the possible values. Both derive the same kebab-case names.
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum SortArg {

@@ -345,7 +345,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     // Tree title doubles as the `/` filter box when filtering (which then
     // transiently replaces a profile label).
-    // A live sort is invisible otherwise — the rows just look wrong-order — so
+    // A live sort is invisible otherwise (the rows just look wrong-order), so
     // each active one is named in the title. Empty while both are manual.
     // The repo one goes bare (the pane is titled "Repos"); the workspace one is
     // tagged, or two identical arrows would be indistinguishable.
