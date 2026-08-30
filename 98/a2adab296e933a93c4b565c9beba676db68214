@@ -1,0 +1,37 @@
+apps/cli/src/main.rs
+  s_78744dba5109cc::t_21555a9febe584 10
+apps/tui/src/palette.rs
+  s_78744dba5109cc::t_21555a9febe584 37
+CHANGELOG.md
+  s_78744dba5109cc::t_1034b3d0b29e96 8-17
+crates/core/src/repo.rs
+  s_78744dba5109cc::t_21555a9febe584 10
+.github/workflows/ci.yml
+  s_78744dba5109cc::t_1034b3d0b29e96 46-52
+crates/core/src/lib.rs
+  s_78744dba5109cc::t_21555a9febe584 1376
+apps/cli/tests/cli.rs
+  s_78744dba5109cc::t_21555a9febe584 1205
+crates/core/src/sort.rs
+  s_78744dba5109cc::t_21555a9febe584 4,9,36,85,92-93,108
+apps/tui/src/render.rs
+  s_78744dba5109cc::t_21555a9febe584 348
+apps/tui/src/main.rs
+  s_78744dba5109cc::t_21555a9febe584 328,1079,1127,1152,5335
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "98a2adab296e933a93c4b565c9beba676db68214",
+  "prompts": {},
+  "sessions": {
+    "s_78744dba5109cc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f7f032d8-7977-4422-b41d-ade25fa74d90",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
