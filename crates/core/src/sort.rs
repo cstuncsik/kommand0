@@ -1,12 +1,12 @@
 //! Tree ordering for repos and workspaces.
 //!
 //! Two independent orderings live side by side. The **manual** order is the
-//! order of `AppState::repos` / `AppState::workspaces` itself — moving an item
+//! order of `AppState::repos` / `AppState::workspaces` itself: moving an item
 //! rewrites those vectors, so it survives restarts for free. On top of it sits
 //! an optional **built-in sort** ([`SortMode`]), applied at render time only:
 //! turning a sort off falls straight back to the saved manual order.
 //!
-//! The name sorts are *stable*, so the manual order is the tie-break — equally
+//! The name sorts are *stable*, so the manual order is the tie-break: equally
 //! named entries keep the order the user arranged by hand. The date sorts
 //! break ties by position instead: see [`sort_desc_by_key`].
 
@@ -33,7 +33,7 @@ pub enum SortMode {
 
 impl SortMode {
     /// The name-sort toggle: off → ascending → descending → off. Coming from a
-    /// date sort it enters at ascending (the toggles are mutually exclusive —
+    /// date sort it enters at ascending (the toggles are mutually exclusive:
     /// only one built-in sort is ever live).
     pub fn cycle_name(self) -> Self {
         match self {
@@ -82,15 +82,15 @@ impl SortMode {
     }
 }
 
-/// Case-insensitive name key — "Zulu" must not sort before "alpha".
+/// Case-insensitive name key: "Zulu" must not sort before "alpha".
 fn name_key(name: &str) -> String {
     name.to_lowercase()
 }
 
 /// Descending by `key`, with ties broken by *reverse* position.
 ///
-/// The timestamps are whole seconds, so anything added in a burst — a setup
-/// script running `kmd repo add a && kmd repo add b` — shares a stamp. A plain
+/// The timestamps are whole seconds, so anything added in a burst (a setup
+/// script running `kmd repo add a && kmd repo add b`) shares a stamp. A plain
 /// stable sort would leave those in insertion order, making "newest first"
 /// show the oldest first. Falling back to reverse position instead recovers
 /// what the missing sub-second resolution would have said.
@@ -105,7 +105,7 @@ fn sort_desc_by_key<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K) {
 /// Order `repos` in place for `mode` (a no-op for [`SortMode::Manual`]).
 ///
 /// A repo added before `added_at` existed has `None`, which sorts as the
-/// oldest — correct, since it predates the field.
+/// oldest, which is correct since it predates the field.
 pub fn sort_repos(repos: &mut [RepoEntry], mode: SortMode) {
     match mode {
         SortMode::Manual => {}

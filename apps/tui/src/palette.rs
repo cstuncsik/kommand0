@@ -34,7 +34,7 @@ pub(crate) enum PaletteAction {
     JumpTab { ws_id: String, index: usize },
     /// Delete a profile (never the TUI's own: the candidates exclude it).
     DeleteProfile { name: String },
-    /// Set the repo (`workspaces: false`) or workspace order outright — the
+    /// Set the repo (`workspaces: false`) or workspace order outright: the
     /// palette's direct jump, versus the keys' asc/desc/off cycle.
     SetSort { workspaces: bool, mode: kommand0_core::SortMode },
 }

@@ -1373,7 +1373,7 @@ impl AppState {
     /// first. Returns false if either id is unknown.
     ///
     /// Takes a *pair* rather than a direction because only the caller knows
-    /// what is on screen — a `/` filter can hide the storage neighbour, and
+    /// what is on screen: a `/` filter can hide the storage neighbour, and
     /// moving an item past a row the user cannot see is indistinguishable
     /// from doing nothing.
     pub fn swap_repos(&mut self, a: &str, b: &str) -> bool {

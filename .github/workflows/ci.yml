@@ -43,6 +43,12 @@ jobs:
 
       # Scans Cargo.lock against the RustSec advisory DB; fails on a vulnerability.
       # If advisories on unrelated PRs get noisy, move this to a scheduled run.
-      - uses: rustsec/audit-check@v2
+      #
+      # Pinned to a SHA rather than @v2 only because the v2 tag still declares
+      # Node 20, which every run warns about. This commit is v2.0.0 plus two
+      # doc changes and "Update to use Node 24" (#48): dist/index.js is
+      # untouched, so the action code is identical to the tag. Move back to a
+      # tag as soon as upstream cuts one that ships Node 24.
+      - uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2.0.0 + Node 24
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -1202,7 +1202,7 @@ fn repo_move_rejects_an_unknown_repo() {
 #[test]
 fn workspace_move_stays_inside_its_own_repo() {
     // Two repos, with the second repo's workspace created BETWEEN the first
-    // repo's two — so the flat storage order interleaves them.
+    // repo's two, so the flat storage order interleaves them.
     let tmp = tempfile::tempdir().unwrap();
     let state = state_with_repos(tmp.path(), &["r1", "r2"]);
     for (name, repo) in [("zebra", "r1"), ("middle", "r2"), ("apple", "r1")] {

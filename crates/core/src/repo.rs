@@ -7,7 +7,7 @@ pub struct RepoEntry {
     pub name: String,
     pub path: String,
     /// Unix seconds when the repo was added, for the date sort. `None` on
-    /// repos tracked before the field existed — they sort as the oldest,
+    /// repos tracked before the field existed, so they sort as the oldest,
     /// which is what they are.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_at: Option<u64>,
