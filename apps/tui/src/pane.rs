@@ -18,7 +18,9 @@ use anyhow::{Context, Result};
 use kommand0_core::PROFILE_ENV;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventState, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
@@ -910,6 +912,7 @@ pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let caps = key.state.contains(KeyEventState::CAPS_LOCK);
     let bytes = match key.code {
         KeyCode::Char(c) if ctrl => {
             // Control bytes only exist for @A-Z[\]^_ (0x40..=0x5F -> 0x00..=0x1F)
@@ -926,10 +929,10 @@ pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Char(c) if alt => {
             // Alt+key sends ESC then the character.
             let mut v = vec![0x1b];
-            v.extend_from_slice(c.to_string().as_bytes());
+            v.extend_from_slice(caps_lock(c, caps).to_string().as_bytes());
             v
         }
-        KeyCode::Char(c) => c.to_string().into_bytes(),
+        KeyCode::Char(c) => caps_lock(c, caps).to_string().into_bytes(),
         // Plain Enter submits (CR); Shift/Alt+Enter inserts a newline (LF), the
         // form claude's composer treats as a soft break, so it must differ.
         KeyCode::Enter if shift || alt => vec![b'\n'],
@@ -951,6 +954,28 @@ pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(bytes)
+}
+
+/// Legacy terminals bake Caps Lock into the byte (`A`); the Kitty protocol
+/// instead reports the unshifted key (`a`) plus a CAPS_LOCK state bit, which the
+/// child never sees. Flip the case so it gets what a real terminal would send.
+/// Shift+letter with Caps Lock on arrives already uppercased (alternate key)
+/// and flips back to lowercase, as on a real keyboard.
+fn caps_lock(c: char, caps: bool) -> char {
+    if !caps {
+        return c;
+    }
+    let flipped: String = if c.is_lowercase() {
+        c.to_uppercase().collect()
+    } else {
+        c.to_lowercase().collect()
+    };
+    let mut chars = flipped.chars();
+    match (chars.next(), chars.next()) {
+        (Some(f), None) => f,
+        // Multi-char mappings (`ß` -> `SS`) have no single-key equivalent.
+        _ => c,
+    }
 }
 
 #[cfg(test)]
@@ -1863,6 +1888,23 @@ mod tests {
             KeyEventState::NONE,
         );
         assert_eq!(encode_key(release), None);
+    }
+
+    #[test]
+    fn caps_lock_flips_letter_case() {
+        use ratatui::crossterm::event::KeyEventKind;
+        let caps = |code, mods| {
+            KeyEvent::new_with_kind_and_state(code, mods, KeyEventKind::Press, KeyEventState::CAPS_LOCK)
+        };
+        // Kitty reports a caps-locked `a` as Char('a') + CAPS_LOCK: send `A`.
+        assert_eq!(encode_key(caps(KeyCode::Char('a'), KeyModifiers::NONE)), Some(b"A".to_vec()));
+        assert_eq!(encode_key(caps(KeyCode::Char('\u{e1}'), KeyModifiers::NONE)), Some("\u{c1}".as_bytes().to_vec()));
+        // Shift+a with Caps Lock arrives as the alternate key `A`: a real keyboard types `a`.
+        assert_eq!(encode_key(caps(KeyCode::Char('A'), KeyModifiers::NONE)), Some(b"a".to_vec()));
+        // Non-letters, Alt-prefixed letters, and the legacy path (no state bit) are unchanged.
+        assert_eq!(encode_key(caps(KeyCode::Char('1'), KeyModifiers::NONE)), Some(b"1".to_vec()));
+        assert_eq!(encode_key(caps(KeyCode::Char('b'), KeyModifiers::ALT)), Some(vec![0x1b, b'B']));
+        assert_eq!(encode_key(k(KeyCode::Char('a'))), Some(b"a".to_vec()));
     }
 
     #[test]

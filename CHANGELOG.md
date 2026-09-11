@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Caps Lock now uppercases typing in embedded sessions** on terminals that
+  speak the Kitty keyboard protocol (Ghostty, kitty, WezTerm, ...), which
+  report the unshifted key plus a Caps Lock flag instead of the uppercase
+  character; the pane flips the case before forwarding, as a real terminal
+  would.
+
 ### Changed
 
 - **`rustsec/audit-check` is pinned to a Node 24 commit**, clearing the last
