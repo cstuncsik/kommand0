@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.27.2] - 2026-09-11
+
 ### Fixed
 
 - **Caps Lock now uppercases typing in embedded sessions** on terminals that
@@ -847,7 +849,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.27.1...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.27.2...HEAD
+[0.27.2]: https://github.com/cstuncsik/kommand0/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/cstuncsik/kommand0/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/cstuncsik/kommand0/compare/v0.26.1...v0.27.0
 [0.26.1]: https://github.com/cstuncsik/kommand0/compare/v0.26.0...v0.26.1
