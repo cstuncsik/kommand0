@@ -1,0 +1,21 @@
+CHANGELOG.md
+  s_d35e7c1d641681::t_45c15b460cc912 8-26
+crates/core/src/git.rs
+  s_d35e7c1d641681::t_461797db641e2d 489-495,536-553,617-625,649-650,652,656-678,1254-1338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9afa72c472ae30a9d4e10deaa215e04ff4cabfad",
+  "prompts": {},
+  "sessions": {
+    "s_d35e7c1d641681": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "737e832a-ff54-44a8-9f59-93787c237415",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
