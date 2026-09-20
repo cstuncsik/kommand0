@@ -5,6 +5,25 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Workspace cleanup can no longer strand a half-removed worktree.** Git deletes
+  a worktree's admin entry *before* it unlinks the files, so a `git worktree
+  remove` that died part-way (an ignored dir whose mode blocks deletion, such as
+  mkcert's `.certs`; a dev server recreating files under it) left a half-deleted
+  tree, a live branch and a still-registered workspace. Every retry then died on
+  the unreadable git status, so there was no way to finish the cleanup from
+  kommand0 at all. Cleanup now tells the two failure shapes apart by re-probing
+  the path instead of guessing: a refusal reports git's own reason (it checks
+  things kommand0's gate does not, such as a dirty submodule) rather than the
+  blanket "it may have changes", and a tree git has already half-deleted, which
+  is unusable and whose tracked content the gate just proved identical to the
+  merged PR tip, is deleted the rest of the way so the workspace can be
+  deregistered. A directory that genuinely cannot be removed is named in the
+  error with the branch left intact, so a retry still works. A directory that was
+  already wreckage when cleanup started is never deleted for you: kommand0 cannot
+  prove what is in it, so it asks.
+
 ## [0.27.2] - 2026-09-11
 
 ### Fixed

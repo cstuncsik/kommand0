@@ -486,6 +486,13 @@ fn pr_supersedes(a: &PrStatus, b: &PrStatus) -> bool {
 /// The worktree is removed WITHOUT `--force` (a last-moment dirty state still
 /// fails safe), and only then is the branch deleted — locally only; the remote
 /// branch is never touched.
+///
+/// A removal that *fails* has two shapes, told apart by [`is_live_worktree`]:
+/// git refused and touched nothing (its own reason is reported, nothing is
+/// deleted), or it died mid-delete after dropping the admin entry, leaving an
+/// unusable half-deleted tree that this finishes deleting. Either way the branch
+/// survives an `Err`, so a retry re-runs every gate: `Ok`/`Err` is the caller's
+/// deregister signal, so a path that deletes the branch must return `Ok`.
 pub fn cleanup_merged_workspace(
     repo_path: &str,
     worktree_path: &str,
@@ -523,6 +530,24 @@ fn is_default_branch(repo_path: &str, branch: &str) -> bool {
             name.strip_prefix("origin/").unwrap_or(&name) == branch
         }
         _ => false,
+    }
+}
+
+/// Whether `worktree_path` is still a worktree git knows about.
+///
+/// The discriminator for a failed `git worktree remove`: git deletes the
+/// `.git/worktrees/<id>` admin entry BEFORE unlinking the files, so a directory
+/// whose `rev-parse` no longer resolves is the wreckage of a half-done removal.
+/// Fails safe in every adjacent shape: a nested independent repo and a plain
+/// subdirectory of a repo both resolve (so both count as live, never wreckage),
+/// and git failing to run at all counts as live too.
+fn is_live_worktree(worktree_path: &str) -> bool {
+    match Command::new("git")
+        .args(["-C", worktree_path, "rev-parse", "--git-dir"])
+        .output()
+    {
+        Ok(o) => o.status.success(),
+        Err(_) => true,
     }
 }
 
@@ -589,6 +614,15 @@ fn cleanup_merged_workspace_with(
     // status on an existing worktree aborts (never assume safe).
     let worktree_exists = std::path::Path::new(worktree_path).exists();
     if worktree_exists {
+        // A dir git no longer recognizes is wreckage from an earlier removal
+        // that died mid-delete: there is no status to read, and nothing here can
+        // prove what survived, so say so rather than dead-end on an unreadable
+        // status (the old message) or delete a path we can't vouch for.
+        if !is_live_worktree(worktree_path) {
+            return Err(format!(
+                "a failed removal left files behind: delete {worktree_path}, then clean up again"
+            ));
+        }
         let st = branch_status(worktree_path)
             .ok_or_else(|| "couldn't read the worktree's git status — not cleaning up".to_string())?;
         if st.dirty {
@@ -612,15 +646,36 @@ fn cleanup_merged_workspace_with(
     }
 
     // Remove the worktree (no --force, so a last-moment dirty state still fails
-    // safe); if it's still there after the attempt, the remove failed — abort.
+    // safe). If the dir survives, which of the two failure shapes it is comes
+    // from re-probing, never from matching git's stderr text.
     if worktree_exists {
-        let _ = Command::new("git")
+        let out = Command::new("git")
             .args(["-C", repo_path, "worktree", "remove", worktree_path])
             .output();
         if std::path::Path::new(worktree_path).exists() {
-            return Err(
-                "couldn't remove the worktree (it may have changes) — not cleaning up".to_string(),
-            );
+            if is_live_worktree(worktree_path) {
+                // Git refused before touching a byte. Report ITS reason: it
+                // checks things this gate doesn't (a dirty submodule, since its
+                // status runs with --ignore-submodules=none).
+                let mut reason = match &out {
+                    Ok(o) => last_line(&o.stderr),
+                    Err(e) => e.to_string(),
+                };
+                if reason.is_empty() {
+                    reason = "it may have changes".to_string();
+                }
+                return Err(format!("couldn't remove the worktree ({reason})"));
+            }
+            // Live at the gate, not live now: git dropped the admin entry and
+            // unlinked an arbitrary subset of the files, so the tree is unusable
+            // and its tracked content was just proven identical to the merged PR
+            // tip. Finish the delete git started; leaving it is what made this
+            // state unrecoverable.
+            if let Err(e) = std::fs::remove_dir_all(worktree_path) {
+                return Err(format!(
+                    "a failed removal left files behind: delete {worktree_path}, then clean up again ({e})"
+                ));
+            }
         }
     }
     // Clean up any stale worktree admin entry (whether we removed it or it was
@@ -1194,6 +1249,91 @@ mod tests {
         gh_pr_stub(&gh, "MERGED", &sha);
         assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
         assert!(!branch_exists(&repo, &branch), "orphaned branch deleted");
+    }
+
+    #[test]
+    fn is_live_worktree_tells_wreckage_from_everything_else() {
+        // The guard the fs fallback rides on: only a dir git has ALREADY stopped
+        // recognizing may be deleted outright, and every adjacent shape has to
+        // land on the protected side.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, _branch, _sha) = repo_with_worktree(tmp.path());
+        assert!(is_live_worktree(wt.to_str().unwrap()), "a linked worktree is live");
+        assert!(is_live_worktree(repo.to_str().unwrap()), "so is the repo itself");
+        let sub = wt.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(is_live_worktree(sub.to_str().unwrap()), "so is a subdir of one");
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-b", "main"]);
+        assert!(is_live_worktree(nested.to_str().unwrap()), "so is an independent repo");
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!is_live_worktree(plain.to_str().unwrap()), "a non-repo dir is not");
+        // The wreckage: admin entry gone, dangling `.git` left behind.
+        std::fs::remove_dir_all(repo.join(".git/worktrees/wt")).unwrap();
+        assert!(!is_live_worktree(wt.to_str().unwrap()), "half-deleted tree is not live");
+    }
+
+    #[test]
+    fn cleanup_names_the_leftovers_of_a_half_deleted_worktree() {
+        // The shape a failed removal leaves behind: git dropped the admin entry
+        // and some files before dying, so the dir has a dangling `.git` and no
+        // readable status. The old code dead-ended here ("couldn't read the
+        // worktree's git status") with no way to finish from kommand0 at all.
+        // It must name what to delete and keep the branch, so the retry works.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        std::fs::remove_dir_all(repo.join(".git/worktrees/wt")).unwrap();
+        std::fs::remove_file(wt.join("a.txt")).unwrap(); // git got this far
+        let gh = tmp.path().join("gh");
+        gh_pr_stub(&gh, "MERGED", &sha);
+        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        assert!(err.contains(wt.to_str().unwrap()), "names the dir to delete: {err}");
+        assert!(wt.exists(), "the leftovers are NOT deleted for us");
+        assert!(branch_exists(&repo, &branch), "branch survives, so a retry can run");
+        // And once the user deletes it, the retry finishes the job.
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
+        assert!(!branch_exists(&repo, &branch), "retry deletes the orphaned branch");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_never_deletes_the_branch_when_the_worktree_survives() {
+        // mkcert-shaped fixture: an IGNORED dir (so kommand0's own dirty gate
+        // passes) whose mode blocks unlinking its contents, so git's remove dies
+        // mid-delete, after dropping the admin entry. Assert the invariant, not
+        // the arm: Ok/Err is the caller's deregister signal, so deleting the
+        // branch while the dir survives would leave a workspace row whose next
+        // cleanup can never resolve a branch tip. Both shapes are legal here: a
+        // root test runner ignores mode 555 and git just succeeds.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        // `info/exclude` lives in the common dir, so it covers the worktree too
+        // (no commit, so the branch tip still matches the stubbed PR).
+        std::fs::write(repo.join(".git/info/exclude"), ".certs/\n").unwrap();
+        std::fs::create_dir_all(wt.join(".certs")).unwrap();
+        std::fs::write(wt.join(".certs/k.pem"), "key").unwrap();
+        std::fs::set_permissions(wt.join(".certs"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let gh = tmp.path().join("gh");
+        gh_pr_stub(&gh, "MERGED", &sha);
+        let res = cleanup(&repo, &wt, &branch, &gh);
+        // Restore before the TempDir drop, or the fixture leaks a temp dir.
+        let _ =
+            std::fs::set_permissions(wt.join(".certs"), std::fs::Permissions::from_mode(0o755));
+        match res {
+            Ok(()) => {
+                assert!(!wt.exists(), "Ok means the dir really is gone");
+                assert!(!branch_exists(&repo, &branch), "Ok deletes the branch");
+            }
+            Err(e) => {
+                assert!(wt.exists(), "Err leaves the leftovers in place: {e}");
+                assert!(branch_exists(&repo, &branch), "Err keeps the branch: {e}");
+                assert!(e.contains("delete") || e.contains("remove"), "actionable: {e}");
+            }
+        }
     }
 
     // --- pr_statuses ---
