@@ -1,0 +1,23 @@
+apps/tui/src/main.rs
+  s_ae507a6f250a33::t_f6749e99d7da76 68-71,895-901,1000-1002,3482-3551,4044-4050,4141-4149,4154,4879-4882,4957-4959,6123-6225,8900-8927
+apps/tui/src/modal.rs
+  s_ae507a6f250a33::t_7956978b118c93 121-127,464-475,544-545,836,1104-1151,1495-1521
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_add_workspace_modal.snap
+  s_ae507a6f250a33::t_80c28f9d2f6766 15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d12d1d3e1d95693dd929c04b28e52da9a55b880d",
+  "prompts": {},
+  "sessions": {
+    "s_ae507a6f250a33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0a9b7884-1045-4938-bf96-e98687a89ded",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
