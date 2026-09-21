@@ -750,6 +750,16 @@ fn is_all_digits(t: &str) -> bool {
     !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Drop an explicit `:<port>` from a URL authority. Shared by both parsers: they
+/// compare their hosts to each other, so a GHES on a nonstandard port has to
+/// read the same way on both sides.
+fn strip_port(host: &str) -> &str {
+    match host.rsplit_once(':') {
+        Some((h, port)) if is_all_digits(port) => h,
+        _ => host,
+    }
+}
+
 fn parse_issue_ref(s: &str) -> Option<ParsedRef<'_>> {
     let bare = s.strip_prefix('#').unwrap_or(s);
     if is_all_digits(bare) {
@@ -767,6 +777,7 @@ fn parse_issue_ref(s: &str) -> Option<ParsedRef<'_>> {
     let head = head.split_once("://").map(|(_, r)| r).unwrap_or(head);
     let mut parts = head.split('/');
     let (host, owner, repo) = (parts.next()?, parts.next()?, parts.next()?);
+    let host = strip_port(host);
     // Exactly host/owner/repo, no empty segment, and no userinfo:
     // `github.com@evil.host/...` reads as github.com but dials evil.host, and a
     // `user:token@` URL must never be echoed into an error or handed to a
@@ -833,11 +844,7 @@ fn origin_slug(repo_dir: &str) -> Option<(String, String)> {
         // so `git@host:2222/o/r` is a PATH and must stay unparseable rather
         // than pin gh to a repo the user didn't name.
         let (host, path) = rest.split_once('/')?;
-        let host = match host.rsplit_once(':') {
-            Some((h, port)) if is_all_digits(port) => h,
-            _ => host,
-        };
-        (host, path)
+        (strip_port(host), path)
     } else {
         rest.split_once([':', '/'])?
     };
@@ -893,8 +900,8 @@ fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
     // Exit 0 = origin's tip is an ancestor of (or equal to) the local branch, so
     // adopting it keeps everything origin has. 128 = a ref is missing (no
     // leftover branch, or no tracking ref), which worktree creation reports.
-    // Only a definite 1 is "behind or diverged".
-    let behind = Command::new("git")
+    // 1 = behind or diverged.
+    let code = Command::new("git")
         .args([
             "-C",
             repo_dir,
@@ -909,9 +916,10 @@ fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
         .stderr(Stdio::null())
         .status()
         .ok()
-        .and_then(|s| s.code())
-        == Some(1);
-    if behind {
+        .and_then(|s| s.code());
+    // No code at all (spawn failed, killed by a signal) answers nothing, so it
+    // must not read as "not behind".
+    if code == Some(1) || code.is_none() {
         return Err(format!(
             "the local branch {branch} is behind or has diverged from origin/{branch}; \
              merge, rebase or rename it, then try again"
@@ -922,8 +930,8 @@ fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
 
 /// Fetch the linked branch, then refuse the two ways adopting it could pick the
 /// wrong commit. Runs after the name gate: the branch reaches a refspec here.
-fn prepare_linked_branch(repo_dir: &str, branch: &str) -> Result<(), String> {
-    fetch_origin_branch(repo_dir, branch)?;
+fn prepare_linked_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(), String> {
+    fetch_origin_branch(repo_dir, branch, gh_bin)?;
     // `create_worktree_from_branch` resolves `refs/remotes/<ref>` BEFORE
     // `refs/remotes/origin/<ref>`, so a linked branch named `alice/fix` would
     // adopt remote `alice`'s `fix` instead. Only an existing ref shadows, hence
@@ -962,37 +970,42 @@ fn origin_fetches(repo_dir: &str, branch: &str) -> bool {
     })
 }
 
+/// Single-quote `s` as one shell word. Git runs a `!`-prefixed credential helper
+/// through `sh`, and kommand0's own state directory can contain a space.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// Refresh `refs/remotes/origin/<branch>` from origin, bounded and
 /// non-interactive. Explicit refspec: a bare `git fetch origin <branch>` leaves
 /// the tracking ref to the configured refspec, and a STALE tracking ref passes
 /// `verify_ref` and silently yields a worktree behind origin.
-fn fetch_origin_branch(repo_dir: &str, branch: &str) -> Result<(), String> {
+fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(), String> {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
     // A `--single-branch` clone maps only its own branch, and `worktree add
     // --track` then dies with "not a branch" on the tracking ref we just
     // fetched. Widen the remote first, unless a refspec already covers it (a
-    // second `set-branches --add` would duplicate the entry).
+    // second `set-branches --add` would duplicate the entry). Best-effort: the
+    // fetch may still work, and its own error is the one worth showing.
     if !origin_fetches(repo_dir, branch) {
-        let _ = Command::new("git")
+        match Command::new("git")
             .args(["-C", repo_dir, "remote", "set-branches", "--add", "origin", branch])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+        {
+            Ok(st) if st.success() => {}
+            Ok(st) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({st})"),
+            Err(e) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({e})"),
+        }
     }
+    let helper = format!("credential.helper=!{} auth git-credential", shell_quote(gh_bin));
     let spawned = Command::new("git")
         // gh authenticates HTTPS through the credential helper it injects, so a
         // private origin + a bare GH_TOKEN fetches only with this. `-c` APPENDS
         // to the helper list, so a user's own helper still runs first, and it's
         // never consulted for an ssh or local origin.
-        .args([
-            "-C",
-            repo_dir,
-            "-c",
-            "credential.helper=!gh auth git-credential",
-            "fetch",
-            "origin",
-            &refspec,
-        ])
+        .args(["-C", repo_dir, "-c", &helper, "fetch", "origin", &refspec])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_SSH_COMMAND", batch_ssh_command())
         .stdin(Stdio::null())
@@ -1087,7 +1100,8 @@ fn issue_branch_with(repo_dir: &str, issue_ref: &str, gh_bin: &str) -> Result<Is
     {
         return Err(format!(
             "can't tell gh which repo to use: origin isn't an owner/repo URL, and gh may \
-             pick the remote {other} instead. Point origin at the repo you mean"
+             pick the remote {other} instead. Point origin at the repo you mean, or check \
+             the linked branch out by name"
         ));
     }
 
@@ -1120,7 +1134,7 @@ fn issue_branch_with(repo_dir: &str, issue_ref: &str, gh_bin: &str) -> Result<Is
         if !is_valid_branch_name(&branch) {
             return Err(format!("gh returned an unusable branch name ({branch:?})"));
         }
-        prepare_linked_branch(repo_dir, &branch)?;
+        prepare_linked_branch(repo_dir, &branch, gh_bin)?;
         return Ok(IssueBranch { branch, reused: true });
     }
 
@@ -1150,7 +1164,7 @@ fn issue_branch_with(repo_dir: &str, issue_ref: &str, gh_bin: &str) -> Result<Is
             "gh returned an unusable branch name ({branch:?}); last output line was {line:?}"
         ));
     }
-    prepare_linked_branch(repo_dir, &branch)?;
+    prepare_linked_branch(repo_dir, &branch, gh_bin)?;
     Ok(IssueBranch { branch, reused: false })
 }
 
@@ -2029,11 +2043,30 @@ mod tests {
             ("a.", false),
             ("a@{0}", false),
             ("a:b", false),
+            ("a^", false),
+            ("a~1", false),
+            ("a?b", false),
+            ("a*b", false),
+            ("a[b", false),
+            ("a\\b", false),
             ("a b", false),
             ("a\u{1}b", false),
         ];
         for (input, want) in cases {
             assert_eq!(is_valid_branch_name(input), *want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn a_gh_path_survives_the_shell_that_runs_the_credential_helper() {
+        // git runs a `!`-prefixed helper through sh, so the path has to come out
+        // the other side byte for byte.
+        for raw in ["/plain/gh", "/with space/gh", "/quote'and$dollar/gh"] {
+            let out = Command::new("sh")
+                .args(["-c", &format!("printf '%s' {}", shell_quote(raw))])
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), raw);
         }
     }
 
@@ -2093,6 +2126,14 @@ mod tests {
                 Some("ssh://git@github.com:443/o/r.git"),
                 url7,
                 &[PIN7],
+                "MARKER-NOPE",
+            ),
+            // Both parsers read `:8443` as a port, so a GHES on a nonstandard
+            // port gates its own issue URL through instead of refusing it.
+            (
+                Some("https://ghe.corp:8443/o/r.git"),
+                "https://ghe.corp:8443/o/r/issues/7",
+                &["issue develop --list --repo ghe.corp/o/r -- 7 [][0][]"],
                 "MARKER-NOPE",
             ),
             // The scp shape has no port, so `:2222/o/r` is a PATH with three
@@ -2320,6 +2361,24 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_checkout_with_a_pinnable_origin_is_not_refused() {
+        // origin + upstream is exactly what the pin is for: gh is told the repo,
+        // so there is nothing left to guess and the lookup must go through.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["remote", "add", "origin", "https://github.com/o/r.git"]);
+        git(&repo, &["remote", "add", "upstream", "https://github.com/up/r.git"]);
+        let gh = tmp.path().join("gh");
+        write_stub(&gh, &format!("#!/bin/sh\n{GH_ARGS_LINE}printf 'MARKER-NOPE\\n' >&2\nexit 1\n"));
+        let err =
+            issue_branch_with(repo.to_str().unwrap(), "123", gh.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("MARKER-NOPE"), "gh ran and its own failure surfaced: {err}");
+        assert_eq!(gh_args(&gh), ["issue develop --list --repo github.com/o/r -- 123 [][0][]"]);
+    }
+
+    #[test]
     fn a_single_branch_clone_still_adopts_the_linked_branch() {
         // `clone --single-branch` maps one branch, so the tracking ref we fetch
         // is covered by no refspec and `worktree add --track` dies with
@@ -2346,6 +2405,19 @@ mod tests {
         let dir = clone.to_str().unwrap();
         let got = issue_branch_with(dir, "123", gh.to_str().unwrap()).unwrap();
         assert_eq!(got.branch, "123-linked");
+
+        // Widening writes to the user's config, so a repeat create must not
+        // append the same refspec again.
+        issue_branch_with(dir, "123", gh.to_str().unwrap()).unwrap();
+        let fetch = Command::new("git")
+            .args(["-C", dir, "config", "--get-all", "remote.origin.fetch"])
+            .output()
+            .unwrap();
+        let added = String::from_utf8_lossy(&fetch.stdout)
+            .lines()
+            .filter(|l| l.contains("123-linked"))
+            .count();
+        assert_eq!(added, 1, "one refspec for the linked branch, not one per create");
 
         match crate::worktree::create_worktree_from_branch(
             dir,

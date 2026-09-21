@@ -15,7 +15,9 @@ All notable changes to kommand0 are documented here. The format is based on
   Esc out of, and every failure reports gh's own reason rather than quietly forking a
   local branch. gh is pinned to `origin` whenever its URL names a repo; where it doesn't
   and another remote could be picked instead, kommand0 refuses rather than write to a repo
-  you didn't name.
+  you didn't name. On a `--single-branch` clone the linked branch is outside `origin`'s
+  refspec, so kommand0 adds it to `remote.origin.fetch` in your repo's git config: one
+  line per issue branch, left in place afterwards.
 
 ### Changed
 

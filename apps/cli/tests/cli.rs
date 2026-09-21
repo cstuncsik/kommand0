@@ -50,6 +50,19 @@ fn kmd_at(cwd: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     cmd.output().unwrap()
 }
 
+/// Put a `git` shim first on PATH for a child process: `body` runs, then the
+/// real git. Returns the PATH value to pass in the child's env (per-child, so
+/// this stays hermetic and parallel-safe).
+fn git_shim(dir: &Path, body: &str) -> String {
+    // Resolve the real git BEFORE the shim shadows it, or the shim exec's itself.
+    let out = Command::new("sh").args(["-c", "command -v git"]).output().unwrap();
+    let real_git = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!real_git.is_empty(), "no git on PATH");
+    std::fs::create_dir_all(dir).unwrap();
+    write_stub(&dir.join("git"), &format!("#!/bin/sh\n{body}\nexec {real_git} \"$@\"\n"));
+    format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default())
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
@@ -313,6 +326,96 @@ fn workspace_create_from_an_issue() {
             "{extra:?}: names the branch it created: {err}"
         );
     }
+}
+
+#[test]
+fn the_linked_branch_fetch_never_asks_for_credentials() {
+    // A PATH shim records how kommand0 actually invokes git: the fetch carries
+    // gh's credential helper (a private HTTPS origin authenticated only by a
+    // GH_TOKEN fetches with nothing else), and neither git nor ssh may fall back
+    // to a prompt, which off the UI thread would hang past the timeout.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\nif [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n  git push -q origin HEAD:refs/heads/123-add-thing\n  printf 'github.com/o/r/tree/123-add-thing\\n'\n  exit 0\nfi\nexit 1\n",
+    );
+
+    let log = tmp.path().join("git.log");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!(
+            "printf '%s [%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
+             \"${{GIT_SSH_COMMAND-UNSET}}\" >> \"{}\"",
+            log.display()
+        ),
+    );
+
+    let out = kmd(
+        &state,
+        &[
+            ("KOMMAND0_GH_BIN", gh.to_str().unwrap()),
+            ("PATH", &path),
+            // A user's own GIT_SSH_COMMAND must survive, with batch mode added.
+            ("GIT_SSH_COMMAND", "ssh -F /dev/null"),
+        ],
+        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "create --issue: {}", String::from_utf8_lossy(&out.stderr));
+
+    let recorded = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = recorded.lines().collect();
+    let fetch = lines
+        .iter()
+        .position(|l| l.contains("fetch origin +refs/heads/123-add-thing:"))
+        .unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}"));
+    assert!(
+        lines[fetch]
+            .contains(&format!("-c credential.helper=!'{}' auth git-credential", gh.display())),
+        "the fetch authenticates through the gh we were told to use: {}",
+        lines[fetch]
+    );
+    assert!(
+        lines[fetch].ends_with("[0][ssh -F /dev/null -oBatchMode=yes]"),
+        "no terminal prompt, and batch mode is appended to the user's ssh command: {}",
+        lines[fetch]
+    );
+    let is_ancestor = lines
+        .iter()
+        .position(|l| l.contains("merge-base --is-ancestor"))
+        .unwrap_or_else(|| panic!("no local-branch check in:\n{recorded}"));
+    assert!(fetch < is_ancestor, "the local branch is judged against a fresh origin ref");
+}
+
+#[test]
+fn refuses_the_linked_branch_when_the_local_branch_check_cannot_answer() {
+    // A leftover local branch is adopted over the fetched ref, so kommand0 only
+    // adopts one that already contains origin's tip. When the check itself dies
+    // (here: killed by a signal) it has proved nothing, and adopting anyway
+    // would silently drop what origin has.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\nif [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n  git push -q origin HEAD:refs/heads/123-add-thing\n  printf 'github.com/o/r/tree/123-add-thing\\n'\n  exit 0\nfi\nexit 1\n",
+    );
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        "case \"$*\" in\n  *\"merge-base --is-ancestor\"*) kill -9 $$ ;;\nesac",
+    );
+
+    let out = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap()), ("PATH", &path)],
+        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(!out.status.success(), "an unanswered check must not adopt the branch");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("behind or has diverged"), "{err}");
 }
 
 #[test]

@@ -131,7 +131,10 @@ as not found. An issue **URL** must point at that same `origin` repo. If `origin
 isn't an `owner/repo` URL (a local path, or no `origin` at all) there is nothing
 to pin to, so kommand0 refuses URL refs, and leaves the targeting to gh only
 while `origin` is the sole remote: with another remote configured it refuses
-outright rather than let gh pick one.
+outright rather than let gh pick one. On a `--single-branch` clone the linked
+branch falls outside `origin`'s refspec, so kommand0 adds it to
+`remote.origin.fetch` in the repo's git config: one line per issue branch, left
+in place afterwards even if the branch is then refused.
 
 > Replace `kmd` with `cargo run -p kommand0-cli --` during development.
 
