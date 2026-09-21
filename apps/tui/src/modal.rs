@@ -1106,7 +1106,9 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             frame.render_widget(Clear, area);
 
             let inner = Layout::vertical([
-                Constraint::Length(2), // message
+                // Three rows, not two: at 80 columns the first line wraps, and
+                // the remote-write notice below it must not be pushed out.
+                Constraint::Length(3), // message
                 Constraint::Min(0),   // spacer
                 Constraint::Length(1), // footer
             ])

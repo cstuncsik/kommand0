@@ -25,7 +25,7 @@ fn is_git_repo(repo_path: &str) -> bool {
 /// exists in the repo. Uses `show-ref --verify` (exact ref lookup), not
 /// `rev-parse` (which applies revision syntax, so e.g. `main^{commit}` would
 /// false-positively resolve).
-fn verify_ref(repo_path: &str, full_ref: &str) -> bool {
+pub(crate) fn verify_ref(repo_path: &str, full_ref: &str) -> bool {
     Command::new("git")
         .args(["-C", repo_path, "show-ref", "--verify", "--quiet", full_ref])
         .stdout(std::process::Stdio::null())

@@ -3515,11 +3515,16 @@ impl App {
     fn finish_issue_resolve(&mut self, req: u64, result: Result<kommand0_core::IssueBranch, String>) {
         // Stale reply (Esc stopped the wait, or a newer request superseded it):
         // drop it BEFORE clearing the latch, showing an error, or creating
-        // anything. Log the branch: a cancelled request may already have created
-        // one on origin, and this is the only record of which.
+        // anything. Log the outcome either way: a cancelled request may already
+        // have created a branch on origin (or failed naming one), and this is
+        // the only record of it.
         if self.issue_req != Some(req) {
-            if let Ok(b) = &result {
-                tracing::info!("dropping a stale issue resolve (req {req}): branch {}", b.branch);
+            match &result {
+                Ok(b) => tracing::info!(
+                    "dropping a stale issue resolve (req {req}): branch {}",
+                    b.branch
+                ),
+                Err(e) => tracing::info!("dropping a stale issue resolve (req {req}): {e}"),
             }
             return;
         }
@@ -3532,9 +3537,13 @@ impl App {
             }
             other => {
                 // Defensive: some other modal replaced ours without clearing the
-                // latch. Log the branch for the same reason as above.
-                if let Ok(b) = &result {
-                    tracing::info!("discarding a resolved issue branch (req {req}): {}", b.branch);
+                // latch. Log the outcome for the same reason as above.
+                match &result {
+                    Ok(b) => tracing::info!(
+                        "discarding a resolved issue branch (req {req}): {}",
+                        b.branch
+                    ),
+                    Err(e) => tracing::info!("discarding a failed issue resolve (req {req}): {e}"),
                 }
                 self.modal = other;
                 return;
@@ -6171,6 +6180,7 @@ mod key_tests {
         app.modal = add_workspace_modal_for("real", "1");
         press(&mut app, KeyCode::Enter).await;
         press(&mut app, KeyCode::Esc).await;
+        assert!(app.issue_req.is_none(), "Esc releases the latch");
         app.modal = add_workspace_modal_for("real", "1");
         press(&mut app, KeyCode::Enter).await;
 
@@ -8910,6 +8920,24 @@ mod key_tests {
         assert!(text.contains("real"), "names the repo whose origin is targeted:\n{text}");
         // The only thing telling the user Esc doesn't undo the remote write.
         assert!(text.contains("stop waiting"), "footer:\n{text}");
+        // The only pre-hoc notice that this writes to origin.
+        assert!(text.contains("may create a new linked branch"), "warns:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn the_resolving_modal_still_warns_at_80_columns() {
+        // The modal is 55% wide, so at 80 columns the inner paragraph is 40
+        // wide and this first line (41 chars) wraps: with a 2-row message the
+        // remote-write notice below it fell off screen.
+        let mut app = test_app();
+        app.modal = modal::ModalState::ResolvingIssue {
+            repo_id: "real".into(),
+            repo_name: "kommand0".into(),
+            issue: "123".into(),
+        };
+        let text = render_to_string(&mut app, 80, 30);
+        assert!(text.contains("may create a new linked branch"), "warns at 80 columns:\n{text}");
+        assert!(text.contains("stop waiting"), "footer survives:\n{text}");
     }
 
     #[tokio::test]

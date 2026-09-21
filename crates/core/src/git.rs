@@ -281,6 +281,17 @@ fn wait_bounded(child: std::process::Child) -> std::io::Result<std::process::Out
     }
 }
 
+/// `GIT_SSH_COMMAND` with batch mode appended: `GIT_TERMINAL_PROMPT` and a null
+/// stdin do NOT stop ssh asking for a key passphrase on /dev/tty, which from the
+/// TUI's worker thread would write into the alt-screen and outlive the timeout.
+/// Appends rather than clobbers, so a user's configured command survives (a
+/// repo-level `core.sshCommand` is still overridden).
+fn batch_ssh_command() -> String {
+    std::env::var("GIT_SSH_COMMAND")
+        .map(|v| format!("{v} -oBatchMode=yes"))
+        .unwrap_or_else(|_| "ssh -oBatchMode=yes".to_string())
+}
+
 /// Run `gh <args>` in `cwd`, non-interactively (no prompts, no tty read, no
 /// pager, no update notifier). Bounded by a wall-clock timeout because `gh` is a
 /// network call: a caller off the UI thread guards a latch on this returning, and
@@ -309,6 +320,12 @@ fn run_gh(gh_bin: &str, cwd: &str, args: &[&str]) -> std::io::Result<std::proces
             // which repo we read a PR from or create a branch on. An empty
             // value reads as unset.
             .env("GH_REPO", "")
+            // `gh issue develop` runs its own `git fetch`, which inherits this
+            // environment: without it an encrypted ssh key that isn't in the
+            // agent blocks on a /dev/tty prompt, pinning a TUI worker thread
+            // past the timeout.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", batch_ssh_command())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -580,8 +597,9 @@ fn cleanup_merged_workspace_with(
     // REINTERPRETS it as a range (the tip check below would fail-closed only by
     // output shape, not by rejection); a leading `-` can't come from a validated
     // workspace name but an adopted ref could carry one.
-    check_branch_name(branch)
-        .map_err(|_| "refusing to delete a malformed branch name".to_string())?;
+    if !is_valid_branch_name(branch) {
+        return Err("refusing to delete a malformed branch name".to_string());
+    }
     // Trunk protection — the one branch cleanup must never delete, however the
     // workspace came to sit on it.
     if is_default_branch(repo_path, branch) {
@@ -728,13 +746,13 @@ struct ParsedRef<'a> {
     target: Option<(String, String)>,
 }
 
-fn digits(t: &str) -> bool {
+fn is_all_digits(t: &str) -> bool {
     !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn parse_issue_ref(s: &str) -> Option<ParsedRef<'_>> {
     let bare = s.strip_prefix('#').unwrap_or(s);
-    if digits(bare) {
+    if is_all_digits(bare) {
         return Some(ParsedRef { number: bare, target: None });
     }
     // URL shape: [scheme://]<host>/<owner>/<repo>/issues/<number>[/][?..|#..]
@@ -743,7 +761,7 @@ fn parse_issue_ref(s: &str) -> Option<ParsedRef<'_>> {
     // rsplit: the LAST `/issues/` is the separator, so an owner or repo
     // literally named `issues` doesn't shadow it.
     let (head, number) = s.rsplit_once("/issues/")?;
-    if !digits(number) {
+    if !is_all_digits(number) {
         return None;
     }
     let head = head.split_once("://").map(|(_, r)| r).unwrap_or(head);
@@ -782,8 +800,8 @@ pub fn is_issue_ref(s: &str) -> bool {
 
 /// `(host, "owner/repo")` of `origin`'s URL, lowercased. `None` when there's no
 /// origin, or its URL isn't `host` + `owner/repo` (a local-path remote, which is
-/// what most tests use; a `host:port` remote also lands here). Deliberately
-/// never returns or logs the raw URL: it can carry a token.
+/// what most tests use). Deliberately never returns or logs the raw URL: it can
+/// carry a token.
 ///
 /// `git remote get-url` expands `url.<base>.insteadOf`, so a rewritten remote
 /// resolves correctly; a bare ~/.ssh/config `Host` alias cannot be expanded by
@@ -800,10 +818,29 @@ fn origin_slug(repo_dir: &str) -> Option<(String, String)> {
     let url = url.trim();
     let url = url.strip_suffix('/').unwrap_or(url);
     let url = url.strip_suffix(".git").unwrap_or(url);
-    // `https://host/o/r`, `ssh://git@host/o/r`, and the scp shape `git@host:o/r`.
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    // `https://host/o/r`, `ssh://git@host[:port]/o/r`, and the scp shape
+    // `git@host:o/r`.
+    let (schemed, rest) = match url.split_once("://") {
+        Some((_, r)) => (true, r),
+        None => (false, url),
+    };
     let rest = rest.rsplit_once('@').map(|(_, r)| r).unwrap_or(rest); // drop userinfo
-    let (host, path) = rest.split_once([':', '/'])?;
+    let (host, path) = if schemed {
+        // With a scheme the path separator is always `/`, so a trailing
+        // `:<digits>` on the authority is a port: GitHub documents
+        // `ssh://git@ssh.github.com:443/o/r` for SSH over 443, and gh itself
+        // normalises that host. In the scp shape `host:path` there is no port,
+        // so `git@host:2222/o/r` is a PATH and must stay unparseable rather
+        // than pin gh to a repo the user didn't name.
+        let (host, path) = rest.split_once('/')?;
+        let host = match host.rsplit_once(':') {
+            Some((h, port)) if is_all_digits(port) => h,
+            _ => host,
+        };
+        (host, path)
+    } else {
+        rest.split_once([':', '/'])?
+    };
     let mut parts = path.split('/');
     let (owner, repo) = (parts.next()?, parts.next()?);
     if parts.next().is_some() || host.is_empty() || owner.is_empty() || repo.is_empty() {
@@ -815,15 +852,25 @@ fn origin_slug(repo_dir: &str) -> Option<(String, String)> {
     ))
 }
 
-/// Reject a branch name kommand0 must not interpolate into a refspec or hand to
+/// The name of the first remote that isn't `origin`, if there is one.
+fn other_remote(repo_dir: &str) -> Option<String> {
+    let out = Command::new("git").args(["-C", repo_dir, "remote"]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|r| !r.is_empty() && *r != "origin")
+        .map(str::to_string)
+}
+
+/// Whether a branch name is safe to interpolate into a refspec or hand to
 /// `git worktree add`. Shared by the issue resolver (names come from the remote)
 /// and by [`cleanup_merged_workspace_with`] (names come from state, possibly
 /// adopted). Not a full `git check-ref-format`: the point is that everything
 /// reaching a refspec, a `-`-leading argv slot or `create_worktree_from_branch`
 /// is boring. A `-evil` branch name really does create a junk tracking ref, and
 /// `refs/heads/a..b` REINTERPRETS as a range.
-fn check_branch_name(branch: &str) -> Result<(), String> {
-    let bad = branch.is_empty()
+fn is_valid_branch_name(branch: &str) -> bool {
+    !(branch.is_empty()
         || branch.starts_with('-')
         || branch.starts_with('/')
         || branch.ends_with('/')
@@ -832,41 +879,7 @@ fn check_branch_name(branch: &str) -> Result<(), String> {
         || branch.contains("..")
         || branch.contains("@{")
         || branch.contains(['~', '^', ':', '?', '*', '[', '\\'])
-        || branch.chars().any(|c| c.is_whitespace() || c.is_control());
-    if bad {
-        // `{:?}` escapes control characters.
-        return Err(format!("unusable branch name ({branch:?})"));
-    }
-    Ok(())
-}
-
-/// The shared syntax gate plus the one rule specific to a name coming from the
-/// remote: `origin/x` is a legal local branch name (hence not in
-/// [`check_branch_name`], whose other consumer is cleanup), but as an adopt ref
-/// it hits `create_worktree_from_branch`'s `refs/remotes/<ref>` arm and silently
-/// adopts the UNRELATED branch `x`.
-fn check_linked_branch(branch: &str) -> Result<(), String> {
-    check_branch_name(branch)?;
-    if branch.starts_with("origin/") {
-        return Err(format!("unusable branch name ({branch:?})"));
-    }
-    Ok(())
-}
-
-/// The OID a fully-qualified ref points at, or `None` if it doesn't exist.
-/// `show-ref --verify` (exact ref lookup), never `rev-parse`: rev-parse applies
-/// revision SYNTAX, so `refs/heads/main^` resolves to the PARENT and exits 0.
-fn show_ref_oid(repo_dir: &str, full_ref: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["-C", repo_dir, "show-ref", "--verify", full_ref])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    // Output is `<oid> <ref>`.
-    let line = last_line(&out.stdout);
-    Some(line.split_whitespace().next()?.to_string())
+        || branch.chars().any(|c| c.is_whitespace() || c.is_control()))
 }
 
 /// `create_worktree_from_branch` tries `refs/heads/<branch>` FIRST, so a
@@ -876,38 +889,77 @@ fn show_ref_oid(repo_dir: &str, full_ref: &str) -> Option<String> {
 /// already contains origin's tip. Refuse only when it is behind or genuinely
 /// diverged, where adopting it would silently drop what origin (and the linked
 /// branch) has.
-///
-/// Returning `origin/<branch>` as the adopt ref is NOT the alternative:
-/// `worktree add --track -b` then fails whenever an identical local branch
-/// exists, which is the common benign case.
 fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
-    let local_ref = format!("refs/heads/{branch}");
-    let Some(local) = show_ref_oid(repo_dir, &local_ref) else { return Ok(()) };
-    let remote_ref = format!("refs/remotes/origin/{branch}");
-    // No tracking ref: let worktree creation report it.
-    let Some(remote) = show_ref_oid(repo_dir, &remote_ref) else { return Ok(()) };
-    if local == remote {
-        return Ok(());
-    }
-    // Local contains origin's tip => ahead. Adopting it keeps the user's work
-    // AND everything origin has, which is exactly the re-create-after-delete case.
-    let ahead = Command::new("git")
-        .args(["-C", repo_dir, "merge-base", "--is-ancestor", &remote_ref, &local_ref])
-        // Null both: a `fatal:` here (the ref is deleted between show_ref_oid
-        // and this call) would otherwise be written straight onto the TUI's alt
-        // screen from the worker thread.
+    // Exit 0 = origin's tip is an ancestor of (or equal to) the local branch, so
+    // adopting it keeps everything origin has. 128 = a ref is missing (no
+    // leftover branch, or no tracking ref), which worktree creation reports.
+    // Only a definite 1 is "behind or diverged".
+    let behind = Command::new("git")
+        .args([
+            "-C",
+            repo_dir,
+            "merge-base",
+            "--is-ancestor",
+            &format!("refs/remotes/origin/{branch}"),
+            &format!("refs/heads/{branch}"),
+        ])
+        // Null both: a `fatal:` for a missing ref would otherwise be written
+        // straight onto the TUI's alt screen from the worker thread.
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ahead {
-        return Ok(());
+        .ok()
+        .and_then(|s| s.code())
+        == Some(1);
+    if behind {
+        return Err(format!(
+            "the local branch {branch} is behind or has diverged from origin/{branch}; \
+             merge, rebase or rename it, then try again"
+        ));
     }
-    Err(format!(
-        "the local branch {branch} is behind or has diverged from origin/{branch}; \
-         merge, rebase or rename it, then try again"
-    ))
+    Ok(())
+}
+
+/// Fetch the linked branch, then refuse the two ways adopting it could pick the
+/// wrong commit. Runs after the name gate: the branch reaches a refspec here.
+fn prepare_linked_branch(repo_dir: &str, branch: &str) -> Result<(), String> {
+    fetch_origin_branch(repo_dir, branch)?;
+    // `create_worktree_from_branch` resolves `refs/remotes/<ref>` BEFORE
+    // `refs/remotes/origin/<ref>`, so a linked branch named `alice/fix` would
+    // adopt remote `alice`'s `fix` instead. Only an existing ref shadows, hence
+    // a lookup rather than a rule against `/`: the names GitHub generates are
+    // full of slashes once a repo uses prefixes.
+    if crate::worktree::verify_ref(repo_dir, &format!("refs/remotes/{branch}")) {
+        return Err(format!(
+            "the linked branch {branch} is shadowed by the remote-tracking ref \
+             refs/remotes/{branch}; check out origin/{branch} explicitly instead"
+        ));
+    }
+    refuse_diverged_local(repo_dir, branch)
+}
+
+/// Whether a configured `remote.origin.fetch` refspec already maps
+/// `refs/heads/<branch>` into the local ref space. False for a `--single-branch`
+/// clone asked about any other branch.
+fn origin_fetches(repo_dir: &str, branch: &str) -> bool {
+    let Ok(out) = Command::new("git")
+        .args(["-C", repo_dir, "config", "--get-all", "remote.origin.fetch"])
+        .output()
+    else {
+        return false;
+    };
+    let want = format!("refs/heads/{branch}");
+    String::from_utf8_lossy(&out.stdout).lines().any(|spec| {
+        let src = spec.trim().trim_start_matches('+').split(':').next().unwrap_or_default();
+        match src.split_once('*') {
+            Some((pre, post)) => {
+                want.len() >= pre.len() + post.len()
+                    && want.starts_with(pre)
+                    && want.ends_with(post)
+            }
+            None => src == want,
+        }
+    })
 }
 
 /// Refresh `refs/remotes/origin/<branch>` from origin, bounded and
@@ -916,17 +968,33 @@ fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
 /// `verify_ref` and silently yields a worktree behind origin.
 fn fetch_origin_branch(repo_dir: &str, branch: &str) -> Result<(), String> {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    // GIT_TERMINAL_PROMPT + null stdin do NOT stop ssh asking for a key
-    // passphrase on /dev/tty; from the TUI's worker thread that would write into
-    // the alt-screen. Append rather than clobber, so a user's configured command
-    // survives (a repo-level core.sshCommand is still overridden).
-    let ssh = std::env::var("GIT_SSH_COMMAND")
-        .map(|v| format!("{v} -oBatchMode=yes"))
-        .unwrap_or_else(|_| "ssh -oBatchMode=yes".to_string());
+    // A `--single-branch` clone maps only its own branch, and `worktree add
+    // --track` then dies with "not a branch" on the tracking ref we just
+    // fetched. Widen the remote first, unless a refspec already covers it (a
+    // second `set-branches --add` would duplicate the entry).
+    if !origin_fetches(repo_dir, branch) {
+        let _ = Command::new("git")
+            .args(["-C", repo_dir, "remote", "set-branches", "--add", "origin", branch])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     let spawned = Command::new("git")
-        .args(["-C", repo_dir, "fetch", "origin", &refspec])
+        // gh authenticates HTTPS through the credential helper it injects, so a
+        // private origin + a bare GH_TOKEN fetches only with this. `-c` APPENDS
+        // to the helper list, so a user's own helper still runs first, and it's
+        // never consulted for an ssh or local origin.
+        .args([
+            "-C",
+            repo_dir,
+            "-c",
+            "credential.helper=!gh auth git-credential",
+            "fetch",
+            "origin",
+            &refspec,
+        ])
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", ssh)
+        .env("GIT_SSH_COMMAND", batch_ssh_command())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1008,9 +1076,20 @@ fn issue_branch_with(repo_dir: &str, issue_ref: &str, gh_bin: &str) -> Result<Is
     // create and link a branch on UPSTREAM, and the worktree add would then die
     // with "branch not found" after an irreversible remote write. Derived from
     // `origin` ONLY, never from the pasted URL; the host prefix keeps GHES
-    // working. No origin (or a local-path / `host:port` one) means no pin, and
-    // gh infers as it does today.
+    // working. A local-path origin (or none at all) means no pin, and gh infers
+    // as it does today.
     let pin = origin.as_ref().map(|(h, s)| format!("{h}/{s}"));
+    // Unpinned, gh only infers safely while `origin` is its sole candidate, so
+    // bail before the first call rather than after the remote write. Origin's URL
+    // stays out of the message: it can carry a token.
+    if pin.is_none()
+        && let Some(other) = other_remote(repo_dir)
+    {
+        return Err(format!(
+            "can't tell gh which repo to use: origin isn't an owner/repo URL, and gh may \
+             pick the remote {other} instead. Point origin at the repo you mean"
+        ));
+    }
 
     let mut args: Vec<&str> = vec!["issue", "develop", "--list"];
     if let Some(p) = &pin {
@@ -1037,9 +1116,11 @@ fn issue_branch_with(repo_dir: &str, issue_ref: &str, gh_bin: &str) -> Result<Is
     }
     if let Some(row) = rows.first() {
         let branch = row.split_whitespace().next().unwrap_or("").to_string();
-        check_linked_branch(&branch).map_err(|e| format!("gh returned an {e}"))?;
-        fetch_origin_branch(repo_dir, &branch)?;
-        refuse_diverged_local(repo_dir, &branch)?;
+        // `{:?}` escapes control characters.
+        if !is_valid_branch_name(&branch) {
+            return Err(format!("gh returned an unusable branch name ({branch:?})"));
+        }
+        prepare_linked_branch(repo_dir, &branch)?;
         return Ok(IssueBranch { branch, reused: true });
     }
 
@@ -1064,10 +1145,12 @@ fn issue_branch_with(repo_dir: &str, issue_ref: &str, gh_bin: &str) -> Result<Is
     // what gh just made on origin.
     let line = last_line(&out.stdout);
     let branch = line.rsplit_once("/tree/").map(|(_, b)| b.trim().to_string()).unwrap_or_default();
-    check_linked_branch(&branch)
-        .map_err(|e| format!("gh returned an {e}; last output line was {line:?}"))?;
-    fetch_origin_branch(repo_dir, &branch)?;
-    refuse_diverged_local(repo_dir, &branch)?;
+    if !is_valid_branch_name(&branch) {
+        return Err(format!(
+            "gh returned an unusable branch name ({branch:?}); last output line was {line:?}"
+        ));
+    }
+    prepare_linked_branch(repo_dir, &branch)?;
     Ok(IssueBranch { branch, reused: false })
 }
 
@@ -1931,6 +2014,30 @@ mod tests {
     }
 
     #[test]
+    fn branch_names_git_could_reinterpret_are_rejected() {
+        // Slashes are fine: a linked branch is routinely `feat/123-x`, and the
+        // reuse path has to accept whatever name the existing branch carries.
+        let cases: &[(&str, bool)] = &[
+            ("123-fix-it", true),
+            ("kommand0/legacy", true),
+            ("", false),
+            ("-evil", false),
+            ("a..b", false),
+            ("a/", false),
+            ("/a", false),
+            ("a//b", false),
+            ("a.", false),
+            ("a@{0}", false),
+            ("a:b", false),
+            ("a b", false),
+            ("a\u{1}b", false),
+        ];
+        for (input, want) in cases {
+            assert_eq!(is_valid_branch_name(input), *want, "{input:?}");
+        }
+    }
+
+    #[test]
     fn issue_branch_pins_gh_to_origin_and_gates_urls() {
         const PIN7: &str = "issue develop --list --repo github.com/o/r -- 7 [][0][]";
         let url7 = "https://github.com/o/r/issues/7";
@@ -1957,6 +2064,22 @@ mod tests {
                 &["issue develop --list --repo github.com/owner/repo -- 7 [][0][]"],
                 "MARKER-NOPE",
             ),
+            // GHES: the host prefix is what keeps a non-github.com install
+            // working, so the pin must carry it.
+            (
+                Some("https://ghe.corp/o/r.git"),
+                "https://ghe.corp/o/r/issues/7",
+                &["issue develop --list --repo ghe.corp/o/r -- 7 [][0][]"],
+                "MARKER-NOPE",
+            ),
+            // `#123` is handed to gh as bare digits: the `#` is a fragment
+            // marker in a URL and a comment character in a shell.
+            (
+                Some("https://github.com/o/r.git"),
+                "#123",
+                &["issue develop --list --repo github.com/o/r -- 123 [][0][]"],
+                "MARKER-NOPE",
+            ),
             (
                 Some("https://github.com/o/r.git"),
                 "https://github.com/other/repo/issues/7",
@@ -1964,9 +2087,17 @@ mod tests {
                 mismatch,
             ),
             (None, url7, &[], "Pass the issue number instead"),
-            // A `host:port` origin isn't an owner/repo URL either, so there is
-            // nothing to gate the URL against and nothing to pin gh to.
-            (Some("ssh://git@github.com:2222/o/r.git"), url7, &[], "Pass the issue number instead"),
+            // An explicit port belongs to the host (GitHub documents SSH over
+            // 443), so the pin survives it.
+            (
+                Some("ssh://git@github.com:443/o/r.git"),
+                url7,
+                &[PIN7],
+                "MARKER-NOPE",
+            ),
+            // The scp shape has no port, so `:2222/o/r` is a PATH with three
+            // segments: not an owner/repo URL, nothing to gate or pin.
+            (Some("git@github.com:2222/o/r.git"), url7, &[], "Pass the issue number instead"),
             (
                 Some("https://user:token@github.com/o/r.git"),
                 "https://github.com/other/repo/issues/7",
@@ -2057,6 +2188,9 @@ mod tests {
         // fragment). The only coverage `check_linked_branch` gets.
         let rows: &[(&str, Result<&str, &str>)] = &[
             ("github.com/o/r/tree/123-fix-it\n", Ok("123-fix-it")),
+            // A slash is legal in a linked branch name, and common once a repo
+            // uses prefixes.
+            ("github.com/o/r/tree/feat/123-fix-it\n", Ok("feat/123-fix-it")),
             // The LAST `/tree/` separates, so a repo named `tree` still parses.
             ("github.com/o/tree/tree/123-fix-it\n", Ok("123-fix-it")),
             ("github.com/o/r/tree/-evil\n", Err("unusable branch name")),
@@ -2067,7 +2201,9 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             let (origin, clone) = issue_fixture(tmp.path());
             // gh would have created this on origin; the Err rows never get here.
-            git(&origin, &["branch", "123-fix-it", "HEAD"]);
+            if let Ok(branch) = want {
+                git(&origin, &["branch", branch, "HEAD"]);
+            }
             let gh = tmp.path().join("gh");
             gh_issue_stub(&gh, "", stdout);
             let got = issue_branch_with(clone.to_str().unwrap(), "123", gh.to_str().unwrap());
@@ -2121,7 +2257,12 @@ mod tests {
             git(&origin, &["commit", "-m", "b"]);
             let b = rev_parse(&origin, "HEAD");
             git(&origin, &["branch", "123-linked", &b]);
-            git(&clone, &["fetch", "origin"]);
+            // "behind" deliberately leaves the tracking ref absent: the refusal
+            // can then only come from the fetch having run FIRST, which is the
+            // whole reason the fetch is unconditional.
+            if case != "behind" {
+                git(&clone, &["fetch", "origin"]);
+            }
             match case {
                 "at origin" => git(&clone, &["branch", "123-linked", &b]),
                 // The routine case: a deleted workspace left its branch behind
@@ -2152,6 +2293,111 @@ mod tests {
                 assert!(err.contains("origin/123-linked"), "{case}: {err}");
             }
         }
+    }
+
+    #[test]
+    fn an_unpinnable_origin_next_to_another_remote_refuses_before_gh_runs() {
+        // Unpinned, gh scores every remote and `upstream` beats `origin`, so in a
+        // fork checkout the create would land on a repo the user never named.
+        // Refuse while nothing has been written yet.
+        for with_origin in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git(&repo, &["init", "-b", "main"]);
+            if with_origin {
+                // A local path: a real remote, but not an owner/repo URL.
+                git(&repo, &["remote", "add", "origin", tmp.path().to_str().unwrap()]);
+            }
+            git(&repo, &["remote", "add", "upstream", "https://github.com/o/r.git"]);
+            let gh = tmp.path().join("gh");
+            write_stub(&gh, &format!("#!/bin/sh\n{GH_ARGS_LINE}exit 0\n"));
+            let err = issue_branch_with(repo.to_str().unwrap(), "123", gh.to_str().unwrap())
+                .unwrap_err();
+            assert!(err.contains("upstream"), "names the remote gh might pick: {err}");
+            assert!(gh_args(&gh).is_empty(), "origin {with_origin}: gh never ran");
+        }
+    }
+
+    #[test]
+    fn a_single_branch_clone_still_adopts_the_linked_branch() {
+        // `clone --single-branch` maps one branch, so the tracking ref we fetch
+        // is covered by no refspec and `worktree add --track` dies with
+        // "not a branch": the linked branch must be added to the remote first.
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_repo(&origin);
+        git(&origin, &["branch", "123-linked", "HEAD"]);
+        let clone = tmp.path().join("clone");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let gh = tmp.path().join("gh");
+        gh_issue_stub(&gh, "123-linked\thttps://github.com/o/r/tree/123-linked\n", "");
+        let dir = clone.to_str().unwrap();
+        let got = issue_branch_with(dir, "123", gh.to_str().unwrap()).unwrap();
+        assert_eq!(got.branch, "123-linked");
+
+        match crate::worktree::create_worktree_from_branch(
+            dir,
+            "repo",
+            "ws",
+            &tmp.path().join("state"),
+            &got.branch,
+        ) {
+            crate::worktree::WorktreeResult::Created { branch_name, .. } => {
+                assert_eq!(branch_name, "123-linked", "adopted the linked branch")
+            }
+            crate::worktree::WorktreeResult::Fallback { reason } => {
+                panic!("the adopt must succeed: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_linked_branch_shadowed_by_a_remote_tracking_ref_is_refused() {
+        // `alice/fix` is a legal branch name, but `create_worktree_from_branch`
+        // resolves `refs/remotes/alice/fix` before `refs/remotes/origin/…`, so
+        // adopting it would check out remote `alice`'s `fix` instead.
+        let tmp = TempDir::new().unwrap();
+        let (origin, clone) = issue_fixture(tmp.path());
+        git(&origin, &["branch", "alice/fix", "HEAD"]);
+        let head = rev_parse(&clone, "HEAD");
+        git(&clone, &["update-ref", "refs/remotes/alice/fix", &head]);
+        let gh = tmp.path().join("gh");
+        gh_issue_stub(&gh, "alice/fix\thttps://github.com/o/r/tree/alice/fix\n", "");
+        let err =
+            issue_branch_with(clone.to_str().unwrap(), "123", gh.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("refs/remotes/alice/fix"), "names the shadowing ref: {err}");
+    }
+
+    #[test]
+    fn gh_cannot_prompt_through_its_own_git() {
+        // `gh issue develop` runs its own `git fetch`; an encrypted ssh key that
+        // isn't in the agent would otherwise block on /dev/tty, pinning a TUI
+        // worker thread past the timeout.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let gh = tmp.path().join("gh");
+        write_stub(
+            &gh,
+            "#!/bin/sh\nprintf '%s|%s\\n' \"${GIT_TERMINAL_PROMPT-UNSET}\" \
+             \"${GIT_SSH_COMMAND-UNSET}\" > \"$0.env\"\nexit 1\n",
+        );
+        let _ = issue_branch_with(tmp.path().to_str().unwrap(), "123", gh.to_str().unwrap());
+        let env = std::fs::read_to_string(format!("{}.env", gh.display())).unwrap();
+        let (prompt, ssh) = env.trim().split_once('|').unwrap();
+        assert_eq!(prompt, "0", "git can't fall back to a terminal prompt");
+        assert!(ssh.ends_with("-oBatchMode=yes"), "ssh can't ask for a passphrase: {ssh}");
     }
 
     #[test]
