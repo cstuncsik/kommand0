@@ -444,7 +444,7 @@ fn main() -> anyhow::Result<()> {
                 // detection (and the remote write with it): `--branch` names one
                 // explicitly, `--fork` means "fork a fresh branch", `--no-worktree`
                 // means "no branch at all". In all three the positional is a NAME.
-                let from_issue = issue.clone().or_else(|| {
+                let from_issue = issue.or_else(|| {
                     name.clone().filter(|n| {
                         !fork && !no_worktree && branch.is_none() && kommand0_core::is_issue_ref(n)
                     })
@@ -452,8 +452,9 @@ fn main() -> anyhow::Result<()> {
                 let (name, branch) = match &from_issue {
                     Some(r) => {
                         let repo_path = state.resolve_repo(&repo)?.path.clone();
-                        // stderr: this performs a REMOTE WRITE and can take ~40s
-                        // worst case. The ref is NOT interpolated: a URL can carry
+                        // stderr: this performs a REMOTE WRITE and can take ~60s
+                        // worst case (three bounded calls: --list, create, fetch).
+                        // The ref is NOT interpolated: a URL can carry
                         // `user:token@`.
                         eprintln!("Resolving issue...");
                         let b = kommand0_core::issue_branch(&repo_path, r)

@@ -9,17 +9,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 - **Create a workspace straight from a GitHub issue.** Type an issue reference (`123`,
   `#123`, or an issue URL) into the Add Workspace **Name** field, or pass
-  `kmd workspace create --issue <ref>` (the positional name is detected the same way), and
-  kommand0 asks GitHub for that issue's branch via `gh issue develop`: an existing linked
-  branch is adopted and re-fetched, otherwise a new one is created on `origin` and linked,
-  so the Development panel shows it and merging its PR closes the issue. The workspace is
-  named after the branch. The lookup runs off the render loop behind a dialog you can Esc
-  out of: Esc only stops kommand0 waiting, and since GitHub may already have created the
-  branch, the next attempt simply adopts whatever exists. Every call is pinned to the
-  repo's `origin`, so a fork checkout with an `upstream` remote can't have the branch
-  created on the wrong repo. Failures (a PR number, no push access, gh missing or
-  unauthenticated, an issue URL pointing somewhere other than `origin`) report the real
-  reason rather than quietly forking a local branch.
+  `kmd workspace create --issue <ref>` (a positional name is detected the same way):
+  `gh issue develop` adopts the issue's linked branch or creates one on `origin`, and the
+  workspace is named after it. The lookup runs off the render loop behind a dialog you can
+  Esc out of, and every failure reports gh's own reason rather than quietly forking a
+  local branch. gh is pinned to `origin` whenever its URL names a repo; where it doesn't
+  and another remote could be picked instead, kommand0 refuses rather than write to a repo
+  you didn't name.
 
 ### Changed
 
@@ -28,6 +24,12 @@ All notable changes to kommand0 are documented here. The format is based on
   of a workspace called `2024`; fill the **Branch** field to get a plain workspace on a
   named branch. `kmd workspace create <digits> --repo x` changes the same way, with
   `--fork`, `--no-worktree` or `--branch` to keep the old behaviour.
+
+### Fixed
+
+- **A stray `GH_REPO` no longer retargets kommand0's `gh` calls.** It beats even
+  `--repo`, so PR/CI status and the merged-PR cleanup could read a different repository
+  than the one you're in.
 
 ## [0.27.3] - 2026-09-20
 

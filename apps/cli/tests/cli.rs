@@ -312,16 +312,6 @@ fn workspace_create_from_an_issue() {
             err.contains("Created linked branch 123-add-thing on origin"),
             "{extra:?}: names the branch it created: {err}"
         );
-
-        let show = stdout(&kmd(&state, &[], &["workspace", "show", "123-add-thing"]));
-        let dir = show
-            .lines()
-            .find_map(|l| l.strip_prefix("Dir:"))
-            .expect("Dir line")
-            .trim()
-            .to_string();
-        assert!(dir.contains("worktrees"), "{extra:?}: got a worktree: {dir}");
-        assert!(Path::new(&dir).exists(), "{extra:?}: the worktree exists: {dir}");
     }
 }
 

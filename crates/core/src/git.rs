@@ -2185,7 +2185,7 @@ mod tests {
     #[test]
     fn issue_branch_parses_the_created_branch_name() {
         // (the create stub's stdout, the branch it should yield or an error
-        // fragment). The only coverage `check_linked_branch` gets.
+        // fragment).
         let rows: &[(&str, Result<&str, &str>)] = &[
             ("github.com/o/r/tree/123-fix-it\n", Ok("123-fix-it")),
             // A slash is legal in a linked branch name, and common once a repo

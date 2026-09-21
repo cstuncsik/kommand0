@@ -45,7 +45,7 @@ const PR_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Carries a background worker's result to the event loop, sending on drop
 /// so the loop always gets a message (and clears the matching `*_inflight`
 /// flag) even if the worker thread panics before finishing. Shared by the
-/// status/PR refreshes, cleanup, and profile delete.
+/// status/PR refreshes, cleanup, the issue resolve, and profile delete.
 struct SendOnDrop<T> {
     tx: tokio::sync::mpsc::UnboundedSender<T>,
     payload: Option<T>,
@@ -895,7 +895,7 @@ pub(crate) struct App {
     /// Monotonic id for issue-resolve requests; the newest one wins.
     issue_seq: u64,
     /// The in-flight issue resolve's id (`Some` == in flight; no separate bool).
-    pub(crate) issue_req: Option<u64>,
+    issue_req: Option<u64>,
     /// Issue-resolve worker → event-loop channel. `None` when not wired (unit tests).
     issue_tx: Option<tokio::sync::mpsc::UnboundedSender<IssueMsg>>,
 
@@ -3480,14 +3480,8 @@ impl App {
     }
 
     /// Resolve an issue reference to its linked branch off the render loop (up
-    /// to two gh network calls plus a fetch).
-    ///
-    /// Bail order is deliberately inverted relative to `start_cleanup` /
-    /// `start_profile_delete`, which return early on a missing `tx` before
-    /// touching state: here the latch and the modal are set FIRST, so unit
-    /// tests (where `issue_tx` is None) can still observe that the routing
-    /// happened. The cost is a modal with no worker behind it in that
-    /// configuration, which only tests see.
+    /// to two gh network calls plus a fetch). The latch and the modal are set
+    /// before the `tx` check, so unit tests (no `tx`) still see the routing.
     fn start_issue_resolve(&mut self, repo: &RepoEntry, issue: String) {
         self.issue_seq += 1;
         let req = self.issue_seq;
