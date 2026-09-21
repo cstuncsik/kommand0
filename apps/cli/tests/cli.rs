@@ -83,7 +83,8 @@ fn write_stub(path: &Path, body: &str) {
 }
 
 /// A tracked repo (with a bare `origin` so pushes succeed) + a workspace on its
-/// own branch (`feat`, named after the workspace). Returns the state dir.
+/// own branch (`feat`, named after the workspace), plus a spare branch nothing
+/// has checked out. Returns the state dir.
 fn setup(root: &Path) -> std::path::PathBuf {
     let state_dir = root.join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -98,6 +99,7 @@ fn setup(root: &Path) -> std::path::PathBuf {
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
     run_git(&repo, &["commit", "-m", "init"]);
+    run_git(&repo, &["branch", "spare"]); // free for `--branch spare` to adopt
     run_git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
 
     let add = kmd(&state_dir, &[], &["repo", "add", repo.to_str().unwrap()]);
@@ -273,6 +275,148 @@ fn workspace_create_over_existing_branch_and_workspace_errors_without_a_note() {
     let err = String::from_utf8_lossy(&dup.stderr);
     assert!(err.contains("already exists"), "canonical error: {err}");
     assert!(!err.contains("forked"), "no misleading fork note: {err}");
+}
+
+#[test]
+fn workspace_create_from_an_issue() {
+    // Both surfaces resolve the same way: `--issue`, and a positional that
+    // looks like an issue reference. Each row needs its own fixture: the
+    // workspace is named after the branch, so a shared one would collide.
+    for extra in [vec!["--issue", "123"], vec!["123"]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let repo = tmp.path().join("repo");
+        let gh = tmp.path().join("gh");
+        // Faithful gh: nothing linked yet, then create pushes the branch to
+        // origin and prints the `…/tree/<branch>` line core parses.
+        write_stub(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\nif [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n  git push -q origin HEAD:refs/heads/123-add-thing\n  printf 'github.com/o/r/tree/123-add-thing\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+        let mut args = vec!["workspace", "create"];
+        args.extend(extra.iter().copied());
+        args.extend(["--repo", repo.to_str().unwrap()]);
+
+        let out = kmd(&state, &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())], &args);
+        assert!(out.status.success(), "{extra:?}: {}", String::from_utf8_lossy(&out.stderr));
+        // The workspace is named after the branch, not after the ref.
+        let text = stdout(&out);
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec![format!("Created workspace: 123-add-thing (repo: repo)")],
+            "{extra:?}: stdout stays pipeable"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("Resolving issue"), "{extra:?}: progress on stderr: {err}");
+        assert!(
+            err.contains("Created linked branch 123-add-thing on origin"),
+            "{extra:?}: names the branch it created: {err}"
+        );
+
+        let show = stdout(&kmd(&state, &[], &["workspace", "show", "123-add-thing"]));
+        let dir = show
+            .lines()
+            .find_map(|l| l.strip_prefix("Dir:"))
+            .expect("Dir line")
+            .trim()
+            .to_string();
+        assert!(dir.contains("worktrees"), "{extra:?}: got a worktree: {dir}");
+        assert!(Path::new(&dir).exists(), "{extra:?}: the worktree exists: {dir}");
+    }
+}
+
+#[test]
+fn workspace_create_from_an_issue_reuses_a_linked_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    // origin must really have the branch: core fetches it, a --list row alone
+    // is not enough.
+    run_git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/123-existing"]);
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then printf '123-existing\\thttps://github.com/o/r/tree/123-existing\\n'; exit 0; fi\nexit 1\n",
+    );
+
+    let out = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+        &["workspace", "create", "--issue", "#123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "create --issue: {}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("Using existing linked branch 123-existing"),
+        "reports the reuse: {err}"
+    );
+
+    // The worktree is really on the linked branch (the BRANCH column, read
+    // from the worktree itself).
+    let status = stdout(&kmd(&state, &[], &["workspace", "status", "123-existing"]));
+    let row = status.lines().nth(1).expect("one status row");
+    assert_eq!(
+        row.split_whitespace().nth(1),
+        Some("123-existing"),
+        "on the linked branch: {status}"
+    );
+}
+
+#[test]
+fn workspace_create_from_an_issue_reports_gh_failure() {
+    // A PR number (or an unauthenticated gh) fails the lookup: surface gh's own
+    // message and leave nothing behind.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nprintf 'GraphQL: Could not resolve to an Issue with the number of 118.\\n' >&2\nexit 1\n",
+    );
+
+    let out = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+        &["workspace", "create", "--issue", "118", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(!out.status.success(), "a failed lookup must fail the command");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Could not resolve to an Issue"), "gh's own message: {err}");
+
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(!list.contains("118"), "no workspace left behind: {list}");
+}
+
+#[test]
+fn workspace_create_suppresses_issue_detection() {
+    // Anything that already says what branch to use means the positional is a
+    // NAME. gh points at a nonexistent path, so any lookup would fail loudly.
+    for extra in [vec!["--fork"], vec!["--no-worktree"], vec!["--branch", "spare"]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let repo = tmp.path().join("repo");
+        let mut args = vec!["workspace", "create", "123"];
+        args.extend(extra.iter().copied());
+        args.extend(["--repo", repo.to_str().unwrap()]);
+
+        let out = kmd(&state, &[("KOMMAND0_GH_BIN", "/nonexistent/definitely/not/gh")], &args);
+        assert!(out.status.success(), "{extra:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            stdout(&out).contains("Created workspace: 123 "),
+            "{extra:?}: a workspace literally named 123: {}",
+            stdout(&out)
+        );
+        if extra[0] == "--branch" {
+            let status = stdout(&kmd(&state, &[], &["workspace", "status", "123"]));
+            let row = status.lines().nth(1).expect("one status row");
+            assert_eq!(
+                row.split_whitespace().nth(1),
+                Some("spare"),
+                "--branch still wins: {status}"
+            );
+        }
+    }
 }
 
 #[test]
