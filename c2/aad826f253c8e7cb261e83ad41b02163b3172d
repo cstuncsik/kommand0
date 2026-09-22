@@ -1,0 +1,19 @@
+apps/cli/tests/cli.rs
+  s_ae507a6f250a33::t_0c42d12c72bb04 319
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c2aad826f253c8e7cb261e83ad41b02163b3172d",
+  "prompts": {},
+  "sessions": {
+    "s_ae507a6f250a33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0a9b7884-1045-4938-bf96-e98687a89ded",
+        "model": "unknown"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
