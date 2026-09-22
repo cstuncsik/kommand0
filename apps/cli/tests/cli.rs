@@ -316,7 +316,7 @@ fn workspace_create_from_an_issue() {
         let text = stdout(&out);
         assert_eq!(
             text.lines().collect::<Vec<_>>(),
-            vec![format!("Created workspace: 123-add-thing (repo: repo)")],
+            vec!["Created workspace: 123-add-thing (repo: repo)"],
             "{extra:?}: stdout stays pipeable"
         );
         let err = String::from_utf8_lossy(&out.stderr);
