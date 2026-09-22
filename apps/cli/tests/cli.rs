@@ -337,6 +337,9 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
     let repo = tmp.path().join("repo");
+    // A leftover local branch, so the divergence check actually runs: it is
+    // skipped outright when there is nothing to shadow the fetched ref.
+    run_git(&repo, &["branch", "123-add-thing"]);
     let gh = tmp.path().join("gh");
     write_stub(
         &gh,
@@ -392,30 +395,36 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
 #[test]
 fn refuses_the_linked_branch_when_the_local_branch_check_cannot_answer() {
     // A leftover local branch is adopted over the fetched ref, so kommand0 only
-    // adopts one that already contains origin's tip. When the check itself dies
-    // (here: killed by a signal) it has proved nothing, and adopting anyway
-    // would silently drop what origin has.
-    let tmp = tempfile::tempdir().unwrap();
-    let state = setup(tmp.path());
-    let repo = tmp.path().join("repo");
-    let gh = tmp.path().join("gh");
-    write_stub(
-        &gh,
-        "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\nif [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n  git push -q origin HEAD:refs/heads/123-add-thing\n  printf 'github.com/o/r/tree/123-add-thing\\n'\n  exit 0\nfi\nexit 1\n",
-    );
-    let path = git_shim(
-        &tmp.path().join("shim"),
-        "case \"$*\" in\n  *\"merge-base --is-ancestor\"*) kill -9 $$ ;;\nesac",
-    );
+    // adopts one that already contains origin's tip. Every way the check can
+    // fail to answer proves nothing, and adopting anyway would silently drop
+    // what origin has: a signal leaves no exit code at all, while 128 is git's
+    // "couldn't traverse" (an absent ref, but equally an unreadable object), so
+    // neither may read as "not behind".
+    for die in ["kill -9 $$", "exit 128"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let repo = tmp.path().join("repo");
+        // The leftover local branch is what makes the check run at all.
+        run_git(&repo, &["branch", "123-add-thing"]);
+        let gh = tmp.path().join("gh");
+        write_stub(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\nif [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n  git push -q origin HEAD:refs/heads/123-add-thing\n  printf 'github.com/o/r/tree/123-add-thing\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+        let path = git_shim(
+            &tmp.path().join("shim"),
+            &format!("case \"$*\" in\n  *\"merge-base --is-ancestor\"*) {die} ;;\nesac"),
+        );
 
-    let out = kmd(
-        &state,
-        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap()), ("PATH", &path)],
-        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
-    );
-    assert!(!out.status.success(), "an unanswered check must not adopt the branch");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("behind or has diverged"), "{err}");
+        let out = kmd(
+            &state,
+            &[("KOMMAND0_GH_BIN", gh.to_str().unwrap()), ("PATH", &path)],
+            &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+        );
+        assert!(!out.status.success(), "{die}: an unanswered check must not adopt the branch");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("behind or has diverged"), "{die}: {err}");
+    }
 }
 
 #[test]

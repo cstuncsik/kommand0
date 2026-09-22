@@ -285,7 +285,10 @@ fn wait_bounded(child: std::process::Child) -> std::io::Result<std::process::Out
 /// stdin do NOT stop ssh asking for a key passphrase on /dev/tty, which from the
 /// TUI's worker thread would write into the alt-screen and outlive the timeout.
 /// Appends rather than clobbers, so a user's configured command survives (a
-/// repo-level `core.sshCommand` is still overridden).
+/// repo-level `core.sshCommand` is still overridden). ssh takes the FIRST value
+/// of a repeated option, so someone who has already put an explicit
+/// `-oBatchMode=no` in their own `GIT_SSH_COMMAND` keeps it, and their choice to
+/// be prompted stands.
 fn batch_ssh_command() -> String {
     std::env::var("GIT_SSH_COMMAND")
         .map(|v| format!("{v} -oBatchMode=yes"))
@@ -897,11 +900,18 @@ fn is_valid_branch_name(branch: &str) -> bool {
 /// diverged, where adopting it would silently drop what origin (and the linked
 /// branch) has.
 fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
-    // Exit 0 = origin's tip is an ancestor of (or equal to) the local branch, so
-    // adopting it keeps everything origin has. 128 = a ref is missing (no
-    // leftover branch, or no tracking ref), which worktree creation reports.
-    // 1 = behind or diverged.
-    let code = Command::new("git")
+    // No leftover branch, nothing to shadow the tracking ref we just fetched.
+    // Settled here rather than by `merge-base`'s exit code: 128 means only
+    // "couldn't answer" (an absent ref, but equally an unreadable object), so
+    // reading it as "no local branch" would let a real one through unchecked.
+    if !crate::worktree::verify_ref(repo_dir, &format!("refs/heads/{branch}")) {
+        return Ok(());
+    }
+    // The branch is really there, so only a clean exit 0 clears it: origin's tip
+    // is an ancestor of (or equal to) the local branch, and adopting it keeps
+    // everything origin has. Everything else refuses, whether that is 1 (behind
+    // or diverged), 128, or no code at all (spawn failed, killed by a signal).
+    let contains_origin = Command::new("git")
         .args([
             "-C",
             repo_dir,
@@ -915,11 +925,9 @@ fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .ok()
-        .and_then(|s| s.code());
-    // No code at all (spawn failed, killed by a signal) answers nothing, so it
-    // must not read as "not behind".
-    if code == Some(1) || code.is_none() {
+        .map(|s| s.code() == Some(0))
+        .unwrap_or(false);
+    if !contains_origin {
         return Err(format!(
             "the local branch {branch} is behind or has diverged from origin/{branch}; \
              merge, rebase or rename it, then try again"
