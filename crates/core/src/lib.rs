@@ -2158,6 +2158,7 @@ mod tests {
         };
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
         dir
@@ -2235,6 +2236,7 @@ mod tests {
         };
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
         git(&["branch", "feat/login"]);
@@ -3089,6 +3091,7 @@ mod tests {
         };
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
 

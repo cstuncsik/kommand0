@@ -488,6 +488,7 @@ mod tests {
         let git = |args: &[&str]| Command::new("git").args(args).current_dir(dir).output().unwrap();
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
     }
