@@ -894,8 +894,11 @@ pub(crate) struct App {
 
     /// Monotonic id for issue-resolve requests; the newest one wins.
     issue_seq: u64,
-    /// The in-flight issue resolve's id (`Some` == in flight; no separate bool).
+    /// The in-flight issue resolve's id (`Some` == the reply is still wanted).
     issue_req: Option<u64>,
+    /// Whether a resolve WORKER is still running. Distinct from `issue_req`,
+    /// which Esc clears: Esc stops the waiting, not the `gh issue develop`.
+    issue_worker_alive: bool,
     /// Issue-resolve worker → event-loop channel. `None` when not wired (unit tests).
     issue_tx: Option<tokio::sync::mpsc::UnboundedSender<IssueMsg>>,
 
@@ -999,6 +1002,7 @@ impl App {
             codex_capture_tx: None,
             issue_seq: 0,
             issue_req: None,
+            issue_worker_alive: false,
             issue_tx: None,
             config: Config::default(),
             config_path: Config::effective_path(),
@@ -3483,6 +3487,26 @@ impl App {
     /// to two gh network calls plus a fetch). The latch and the modal are set
     /// before the `tx` check, so unit tests (no `tx`) still see the routing.
     fn start_issue_resolve(&mut self, repo: &RepoEntry, issue: String) {
+        // Esc stops us WAITING, it does not stop the worker, so without this a
+        // resubmit runs a second `gh issue develop` against the same issue. If
+        // the second `--list` beats the first create, BOTH create: the issue
+        // ends up with two linked branches and every later lookup dead-ends on
+        // "has 2 linked branches", with no way back from inside kommand0.
+        // `start_cleanup` and `start_profile_delete` guard the same way.
+        if self.issue_worker_alive {
+            let (repo_id, repo_name) = (repo.id.clone(), repo.name.clone());
+            self.finish_add_workspace(
+                Err(anyhow::anyhow!(
+                    "an issue lookup is still running for this repo; \
+                     wait for it to finish before starting another"
+                )),
+                repo_id,
+                repo_name,
+                issue,
+                String::new(),
+            );
+            return;
+        }
         self.issue_seq += 1;
         let req = self.issue_seq;
         self.issue_req = Some(req);
@@ -3494,6 +3518,9 @@ impl App {
         let Some(tx) = self.issue_tx.clone() else {
             return; // not wired (unit tests)
         };
+        // Only once a worker really exists, so the unwired unit-test path never
+        // latches something nothing would clear.
+        self.issue_worker_alive = true;
         let repo_path = repo.path.clone();
         std::thread::spawn(move || {
             let mut guard = SendOnDrop {
@@ -3507,6 +3534,9 @@ impl App {
 
     /// Adopt the branch an issue resolved to (or surface the failure).
     fn finish_issue_resolve(&mut self, req: u64, result: Result<kommand0_core::IssueBranch, String>) {
+        // FIRST, before any early return: the worker that produced this reply is
+        // done, so a dropped stale reply still releases the re-entry guard.
+        self.issue_worker_alive = false;
         // Stale reply (Esc stopped the wait, or a newer request superseded it):
         // drop it BEFORE clearing the latch, showing an error, or creating
         // anything. Log the outcome either way: a cancelled request may already
@@ -3546,10 +3576,28 @@ impl App {
         // The workspace name comes from the branch; `finish_add_workspace`
         // reopens Add Workspace with the typed ref + the error on failure, so
         // gh's own message is what the user sees.
+        let created = result.as_ref().ok().map(|b| (b.branch.clone(), b.reused));
         let result = result
             .map_err(anyhow::Error::msg)
             .and_then(|b| self.state.create_workspace_from_branch(None, &repo_id, &b.branch));
+        let ok = result.is_ok();
         self.finish_add_workspace(result, repo_id, repo_name, issue, String::new());
+        // The resolving modal is gone by now, and its "may create a new linked
+        // branch" warning with it. On the create path this notice is the user's
+        // only record that kommand0 just wrote to their remote (the CLI prints
+        // the same thing on stderr).
+        if let Some((branch, reused)) = created
+            && ok
+        {
+            self.profile_notice = Some((
+                if reused {
+                    format!("Using existing linked branch {branch}")
+                } else {
+                    format!("Created linked branch {branch} on origin")
+                },
+                false,
+            ));
+        }
     }
 
     /// While a profile delete runs, quitting would kill the worker mid
@@ -4043,14 +4091,22 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
 
     // Modal dialog: swallow all keys
     if app.modal.is_active() {
+        // Read before the handler runs: it replaces the state with `None`.
+        let was_resolving_issue = matches!(app.modal, modal::ModalState::ResolvingIssue { .. });
         match modal::handle_modal_key(&mut app.modal, key) {
             modal::ModalResult::Consumed => {}
             // Esc during an in-flight issue resolve stops kommand0 WAITING,
             // nothing more: gh may already have created the linked branch, and
-            // the next attempt adopts it through `--list`. Clearing the latch on
-            // `Consumed` too would let one stray keypress during the wait drop
-            // the real reply as stale.
-            modal::ModalResult::Cancelled => app.issue_req = None,
+            // the next attempt adopts it through `--list` once the worker has
+            // finished (`issue_worker_alive` holds the retry until then).
+            // Clearing the latch on `Consumed` too would let one stray keypress
+            // during the wait drop the real reply as stale. Scoped to the
+            // resolving modal so cancelling any OTHER modal can't reach in here.
+            modal::ModalResult::Cancelled => {
+                if was_resolving_issue {
+                    app.issue_req = None;
+                }
+            }
             modal::ModalResult::SubmitRepo(path) => match app.state.add_repo(&path) {
                 Ok(repo) => {
                     // Expand the just-added repo so its "(no workspaces — press w)"
@@ -6207,6 +6263,136 @@ mod key_tests {
         assert!(app.issue_req.is_none(), "latch cleared");
         let ws = app.workspaces.iter().find(|w| w.name == "issuelive").expect("workspace created");
         assert_eq!(ws.branch_name.as_deref(), Some("issuelive"));
+        // The modal (and its remote-write warning) is gone, so the notice is
+        // the only remaining record of what happened on origin.
+        let (msg, is_error) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("Using existing linked branch issuelive"), "{msg}");
+        assert!(!is_error, "a successful adopt is not an error");
+    }
+
+    #[tokio::test]
+    async fn a_created_linked_branch_says_so_in_the_tree_notice() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuecreated");
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        let req = app.issue_req.unwrap();
+        app.finish_issue_resolve(
+            req,
+            Ok(kommand0_core::IssueBranch { branch: "issuecreated".into(), reused: false }),
+        );
+
+        let (msg, _) = app.profile_notice.clone().expect("notice set");
+        assert!(
+            msg.contains("Created linked branch issuecreated on origin"),
+            "names the remote write: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resubmit_while_a_worker_is_alive_is_refused() {
+        // Esc stops the waiting, not the `gh issue develop`. A second resolve
+        // launched on top of the first can make GitHub link two branches to the
+        // issue, which dead-ends every later lookup. The worker latch outlives
+        // Esc precisely so the retry is held until the first one lands.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuereentry");
+        // Wire a channel so the worker path is taken (the unwired unit-test
+        // path deliberately never latches).
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<IssueMsg>();
+        app.issue_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        assert!(app.issue_worker_alive, "the worker is latched");
+
+        press(&mut app, KeyCode::Esc).await;
+        assert!(app.issue_req.is_none(), "Esc stops the waiting");
+        assert!(app.issue_worker_alive, "but the worker is still running");
+
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        match &app.modal {
+            modal::ModalState::AddWorkspace { error: Some(e), input, .. } => {
+                assert!(e.contains("still running"), "says why it refused: {e}");
+                assert_eq!(input, "1", "the typed ref is preserved for a retry");
+            }
+            _ => panic!("expected AddWorkspace reopened with an error"),
+        }
+
+        // The first worker's reply releases the latch, so the retry can proceed.
+        app.finish_issue_resolve(1, Err("boom".into()));
+        assert!(!app.issue_worker_alive, "a reply releases the worker latch");
+    }
+
+    #[tokio::test]
+    async fn a_stale_reply_still_releases_the_worker_latch() {
+        // Otherwise Esc + a reply that arrives as stale would wedge the feature
+        // for the rest of the session.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuerelease");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<IssueMsg>();
+        app.issue_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Esc).await;
+
+        app.finish_issue_resolve(1, Ok(kommand0_core::IssueBranch {
+            branch: "issuerelease".into(),
+            reused: true,
+        }));
+        assert!(!app.issue_worker_alive, "the latch is released before the staleness check");
+        assert!(
+            !app.workspaces.iter().any(|w| w.name == "issuerelease"),
+            "and the stale reply still creates nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_worker_surfaces_as_an_error_not_a_success() {
+        // The `SendOnDrop` payload is what a panicking worker hands back. If it
+        // ever became a fabricated `Ok`, kommand0 would create a workspace on a
+        // branch that was never resolved.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issueinterrupted");
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        let req = app.issue_req.unwrap();
+        app.finish_issue_resolve(req, Err("the issue lookup was interrupted".into()));
+
+        match &app.modal {
+            modal::ModalState::AddWorkspace { error: Some(e), .. } => {
+                assert!(e.contains("interrupted"), "surfaces the interruption: {e}");
+            }
+            _ => panic!("expected AddWorkspace reopened with an error"),
+        }
+        assert!(!app.workspaces.iter().any(|w| w.repo_id == "real"), "nothing created");
+    }
+
+    #[tokio::test]
+    async fn a_reply_landing_under_a_foreign_modal_changes_nothing() {
+        // Defensive arm: some other modal replaced ours without clearing the
+        // latch. It must not create a workspace, and must leave that modal up.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issueforeign");
+        app.issue_req = Some(5);
+        app.modal = modal::ModalState::ConfirmDelete {
+            target: modal::DeleteTarget::Workspace {
+                id: "x".into(),
+                name: "x".into(),
+                repo: "real".into(),
+            },
+        };
+        app.finish_issue_resolve(5, Ok(kommand0_core::IssueBranch {
+            branch: "issueforeign".into(),
+            reused: true,
+        }));
+
+        assert!(matches!(app.modal, modal::ModalState::ConfirmDelete { .. }), "modal survives");
+        assert!(
+            !app.workspaces.iter().any(|w| w.name == "issueforeign"),
+            "nothing created"
+        );
+        assert!(app.issue_req.is_none(), "the latch is released either way");
     }
 
     #[tokio::test]
@@ -8902,36 +9088,38 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn resolving_issue_modal_renders_the_issue_and_repo() {
-        let mut app = test_app();
-        app.modal = modal::ModalState::ResolvingIssue {
-            repo_id: "real".into(),
-            repo_name: "real".into(),
-            issue: "123".into(),
-        };
-        let text = render_to_string(&mut app, 100, 30);
-        assert!(text.contains("123"), "names the issue:\n{text}");
-        assert!(text.contains("real"), "names the repo whose origin is targeted:\n{text}");
-        // The only thing telling the user Esc doesn't undo the remote write.
-        assert!(text.contains("stop waiting"), "footer:\n{text}");
-        // The only pre-hoc notice that this writes to origin.
-        assert!(text.contains("may create a new linked branch"), "warns:\n{text}");
-    }
-
-    #[tokio::test]
-    async fn the_resolving_modal_still_warns_at_80_columns() {
-        // The modal is 55% wide, so at 80 columns the inner paragraph is 40
-        // wide and this first line (41 chars) wraps: with a 2-row message the
-        // remote-write notice below it fell off screen.
-        let mut app = test_app();
-        app.modal = modal::ModalState::ResolvingIssue {
-            repo_id: "real".into(),
-            repo_name: "kommand0".into(),
-            issue: "123".into(),
-        };
-        let text = render_to_string(&mut app, 80, 30);
-        assert!(text.contains("may create a new linked branch"), "warns at 80 columns:\n{text}");
-        assert!(text.contains("stop waiting"), "footer survives:\n{text}");
+    async fn the_resolving_modal_names_its_target_and_keeps_its_footer() {
+        // The modal is 55% wide and 20% high, so both axes bite at the small
+        // end: at 80 columns the first line (41 chars) wraps into a 40-wide
+        // paragraph and would push the remote-write notice out, and at 24 rows
+        // the inner area is 2-3 rows, where a fixed-height message would eat
+        // the footer. The footer is the only thing telling the user Esc does
+        // not undo the remote write, so it must survive everywhere.
+        for (w, h, repo) in [(100u16, 30u16, "real"), (80, 30, "kommand0"), (80, 24, "kommand0")] {
+            let mut app = test_app();
+            app.modal = modal::ModalState::ResolvingIssue {
+                repo_id: "real".into(),
+                repo_name: repo.into(),
+                issue: "123".into(),
+            };
+            let text = render_to_string(&mut app, w, h);
+            let at = format!("at {w}x{h}");
+            // The full sentence, not just the repo name: a bare `contains(repo)`
+            // is satisfied by the block title alone.
+            assert!(
+                text.contains(&format!("Resolving issue 123 on {repo}'s")),
+                "{at}: names the issue and the repo whose origin is targeted:\n{text}"
+            );
+            assert!(text.contains("stop waiting"), "{at}: footer survives:\n{text}");
+            if h >= 30 {
+                // The pre-hoc notice that this writes to origin. At 24 rows the
+                // modal is too short for it; the footer is what must not go.
+                assert!(
+                    text.contains("may create a new linked branch"),
+                    "{at}: warns:\n{text}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

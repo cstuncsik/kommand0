@@ -1107,7 +1107,10 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
 
             let inner = Layout::vertical([
                 // Three rows, not two: at 80 columns the first line wraps, and
-                // the remote-write notice below it must not be pushed out.
+                // the remote-write notice below it must not be pushed out. The
+                // footer still survives a short terminal (checked down to 16
+                // rows): when the three rows don't fit, the solver shrinks this
+                // one rather than dropping the trailing `Length(1)`.
                 Constraint::Length(3), // message
                 Constraint::Min(0),   // spacer
                 Constraint::Length(1), // footer
