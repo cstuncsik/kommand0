@@ -187,7 +187,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `p` | Tree | Open the workspace's PR in a browser |
 | `c` | Tree | Clean up the selected merged workspace (worktree + branch) |
 | `a` | Tree | Add repository (modal) |
-| `w` | Tree | Add workspace to selected repo (modal; a `#123` / issue URL name creates the branch GitHub links to that issue) |
+| `w` | Tree | Add workspace to selected repo (modal; a `123` / `#123` / issue URL name creates the branch GitHub links to that issue) |
 | `d` / `D` | Tree | Delete / force-delete selected |
 | _typing_ | Embedded | Goes straight to the embedded Claude |
 | `Ctrl+A` then `c` | Embedded | New Claude Code session tab |
