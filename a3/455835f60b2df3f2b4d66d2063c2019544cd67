@@ -1,0 +1,22 @@
+apps/tui/tests/e2e.rs
+  s_42971f855e1ce9::t_0f7b5ddf74a833 1407-1455
+  s_42971f855e1ce9::t_ea3a7859ddaa1a 1406
+apps/tui/tests/fixtures/gh-stub-issue
+  s_42971f855e1ce9::t_bb51646d4b3b0e 1-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a3455835f60b2df3f2b4d66d2063c2019544cd67",
+  "prompts": {},
+  "sessions": {
+    "s_42971f855e1ce9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "87a5bac5-2a8b-4ad6-a391-f6ba9c4ce05c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
