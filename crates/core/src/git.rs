@@ -316,9 +316,24 @@ fn wait_bounded_in(
 /// put an explicit `-oBatchMode=no` in their own command keeps it, and their
 /// choice to be prompted stands.
 fn batch_ssh_command(repo_dir: &str) -> String {
-    let base = std::env::var("GIT_SSH_COMMAND").ok().filter(|v| !v.trim().is_empty());
-    let base = base.or_else(|| git_config_value(repo_dir, "core.sshCommand"));
-    format!("{} -oBatchMode=yes", base.as_deref().unwrap_or("ssh"))
+    let env = std::env::var("GIT_SSH_COMMAND").ok();
+    // Only read the config when the environment doesn't already decide it.
+    let cfg = env
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .is_none()
+        .then(|| git_config_value(repo_dir, "core.sshCommand"))
+        .flatten();
+    ssh_command_with_batch_mode(env.as_deref(), cfg.as_deref())
+}
+
+/// The precedence rule itself, pure so it can be tabled: a non-blank
+/// `GIT_SSH_COMMAND` wins, else `core.sshCommand`, else plain ssh. An empty
+/// environment variable is treated as absent — git would die on it
+/// (`error: cannot run :`), and repairing it beats propagating it.
+fn ssh_command_with_batch_mode(env: Option<&str>, cfg: Option<&str>) -> String {
+    let base = env.filter(|v| !v.trim().is_empty()).or(cfg);
+    format!("{} -oBatchMode=yes", base.unwrap_or("ssh"))
 }
 
 /// A single git config value for `repo_dir`, or `None` when unset (or git
@@ -840,9 +855,20 @@ fn parse_url_head(head: &str) -> Option<(String, String)> {
 /// `(host, "owner/repo")` of the repo a `gh issue develop` URL points at: the
 /// second field of a `--list` row, or the `…/tree/<branch>` line the create call
 /// prints. `None` when there is no `/tree/` URL to read.
+/// Positional, not `rsplit("/tree/")`: a branch name may itself contain
+/// `/tree/`, and rsplitting on the last one then yields an over-long head that
+/// parses as nothing, silently skipping the check. Taking the first four
+/// segments and requiring the fourth to be `tree` is also correct for a repo
+/// literally named `tree`, which is why rsplit was there in the first place.
 fn linked_branch_repo(url: &str) -> Option<(String, String)> {
-    let (head, _) = url.rsplit_once("/tree/")?;
-    parse_url_head(head)
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let mut parts = rest.split('/');
+    let (host, owner, repo, tree) =
+        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if tree != "tree" {
+        return None;
+    }
+    parse_url_head(&format!("{host}/{owner}/{repo}"))
 }
 
 fn parse_issue_ref(s: &str) -> Option<ParsedRef<'_>> {
@@ -948,8 +974,8 @@ fn is_valid_branch_name(branch: &str) -> bool {
     // writes THROUGH the `refs/remotes/origin/HEAD` symref, so local
     // `origin/<default>` silently moves to that branch's commit and every
     // ahead/behind and default-branch diff is skewed until the next full fetch.
-    // Neither name can be created by `git branch`, and `validate_new_workspace_name`
-    // already rejects both one layer down, so nothing legitimate is lost.
+    // git itself refuses to create it, so only the API can. `@` git WILL create,
+    // but it is rev-parse shorthand for HEAD, so refuse it here too.
     !(branch.is_empty()
         || branch == "HEAD"
         || branch == "@"
@@ -1040,7 +1066,14 @@ fn origin_fetches(repo_dir: &str, branch: &str) -> bool {
     String::from_utf8_lossy(&out.stdout).lines().any(|spec| {
         let src = spec.trim().trim_start_matches('+').split(':').next().unwrap_or_default();
         match src.split_once('*') {
-            Some((pre, post)) => want.starts_with(pre) && want.ends_with(post),
+            // The length term stops `pre` and `post` overlapping in `want`:
+            // without it `+refs/heads/a*a:…` claims to cover `refs/heads/a`,
+            // and the widening that the branch actually needs is skipped.
+            Some((pre, post)) => {
+                want.len() >= pre.len() + post.len()
+                    && want.starts_with(pre)
+                    && want.ends_with(post)
+            }
             None => src == want,
         }
     })
@@ -1101,10 +1134,11 @@ fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(),
 /// Map a `run_gh` spawn/timeout failure onto its user-facing message. A non-zero
 /// exit isn't one of these: the caller reads `status` itself.
 ///
-/// Only `NotFound` earns the "install it" hint. A moved working directory, a
-/// non-executable binary (EACCES) or an exhausted ETXTBSY retry all arrive here
-/// too, and telling that user to install the gh they already have sends them
-/// down the wrong path.
+/// Only `NotFound` earns the "install it" hint. A non-executable binary
+/// (EACCES) or an exhausted ETXTBSY retry arrive here too, and telling that
+/// user to install the gh they already have sends them down the wrong path. (A
+/// deleted working directory is NOT one of these: `current_dir` on a missing
+/// path also reports `NotFound`, so it still gets the install hint.)
 fn gh_unavailable(e: &std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::TimedOut => {
@@ -1285,9 +1319,13 @@ fn issue_branch_with(repo_dir: &str, issue_ref: &str, gh_bin: &str) -> Result<Is
         ));
     }
     // We never pass `--branch-repo`, so this should always be the pinned repo.
-    // Assert it anyway: it is one comparison, and it is the difference between
-    // noticing a gh behaviour change and silently checking out the wrong branch.
-    refuse_a_foreign_linked_branch(&pin, Some(line.as_str()), number, &branch)?;
+    // Only WARN if it isn't: gh has already created the branch on the remote by
+    // now, and refusing here would dead-end the issue (the retry takes the
+    // `--list` path and refuses again). A repo renamed on GitHub since the
+    // remote URL was set is enough to trip it, with nothing wrong.
+    if let Err(e) = refuse_a_foreign_linked_branch(&pin, Some(line.as_str()), number, &branch) {
+        tracing::warn!("{e}");
+    }
     prepare_linked_branch(repo_dir, &branch, gh_bin)?;
     Ok(IssueBranch { branch, reused: false })
 }
@@ -1314,7 +1352,6 @@ mod tests {
     fn init_repo(dir: &Path) {
         git(dir, &["init", "-b", "main"]);
         git(dir, &["config", "user.email", "t@t"]);
-        git(dir, &["config", "commit.gpgsign", "false"]);
         git(dir, &["config", "user.name", "t"]);
         // A developer with global `commit.gpgsign = true` would otherwise have
         // every commit here block on a signing agent.
@@ -2104,7 +2141,6 @@ mod tests {
         git(tmp, &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()]);
         // A clone inherits no commit identity, and several rows commit locally.
         git(&clone, &["config", "user.email", "t@t"]);
-        git(&clone, &["config", "commit.gpgsign", "false"]);
         git(&clone, &["config", "user.name", "t"]);
         git(&clone, &["config", "commit.gpgsign", "false"]);
         (origin, clone)
@@ -2699,58 +2735,42 @@ mod tests {
     }
 
     #[test]
-    fn a_linked_branch_in_another_repo_is_refused() {
-        // `gh issue develop --branch-repo` (and GitHub's Development panel)
-        // links a branch that lives somewhere else. `--list` reports only the
-        // NAME, so without the URL check we would fetch that name from origin
-        // and silently adopt origin's unrelated branch of the same name.
-        let tmp = TempDir::new().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["remote", "add", "origin", "https://github.com/o/r.git"]);
-        let gh = tmp.path().join("gh");
-        gh_issue_stub(&gh, "fix\thttps://github.com/fork/r/tree/fix\n", "");
-        let err =
-            issue_branch_with(repo.to_str().unwrap(), "7", gh.to_str().unwrap()).unwrap_err();
-        assert!(err.contains("lives in github.com/fork/r"), "names the other repo: {err}");
-        assert!(err.contains("not github.com/o/r"), "names the pin: {err}");
-    }
-
-    #[test]
-    fn a_linked_branch_in_the_pinned_repo_passes_the_repo_check() {
-        // The accept-side twin: same repo (and a differently-cased URL, which
-        // must still match) gets PAST the check, and the only thing left to
-        // fail is the fetch of a branch this fixture's origin can't serve.
-        let tmp = TempDir::new().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["remote", "add", "origin", "https://github.com/o/r.git"]);
-        let gh = tmp.path().join("gh");
-        gh_issue_stub(&gh, "fix\thttps://GitHub.com/O/R/tree/fix\n", "");
-        let err =
-            issue_branch_with(repo.to_str().unwrap(), "7", gh.to_str().unwrap()).unwrap_err();
-        assert!(!err.contains("lives in"), "same repo must not be refused: {err}");
-        assert!(err.contains("couldn't fetch"), "it got as far as the fetch: {err}");
-    }
-
-    #[test]
-    fn a_list_row_without_a_url_is_not_treated_as_foreign() {
-        // gh's output shape changing must degrade to the old behaviour, not
-        // block every lookup. Same reasoning as above: the fetch is the next
-        // thing to fail, and the repo check is not.
-        let tmp = TempDir::new().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["remote", "add", "origin", "https://github.com/o/r.git"]);
-        let gh = tmp.path().join("gh");
-        gh_issue_stub(&gh, "fix\n", "");
-        let err =
-            issue_branch_with(repo.to_str().unwrap(), "7", gh.to_str().unwrap()).unwrap_err();
-        assert!(!err.contains("lives in"), "an unparseable URL is not a refusal: {err}");
-        assert!(err.contains("couldn't fetch"), "{err}");
+    fn a_linked_branch_is_matched_against_the_pinned_repo() {
+        // A linked branch can live somewhere else (`gh issue develop
+        // --branch-repo`, and GitHub's Development panel offers a repo
+        // picker). `--list` reports only the NAME, so without the URL check we
+        // would fetch that name from origin and silently adopt origin's
+        // unrelated branch of the same name.
+        //
+        // `.invalid` is reserved (RFC 2606), so the accept rows fail fast at
+        // DNS instead of reaching github.com with the developer's credentials.
+        // Getting as far as `couldn't fetch` IS the accept assertion: it proves
+        // control flow went past the check.
+        let rows: &[(&str, &str)] = &[
+            ("fix\thttps://github.invalid/fork/r/tree/fix\n", "lives in github.invalid/fork/r"),
+            // Same repo, different case: must pass.
+            ("fix\thttps://GitHub.invalid/O/R/tree/fix\n", "couldn't fetch"),
+            // No URL to read: gh changing its output shape must degrade to the
+            // old behaviour, not refuse every lookup.
+            ("fix\n", "couldn't fetch"),
+        ];
+        for (row, want) in rows {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git(&repo, &["init", "-b", "main"]);
+            git(&repo, &["remote", "add", "origin", "https://github.invalid/o/r.git"]);
+            let gh = tmp.path().join("gh");
+            gh_issue_stub(&gh, row, "");
+            let err =
+                issue_branch_with(repo.to_str().unwrap(), "7", gh.to_str().unwrap()).unwrap_err();
+            assert!(err.contains(want), "{row:?}: expected {want:?}, got: {err}");
+            if !want.starts_with("lives in") {
+                assert!(!err.contains("lives in"), "{row:?}: must not be refused: {err}");
+            } else {
+                assert!(err.contains("not github.invalid/o/r"), "names the pin: {err}");
+            }
+        }
     }
 
     #[test]
@@ -2771,29 +2791,41 @@ mod tests {
         // git's own precedence: GIT_SSH_COMMAND beats core.sshCommand (see
         // git-config(1)). Reading only the environment would swap a repo-scoped
         // identity for the default key, and on the issue path that failure
-        // lands AFTER the branch has been created on origin.
+        // lands AFTER the branch has been created on origin. Tabled against the
+        // pure rule: reading the real environment here would switch the test
+        // off for anyone who exports GIT_SSH_COMMAND, and `set_var` is
+        // process-global and unsafe.
+        let rows: &[(Option<&str>, Option<&str>, &str)] = &[
+            (None, None, "ssh -oBatchMode=yes"),
+            (None, Some("ssh -i /k/cfg"), "ssh -i /k/cfg -oBatchMode=yes"),
+            (Some("ssh -i /k/env"), None, "ssh -i /k/env -oBatchMode=yes"),
+            // The environment wins, exactly as it does for git itself.
+            (Some("ssh -i /k/env"), Some("ssh -i /k/cfg"), "ssh -i /k/env -oBatchMode=yes"),
+            // Blank reads as absent, so the config still gets its turn.
+            (Some("   "), Some("ssh -i /k/cfg"), "ssh -i /k/cfg -oBatchMode=yes"),
+            // ssh takes the FIRST value of a repeated option, so someone who
+            // asked to be prompted keeps that.
+            (Some("ssh -oBatchMode=no"), None, "ssh -oBatchMode=no -oBatchMode=yes"),
+        ];
+        for (env, cfg, want) in rows {
+            assert_eq!(&ssh_command_with_batch_mode(*env, *cfg), want, "{env:?} / {cfg:?}");
+        }
+
+        // The repo-backed half, which does not depend on the environment.
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         let dir = tmp.path().to_str().unwrap();
-
-        // No env var set for this repo: core.sshCommand must be honoured.
-        // (The suite never sets GIT_SSH_COMMAND, and set_var is unsafe/global,
-        // so this reads the real environment on purpose.)
-        if std::env::var("GIT_SSH_COMMAND").is_err() {
-            assert_eq!(batch_ssh_command(dir), "ssh -oBatchMode=yes", "no config, no env");
-            git(tmp.path(), &["config", "core.sshCommand", "ssh -i /k/id"]);
-            assert_eq!(
-                batch_ssh_command(dir),
-                "ssh -i /k/id -oBatchMode=yes",
-                "core.sshCommand survives, with batch mode appended"
-            );
-        }
+        assert_eq!(git_config_value(dir, "core.sshCommand"), None, "unset reads as None");
+        git(tmp.path(), &["config", "core.sshCommand", "ssh -i /k/id"]);
+        assert_eq!(git_config_value(dir, "core.sshCommand"), Some("ssh -i /k/id".to_string()));
     }
 
     #[test]
     fn wait_bounded_in_gives_up_on_a_child_that_outlives_the_deadline() {
         let child = Command::new("sh")
-            .args(["-c", "sleep 30"])
+            // 100x the deadline: long enough to be deterministic, short enough
+            // that the orphan is gone soon after the suite.
+            .args(["-c", "sleep 5"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

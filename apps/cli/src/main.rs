@@ -447,9 +447,20 @@ fn main() -> anyhow::Result<()> {
                 // detection (and the remote write with it): `--branch` names one
                 // explicitly, `--fork` means "fork a fresh branch", `--no-worktree`
                 // means "no branch at all". In all three the positional is a NAME.
-                // Remember whether the ref was asked for or merely detected: an
-                // implicit one has an escape hatch worth naming when it fails.
-                let explicit_issue = issue.is_some();
+                // An implicitly detected ref has an escape hatch worth naming
+                // when it fails, but only for the bare-number shape: `--fork`
+                // with a URL positional dies on `validate_new_workspace_name`
+                // instead (a workspace name can't contain `/`), so the advice
+                // would be wrong. Restricting it also keeps the ref out of the
+                // message, which a URL must stay out of: it can carry
+                // credentials, and a percent-encoded `user%3Atoken%40` passes
+                // the parser's literal-`@` check.
+                let hint_ref = issue
+                    .is_none()
+                    .then_some(name.as_deref())
+                    .flatten()
+                    .filter(|n| n.trim_start_matches('#').bytes().all(|b| b.is_ascii_digit()))
+                    .map(str::to_string);
                 let from_issue = issue.or_else(|| {
                     name.clone().filter(|n| {
                         !fork && !no_worktree && branch.is_none() && kommand0_core::is_issue_ref(n)
@@ -464,17 +475,14 @@ fn main() -> anyhow::Result<()> {
                         // `user:token@`.
                         eprintln!("Resolving issue...");
                         let b = kommand0_core::issue_branch(&repo_path, r)
-                            .map_err(|e| {
-                                if explicit_issue {
-                                    anyhow::Error::msg(e)
-                                } else {
-                                    // The user typed a name, not `--issue`. Say
-                                    // how to get the old local behaviour back.
-                                    anyhow::anyhow!(
-                                        "{e}\n({r:?} was read as an issue reference; \
-                                         pass --fork for a workspace literally named {r})"
-                                    )
-                                }
+                            .map_err(|e| match &hint_ref {
+                                // The user typed a name, not `--issue`. Say how
+                                // to get the old, purely local behaviour back.
+                                Some(n) => anyhow::anyhow!(
+                                    "{e}\n({n} was read as an issue reference; \
+                                     pass --fork for a workspace literally named {n})"
+                                ),
+                                None => anyhow::Error::msg(e),
                             })?;
                         if b.reused {
                             eprintln!("Using existing linked branch {}", b.branch);

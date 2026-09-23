@@ -406,6 +406,49 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
 }
 
 #[test]
+fn the_fetch_keeps_the_repos_own_ssh_command() {
+    // git's precedence: GIT_SSH_COMMAND beats core.sshCommand, so forcing batch
+    // mode through the environment used to replace a repo-scoped identity with
+    // the default key — and on this path that failure lands AFTER the linked
+    // branch has been created on origin. An empty GIT_SSH_COMMAND reads as
+    // absent (git would die on it anyway), which makes this deterministic no
+    // matter what the developer has exported.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    run_git(&repo, &["config", "core.sshCommand", "ssh -i /k/deploy"]);
+    let gh = tmp.path().join("gh");
+    gh_develop_stub(&gh);
+
+    let log = tmp.path().join("git.log");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!("printf '%s [%s]\\n' \"$*\" \"${{GIT_SSH_COMMAND-UNSET}}\" >> \"{}\"", log.display()),
+    );
+
+    let out = kmd(
+        &state,
+        &[
+            ("KOMMAND0_GH_BIN", gh.to_str().unwrap()),
+            ("PATH", &path),
+            ("GIT_SSH_COMMAND", ""),
+        ],
+        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "create --issue: {}", String::from_utf8_lossy(&out.stderr));
+
+    let recorded = std::fs::read_to_string(&log).unwrap();
+    let fetch = recorded
+        .lines()
+        .find(|l| l.contains("fetch origin +refs/heads/123-add-thing:"))
+        .unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}"));
+    assert!(
+        fetch.ends_with("[ssh -i /k/deploy -oBatchMode=yes]"),
+        "the repo's own ssh command survives, with batch mode appended: {fetch}"
+    );
+}
+
+#[test]
 fn refuses_the_linked_branch_when_the_local_branch_check_cannot_answer() {
     // A leftover local branch is adopted over the fetched ref, so kommand0 only
     // adopts one that already contains origin's tip. Every way the check can
@@ -526,8 +569,28 @@ fn an_implicitly_detected_issue_ref_names_the_escape_hatch_when_it_fails() {
         &[("KOMMAND0_GH_BIN", gh)],
         &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
     );
+    assert!(!explicit.status.success(), "the same lookup, the same failure");
     let err = String::from_utf8_lossy(&explicit.stderr);
+    assert!(err.contains("gh CLI not found"), "it reached the same failure: {err}");
     assert!(!err.contains("--fork"), "an explicit --issue needs no escape hatch: {err}");
+
+    // A URL positional gets no hint either: `--fork` on a URL dies on the
+    // workspace-name check instead, and a URL must stay out of the message.
+    let url = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh)],
+        &[
+            "workspace",
+            "create",
+            "https://github.com/o/r/issues/123?access_token=SECRET",
+            "--repo",
+            repo.to_str().unwrap(),
+        ],
+    );
+    assert!(!url.status.success(), "the lookup still runs for a URL");
+    let err = String::from_utf8_lossy(&url.stderr);
+    assert!(!err.contains("--fork"), "no wrong advice for a URL: {err}");
+    assert!(!err.contains("SECRET"), "the pasted URL is never echoed back: {err}");
 }
 
 #[test]
@@ -1403,7 +1466,6 @@ fn state_with_repos(root: &Path, names: &[&str]) -> std::path::PathBuf {
         run_git(&repo, &["init", "-b", "main"]);
         run_git(&repo, &["config", "user.email", "t@t"]);
         run_git(&repo, &["config", "commit.gpgsign", "false"]);
-    run_git(&repo, &["config", "commit.gpgsign", "false"]);
         run_git(&repo, &["config", "user.name", "t"]);
         run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
         let add = kmd(&state_dir, &[], &["repo", "add", repo.to_str().unwrap()]);

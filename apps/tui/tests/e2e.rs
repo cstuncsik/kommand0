@@ -1371,6 +1371,7 @@ fn c_cleans_up_a_merged_workspace() {
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
     run_git(&repo, &["config", "user.name", "t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
     run_git(&repo, &["commit", "-m", "init"]);
@@ -1448,6 +1449,10 @@ fn w_with_an_issue_ref_resolves_it_and_creates_the_workspace() {
     // The reply crossed the channel and the workspace was named after the
     // branch, not after the ref that was typed.
     tui.wait_for("123-linked");
+    // The screen could show the name for other reasons; the point of the
+    // feature is that the worktree is on the branch origin carries.
+    let st = tui.read_state();
+    assert_eq!(st["workspaces"][0]["branch_name"], "123-linked", "state: {st}");
 
     tui.send("q");
     tui.wait_exit();
