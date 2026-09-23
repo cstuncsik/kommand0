@@ -59,8 +59,26 @@ fn git_shim(dir: &Path, body: &str) -> String {
     let real_git = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(!real_git.is_empty(), "no git on PATH");
     std::fs::create_dir_all(dir).unwrap();
-    write_stub(&dir.join("git"), &format!("#!/bin/sh\n{body}\nexec {real_git} \"$@\"\n"));
+    // Quoted: a git under a path with a space would otherwise split into words.
+    write_stub(&dir.join("git"), &format!("#!/bin/sh\n{body}\nexec \"{real_git}\" \"$@\"\n"));
     format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default())
+}
+
+/// The `gh issue develop` stub three issue tests share: no linked branch yet,
+/// then `create` pushes `123-add-thing` to origin and prints the
+/// `…/tree/<branch>` line core parses.
+fn gh_develop_stub(path: &Path) {
+    write_stub(
+        path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\n\
+         if [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n\
+        \x20 git push -q origin HEAD:refs/heads/123-add-thing\n\
+        \x20 printf 'github.com/o/r/tree/123-add-thing\\n'\n\
+        \x20 exit 0\n\
+         fi\n\
+         exit 1\n",
+    );
 }
 
 fn stdout(out: &Output) -> String {
@@ -108,6 +126,7 @@ fn setup(root: &Path) -> std::path::PathBuf {
     run_git(&remote, &["init", "--bare", "-b", "main"]);
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
@@ -151,6 +170,7 @@ fn workspace_create_from_an_existing_branch() {
     std::fs::create_dir_all(&repo).unwrap();
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
@@ -194,6 +214,7 @@ fn repo_with_branch_feat(root: &Path) -> (std::path::PathBuf, String) {
     std::fs::create_dir_all(&repo).unwrap();
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
@@ -300,12 +321,7 @@ fn workspace_create_from_an_issue() {
         let state = setup(tmp.path());
         let repo = tmp.path().join("repo");
         let gh = tmp.path().join("gh");
-        // Faithful gh: nothing linked yet, then create pushes the branch to
-        // origin and prints the `…/tree/<branch>` line core parses.
-        write_stub(
-            &gh,
-            "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\nif [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n  git push -q origin HEAD:refs/heads/123-add-thing\n  printf 'github.com/o/r/tree/123-add-thing\\n'\n  exit 0\nfi\nexit 1\n",
-        );
+        gh_develop_stub(&gh);
         let mut args = vec!["workspace", "create"];
         args.extend(extra.iter().copied());
         args.extend(["--repo", repo.to_str().unwrap()]);
@@ -341,10 +357,7 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
     // skipped outright when there is nothing to shadow the fetched ref.
     run_git(&repo, &["branch", "123-add-thing"]);
     let gh = tmp.path().join("gh");
-    write_stub(
-        &gh,
-        "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\nif [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n  git push -q origin HEAD:refs/heads/123-add-thing\n  printf 'github.com/o/r/tree/123-add-thing\\n'\n  exit 0\nfi\nexit 1\n",
-    );
+    gh_develop_stub(&gh);
 
     let log = tmp.path().join("git.log");
     let path = git_shim(
@@ -407,10 +420,7 @@ fn refuses_the_linked_branch_when_the_local_branch_check_cannot_answer() {
         // The leftover local branch is what makes the check run at all.
         run_git(&repo, &["branch", "123-add-thing"]);
         let gh = tmp.path().join("gh");
-        write_stub(
-            &gh,
-            "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\nif [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n  git push -q origin HEAD:refs/heads/123-add-thing\n  printf 'github.com/o/r/tree/123-add-thing\\n'\n  exit 0\nfi\nexit 1\n",
-        );
+        gh_develop_stub(&gh);
         let path = git_shim(
             &tmp.path().join("shim"),
             &format!("case \"$*\" in\n  *\"merge-base --is-ancestor\"*) {die} ;;\nesac"),
@@ -491,6 +501,36 @@ fn workspace_create_from_an_issue_reports_gh_failure() {
 }
 
 #[test]
+fn an_implicitly_detected_issue_ref_names_the_escape_hatch_when_it_fails() {
+    // `kmd workspace create 123 --repo x` used to make a workspace called 123.
+    // It now performs a lookup, so when that lookup fails the error has to say
+    // how to get the old behaviour back — `--issue 123` failing does not, the
+    // user asked for it.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let gh = "/nonexistent/definitely/not/gh";
+
+    let implicit = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh)],
+        &["workspace", "create", "123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(!implicit.status.success(), "the lookup failed, so the command must");
+    let err = String::from_utf8_lossy(&implicit.stderr);
+    assert!(err.contains("gh CLI not found"), "gh's own reason survives: {err}");
+    assert!(err.contains("--fork"), "names the escape hatch: {err}");
+
+    let explicit = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh)],
+        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+    );
+    let err = String::from_utf8_lossy(&explicit.stderr);
+    assert!(!err.contains("--fork"), "an explicit --issue needs no escape hatch: {err}");
+}
+
+#[test]
 fn workspace_create_suppresses_issue_detection() {
     // Anything that already says what branch to use means the positional is a
     // NAME. gh points at a nonexistent path, so any lookup would fail loudly.
@@ -531,6 +571,7 @@ fn workspace_names_are_per_repo_and_ids_disambiguate() {
         std::fs::create_dir_all(&dir).unwrap();
         run_git(&dir, &["init", "-b", "main"]);
         run_git(&dir, &["config", "user.email", "t@t"]);
+        run_git(&dir, &["config", "commit.gpgsign", "false"]);
         run_git(&dir, &["config", "user.name", "t"]);
         std::fs::write(dir.join("a.txt"), "1").unwrap();
         run_git(&dir, &["add", "."]);
@@ -971,6 +1012,7 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     std::fs::create_dir_all(&repo).unwrap();
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
@@ -1109,6 +1151,7 @@ fn profile_delete_force_removes_dir_and_worktrees_keeps_branch() {
     std::fs::create_dir_all(&repo).unwrap();
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
@@ -1359,6 +1402,8 @@ fn state_with_repos(root: &Path, names: &[&str]) -> std::path::PathBuf {
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "-b", "main"]);
         run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
         run_git(&repo, &["config", "user.name", "t"]);
         run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
         let add = kmd(&state_dir, &[], &["repo", "add", repo.to_str().unwrap()]);

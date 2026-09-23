@@ -156,7 +156,10 @@ enum RepoAction {
 enum WorkspaceAction {
     /// Create a new workspace
     Create {
-        /// Workspace name (auto-generated from the repo or branch if omitted)
+        /// Workspace name, or an issue reference (`123`, `#123`, an issue URL),
+        /// which is resolved like `--issue`. Auto-generated from the repo or
+        /// branch if omitted; pass `--branch`, `--fork` or `--no-worktree` to
+        /// force a workspace literally named `123`
         name: Option<String>,
         /// Repo reference (name, path, or ID)
         #[arg(long)]
@@ -444,6 +447,9 @@ fn main() -> anyhow::Result<()> {
                 // detection (and the remote write with it): `--branch` names one
                 // explicitly, `--fork` means "fork a fresh branch", `--no-worktree`
                 // means "no branch at all". In all three the positional is a NAME.
+                // Remember whether the ref was asked for or merely detected: an
+                // implicit one has an escape hatch worth naming when it fails.
+                let explicit_issue = issue.is_some();
                 let from_issue = issue.or_else(|| {
                     name.clone().filter(|n| {
                         !fork && !no_worktree && branch.is_none() && kommand0_core::is_issue_ref(n)
@@ -458,7 +464,18 @@ fn main() -> anyhow::Result<()> {
                         // `user:token@`.
                         eprintln!("Resolving issue...");
                         let b = kommand0_core::issue_branch(&repo_path, r)
-                            .map_err(anyhow::Error::msg)?;
+                            .map_err(|e| {
+                                if explicit_issue {
+                                    anyhow::Error::msg(e)
+                                } else {
+                                    // The user typed a name, not `--issue`. Say
+                                    // how to get the old local behaviour back.
+                                    anyhow::anyhow!(
+                                        "{e}\n({r:?} was read as an issue reference; \
+                                         pass --fork for a workspace literally named {r})"
+                                    )
+                                }
+                            })?;
                         if b.reused {
                             eprintln!("Using existing linked branch {}", b.branch);
                         } else {
