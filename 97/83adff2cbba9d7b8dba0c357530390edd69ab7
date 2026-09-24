@@ -1,0 +1,46 @@
+apps/tui/src/modal.rs
+  s_8b2585d1e999e1::t_d28a1693680eca 2,9
+  s_8b2585d1e999e1::t_29bc7533fe43fc 1110-1111,1126-1128,1133
+  s_8b2585d1e999e1::t_090a8bf2da3f1e 1115-1119
+  s_8b2585d1e999e1::t_736e05b237af66 1082-1084,1093
+  s_8b2585d1e999e1::t_179a39b0540b6c 1129-1131
+apps/tui/src/render.rs
+  s_8b2585d1e999e1::t_f5a881f49d2ca7 820
+  s_8b2585d1e999e1::t_9731ea3e90a74e 1645-1653
+  s_8b2585d1e999e1::t_84ac995f3afadc 1716-1723
+apps/tui/src/main.rs
+  s_8b2585d1e999e1::t_ee994151ea01ab 71-73
+  s_8b2585d1e999e1::t_4a877f9c3a308b 9986-9987
+  s_8b2585d1e999e1::t_b16a056591b8f7 9844
+  s_8b2585d1e999e1::t_0a80e7d9de4ec0 3588-3589
+  s_8b2585d1e999e1::t_d04e0b5921e213 3493-3497,3508-3509,3522-3524
+  s_8b2585d1e999e1::t_95fa2bc195d885 9772,9775-9791,9793-9794,9799,9805
+  s_8b2585d1e999e1::t_2963b70bb3ba33 3554-3560
+  s_8b2585d1e999e1::t_5097c5f13d43c8 3714-3720
+  s_8b2585d1e999e1::t_ac0ba4af388285 3653-3655
+  s_8b2585d1e999e1::t_03771b5565cd0e 9773-9774
+  s_8b2585d1e999e1::t_cbec0a027d6875 3674,3676,3678
+  s_8b2585d1e999e1::t_6977308d7f1d53 5276
+  s_8b2585d1e999e1::t_21b8121fee7582 9871-9875
+  s_8b2585d1e999e1::t_55e2549169ddeb 3530-3538,3540-3541,3543
+  s_8b2585d1e999e1::t_af392a158a32f1 3693-3694
+  s_8b2585d1e999e1::t_e60cb1ec3b7bb1 9901-9912,9921
+  s_8b2585d1e999e1::t_8b89ae773f70bf 9913-9916
+  s_8b2585d1e999e1::t_81052d9552cb62 10002
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9783adff2cbba9d7b8dba0c357530390edd69ab7",
+  "prompts": {},
+  "sessions": {
+    "s_8b2585d1e999e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "421e709d-831d-48ba-a278-0deaa0fdf4fa",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
