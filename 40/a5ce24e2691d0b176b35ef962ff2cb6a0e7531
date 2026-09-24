@@ -1,0 +1,56 @@
+CHANGELOG.md
+  s_8b2585d1e999e1::t_564f9585ed7ac2 36-73,939-940
+crates/core/src/worktree.rs
+  s_8b2585d1e999e1::t_564f9585ed7ac2 28,491
+apps/tui/src/main.rs
+  s_8b2585d1e999e1::t_564f9585ed7ac2 50,89-92,928-940,1043-1046,3774-3895,4387-4388,4390-4402,4493-4501,4506,5245-5248,5323-5325,6367,6495-6731,9406-9457
+  s_8b2585d1e999e1::t_a55a4419814917 9458
+README.md
+  s_8b2585d1e999e1::t_564f9585ed7ac2 89,120-139,156,191
+Cargo.toml
+  s_8b2585d1e999e1::t_564f9585ed7ac2 6
+crates/core/src/lib.rs
+  s_8b2585d1e999e1::t_564f9585ed7ac2 2251,2329,3184
+  s_8b2585d1e999e1::t_84e35f6a91a5e0 15-17
+apps/cli/src/main.rs
+  s_8b2585d1e999e1::t_84e35f6a91a5e0 1071-1072
+  s_8b2585d1e999e1::t_564f9585ed7ac2 171-174,190-193,535,537-588,1073-1083
+  s_8b2585d1e999e1::t_e776739fde93b1 1084
+apps/tui/tests/e2e.rs
+  s_8b2585d1e999e1::t_564f9585ed7ac2 1374,1451-1498
+  s_8b2585d1e999e1::t_f707f3871e0ffa 1419
+  s_8b2585d1e999e1::t_b2ce2ca55439a5 1450
+  s_8b2585d1e999e1::t_4e4390adf07d58 1499-1503
+.gitignore
+  s_8b2585d1e999e1::t_564f9585ed7ac2 13,15
+apps/tui/tests/fixtures/gh-stub-issue
+  s_8b2585d1e999e1::t_564f9585ed7ac2 1-14
+apps/tui/src/modal.rs
+  s_8b2585d1e999e1::t_564f9585ed7ac2 140-146,501-512,582-583,874,1222-1274,1628-1652
+  s_8b2585d1e999e1::t_06e82d10a839d8 1653-1654
+apps/cli/tests/cli.rs
+  s_8b2585d1e999e1::t_564f9585ed7ac2 55-85,119-120,131,136,175,219,316-628,639,1280,1419,1670
+crates/core/src/git.rs
+  s_8b2585d1e999e1::t_f707f3871e0ffa 744-747
+  s_8b2585d1e999e1::t_564f9585ed7ac2 14-21,272-355,375-390,404,1021-1552,1576-1578,1636,1750,1877,1976,2013,2517-3258
+Cargo.lock
+  s_8b2585d1e999e1::t_76ccd2adaf1621 909,923,941
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_add_workspace_modal.snap
+  s_8b2585d1e999e1::t_03e25626d98268 15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "40a5ce24e2691d0b176b35ef962ff2cb6a0e7531",
+  "prompts": {},
+  "sessions": {
+    "s_8b2585d1e999e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "421e709d-831d-48ba-a278-0deaa0fdf4fa",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
