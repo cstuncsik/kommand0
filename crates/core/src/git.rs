@@ -527,6 +527,8 @@ fn is_default_branch(repo_path: &str, branch: &str) -> bool {
     if branch == "main" || branch == "master" {
         return true;
     }
+    // ponytail: one `symbolic-ref` spawn per gated branch; resolve origin/HEAD
+    // once per scan if a huge repo makes the local gates measurable.
     match Command::new("git")
         .args(["-C", repo_path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .output()
@@ -558,12 +560,12 @@ fn is_live_worktree(worktree_path: &str) -> bool {
 }
 
 /// The newest PR whose head is a branch, as `gh` reports it.
-pub struct PrLookup {
-    pub state: String,
+struct PrLookup {
+    state: String,
     /// The oid of the PR's last commit (empty when it has none).
-    pub tip: String,
+    tip: String,
     /// Absent when gh printed the older two-line shape.
-    pub number: Option<u64>,
+    number: Option<u64>,
 }
 
 /// `Ok(None)` = no PR has that head. `Err` = gh itself failed: not installed or
@@ -673,6 +675,17 @@ fn delete_local_branch(repo_path: &str, branch: &str) -> Result<(), String> {
     }
 }
 
+/// The oid `refs/heads/<branch>` points at, or None when it doesn't resolve.
+fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
+    match Command::new("git")
+        .args(["-C", repo_path, "rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+    {
+        Ok(o) if o.status.success() => Some(last_line(&o.stdout)),
+        _ => None,
+    }
+}
+
 fn cleanup_merged_workspace_with(
     repo_path: &str,
     worktree_path: &str,
@@ -740,12 +753,8 @@ fn cleanup_merged_workspace_with(
 
     // The branch tip must be exactly what the PR merged: no commits beyond it
     // (pushed OR unpushed). This is the guard that makes the force-delete safe.
-    let local_tip = match Command::new("git")
-        .args(["-C", repo_path, "rev-parse", &format!("refs/heads/{branch}")])
-        .output()
-    {
-        Ok(o) if o.status.success() => last_line(&o.stdout),
-        _ => return Err("couldn't resolve the branch tip — not cleaning up".to_string()),
+    let Some(local_tip) = branch_tip(repo_path, branch) else {
+        return Err("couldn't resolve the branch tip — not cleaning up".to_string());
     };
     if pr_tip.is_empty() || local_tip != pr_tip {
         return Err("the branch has commits beyond its merged PR — not cleaning up".to_string());
@@ -791,8 +800,13 @@ fn cleanup_merged_workspace_with(
         .output();
 
     // The PR-tip check above proved there's nothing beyond the merge.
-    delete_local_branch(repo_path, branch)
-        .map_err(|e| format!("worktree removed, but couldn't delete branch {branch}: {e}"))
+    delete_local_branch(repo_path, branch).map_err(|e| {
+        if worktree_exists {
+            format!("worktree removed, but couldn't delete branch {branch}: {e}")
+        } else {
+            format!("couldn't delete branch {branch}: {e}")
+        }
+    })
 }
 
 /// What the repo-wide scan decided for one local branch.
@@ -809,11 +823,13 @@ pub enum Verdict {
 /// One local branch as [`scan_merged_branches`] saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchVerdict {
+    /// The short name (`refs/heads/` stripped).
     pub branch: String,
     /// The tip at scan time; [`delete_branches`] refuses a branch that moved.
     pub tip: String,
     /// The PR number, whenever a PR was found.
     pub pr: Option<u64>,
+    /// What the scan decided for it.
     pub verdict: Verdict,
 }
 
@@ -853,8 +869,6 @@ fn scan_merged_branches_with(
     let text = String::from_utf8_lossy(&out.stdout);
     let fields: Vec<&str> = text.split('\0').collect();
     let mut verdicts = Vec::new();
-    // ponytail: one gh round-trip per branch; batch them through `gh api graphql`
-    // if a repo with hundreds of branches makes the scan too slow.
     // for-each-ref ends each record with '\n', which lands in front of the next
     // refname; the newline-only remainder after the last NUL is dropped.
     let (records, _) = fields.as_chunks::<3>();
@@ -865,6 +879,8 @@ fn scan_merged_branches_with(
         let tip = tip.to_string();
         let (pr, verdict) = match refuse_branch_delete(repo_path, branch, protected) {
             Err(r) => (None, Verdict::Skip(r.short().to_string())),
+            // ponytail: one gh round-trip per branch; batch them through `gh api graphql`
+            // if a repo with hundreds of branches makes the scan too slow.
             Ok(()) => match lookup_pr(gh_bin, repo_path, branch).map_err(|e| format!("{branch}: {e}"))? {
                 None => (None, Verdict::Skip("no PR".to_string())),
                 Some(pr) => {
@@ -896,15 +912,10 @@ pub fn delete_branches(
 ) -> Vec<(String, Result<(), String>)> {
     let delete = |branch: &str, tip: &str| -> Result<(), String> {
         refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
-        match Command::new("git")
-            .args(["-C", repo_path, "rev-parse", &format!("refs/heads/{branch}")])
-            .output()
-        {
-            Ok(o) if o.status.success() && last_line(&o.stdout) == tip => {
-                delete_local_branch(repo_path, branch)
-            }
-            _ => Err("moved since scan".to_string()),
+        if branch_tip(repo_path, branch).as_deref() != Some(tip) {
+            return Err("moved since scan".to_string());
         }
+        delete_local_branch(repo_path, branch)
     };
     branches.iter().map(|(b, t)| (b.clone(), delete(b, t))).collect()
 }
@@ -1234,11 +1245,7 @@ mod tests {
         git(&repo, &["commit", "-m", "init"]);
         let wt = root.join("wt");
         git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", branch]);
-        let tip = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "rev-parse", &format!("refs/heads/{branch}")])
-            .output()
-            .unwrap();
-        let sha = String::from_utf8_lossy(&tip.stdout).trim().to_string();
+        let sha = tip_of(&repo, branch);
         (repo, wt, branch.to_string(), sha)
     }
 
@@ -1481,6 +1488,22 @@ mod tests {
         gh_pr_stub(&gh, "MERGED", &sha);
         assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
         assert!(!branch_exists(&repo, &branch), "orphaned branch deleted");
+    }
+
+    #[test]
+    fn cleanup_does_not_claim_a_removal_when_the_worktree_was_already_gone() {
+        // Nothing was removed on this path, so a failed `branch -D` (the branch
+        // is checked out in the main repo by now) must not say "worktree removed".
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        std::fs::remove_dir_all(&wt).unwrap();
+        git(&repo, &["worktree", "prune"]);
+        git(&repo, &["switch", &branch]);
+        let gh = tmp.path().join("gh");
+        gh_pr_stub(&gh, "MERGED", &sha);
+        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        assert!(err.starts_with(&format!("couldn't delete branch {branch}:")), "{err}");
+        assert!(branch_exists(&repo, &branch), "the branch survives the refusal");
     }
 
     #[test]

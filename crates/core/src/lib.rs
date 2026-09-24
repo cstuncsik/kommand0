@@ -1986,7 +1986,39 @@ pub enum RepoCleanupItem {
     Delete { branch: String, tip: String, pr: Option<u64> },
     /// A kommand0 workspace's branch: the workspace cleanup owns it.
     Workspace { ws_id: String, branch: String, pr: Option<u64> },
+    /// Left alone; `reason` is what the preview shows.
     Skip { branch: String, pr: Option<u64>, reason: String },
+}
+
+impl RepoCleanupItem {
+    pub fn branch(&self) -> &str {
+        match self {
+            Self::Delete { branch, .. } | Self::Workspace { branch, .. } | Self::Skip { branch, .. } => {
+                branch
+            }
+        }
+    }
+
+    pub fn pr(&self) -> Option<u64> {
+        match self {
+            Self::Delete { pr, .. } | Self::Workspace { pr, .. } | Self::Skip { pr, .. } => *pr,
+        }
+    }
+
+    /// The PR column: `#N`, or `-` without a PR.
+    pub fn pr_label(&self) -> String {
+        self.pr().map(|n| format!("#{n}")).unwrap_or_else(|| "-".to_string())
+    }
+
+    /// The plan's Delete rows as the `(branch, tip)` pairs [`delete_branches`] takes.
+    pub fn deletes(plan: &[Self]) -> Vec<(String, String)> {
+        plan.iter()
+            .filter_map(|item| match item {
+                Self::Delete { branch, tip, .. } => Some((branch.clone(), tip.clone())),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Route a repo scan. Any Delete/CheckedOut verdict whose branch is the

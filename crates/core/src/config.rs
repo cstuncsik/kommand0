@@ -143,6 +143,14 @@ impl Config {
         let contents = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink reads as NotFound too, but it is a present,
+                // broken config: only a truly absent path is the default.
+                if std::fs::symlink_metadata(path).is_ok() {
+                    return Err(format!(
+                        "{} is a dangling symlink; fix it before cleaning up",
+                        path.display()
+                    ));
+                }
                 return Ok(Self::default().protected_branches);
             }
             Err(e) => return Err(format!("{}: {e}; fix it before cleaning up", path.display())),
@@ -397,5 +405,17 @@ mod tests {
         assert!(err.contains("fix it before cleaning up"), "a read error fails closed: {err}");
         std::fs::write(&path, r#"{ "protected_branches": [] }"#).unwrap();
         assert_eq!(Config::protected_branches_at(&path).unwrap(), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_branches_at_refuses_a_dangling_symlink() {
+        // A dangling link reads as NotFound too, but it is a present, broken
+        // config (a dotfiles link whose target moved), not an absent one.
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("config.json");
+        std::os::unix::fs::symlink(tmp.path().join("missing.json"), &link).unwrap();
+        let err = Config::protected_branches_at(&link).unwrap_err();
+        assert!(err.contains("dangling"), "{err}");
     }
 }
