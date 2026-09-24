@@ -5,6 +5,34 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Repo-level cleanup of merged-PR branches.** `c` on a repo row in the TUI
+  scans the repo's local branches off the render loop (one `gh pr list` per
+  branch), previews the plan in a `Clean Up Repo` modal and, on `y`, deletes
+  every branch whose PR is merged and whose tip is exactly the merged commit.
+  Branches that belong to a kommand0 workspace are routed through the existing
+  workspace cleanup (one shared pane-capture grace for the set); a branch
+  checked out elsewhere is skipped with its path. The outcome lands in the repo
+  detail pane, and a scan that finishes while something else owns the keyboard
+  is parked and reviewed on the next `c` instead of stealing the screen. The
+  same flow is `kmd repo cleanup <repo> [--dry-run] [--force]` on the CLI:
+  `--dry-run` prints the BRANCH / PR / ACTION table only, a non-interactive run
+  needs `--force`, and the exit code is 1 when any item failed.
+- **`protected_branches` config key**: exact branch names neither cleanup
+  deletes. Default `develop`, `development`, `staging`; a configured list
+  replaces it, so `[]` disables it, while `main`/`master`/`origin/HEAD` stay
+  refused regardless. `--force` never bypasses it.
+
+### Changed
+
+- **Workspace cleanup honors `protected_branches`** (default
+  `develop`/`development`/`staging`), re-reads `config.json` when it runs and
+  aborts on an unparseable or unreadable file instead of degrading to the
+  default list, and refuses a worktree whose HEAD is no longer on the
+  workspace's branch, since removing it would take the other branch's checkout
+  with it.
+
 ## [0.27.3] - 2026-09-20
 
 ### Fixed
