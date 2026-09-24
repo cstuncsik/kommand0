@@ -118,6 +118,13 @@ pub(crate) enum ModalState {
         repo_name: String,
         name: String,
     },
+    /// A `gh issue develop` lookup is in flight for `issue`. Nothing is
+    /// editable: Esc stops kommand0 waiting, every other key is swallowed.
+    ResolvingIssue {
+        repo_id: String,
+        repo_name: String,
+        issue: String,
+    },
 }
 
 impl ModalState {
@@ -454,6 +461,18 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                 _ => ModalResult::Consumed,
             }
         }
+        ModalState::ResolvingIssue { .. } => match key.code {
+            KeyCode::Esc => {
+                *modal = ModalState::None;
+                ModalResult::Cancelled
+            }
+            // Ctrl+C cancels in every modal; keep that here too.
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                *modal = ModalState::None;
+                ModalResult::Cancelled
+            }
+            _ => ModalResult::Consumed,
+        },
     }
 }
 
@@ -522,7 +541,8 @@ pub(crate) fn handle_modal_paste(modal: &mut ModalState, text: &str) {
         ModalState::None
         | ModalState::ConfirmDelete { .. }
         | ModalState::ConfirmCleanup { .. }
-        | ModalState::ConfirmBranchCheckout { .. } => {
+        | ModalState::ConfirmBranchCheckout { .. }
+        | ModalState::ResolvingIssue { .. } => {
             return;
         }
     };
@@ -813,7 +833,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
 
             // Name field — the cursor is drawn only on the focused field.
             frame.render_widget(
-                Paragraph::new(Line::styled("Workspace name (blank = from branch):", lbl(name_focused))),
+                Paragraph::new(Line::styled("Name/#issue/URL (blank = from branch):", lbl(name_focused))),
                 inner[0],
             );
             if name_focused {
@@ -1077,6 +1097,59 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                     Span::raw(" fork a new branch   ".to_string()),
                     Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(" cancel"),
+                ])),
+                inner[2],
+            );
+        }
+        ModalState::ResolvingIssue { repo_name, issue, .. } => {
+            let area = centered_rect(55, 20, frame.area());
+            frame.render_widget(Clear, area);
+
+            let inner = Layout::vertical([
+                // Three rows, not two: at 80 columns the first line wraps, and
+                // the remote-write notice below it must not be pushed out. The
+                // footer still survives a short terminal (checked down to 16
+                // rows): when the three rows don't fit, the solver shrinks this
+                // one rather than dropping the trailing `Length(1)`.
+                Constraint::Length(3), // message
+                Constraint::Min(0),   // spacer
+                Constraint::Length(1), // footer
+            ])
+            .split(Rect::new(
+                area.x + 2,
+                area.y + 1,
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(2),
+            ));
+
+            let block = Block::default()
+                .title(format!(" Add Workspace to {repo_name} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th.accent));
+            frame.render_widget(block, area);
+
+            // Name the target: this can perform a remote write.
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(
+                        format!("Resolving issue {issue} on {repo_name}'s origin."),
+                        Style::default().fg(th.text),
+                    ),
+                    Line::styled(
+                        "GitHub may create a new linked branch.",
+                        Style::default().fg(th.muted),
+                    ),
+                ])
+                .wrap(Wrap { trim: true }),
+                inner[0],
+            );
+
+            // Esc does NOT cancel the remote operation, so the footer must not
+            // imply it does.
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Esc", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+                    Span::raw(" stop waiting"),
                 ])),
                 inner[2],
             );
@@ -1422,6 +1495,33 @@ mod tests {
         let mut modal = confirm_branch_checkout_modal();
         assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Char('n'))), ModalResult::Consumed), "n is a no-op");
         assert!(matches!(modal, ModalState::ConfirmBranchCheckout { .. }), "n leaves the prompt open");
+    }
+
+    #[test]
+    fn resolving_issue_esc_cancels_and_other_keys_are_consumed() {
+        let resolving = || ModalState::ResolvingIssue {
+            repo_id: "r1".into(),
+            repo_name: "demo".into(),
+            issue: "123".into(),
+        };
+        let mut modal = resolving();
+        assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Esc)), ModalResult::Cancelled));
+        assert!(matches!(modal, ModalState::None), "Esc closes the modal");
+
+        let mut modal = resolving();
+        let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(handle_modal_key(&mut modal, ev), ModalResult::Cancelled));
+        assert!(matches!(modal, ModalState::None), "Ctrl+C closes the modal");
+
+        // Nothing is editable while the lookup is in flight.
+        for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Tab, KeyCode::Backspace] {
+            let mut modal = resolving();
+            assert!(
+                matches!(handle_modal_key(&mut modal, key(code)), ModalResult::Consumed),
+                "{code:?} is swallowed"
+            );
+            assert!(matches!(modal, ModalState::ResolvingIssue { .. }), "{code:?} leaves it open");
+        }
     }
 
     #[test]
