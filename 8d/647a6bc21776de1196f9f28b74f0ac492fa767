@@ -1,0 +1,54 @@
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_tree_collapsed.snap
+  s_8b2585d1e999e1::t_b0b8f28e9ff968 10
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_palette_overlay.snap
+  s_8b2585d1e999e1::t_7c84a0f2f0fb93 10,20-21
+apps/tui/src/palette.rs
+  s_8b2585d1e999e1::t_4351b153c48d02 29-30
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_add_repo_modal.snap
+  s_8b2585d1e999e1::t_1070ce546c1c89 10
+README.md
+  s_8b2585d1e999e1::t_a17a894a9e21e4 178,189
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_add_workspace_modal.snap
+  s_8b2585d1e999e1::t_6045d14c8c7441 10
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_narrow_terminal.snap
+  s_8b2585d1e999e1::t_8cd54bb61ced13 10
+apps/tui/src/buttons.rs
+  s_8b2585d1e999e1::t_4351b153c48d02 23-24
+apps/tui/src/main.rs
+  s_8b2585d1e999e1::t_4351b153c48d02 2026,2036,2038,2125,5537-5539,10576-10577,10584-10637
+  s_8b2585d1e999e1::t_159891096435ce 2126,10638
+  s_8b2585d1e999e1::t_cd75766a295d52 2031-2033,10213,10256,10295
+  s_8b2585d1e999e1::t_882d93aace7b2c 2048-2051,2117-2124
+  s_fc3d7618d36de0::t_5298a452f323ad 2178-2179
+  s_8b2585d1e999e1::t_6d850d82bc33a4 2021-2025,2027-2030,2034-2035,2037,2039,2175-2177
+CHANGELOG.md
+  s_8b2585d1e999e1::t_a17a894a9e21e4 19-20
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_tree_expanded.snap
+  s_8b2585d1e999e1::t_edbc5b8b083b18 10
+apps/tui/src/render.rs
+  s_8b2585d1e999e1::t_882d93aace7b2c 990-1023
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8d647a6bc21776de1196f9f28b74f0ac492fa767",
+  "prompts": {},
+  "sessions": {
+    "s_8b2585d1e999e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "421e709d-831d-48ba-a278-0deaa0fdf4fa",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    },
+    "s_fc3d7618d36de0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "643f9524-3fec-4b87-9feb-980e05a94751",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
