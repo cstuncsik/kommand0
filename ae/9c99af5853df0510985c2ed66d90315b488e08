@@ -1,0 +1,26 @@
+apps/cli/src/main.rs
+  s_8b2585d1e999e1::t_82980fbd6ab506 443-445,448-454,456
+  s_8b2585d1e999e1::t_8e8cb6e24c4031 477-479,481,484,492,496,503,507
+apps/cli/tests/cli.rs
+  s_8b2585d1e999e1::t_a91f867149aaa3 392-393
+  s_8b2585d1e999e1::t_d922d9e26a3886 421
+  s_8b2585d1e999e1::t_3f2619eb6bb72a 482,488-528
+  s_8b2585d1e999e1::t_52619f24a66af9 463-464
+  s_8b2585d1e999e1::t_306169bd1304a6 529-530
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ae9c99af5853df0510985c2ed66d90315b488e08",
+  "prompts": {},
+  "sessions": {
+    "s_8b2585d1e999e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "421e709d-831d-48ba-a278-0deaa0fdf4fa",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
