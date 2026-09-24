@@ -389,8 +389,8 @@ fn repo_cleanup_force_deletes_stale_branches_and_routes_the_workspace() {
     let out = repo_cleanup(&state, &gh, &repo, &["--force"]);
     assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
     let text = stdout(&out);
-    assert!(text.contains("deleted stale"), "{text}");
-    assert!(text.contains("cleaned up workspace feat"), "{text}");
+    assert!(text.contains("Deleted branch: stale"), "{text}");
+    assert!(text.contains("Cleaned up workspace: feat"), "{text}");
     assert!(!branch_exists(&repo, "stale") && !branch_exists(&repo, "feat"), "both branches gone");
     assert!(branch_exists(&repo, "development"), "the protected branch survives");
     assert!(!feat_dir.exists(), "feat's worktree removed");
@@ -417,12 +417,8 @@ fn repo_cleanup_dry_run_lists_and_deletes_nothing() {
         assert!(branch_exists(&repo, b), "{b} intact");
     }
     assert!(feat_dir.exists(), "worktree intact");
-}
 
-#[test]
-fn repo_cleanup_reads_protected_branches_from_config() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    // A configured list replaces the built-in default, so `[]` unprotects it.
     std::fs::write(state.join("config.json"), r#"{ "protected_branches": [] }"#).unwrap();
     let out = repo_cleanup(&state, &gh, &repo, &["--dry-run"]);
     assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
@@ -464,8 +460,8 @@ fn repo_cleanup_exits_1_when_a_routed_workspace_refuses() {
     let out = repo_cleanup(&state, &gh, &repo, &["--force"]);
     assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let text = stdout(&out);
-    assert!(text.contains("deleted stale"), "the plain delete still ran: {text}");
-    assert!(text.contains("failed workspace feat"), "{text}");
+    assert!(text.contains("Deleted branch: stale"), "the plain delete still ran: {text}");
+    assert!(text.contains("Could not clean up workspace feat"), "{text}");
     assert!(branch_exists(&repo, "feat") && feat_dir.exists(), "feat's branch and worktree survive");
     let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
     assert!(list.contains("feat"), "workspace row survives: {list}");
@@ -483,10 +479,53 @@ fn repo_cleanup_routes_a_workspace_whose_worktree_was_pruned() {
     run_git(&repo, &["worktree", "prune"]);
     let out = repo_cleanup(&state, &gh, &repo, &["--force"]);
     assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout(&out).contains("cleaned up workspace feat"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("Cleaned up workspace: feat"), "{}", stdout(&out));
     assert!(!branch_exists(&repo, "feat"), "branch gone");
     let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
     assert!(!list.contains("feat"), "workspace row dropped: {list}");
+}
+
+#[test]
+fn workspace_cleanup_refuses_a_protected_branch_and_a_bad_config() {
+    // Bare naming puts the workspace on branch `development`, which the
+    // built-in default list protects; the merged gh stub would otherwise let
+    // the cleanup through.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let create = kmd(
+        &state,
+        &[],
+        &["workspace", "create", "development", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(create.status.success(), "create: {}", String::from_utf8_lossy(&create.stderr));
+    let dir = workspace_dir(&state, "development");
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
+    );
+    let cleanup = || {
+        kmd(
+            &state,
+            &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+            &["workspace", "cleanup", "development", "--force"],
+        )
+    };
+
+    let out = cleanup();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("protected branch"), "{err}");
+    assert!(branch_exists(&repo, "development") && dir.exists(), "branch and worktree intact");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(list.contains("development"), "workspace row survives: {list}");
+
+    std::fs::write(state.join("config.json"), "{ bad").unwrap();
+    let out = cleanup();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("invalid"), "an unparseable config blocks the cleanup: {err}");
 }
 
 #[test]

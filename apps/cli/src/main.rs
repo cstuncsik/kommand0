@@ -440,27 +440,20 @@ fn main() -> anyhow::Result<()> {
                     scan_merged_branches(&repo.path, &protected).map_err(anyhow::Error::msg)?;
                 let plan = plan_repo_cleanup(verdicts, &repo.id, &state.workspaces);
 
-                let ws_name = |id: &str| {
-                    state
-                        .workspaces
-                        .iter()
-                        .find(|w| w.id == id)
-                        .map(|w| w.name.as_str())
-                        .unwrap_or("(unknown)")
-                };
+                fn ws_of<'a>(state: &'a AppState, id: &str) -> Option<&'a Workspace> {
+                    state.workspaces.iter().find(|w| w.id == id)
+                }
                 println!("{:<30} {:<7} ACTION", "BRANCH", "PR");
                 for item in &plan {
-                    let (branch, pr, action) = match item {
-                        RepoCleanupItem::Delete { branch, pr, .. } => (branch, pr, "delete".to_string()),
-                        RepoCleanupItem::Workspace { ws_id, branch, pr } => {
-                            (branch, pr, format!("clean up workspace '{}'", ws_name(ws_id)))
-                        }
-                        RepoCleanupItem::Skip { branch, pr, reason } => {
-                            (branch, pr, format!("skip: {reason}"))
-                        }
+                    let action = match item {
+                        RepoCleanupItem::Delete { .. } => "delete".to_string(),
+                        RepoCleanupItem::Workspace { ws_id, .. } => format!(
+                            "clean up workspace '{}'",
+                            ws_of(&state, ws_id).map(|w| w.name.as_str()).unwrap_or("(unknown)")
+                        ),
+                        RepoCleanupItem::Skip { reason, .. } => format!("skip: {reason}"),
                     };
-                    let pr = pr.map(|n| format!("#{n}")).unwrap_or_else(|| "-".to_string());
-                    println!("{branch:<30} {pr:<7} {action}");
+                    println!("{:<30} {:<7} {action}", item.branch(), item.pr_label());
                 }
                 let actionable =
                     plan.iter().filter(|i| !matches!(i, RepoCleanupItem::Skip { .. })).count();
@@ -481,21 +474,14 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 let mut failed = 0;
-                let deletes: Vec<(String, String)> = plan
-                    .iter()
-                    .filter_map(|i| match i {
-                        RepoCleanupItem::Delete { branch, tip, .. } => {
-                            Some((branch.clone(), tip.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                for (branch, result) in delete_branches(&repo.path, &deletes, &protected) {
+                for (branch, result) in
+                    delete_branches(&repo.path, &RepoCleanupItem::deletes(&plan), &protected)
+                {
                     match result {
-                        Ok(()) => println!("deleted {branch}"),
+                        Ok(()) => println!("Deleted branch: {branch}"),
                         Err(e) => {
                             failed += 1;
-                            println!("failed {branch}: {e}");
+                            println!("Could not delete branch {branch}: {e}");
                         }
                     }
                 }
@@ -503,25 +489,22 @@ fn main() -> anyhow::Result<()> {
                     let RepoCleanupItem::Workspace { ws_id, branch, .. } = item else {
                         continue;
                     };
-                    let Some((ws_name, worktree)) = state
-                        .workspaces
-                        .iter()
-                        .find(|w| &w.id == ws_id)
+                    let Some((ws_name, worktree)) = ws_of(&state, ws_id)
                         .and_then(|w| Some((w.name.clone(), w.worktree_path.clone()?)))
                     else {
                         failed += 1;
-                        println!("failed workspace {ws_id}: workspace not found");
+                        println!("Could not clean up workspace {ws_id}: workspace not found");
                         continue;
                     };
                     match cleanup_merged_workspace(&repo.path, &worktree, branch, &protected) {
                         Ok(()) => {
                             // Exact id, never the name: see WorkspaceAction::Cleanup.
                             state.delete_workspace_by_id(ws_id)?;
-                            println!("cleaned up workspace {ws_name}");
+                            println!("Cleaned up workspace: {ws_name}");
                         }
                         Err(e) => {
                             failed += 1;
-                            println!("failed workspace {ws_name}: {e}");
+                            println!("Could not clean up workspace {ws_name}: {e}");
                         }
                     }
                 }
