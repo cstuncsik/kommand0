@@ -1,0 +1,35 @@
+crates/core/src/config.rs
+  s_8b2585d1e999e1::t_59d67719d022b5 146-153
+  s_8b2585d1e999e1::t_e54fc4605aa94c 409-420
+crates/core/src/lib.rs
+  s_8b2585d1e999e1::t_bb9f3e5150ac0b 1989,1993-2021
+  s_8b2585d1e999e1::t_080ebb8b90d029 2022-2023
+crates/core/src/git.rs
+  s_8b2585d1e999e1::t_bde375e3155a71 756-757
+  s_8b2585d1e999e1::t_d3cb6769085c99 803-809
+  s_8b2585d1e999e1::t_3e55c989d4d594 1494-1508
+  s_8b2585d1e999e1::t_ebf00324ccb2ca 1248
+  s_8b2585d1e999e1::t_dbf7add5a80b11 563-564,566,568
+  s_8b2585d1e999e1::t_355559d3dec262 826,832
+  s_8b2585d1e999e1::t_e094c06613a733 915-916,918
+  s_8b2585d1e999e1::t_cc861d0246f10b 530-531
+  s_8b2585d1e999e1::t_3b4ccb8924189c 882-883
+  s_8b2585d1e999e1::t_b9d153463b6da7 678-688
+  s_8b2585d1e999e1::t_ec83855275fa4d 1493
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cfa0bd1712e5d464793755d1fac1db78b172bfbb",
+  "prompts": {},
+  "sessions": {
+    "s_8b2585d1e999e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "421e709d-831d-48ba-a278-0deaa0fdf4fa",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
