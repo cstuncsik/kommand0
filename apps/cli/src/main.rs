@@ -4,8 +4,8 @@ use std::os::unix::process::CommandExt; // for Command::process_group
 use clap::{Parser, Subcommand, ValueEnum};
 use kommand0_core::workspace::format_timestamp;
 use kommand0_core::{
-    AppState, Config, SessionStatus, SortMode, Workspace, branch_status,
-    cleanup_merged_workspace,
+    AppState, Config, RepoCleanupItem, SessionStatus, SortMode, Workspace, branch_status,
+    cleanup_merged_workspace, delete_branches, plan_repo_cleanup, scan_merged_branches,
 };
 
 /// Clap mirror of [`SortMode`]: keeps clap out of the core crate while giving
@@ -150,6 +150,17 @@ enum RepoAction {
     Sort {
         /// The mode to switch to; omit to print the current one
         mode: Option<SortArg>,
+    },
+    /// Delete local branches whose PR is merged (merged kommand0 worktrees are cleaned up too)
+    Cleanup {
+        /// Repo reference (name, path, or ID)
+        name: String,
+        /// Print the plan and exit
+        #[arg(long, conflicts_with = "force")]
+        dry_run: bool,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -420,6 +431,103 @@ fn main() -> anyhow::Result<()> {
                 state.swap_repos(&repo.id, &other);
                 state.save()?;
                 println!("Moved repo '{}' {}.", repo.name, direction.word());
+            }
+            RepoAction::Cleanup { name, dry_run, force } => {
+                let protected = Config::protected_branches_now().map_err(anyhow::Error::msg)?;
+                let mut state = AppState::load()?;
+                let repo = state.resolve_repo(&name)?.clone();
+                let verdicts =
+                    scan_merged_branches(&repo.path, &protected).map_err(anyhow::Error::msg)?;
+                let plan = plan_repo_cleanup(verdicts, &repo.id, &state.workspaces);
+
+                let ws_name = |id: &str| {
+                    state
+                        .workspaces
+                        .iter()
+                        .find(|w| w.id == id)
+                        .map(|w| w.name.as_str())
+                        .unwrap_or("(unknown)")
+                };
+                println!("{:<30} {:<7} ACTION", "BRANCH", "PR");
+                for item in &plan {
+                    let (branch, pr, action) = match item {
+                        RepoCleanupItem::Delete { branch, pr, .. } => (branch, pr, "delete".to_string()),
+                        RepoCleanupItem::Workspace { ws_id, branch, pr } => {
+                            (branch, pr, format!("clean up workspace '{}'", ws_name(ws_id)))
+                        }
+                        RepoCleanupItem::Skip { branch, pr, reason } => {
+                            (branch, pr, format!("skip: {reason}"))
+                        }
+                    };
+                    let pr = pr.map(|n| format!("#{n}")).unwrap_or_else(|| "-".to_string());
+                    println!("{branch:<30} {pr:<7} {action}");
+                }
+                let actionable =
+                    plan.iter().filter(|i| !matches!(i, RepoCleanupItem::Skip { .. })).count();
+                if actionable == 0 {
+                    println!("Nothing to clean up.");
+                    return Ok(());
+                }
+                if dry_run {
+                    return Ok(());
+                }
+                if !force
+                    && !confirm_or_exit("clean up", || {
+                        Ok(format!("Clean up {actionable} branch(es) in '{}'?", repo.name))
+                    })?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+
+                let mut failed = 0;
+                let deletes: Vec<(String, String)> = plan
+                    .iter()
+                    .filter_map(|i| match i {
+                        RepoCleanupItem::Delete { branch, tip, .. } => {
+                            Some((branch.clone(), tip.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for (branch, result) in delete_branches(&repo.path, &deletes, &protected) {
+                    match result {
+                        Ok(()) => println!("deleted {branch}"),
+                        Err(e) => {
+                            failed += 1;
+                            println!("failed {branch}: {e}");
+                        }
+                    }
+                }
+                for item in &plan {
+                    let RepoCleanupItem::Workspace { ws_id, branch, .. } = item else {
+                        continue;
+                    };
+                    let Some((ws_name, worktree)) = state
+                        .workspaces
+                        .iter()
+                        .find(|w| &w.id == ws_id)
+                        .and_then(|w| Some((w.name.clone(), w.worktree_path.clone()?)))
+                    else {
+                        failed += 1;
+                        println!("failed workspace {ws_id}: workspace not found");
+                        continue;
+                    };
+                    match cleanup_merged_workspace(&repo.path, &worktree, branch, &protected) {
+                        Ok(()) => {
+                            // Exact id, never the name: see WorkspaceAction::Cleanup.
+                            state.delete_workspace_by_id(ws_id)?;
+                            println!("cleaned up workspace {ws_name}");
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            println!("failed workspace {ws_name}: {e}");
+                        }
+                    }
+                }
+                if failed > 0 {
+                    anyhow::bail!("{failed} item(s) failed");
+                }
             }
             RepoAction::Sort { mode } => {
                 let mut state = AppState::load()?;
@@ -907,6 +1015,15 @@ mod tests {
             ])
             .is_err(),
             "--fork + --no-worktree must be rejected"
+        );
+    }
+
+    #[test]
+    fn dry_run_conflicts_with_force() {
+        assert!(Cli::try_parse_from(["kmd", "repo", "cleanup", "r", "--dry-run"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kmd", "repo", "cleanup", "r", "--dry-run", "--force"]).is_err(),
+            "--dry-run + --force must be rejected"
         );
     }
 }
