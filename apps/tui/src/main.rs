@@ -3455,12 +3455,23 @@ impl App {
         self.cleanup_inflight.insert(ws_id.to_string());
         self.cleanup_result.remove(ws_id);
         let id = ws_id.to_string();
+        let config_path = self.config_path.clone();
         std::thread::spawn(move || {
             let mut guard = SendOnDrop {
                 tx,
                 payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
             };
-            let result = kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch);
+            // The file, not the startup snapshot: an edit applies to the next
+            // cleanup, and an unparseable file blocks it rather than degrading.
+            let protected = match Config::protected_branches_at(&config_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    guard.payload = Some((id, Err(e)));
+                    return;
+                }
+            };
+            let result =
+                kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch, &protected);
             guard.payload = Some((id, result));
         });
     }

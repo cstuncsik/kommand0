@@ -4,7 +4,8 @@ use std::os::unix::process::CommandExt; // for Command::process_group
 use clap::{Parser, Subcommand, ValueEnum};
 use kommand0_core::workspace::format_timestamp;
 use kommand0_core::{
-    AppState, SessionStatus, SortMode, Workspace, branch_status, cleanup_merged_workspace,
+    AppState, Config, SessionStatus, SortMode, Workspace, branch_status,
+    cleanup_merged_workspace,
 };
 
 /// Clap mirror of [`SortMode`]: keeps clap out of the core crate while giving
@@ -627,6 +628,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             WorkspaceAction::Cleanup { name, force } => {
+                let protected = Config::protected_branches_now().map_err(anyhow::Error::msg)?;
                 let mut state = AppState::load()?;
                 let ws = state.show_workspace(&name)?.clone();
                 let (Some(worktree), Some(branch)) =
@@ -652,7 +654,7 @@ fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                match cleanup_merged_workspace(&repo, &worktree, &branch) {
+                match cleanup_merged_workspace(&repo, &worktree, &branch, &protected) {
                     Ok(()) => {
                         // The worktree + branch are gone; drop the workspace
                         // entry by exact id (never re-resolve the user's string

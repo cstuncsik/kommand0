@@ -8,7 +8,9 @@
 //!
 //! [`cleanup_merged_workspace`] removes a merged workspace's worktree and branch
 //! via the `gh` CLI. It runs synchronously and is meant to be called off the UI
-//! thread (it makes a network call).
+//! thread (it makes a network call). [`scan_merged_branches`] and
+//! [`delete_branches`] are its repo-wide counterpart: a verdict per local branch
+//! (one gh call each), then a local delete that re-checks every gate.
 
 use std::process::{Command, Stdio};
 
@@ -473,11 +475,14 @@ fn pr_supersedes(a: &PrStatus, b: &PrStatus) -> bool {
 
 /// Remove a merged workspace's worktree and delete its branch — but only when it
 /// is provably safe. Returns a message (deleting nothing) unless ALL hold:
-/// - the branch is not the repo's default branch (see [`is_default_branch`])
-///   and not a malformed name (empty, `..`, leading `-`). Any *other* branch —
-///   including one kommand0 didn't create — is fair game once the checks below
+/// - the branch is not the repo's default branch (see [`is_default_branch`]),
+///   not a malformed name (empty, `..`, leading `-`), and not one of the
+///   `protected` names (the config's `protected_branches`). Any *other* branch,
+///   including one kommand0 didn't create, is fair game once the checks below
 ///   hold: adopting and cleaning up your own branches is deliberate behavior;
 /// - its PR is `MERGED` (per `gh`);
+/// - the worktree, if it still exists, is live and its HEAD is still on
+///   `branch` (a `git switch` inside it made the dir another branch's checkout);
 /// - the worktree is clean (no uncommitted/untracked changes; an unreadable
 ///   status aborts rather than assuming clean); and
 /// - the branch tip equals the last commit the PR merged (so there are no
@@ -497,8 +502,9 @@ pub fn cleanup_merged_workspace(
     repo_path: &str,
     worktree_path: &str,
     branch: &str,
+    protected: &[String],
 ) -> Result<(), String> {
-    cleanup_merged_workspace_with(repo_path, worktree_path, branch, &gh_bin())
+    cleanup_merged_workspace_with(repo_path, worktree_path, branch, protected, &gh_bin())
 }
 
 /// Whether `branch` is (or plausibly is) the repo's default branch — the
@@ -551,31 +557,21 @@ fn is_live_worktree(worktree_path: &str) -> bool {
     }
 }
 
-fn cleanup_merged_workspace_with(
-    repo_path: &str,
-    worktree_path: &str,
-    branch: &str,
-    gh_bin: &str,
-) -> Result<(), String> {
-    // Malformed names: `..` is refused because `rev-parse refs/heads/a..b`
-    // REINTERPRETS it as a range (the tip check below would fail-closed only by
-    // output shape, not by rejection); a leading `-` can't come from a validated
-    // workspace name but an adopted ref could carry one.
-    if branch.is_empty() || branch.contains("..") || branch.starts_with('-') {
-        return Err("refusing to delete a malformed branch name".to_string());
-    }
-    // Trunk protection — the one branch cleanup must never delete, however the
-    // workspace came to sit on it.
-    if is_default_branch(repo_path, branch) {
-        return Err(format!("refusing to delete the default branch ({branch})"));
-    }
+/// The newest PR whose head is a branch, as `gh` reports it.
+pub struct PrLookup {
+    pub state: String,
+    /// The oid of the PR's last commit (empty when it has none).
+    pub tip: String,
+    /// Absent when gh printed the older two-line shape.
+    pub number: Option<u64>,
+}
 
-    // The PR must be merged; capture the oid of the last commit it merged. Look
-    // up by `--head <branch>` (a bare positional would be parsed as a PR NUMBER
-    // for an all-digit branch name). Multiple PRs can share a head over time —
-    // take the newest by number, mirroring the pr-status view. Run gh from the
-    // repo (not the worktree) so a partial-cleanup retry — worktree already
-    // gone — still works instead of failing with a bogus "gh not found".
+/// `Ok(None)` = no PR has that head. `Err` = gh itself failed: not installed or
+/// timed out, or a non-zero exit (not authenticated, not a GitHub repo). Looks
+/// up by `--head <branch>` (a bare positional would be parsed as a PR NUMBER for
+/// an all-digit branch name); several PRs can share a head over time, so the
+/// newest by number wins, mirroring the pr-status view.
+fn lookup_pr(gh_bin: &str, repo_path: &str, branch: &str) -> Result<Option<PrLookup>, String> {
     let out = match run_gh(
         gh_bin,
         repo_path,
@@ -589,20 +585,109 @@ fn cleanup_merged_workspace_with(
             "--json",
             "number,state,commits",
             "-q",
-            "(sort_by(.number) | last) // {} | (.state // \"NONE\"), (.commits[-1].oid // \"\")",
+            "(sort_by(.number) | last) // {} | (.state // \"NONE\"), (.commits[-1].oid // \"\"), (.number // \"\")",
         ],
     ) {
         Ok(o) if o.status.success() => o,
-        Ok(o) => return Err(format!("no merged PR found for this branch ({})", last_line(&o.stderr))),
+        Ok(o) => return Err(format!("gh pr list failed ({})", last_line(&o.stderr))),
         Err(_) => return Err("gh CLI not found — install GitHub CLI to clean up".to_string()),
     };
     let text = String::from_utf8_lossy(&out.stdout);
     let mut lines = text.lines();
-    let state = lines.next().unwrap_or("").trim();
-    let pr_tip = lines.next().unwrap_or("").trim().to_string();
+    let state = lines.next().unwrap_or("").trim().to_string();
     if state == "NONE" {
-        return Err("no PR found for this branch — not cleaning up".to_string());
+        return Ok(None);
     }
+    let tip = lines.next().unwrap_or("").trim().to_string();
+    let number = lines.next().and_then(|l| l.trim().parse().ok());
+    Ok(Some(PrLookup { state, tip, number }))
+}
+
+/// Why a local branch must not be deleted, in gate order.
+enum BranchRefusal {
+    Malformed,
+    Default,
+    Protected,
+}
+
+impl BranchRefusal {
+    /// The scan's skip reason.
+    fn short(&self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed branch name",
+            Self::Default => "default branch",
+            Self::Protected => "protected branch",
+        }
+    }
+
+    /// The cleanup's refusal message.
+    fn message(&self, branch: &str) -> String {
+        match self {
+            Self::Malformed => "refusing to delete a malformed branch name".to_string(),
+            Self::Default => format!("refusing to delete the default branch ({branch})"),
+            Self::Protected => format!(
+                "refusing to delete a protected branch ({branch}); remove it from protected_branches to clean up"
+            ),
+        }
+    }
+}
+
+/// The gate every local branch delete runs first, so protection lives in one
+/// place. Order: malformed, default, protected (a protected name that is also
+/// the default reports the stronger reason).
+fn refuse_branch_delete(
+    repo_path: &str,
+    branch: &str,
+    protected: &[String],
+) -> Result<(), BranchRefusal> {
+    // Malformed names: `..` is refused because `rev-parse refs/heads/a..b`
+    // REINTERPRETS it as a range (the tip check would fail-closed only by output
+    // shape, not by rejection); a leading `-` can't come from a validated
+    // workspace name but an adopted ref could carry one.
+    if branch.is_empty() || branch.contains("..") || branch.starts_with('-') {
+        return Err(BranchRefusal::Malformed);
+    }
+    // Trunk protection: the one branch cleanup must never delete, however the
+    // workspace came to sit on it.
+    if is_default_branch(repo_path, branch) {
+        return Err(BranchRefusal::Default);
+    }
+    if protected.iter().any(|p| p == branch) {
+        return Err(BranchRefusal::Protected);
+    }
+    Ok(())
+}
+
+/// `git branch -D -- <branch>`: force, because a squash-merge leaves the branch
+/// "unmerged" locally (the callers' tip checks proved nothing lies beyond the
+/// merge). `--` makes the gate's leading-dash refusal belt-and-braces, not
+/// load-bearing. Err is git's last stderr line or the io error.
+fn delete_local_branch(repo_path: &str, branch: &str) -> Result<(), String> {
+    match Command::new("git")
+        .args(["-C", repo_path, "branch", "-D", "--", branch])
+        .output()
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(last_line(&o.stderr)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn cleanup_merged_workspace_with(
+    repo_path: &str,
+    worktree_path: &str,
+    branch: &str,
+    protected: &[String],
+    gh_bin: &str,
+) -> Result<(), String> {
+    refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
+
+    // The PR must be merged; capture the oid of the last commit it merged. Run
+    // gh from the repo (not the worktree) so a partial-cleanup retry (worktree
+    // already gone) still works instead of failing with a bogus "gh not found".
+    let Some(PrLookup { state, tip: pr_tip, .. }) = lookup_pr(gh_bin, repo_path, branch)? else {
+        return Err("no PR found for this branch — not cleaning up".to_string());
+    };
     if state != "MERGED" {
         return Err(format!(
             "the PR for this branch isn't merged (state: {state}) — not cleaning up"
@@ -621,6 +706,27 @@ fn cleanup_merged_workspace_with(
         if !is_live_worktree(worktree_path) {
             return Err(format!(
                 "a failed removal left files behind: delete {worktree_path}, then clean up again"
+            ));
+        }
+        // HEAD must still be on `branch`: after a `git switch` inside the
+        // worktree the dir is another branch's checkout, and removing it would
+        // take that checkout (ignored files included) with it. Full ref, not
+        // `--short`: with a same-named tag `--short` prints `heads/<b>`.
+        let head = match Command::new("git")
+            .args(["-C", worktree_path, "symbolic-ref", "HEAD"])
+            .output()
+        {
+            Ok(o) if o.status.success() => last_line(&o.stdout),
+            _ => String::new(), // detached (exit 128), or git itself failed
+        };
+        if head != format!("refs/heads/{branch}") {
+            let on = match head.strip_prefix("refs/heads/") {
+                Some(b) => b,
+                None if head.is_empty() => "a detached HEAD",
+                None => head.as_str(),
+            };
+            return Err(format!(
+                "the worktree is on {on}, not {branch}; switch back or delete it by hand"
             ));
         }
         let st = branch_status(worktree_path)
@@ -684,20 +790,123 @@ fn cleanup_merged_workspace_with(
         .args(["-C", repo_path, "worktree", "prune"])
         .output();
 
-    // Delete the local branch (force: a squash-merge leaves it "unmerged" locally,
-    // but the PR-tip check above proved there's nothing beyond the merge). `--`
-    // makes the gate's leading-dash refusal belt-and-braces, not load-bearing.
-    match Command::new("git")
-        .args(["-C", repo_path, "branch", "-D", "--", branch])
+    // The PR-tip check above proved there's nothing beyond the merge.
+    delete_local_branch(repo_path, branch)
+        .map_err(|e| format!("worktree removed, but couldn't delete branch {branch}: {e}"))
+}
+
+/// What the repo-wide scan decided for one local branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Merged PR, tip equals the PR's last commit, checked out nowhere.
+    Delete,
+    /// Same, but checked out at `worktree` (git refuses `branch -D` there).
+    CheckedOut { worktree: String },
+    /// Not deletable, and why (short, user-facing).
+    Skip(String),
+}
+
+/// One local branch as [`scan_merged_branches`] saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchVerdict {
+    pub branch: String,
+    /// The tip at scan time; [`delete_branches`] refuses a branch that moved.
+    pub tip: String,
+    /// The PR number, whenever a PR was found.
+    pub pr: Option<u64>,
+    pub verdict: Verdict,
+}
+
+/// Classify every local branch of `repo_path` for deletion: the name gates of
+/// [`cleanup_merged_workspace`] first (default/malformed/protected names never
+/// reach gh), then one PR lookup per remaining branch. Deletes and prunes
+/// nothing. The first gh failure aborts the whole scan, so a missing or wedged
+/// gh can't read as "no PR" for every branch.
+pub fn scan_merged_branches(
+    repo_path: &str,
+    protected: &[String],
+) -> Result<Vec<BranchVerdict>, String> {
+    scan_merged_branches_with(repo_path, protected, &gh_bin())
+}
+
+fn scan_merged_branches_with(
+    repo_path: &str,
+    protected: &[String],
+    gh_bin: &str,
+) -> Result<Vec<BranchVerdict>, String> {
+    // NUL-separated, NUL-terminated records: a newline in a foreign worktree
+    // path can't truncate one. `%(refname)` + strip, not `refname:short`, so a
+    // same-named tag can't shadow the branch.
+    let out = Command::new("git")
+        .args([
+            "-C",
+            repo_path,
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(worktreepath)%00",
+            "refs/heads",
+        ])
         .output()
-    {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(format!(
-            "worktree removed, but couldn't delete branch {branch}: {}",
-            last_line(&o.stderr)
-        )),
-        Err(e) => Err(format!("worktree removed, but couldn't delete branch {branch}: {e}")),
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(last_line(&out.stderr));
     }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let fields: Vec<&str> = text.split('\0').collect();
+    let mut verdicts = Vec::new();
+    // ponytail: one gh round-trip per branch; batch them through `gh api graphql`
+    // if a repo with hundreds of branches makes the scan too slow.
+    // for-each-ref ends each record with '\n', which lands in front of the next
+    // refname; the newline-only remainder after the last NUL is dropped.
+    let (records, _) = fields.as_chunks::<3>();
+    for &[refname, tip, worktree] in records {
+        let Some(branch) = refname.trim_start_matches('\n').strip_prefix("refs/heads/") else {
+            continue;
+        };
+        let tip = tip.to_string();
+        let (pr, verdict) = match refuse_branch_delete(repo_path, branch, protected) {
+            Err(r) => (None, Verdict::Skip(r.short().to_string())),
+            Ok(()) => match lookup_pr(gh_bin, repo_path, branch).map_err(|e| format!("{branch}: {e}"))? {
+                None => (None, Verdict::Skip("no PR".to_string())),
+                Some(pr) => {
+                    let verdict = if pr.state != "MERGED" {
+                        Verdict::Skip(format!("PR not merged ({})", pr.state))
+                    } else if pr.tip.is_empty() || pr.tip != tip {
+                        Verdict::Skip("commits beyond the merged PR".to_string())
+                    } else if !worktree.is_empty() {
+                        Verdict::CheckedOut { worktree: worktree.to_string() }
+                    } else {
+                        Verdict::Delete
+                    };
+                    (pr.number, verdict)
+                }
+            },
+        };
+        verdicts.push(BranchVerdict { branch: branch.to_string(), tip, pr, verdict });
+    }
+    Ok(verdicts)
+}
+
+/// Delete local branches, each only while it still points at its scan-time
+/// `tip` (else "moved since scan"). The name gates re-run; nothing here touches
+/// remotes, prunes, or calls gh. Results come back in input order.
+pub fn delete_branches(
+    repo_path: &str,
+    branches: &[(String, String)],
+    protected: &[String],
+) -> Vec<(String, Result<(), String>)> {
+    let delete = |branch: &str, tip: &str| -> Result<(), String> {
+        refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
+        match Command::new("git")
+            .args(["-C", repo_path, "rev-parse", &format!("refs/heads/{branch}")])
+            .output()
+        {
+            Ok(o) if o.status.success() && last_line(&o.stdout) == tip => {
+                delete_local_branch(repo_path, branch)
+            }
+            _ => Err("moved since scan".to_string()),
+        }
+    };
+    branches.iter().map(|(b, t)| (b.clone(), delete(b, t))).collect()
 }
 
 #[cfg(test)]
@@ -1054,6 +1263,7 @@ mod tests {
             repo.to_str().unwrap(),
             wt.to_str().unwrap(),
             branch,
+            &[],
             gh.to_str().unwrap(),
         )
     }
@@ -1228,6 +1438,28 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_refuses_a_worktree_switched_to_another_branch() {
+        // The workspace's dir is live but a `git switch` inside it moved HEAD off
+        // the workspace's branch: removing the dir would destroy the OTHER
+        // branch's checkout (and its ignored files) on a merged-PR verdict that
+        // was never about it.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        git(&wt, &["switch", "-c", "elsewhere"]);
+        let gh = tmp.path().join("gh");
+        gh_pr_stub(&gh, "MERGED", &sha);
+        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        assert!(err.contains("is on elsewhere, not"), "names both branches: {err}");
+        assert!(wt.exists(), "worktree untouched");
+        assert!(branch_exists(&repo, &branch) && branch_exists(&repo, "elsewhere"), "both branches intact");
+        // Detached HEAD is the same refusal.
+        git(&wt, &["switch", "--detach"]);
+        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        assert!(err.contains("detached HEAD"), "detached is refused too: {err}");
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
+
+    #[test]
     fn cleanup_refuses_when_pr_has_no_commits() {
         let tmp = TempDir::new().unwrap();
         let (repo, wt, branch, _) = repo_with_worktree(tmp.path());
@@ -1333,6 +1565,161 @@ mod tests {
                 assert!(branch_exists(&repo, &branch), "Err keeps the branch: {e}");
                 assert!(e.contains("delete") || e.contains("remove"), "actionable: {e}");
             }
+        }
+    }
+
+    #[test]
+    fn cleanup_refuses_protected_branch_before_gh() {
+        // gh is absent, so passing proves the gate fires before any network
+        // call; with an empty list the same branch reaches gh (the list is
+        // honored, not hardcoded).
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch, _) = repo_with_worktree_on(tmp.path(), "development");
+        let gh = tmp.path().join("gh");
+        let err = cleanup_merged_workspace_with(
+            repo.to_str().unwrap(),
+            wt.to_str().unwrap(),
+            &branch,
+            &["development".to_string()],
+            gh.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("protected branch"), "expected protected refusal, got: {err}");
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        assert!(err.contains("gh CLI not found"), "an empty list lets it through to gh: {err}");
+    }
+
+    // --- scan_merged_branches / delete_branches ---
+
+    /// [`init_repo`] at `<root>/repo` plus `branches`, all at the initial commit.
+    fn repo_with_branches(root: &Path, branches: &[&str]) -> std::path::PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        for b in branches {
+            git(&repo, &["branch", b]);
+        }
+        repo
+    }
+
+    fn tip_of(repo: &Path, branch: &str) -> String {
+        let out = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "rev-parse", &format!("refs/heads/{branch}")])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn scan_classifies_branches_and_skips_gates_without_gh() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_branches(
+            tmp.path(),
+            &["development", "merged-ok", "feat/x", "open-pr", "no-pr", "other"],
+        );
+        let initial = tip_of(&repo, "main");
+        // One commit beyond what the (stubbed) PR merged.
+        git(&repo, &["switch", "-c", "merged-ahead"]);
+        std::fs::write(repo.join("more.txt"), "x").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "beyond"]);
+        let wt = tmp.path().join("wt");
+        git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"]);
+        git(&repo, &["switch", "other"]); // checked out in the main repo itself
+        let gh = tmp.path().join("gh");
+        write_stub(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$4\" >> \"$0.args\"\ncase \"$4\" in\n  merged-ok|feat/x|wt-branch|other) printf 'MERGED\\n%s\\n7\\n' \"$(git rev-parse \"refs/heads/$4\")\"; exit 0 ;;\n  merged-ahead) printf 'MERGED\\n{initial}\\n8\\n'; exit 0 ;;\n  open-pr) printf 'OPEN\\n%s\\n9\\n' \"$(git rev-parse \"refs/heads/$4\")\"; exit 0 ;;\n  no-pr) printf 'NONE\\n\\n\\n'; exit 0 ;;\nesac\nexit 1\n"
+            ),
+        );
+
+        let verdicts = scan_merged_branches_with(
+            repo.to_str().unwrap(),
+            &["development".to_string()],
+            gh.to_str().unwrap(),
+        )
+        .unwrap();
+        let of = |name: &str| {
+            verdicts.iter().find(|v| v.branch == name).unwrap_or_else(|| panic!("{name} scanned"))
+        };
+        assert_eq!(verdicts.len(), 9);
+        assert_eq!(of("merged-ok").verdict, Verdict::Delete);
+        assert_eq!(of("merged-ok").pr, Some(7));
+        assert_eq!(of("merged-ok").tip, initial);
+        assert_eq!(of("feat/x").verdict, Verdict::Delete, "refs/heads/ stripped, slash kept");
+        assert_eq!(of("merged-ahead").verdict, Verdict::Skip("commits beyond the merged PR".into()));
+        assert_eq!(of("merged-ahead").pr, Some(8), "the PR number rides along with a skip");
+        assert_eq!(of("open-pr").verdict, Verdict::Skip("PR not merged (OPEN)".into()));
+        assert_eq!(of("no-pr").verdict, Verdict::Skip("no PR".into()));
+        assert_eq!(of("no-pr").pr, None);
+        assert_eq!(of("development").verdict, Verdict::Skip("protected branch".into()));
+        assert_eq!(of("main").verdict, Verdict::Skip("default branch".into()));
+        match &of("wt-branch").verdict {
+            Verdict::CheckedOut { worktree } => assert!(worktree.ends_with("/wt"), "{worktree}"),
+            v => panic!("wt-branch: {v:?}"),
+        }
+        let repo_real = std::fs::canonicalize(&repo).unwrap();
+        assert_eq!(
+            of("other").verdict,
+            Verdict::CheckedOut { worktree: repo_real.to_str().unwrap().to_string() },
+            "the main checkout counts, at the realpath git reports"
+        );
+        // Gated names never reach gh; everything else is asked exactly once.
+        let mut asked: Vec<String> = std::fs::read_to_string(format!("{}.args", gh.display()))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        asked.sort();
+        assert_eq!(
+            asked,
+            ["feat/x", "merged-ahead", "merged-ok", "no-pr", "open-pr", "other", "wt-branch"]
+        );
+    }
+
+    #[test]
+    fn scan_aborts_when_gh_missing() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_branches(tmp.path(), &["feat"]);
+        let err = scan_merged_branches_with(
+            repo.to_str().unwrap(),
+            &[],
+            "/nonexistent/definitely/not/gh",
+        )
+        .unwrap_err();
+        assert!(err.contains("gh CLI not found"), "the first gh failure aborts: {err}");
+    }
+
+    #[test]
+    fn delete_branches_refuses_every_gate_and_deletes_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_branches(tmp.path(), &["a", "b", "development"]);
+        let wt = tmp.path().join("wt");
+        git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"]);
+        let sha = tip_of(&repo, "main");
+        let input = [
+            ("a".to_string(), sha.clone()),
+            ("b".to_string(), "0".repeat(40)), // stale tip
+            ("main".to_string(), sha.clone()),
+            ("x..y".to_string(), sha.clone()),
+            ("development".to_string(), sha.clone()),
+            ("wt-branch".to_string(), sha.clone()),
+        ];
+        let results =
+            delete_branches(repo.to_str().unwrap(), &input, &["development".to_string()]);
+        let names: Vec<&str> = results.iter().map(|(b, _)| b.as_str()).collect();
+        assert_eq!(names, ["a", "b", "main", "x..y", "development", "wt-branch"], "input order");
+        assert_eq!(results[0].1, Ok(()));
+        assert_eq!(results[1].1, Err("moved since scan".to_string()));
+        assert!(results[2].1.as_ref().unwrap_err().contains("default branch"));
+        assert!(results[3].1.as_ref().unwrap_err().contains("malformed"));
+        assert!(results[4].1.as_ref().unwrap_err().contains("protected branch"));
+        assert!(results[5].1.is_err(), "git refuses a checked-out branch");
+        assert!(!branch_exists(&repo, "a"), "a deleted");
+        for survivor in ["b", "main", "development", "wt-branch"] {
+            assert!(branch_exists(&repo, survivor), "{survivor} survives");
         }
     }
 

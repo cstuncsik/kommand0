@@ -12,8 +12,9 @@ pub mod worktree;
 pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
 pub use git::{
-    BranchStatus, FileDiff, PrChecks, PrReview, PrState, PrStatus, branch_status,
-    cleanup_merged_workspace, diff_files_vs_default_branch, pr_statuses,
+    BranchStatus, BranchVerdict, FileDiff, PrChecks, PrReview, PrState, PrStatus, Verdict,
+    branch_status, cleanup_merged_workspace, delete_branches, diff_files_vs_default_branch,
+    pr_statuses, scan_merged_branches,
 };
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
@@ -1978,6 +1979,64 @@ impl AppState {
     }
 }
 
+/// One row of a repo cleanup plan (see [`plan_repo_cleanup`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoCleanupItem {
+    /// A plain local branch: [`delete_branches`] with the scan-time tip.
+    Delete { branch: String, tip: String, pr: Option<u64> },
+    /// A kommand0 workspace's branch: the workspace cleanup owns it.
+    Workspace { ws_id: String, branch: String, pr: Option<u64> },
+    Skip { branch: String, pr: Option<u64>, reason: String },
+}
+
+/// Route a repo scan. Any Delete/CheckedOut verdict whose branch is the
+/// `branch_name` of one of `repo_id`'s own-branch workspaces (`worktree_path`
+/// set) becomes a Workspace item: the workspace cleanup owns the worktree AND
+/// the state.json row, whatever state the worktree dir or its admin entry is in
+/// (a manually deleted + pruned worktree scans as a bare Delete). Any other
+/// CheckedOut is a Skip naming the path, plus "; run git worktree prune" when the
+/// dir no longer exists. Output order: Delete, Workspace, Skip (skips sorted by
+/// reason). Routes by name only: no path comparison, so symlinked state dirs
+/// and realpath differences are irrelevant.
+pub fn plan_repo_cleanup(
+    verdicts: Vec<BranchVerdict>,
+    repo_id: &str,
+    workspaces: &[Workspace],
+) -> Vec<RepoCleanupItem> {
+    let (mut deletes, mut routed, mut skips) = (Vec::new(), Vec::new(), Vec::new());
+    for v in verdicts {
+        // First match wins: names are unique per repo, and git refuses one
+        // branch in two worktrees.
+        let ws = workspaces.iter().find(|w| {
+            w.repo_id == repo_id
+                && w.worktree_path.is_some()
+                && w.branch_name.as_deref() == Some(v.branch.as_str())
+        });
+        match (v.verdict, ws) {
+            (Verdict::Skip(reason), _) => skips.push((reason, v.branch, v.pr)),
+            (_, Some(ws)) => routed.push(RepoCleanupItem::Workspace {
+                ws_id: ws.id.clone(),
+                branch: v.branch,
+                pr: v.pr,
+            }),
+            (Verdict::Delete, None) => {
+                deletes.push(RepoCleanupItem::Delete { branch: v.branch, tip: v.tip, pr: v.pr })
+            }
+            (Verdict::CheckedOut { worktree }, None) => {
+                let hint =
+                    if Path::new(&worktree).exists() { "" } else { "; run git worktree prune" };
+                skips.push((format!("checked out at {worktree}{hint}"), v.branch, v.pr));
+            }
+        }
+    }
+    skips.sort();
+    deletes.extend(routed);
+    deletes.extend(
+        skips.into_iter().map(|(reason, branch, pr)| RepoCleanupItem::Skip { branch, pr, reason }),
+    );
+    deletes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3891,6 +3950,59 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.contains("exceeds 200 chars")),
             "overlong slug warned: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn plan_routes_workspace_branches_and_hints_stale_checkouts() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().to_str().unwrap().to_string();
+        let missing = tmp.path().join("gone").to_str().unwrap().to_string();
+        let own = |id: &str, repo: &str, branch: &str| Workspace {
+            repo_id: repo.into(),
+            worktree_path: Some(format!("/wt/{id}")),
+            branch_name: Some(branch.into()),
+            ..ws(id, id)
+        };
+        let workspaces = [own("w1", "r", "feat"), own("w2", "r", "feat2"), own("w3", "r2", "feat3")];
+        let v = |branch: &str, verdict: Verdict| BranchVerdict {
+            branch: branch.into(),
+            tip: "t".into(),
+            pr: Some(1),
+            verdict,
+        };
+        let items = plan_repo_cleanup(
+            vec![
+                v("zzz", Verdict::Skip("no PR".into())),
+                v("stale-foreign", Verdict::CheckedOut { worktree: missing.clone() }),
+                v("feat", Verdict::Delete), // w1's branch: dir gone + entry pruned shape
+                v("foreign", Verdict::CheckedOut { worktree: existing.clone() }),
+                v("feat2", Verdict::CheckedOut { worktree: "/wt/w2".into() }),
+                v("feat3", Verdict::Delete), // another repo's workspace: not ours
+                v("loose", Verdict::Delete),
+            ],
+            "r",
+            &workspaces,
+        );
+        assert_eq!(
+            items,
+            vec![
+                RepoCleanupItem::Delete { branch: "feat3".into(), tip: "t".into(), pr: Some(1) },
+                RepoCleanupItem::Delete { branch: "loose".into(), tip: "t".into(), pr: Some(1) },
+                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "feat".into(), pr: Some(1) },
+                RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "feat2".into(), pr: Some(1) },
+                RepoCleanupItem::Skip {
+                    branch: "foreign".into(),
+                    pr: Some(1),
+                    reason: format!("checked out at {existing}"),
+                },
+                RepoCleanupItem::Skip {
+                    branch: "stale-foreign".into(),
+                    pr: Some(1),
+                    reason: format!("checked out at {missing}; run git worktree prune"),
+                },
+                RepoCleanupItem::Skip { branch: "zzz".into(), pr: Some(1), reason: "no PR".into() },
+            ]
         );
     }
 }
