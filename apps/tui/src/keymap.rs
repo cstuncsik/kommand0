@@ -136,7 +136,7 @@ impl Action {
             Action::CloseSession => "Close embedded claude",
             Action::ReviewDiff => "Review changes (PR-style diff)",
             Action::OpenPrInBrowser => "Open the PR in a browser",
-            Action::Cleanup => "Clean up a merged workspace",
+            Action::Cleanup => "Clean up merged workspace / repo",
             Action::Filter => "Filter workspaces (Esc clears)",
             Action::Palette => "Go to workspace",
             Action::NextWaiting => "Next workspace that needs you",

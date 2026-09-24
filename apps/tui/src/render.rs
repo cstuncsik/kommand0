@@ -964,7 +964,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 .count();
 
             let title = format!(" Repo: {name} ");
-            let lines = vec![
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled(
                         "Name: ",
@@ -993,6 +993,24 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::raw(format!("{active} active, {total} total")),
                 ]),
             ];
+
+            // Repo cleanup: spinner while the scan/delete runs, else its last outcome.
+            let inflight = app.repo_cleanup_inflight.as_deref() == Some(id.as_str());
+            if inflight || app.repo_cleanup_result.contains_key(id) {
+                lines.push(Line::raw(""));
+                if inflight {
+                    // ponytail: one spinner for the whole scan; a per-branch
+                    // counter needs the worker to report progress.
+                    let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+                    lines.push(Line::styled(
+                        format!("{spin} Cleaning up…"),
+                        Style::default().fg(th.dirty),
+                    ));
+                } else if let Some((msg, is_error)) = app.repo_cleanup_result.get(id) {
+                    let color = if *is_error { th.error } else { th.text };
+                    lines.push(Line::styled(msg.clone(), Style::default().fg(color)));
+                }
+            }
             (title, lines)
         }
         Some(TreeNode::Workspace { ws, repo_name }) => {

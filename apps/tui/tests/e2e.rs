@@ -1404,6 +1404,48 @@ fn c_cleans_up_a_merged_workspace() {
 }
 
 #[test]
+fn c_on_a_repo_row_cleans_up_merged_branches() {
+    // A repo with a plain `stale` branch (no workspace) whose PR the stubbed gh
+    // reports merged: `c` on the repo row scans in the background, the preview
+    // opens, `y` deletes the branch and the repo detail line reports it (the
+    // worker -> channel -> select! path has no other automated coverage).
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "user.name", "t"]);
+    run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+    run_git(&repo, &["branch", "stale"]);
+
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
+        "workspaces": [],
+        "sessions": []
+    })
+    .to_string();
+
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "gh-stub-merged")]);
+    tui.wait_for("demo");
+    tui.send("c"); // repo row selected: scan -> preview modal
+    tui.wait_for("Clean Up Repo");
+    tui.send("y"); // confirm
+    tui.wait_for("Deleted 1 branch");
+
+    let stale_exists = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "refs/heads/stale"])
+        .current_dir(&repo)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(!stale_exists, "the stale branch is deleted");
+
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn slash_filters_the_tree_and_capital_a_archives() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().to_str().unwrap();
