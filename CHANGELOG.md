@@ -33,6 +33,44 @@ All notable changes to kommand0 are documented here. The format is based on
   workspace's branch, since removing it would take the other branch's checkout
   with it.
 
+## [0.28.0] - 2026-09-24
+
+### Added
+
+- **Create a workspace straight from a GitHub issue.** Type an issue reference (`123`,
+  `#123`, or an issue URL) into the Add Workspace **Name** field, or pass
+  `kmd workspace create --issue <ref>` (a positional name is detected the same way):
+  `gh issue develop` adopts the issue's linked branch or creates one on `origin`, and the
+  workspace is named after it. The lookup runs off the render loop behind a dialog you can
+  Esc out of, and every failure reports gh's own reason rather than quietly forking a
+  local branch. Esc stops the waiting, not the lookup, so a resubmit is held until the
+  running one lands (two concurrent lookups could otherwise link two branches to the
+  same issue). A linked branch that lives in another repository is refused rather than
+  matched by name against `origin`. gh is pinned to `origin` whenever its URL names a
+  repo, port included; where it doesn't
+  and another remote could be picked instead, kommand0 refuses rather than write to a repo
+  you didn't name. On a `--single-branch` clone the linked branch is outside `origin`'s
+  refspec, so kommand0 adds it to `remote.origin.fetch` in your repo's git config: one
+  line per issue branch, left in place afterwards.
+
+### Changed
+
+- **An all-digit workspace name now means an issue.** In the TUI's Add Workspace dialog, a
+  Name like `2024` creates the workspace on the branch GitHub links to issue 2024 instead
+  of a workspace called `2024`; fill the **Branch** field to get a plain workspace on a
+  named branch. `kmd workspace create <digits> --repo x` changes the same way, with
+  `--fork`, `--no-worktree` or `--branch` to keep the old behaviour.
+
+### Fixed
+
+- **A stray `GH_REPO` no longer retargets kommand0's `gh` calls.** It overrides the
+  repository gh would infer from your remotes, so PR/CI status and the merged-PR
+  cleanup could read a different repository than the one you're in.
+- **`core.sshCommand` is honoured again when kommand0 fetches or calls `gh`.** Forcing
+  ssh into batch mode used to replace a repo-scoped identity with the default key, so
+  on an SSH origin with `core.sshCommand` set the issue fetch failed with
+  `Permission denied` *after* the linked branch had already been created.
+
 ## [0.27.3] - 2026-09-20
 
 ### Fixed
@@ -898,7 +936,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.27.3...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/cstuncsik/kommand0/compare/v0.27.3...v0.28.0
 [0.27.3]: https://github.com/cstuncsik/kommand0/compare/v0.27.2...v0.27.3
 [0.27.2]: https://github.com/cstuncsik/kommand0/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/cstuncsik/kommand0/compare/v0.27.0...v0.27.1

@@ -12,9 +12,9 @@ pub mod worktree;
 pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
 pub use git::{
-    BranchStatus, BranchVerdict, FileDiff, PrChecks, PrReview, PrState, PrStatus, Verdict,
-    branch_status, cleanup_merged_workspace, delete_branches, diff_files_vs_default_branch,
-    pr_statuses, scan_merged_branches,
+    BranchStatus, BranchVerdict, FileDiff, IssueBranch, PrChecks, PrReview, PrState, PrStatus,
+    Verdict, branch_status, cleanup_merged_workspace, delete_branches,
+    diff_files_vs_default_branch, is_issue_ref, issue_branch, pr_statuses, scan_merged_branches,
 };
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
@@ -2248,6 +2248,7 @@ mod tests {
         };
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
         dir
@@ -2325,6 +2326,7 @@ mod tests {
         };
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
         git(&["branch", "feat/login"]);
@@ -3179,6 +3181,7 @@ mod tests {
         };
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
 

@@ -168,7 +168,10 @@ enum RepoAction {
 enum WorkspaceAction {
     /// Create a new workspace
     Create {
-        /// Workspace name (auto-generated from the repo or branch if omitted)
+        /// Workspace name, or an issue reference (`123`, `#123`, an issue URL),
+        /// which is resolved like `--issue`. Auto-generated from the repo or
+        /// branch if omitted; pass `--branch`, `--fork` or `--no-worktree` to
+        /// force a workspace literally named `123`
         name: Option<String>,
         /// Repo reference (name, path, or ID)
         #[arg(long)]
@@ -184,6 +187,10 @@ enum WorkspaceAction {
         /// gets a `-2`/`-3` suffix then; skips the existing-branch checkout prompt)
         #[arg(long, conflicts_with_all = ["branch", "no_worktree"])]
         fork: bool,
+        /// Create the workspace on the branch GitHub links to an issue (a
+        /// number, `#123`, or an issue URL), via `gh issue develop`
+        #[arg(long, conflicts_with_all = ["name", "branch", "no_worktree", "fork"])]
+        issue: Option<String>,
     },
     /// List workspaces
     List {
@@ -525,8 +532,60 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name, repo, branch, no_worktree, fork } => {
+            WorkspaceAction::Create { name, repo, branch, no_worktree, fork, issue } => {
                 let mut state = AppState::load()?;
+                // `--issue`, or a positional that looks like an issue reference.
+                // Anything that already says what branch to use suppresses the
+                // detection (and the remote write with it): `--branch` names one
+                // explicitly, `--fork` means "fork a fresh branch", `--no-worktree`
+                // means "no branch at all". In all three the positional is a NAME.
+                // An implicitly detected ref has an escape hatch worth naming
+                // when it fails, but only for the bare-number shape: `--fork`
+                // with a URL positional dies on `validate_new_workspace_name`
+                // instead (a workspace name can't contain `/`), so the advice
+                // would be wrong. Restricting it also keeps the ref out of the
+                // message, which a URL must stay out of: it can carry
+                // credentials, and a percent-encoded `user%3Atoken%40` passes
+                // the parser's literal-`@` check.
+                let hint_ref = issue
+                    .is_none()
+                    .then_some(name.as_deref())
+                    .flatten()
+                    .filter(|n| n.trim_start_matches('#').bytes().all(|b| b.is_ascii_digit()))
+                    .map(str::to_string);
+                let from_issue = issue.or_else(|| {
+                    name.clone().filter(|n| {
+                        !fork && !no_worktree && branch.is_none() && kommand0_core::is_issue_ref(n)
+                    })
+                });
+                let (name, branch) = match &from_issue {
+                    Some(r) => {
+                        let repo_path = state.resolve_repo(&repo)?.path.clone();
+                        // stderr: this performs a REMOTE WRITE and can take ~60s
+                        // worst case (three bounded calls: --list, create, fetch).
+                        // The ref is NOT interpolated: a URL can carry
+                        // `user:token@`.
+                        eprintln!("Resolving issue...");
+                        let b = kommand0_core::issue_branch(&repo_path, r)
+                            .map_err(|e| match &hint_ref {
+                                // The user typed a name, not `--issue`. Say how
+                                // to get the old, purely local behaviour back.
+                                Some(n) => anyhow::anyhow!(
+                                    "{e}\n({n} was read as an issue reference; \
+                                     pass --fork for a workspace literally named {n})"
+                                ),
+                                None => anyhow::Error::msg(e),
+                            })?;
+                        if b.reused {
+                            eprintln!("Using existing linked branch {}", b.branch);
+                        } else {
+                            eprintln!("Created linked branch {} on origin", b.branch);
+                        }
+                        // None: the workspace is named after the branch.
+                        (None, Some(b.branch))
+                    }
+                    None => (name, branch),
+                };
                 let ws = match (branch, no_worktree) {
                     (Some(_), true) => {
                         anyhow::bail!("--branch and --no-worktree can't be combined")
@@ -1008,5 +1067,19 @@ mod tests {
             Cli::try_parse_from(["kmd", "repo", "cleanup", "r", "--dry-run", "--force"]).is_err(),
             "--dry-run + --force must be rejected"
         );
+    }
+
+    #[test]
+    fn issue_conflicts_with_anything_that_already_names_a_branch() {
+        // Asserted by error KIND: an out-of-process check would pass on a
+        // MISSING declaration by invoking the developer's real gh.
+        for extra in [vec!["x"], vec!["--branch", "b"], vec!["--fork"], vec!["--no-worktree"]] {
+            let mut args = vec!["kmd", "workspace", "create", "--repo", "r", "--issue", "1"];
+            args.extend(extra.iter().copied());
+            let err = Cli::try_parse_from(&args)
+                .err()
+                .unwrap_or_else(|| panic!("--issue + {extra:?} must be rejected"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{extra:?}: {err}");
+        }
     }
 }

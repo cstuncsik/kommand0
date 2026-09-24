@@ -52,6 +52,37 @@ fn kmd_at(cwd: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     cmd.output().unwrap()
 }
 
+/// Put a `git` shim first on PATH for a child process: `body` runs, then the
+/// real git. Returns the PATH value to pass in the child's env (per-child, so
+/// this stays hermetic and parallel-safe).
+fn git_shim(dir: &Path, body: &str) -> String {
+    // Resolve the real git BEFORE the shim shadows it, or the shim exec's itself.
+    let out = Command::new("sh").args(["-c", "command -v git"]).output().unwrap();
+    let real_git = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!real_git.is_empty(), "no git on PATH");
+    std::fs::create_dir_all(dir).unwrap();
+    // Quoted: a git under a path with a space would otherwise split into words.
+    write_stub(&dir.join("git"), &format!("#!/bin/sh\n{body}\nexec \"{real_git}\" \"$@\"\n"));
+    format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default())
+}
+
+/// The `gh issue develop` stub three issue tests share: no linked branch yet,
+/// then `create` pushes `123-add-thing` to origin and prints the
+/// `…/tree/<branch>` line core parses.
+fn gh_develop_stub(path: &Path) {
+    write_stub(
+        path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then exit 0; fi\n\
+         if [ \"$1\" = issue ] && [ \"$2\" = develop ]; then\n\
+        \x20 git push -q origin HEAD:refs/heads/123-add-thing\n\
+        \x20 printf 'github.com/o/r/tree/123-add-thing\\n'\n\
+        \x20 exit 0\n\
+         fi\n\
+         exit 1\n",
+    );
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
@@ -85,7 +116,8 @@ fn write_stub(path: &Path, body: &str) {
 }
 
 /// A tracked repo (with a bare `origin` so pushes succeed) + a workspace on its
-/// own branch (`feat`, named after the workspace). Returns the state dir.
+/// own branch (`feat`, named after the workspace), plus a spare branch nothing
+/// has checked out. Returns the state dir.
 fn setup(root: &Path) -> std::path::PathBuf {
     let state_dir = root.join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -96,10 +128,12 @@ fn setup(root: &Path) -> std::path::PathBuf {
     run_git(&remote, &["init", "--bare", "-b", "main"]);
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
     run_git(&repo, &["commit", "-m", "init"]);
+    run_git(&repo, &["branch", "spare"]); // free for `--branch spare` to adopt
     run_git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
 
     let add = kmd(&state_dir, &[], &["repo", "add", repo.to_str().unwrap()]);
@@ -138,6 +172,7 @@ fn workspace_create_from_an_existing_branch() {
     std::fs::create_dir_all(&repo).unwrap();
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
@@ -181,6 +216,7 @@ fn repo_with_branch_feat(root: &Path) -> (std::path::PathBuf, String) {
     std::fs::create_dir_all(&repo).unwrap();
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
@@ -278,6 +314,319 @@ fn workspace_create_over_existing_branch_and_workspace_errors_without_a_note() {
 }
 
 #[test]
+fn workspace_create_from_an_issue() {
+    // Both surfaces resolve the same way: `--issue`, and a positional that
+    // looks like an issue reference. Each row needs its own fixture: the
+    // workspace is named after the branch, so a shared one would collide.
+    for extra in [vec!["--issue", "123"], vec!["123"]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let repo = tmp.path().join("repo");
+        let gh = tmp.path().join("gh");
+        gh_develop_stub(&gh);
+        let mut args = vec!["workspace", "create"];
+        args.extend(extra.iter().copied());
+        args.extend(["--repo", repo.to_str().unwrap()]);
+
+        let out = kmd(&state, &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())], &args);
+        assert!(out.status.success(), "{extra:?}: {}", String::from_utf8_lossy(&out.stderr));
+        // The workspace is named after the branch, not after the ref.
+        let text = stdout(&out);
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec!["Created workspace: 123-add-thing (repo: repo)"],
+            "{extra:?}: stdout stays pipeable"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("Resolving issue"), "{extra:?}: progress on stderr: {err}");
+        assert!(
+            err.contains("Created linked branch 123-add-thing on origin"),
+            "{extra:?}: names the branch it created: {err}"
+        );
+    }
+}
+
+#[test]
+fn the_linked_branch_fetch_never_asks_for_credentials() {
+    // A PATH shim records how kommand0 actually invokes git: the fetch carries
+    // gh's credential helper (a private HTTPS origin authenticated only by a
+    // GH_TOKEN fetches with nothing else), and neither git nor ssh may fall back
+    // to a prompt, which off the UI thread would hang past the timeout.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    // A leftover local branch, so the divergence check actually runs: it is
+    // skipped outright when there is nothing to shadow the fetched ref.
+    run_git(&repo, &["branch", "123-add-thing"]);
+    let gh = tmp.path().join("gh");
+    gh_develop_stub(&gh);
+
+    let log = tmp.path().join("git.log");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!(
+            "printf '%s [%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
+             \"${{GIT_SSH_COMMAND-UNSET}}\" >> \"{}\"",
+            log.display()
+        ),
+    );
+
+    let out = kmd(
+        &state,
+        &[
+            ("KOMMAND0_GH_BIN", gh.to_str().unwrap()),
+            ("PATH", &path),
+            // A user's own GIT_SSH_COMMAND must survive, with batch mode added.
+            ("GIT_SSH_COMMAND", "ssh -F /dev/null"),
+        ],
+        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "create --issue: {}", String::from_utf8_lossy(&out.stderr));
+
+    let recorded = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = recorded.lines().collect();
+    let fetch = lines
+        .iter()
+        .position(|l| l.contains("fetch origin +refs/heads/123-add-thing:"))
+        .unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}"));
+    assert!(
+        lines[fetch]
+            .contains(&format!("-c credential.helper=!'{}' auth git-credential", gh.display())),
+        "the fetch authenticates through the gh we were told to use: {}",
+        lines[fetch]
+    );
+    assert!(
+        lines[fetch].ends_with("[0][ssh -F /dev/null -oBatchMode=yes]"),
+        "no terminal prompt, and batch mode is appended to the user's ssh command: {}",
+        lines[fetch]
+    );
+    let is_ancestor = lines
+        .iter()
+        .position(|l| l.contains("merge-base --is-ancestor"))
+        .unwrap_or_else(|| panic!("no local-branch check in:\n{recorded}"));
+    assert!(fetch < is_ancestor, "the local branch is judged against a fresh origin ref");
+}
+
+#[test]
+fn the_fetch_keeps_the_repos_own_ssh_command() {
+    // git's precedence: GIT_SSH_COMMAND beats core.sshCommand, so forcing batch
+    // mode through the environment used to replace a repo-scoped identity with
+    // the default key — and on this path that failure lands AFTER the linked
+    // branch has been created on origin. An empty GIT_SSH_COMMAND reads as
+    // absent (git would die on it anyway), which makes this deterministic no
+    // matter what the developer has exported.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    run_git(&repo, &["config", "core.sshCommand", "ssh -i /k/deploy"]);
+    let gh = tmp.path().join("gh");
+    gh_develop_stub(&gh);
+
+    let log = tmp.path().join("git.log");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!("printf '%s [%s]\\n' \"$*\" \"${{GIT_SSH_COMMAND-UNSET}}\" >> \"{}\"", log.display()),
+    );
+
+    let out = kmd(
+        &state,
+        &[
+            ("KOMMAND0_GH_BIN", gh.to_str().unwrap()),
+            ("PATH", &path),
+            ("GIT_SSH_COMMAND", ""),
+        ],
+        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "create --issue: {}", String::from_utf8_lossy(&out.stderr));
+
+    let recorded = std::fs::read_to_string(&log).unwrap();
+    let fetch = recorded
+        .lines()
+        .find(|l| l.contains("fetch origin +refs/heads/123-add-thing:"))
+        .unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}"));
+    assert!(
+        fetch.ends_with("[ssh -i /k/deploy -oBatchMode=yes]"),
+        "the repo's own ssh command survives, with batch mode appended: {fetch}"
+    );
+}
+
+#[test]
+fn refuses_the_linked_branch_when_the_local_branch_check_cannot_answer() {
+    // A leftover local branch is adopted over the fetched ref, so kommand0 only
+    // adopts one that already contains origin's tip. Every way the check can
+    // fail to answer proves nothing, and adopting anyway would silently drop
+    // what origin has: a signal leaves no exit code at all, while 128 is git's
+    // "couldn't traverse" (an absent ref, but equally an unreadable object), so
+    // neither may read as "not behind".
+    for die in ["kill -9 $$", "exit 128"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let repo = tmp.path().join("repo");
+        // The leftover local branch is what makes the check run at all.
+        run_git(&repo, &["branch", "123-add-thing"]);
+        let gh = tmp.path().join("gh");
+        gh_develop_stub(&gh);
+        let path = git_shim(
+            &tmp.path().join("shim"),
+            &format!("case \"$*\" in\n  *\"merge-base --is-ancestor\"*) {die} ;;\nesac"),
+        );
+
+        let out = kmd(
+            &state,
+            &[("KOMMAND0_GH_BIN", gh.to_str().unwrap()), ("PATH", &path)],
+            &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+        );
+        assert!(!out.status.success(), "{die}: an unanswered check must not adopt the branch");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("behind or has diverged"), "{die}: {err}");
+    }
+}
+
+#[test]
+fn workspace_create_from_an_issue_reuses_a_linked_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    // origin must really have the branch: core fetches it, a --list row alone
+    // is not enough.
+    run_git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/123-existing"]);
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = issue ] && [ \"$2\" = develop ] && [ \"$3\" = --list ]; then printf '123-existing\\thttps://github.com/o/r/tree/123-existing\\n'; exit 0; fi\nexit 1\n",
+    );
+
+    let out = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+        &["workspace", "create", "--issue", "#123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "create --issue: {}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("Using existing linked branch 123-existing"),
+        "reports the reuse: {err}"
+    );
+
+    // The worktree is really on the linked branch (the BRANCH column, read
+    // from the worktree itself).
+    let status = stdout(&kmd(&state, &[], &["workspace", "status", "123-existing"]));
+    let row = status.lines().nth(1).expect("one status row");
+    assert_eq!(
+        row.split_whitespace().nth(1),
+        Some("123-existing"),
+        "on the linked branch: {status}"
+    );
+}
+
+#[test]
+fn workspace_create_from_an_issue_reports_gh_failure() {
+    // A PR number (or an unauthenticated gh) fails the lookup: surface gh's own
+    // message and leave nothing behind.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nprintf 'GraphQL: Could not resolve to an Issue with the number of 118.\\n' >&2\nexit 1\n",
+    );
+
+    let out = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+        &["workspace", "create", "--issue", "118", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(!out.status.success(), "a failed lookup must fail the command");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Could not resolve to an Issue"), "gh's own message: {err}");
+
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(!list.contains("118"), "no workspace left behind: {list}");
+}
+
+#[test]
+fn an_implicitly_detected_issue_ref_names_the_escape_hatch_when_it_fails() {
+    // `kmd workspace create 123 --repo x` used to make a workspace called 123.
+    // It now performs a lookup, so when that lookup fails the error has to say
+    // how to get the old behaviour back — `--issue 123` failing does not, the
+    // user asked for it.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let gh = "/nonexistent/definitely/not/gh";
+
+    let implicit = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh)],
+        &["workspace", "create", "123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(!implicit.status.success(), "the lookup failed, so the command must");
+    let err = String::from_utf8_lossy(&implicit.stderr);
+    assert!(err.contains("gh CLI not found"), "gh's own reason survives: {err}");
+    assert!(err.contains("--fork"), "names the escape hatch: {err}");
+
+    let explicit = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh)],
+        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(!explicit.status.success(), "the same lookup, the same failure");
+    let err = String::from_utf8_lossy(&explicit.stderr);
+    assert!(err.contains("gh CLI not found"), "it reached the same failure: {err}");
+    assert!(!err.contains("--fork"), "an explicit --issue needs no escape hatch: {err}");
+
+    // A URL positional gets no hint either: `--fork` on a URL dies on the
+    // workspace-name check instead, and a URL must stay out of the message.
+    let url = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", gh)],
+        &[
+            "workspace",
+            "create",
+            "https://github.com/o/r/issues/123?access_token=SECRET",
+            "--repo",
+            repo.to_str().unwrap(),
+        ],
+    );
+    assert!(!url.status.success(), "the lookup still runs for a URL");
+    let err = String::from_utf8_lossy(&url.stderr);
+    assert!(!err.contains("--fork"), "no wrong advice for a URL: {err}");
+    assert!(!err.contains("SECRET"), "the pasted URL is never echoed back: {err}");
+}
+
+#[test]
+fn workspace_create_suppresses_issue_detection() {
+    // Anything that already says what branch to use means the positional is a
+    // NAME. gh points at a nonexistent path, so any lookup would fail loudly.
+    for extra in [vec!["--fork"], vec!["--no-worktree"], vec!["--branch", "spare"]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let repo = tmp.path().join("repo");
+        let mut args = vec!["workspace", "create", "123"];
+        args.extend(extra.iter().copied());
+        args.extend(["--repo", repo.to_str().unwrap()]);
+
+        let out = kmd(&state, &[("KOMMAND0_GH_BIN", "/nonexistent/definitely/not/gh")], &args);
+        assert!(out.status.success(), "{extra:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            stdout(&out).contains("Created workspace: 123 "),
+            "{extra:?}: a workspace literally named 123: {}",
+            stdout(&out)
+        );
+        if extra[0] == "--branch" {
+            let status = stdout(&kmd(&state, &[], &["workspace", "status", "123"]));
+            let row = status.lines().nth(1).expect("one status row");
+            assert_eq!(
+                row.split_whitespace().nth(1),
+                Some("spare"),
+                "--branch still wins: {status}"
+            );
+        }
+    }
+}
+
+#[test]
 fn workspace_names_are_per_repo_and_ids_disambiguate() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
@@ -287,6 +636,7 @@ fn workspace_names_are_per_repo_and_ids_disambiguate() {
         std::fs::create_dir_all(&dir).unwrap();
         run_git(&dir, &["init", "-b", "main"]);
         run_git(&dir, &["config", "user.email", "t@t"]);
+        run_git(&dir, &["config", "commit.gpgsign", "false"]);
         run_git(&dir, &["config", "user.name", "t"]);
         std::fs::write(dir.join("a.txt"), "1").unwrap();
         run_git(&dir, &["add", "."]);
@@ -927,6 +1277,7 @@ fn profile_rename_rewrites_worktree_and_session_paths() {
     std::fs::create_dir_all(&repo).unwrap();
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
@@ -1065,6 +1416,7 @@ fn profile_delete_force_removes_dir_and_worktrees_keeps_branch() {
     std::fs::create_dir_all(&repo).unwrap();
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
@@ -1315,6 +1667,7 @@ fn state_with_repos(root: &Path, names: &[&str]) -> std::path::PathBuf {
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "-b", "main"]);
         run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "commit.gpgsign", "false"]);
         run_git(&repo, &["config", "user.name", "t"]);
         run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
         let add = kmd(&state_dir, &[], &["repo", "add", repo.to_str().unwrap()]);

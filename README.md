@@ -86,7 +86,7 @@ kmd repo sort [manual|name-asc|name-desc|added-asc|added-desc]   # omit to show
 kmd repo cleanup <name-or-path> [--dry-run] [--force]  # delete local branches whose PR is merged
 
 # Workspaces
-kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--fork] [--no-worktree]
+kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--issue <ref>] [--fork] [--no-worktree]
 kmd workspace list [--all] [--repo <name>]
 kmd workspace show <name>
 kmd workspace status [<name>]          # git branch / ahead-behind / dirty
@@ -117,6 +117,26 @@ check one out explicitly. `--no-worktree` skips the worktree entirely and uses
 the repo root as the working directory (can't be combined with `--branch` or
 `--fork`).
 
+Pass `--issue <ref>` (a number, `#123`, or an issue URL) to create the workspace
+on the branch GitHub links to that issue, via `gh issue develop`: an existing
+linked branch is reused, otherwise a new one is created on the remote and linked
+(so merging its PR closes the issue). The workspace is named after the branch. A
+positional name that looks like an issue reference is detected the same way, so
+`kmd workspace create 123 --repo x` does the same thing; pass `--branch`,
+`--fork` or `--no-worktree` when you really do want a workspace literally named
+`123`. `--issue` can't be combined with a positional name, `--branch`, `--fork`
+or `--no-worktree`. The lookup is pinned to the repo's **`origin`** remote, so a
+fork checkout that also has an `upstream` won't have the branch created on the
+wrong repo; the flip side is that an issue living only on `upstream` is reported
+as not found. An issue **URL** must point at that same `origin` repo. If `origin`
+isn't an `owner/repo` URL (a local path, or no `origin` at all) there is nothing
+to pin to, so kommand0 refuses URL refs, and leaves the targeting to gh only
+while `origin` is the sole remote: with another remote configured it refuses
+outright rather than let gh pick one. On a `--single-branch` clone the linked
+branch falls outside `origin`'s refspec, so kommand0 adds it to
+`remote.origin.fetch` in the repo's git config: one line per issue branch, left
+in place afterwards even if the branch is then refused.
+
 > Replace `kmd` with `cargo run -p kommand0-cli --` during development.
 
 ## TUI
@@ -133,7 +153,7 @@ cargo run -p kommand0-tui   # from a checkout
 - **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9), and `Ctrl+A l` toggles back to the last-active tab (tmux-style). Open a new **Claude Code** tab with `Ctrl+A c` (or the `[+]` tab), a **codex** tab with `Ctrl+A e`, a **gemini** tab with `Ctrl+A g`, an **opencode** tab with `Ctrl+A o`, or a **shell** tab with `Ctrl+A s`: a `$SHELL` session in the worktree, for running anything (lazygit, or `tmux`/`zellij` for splits inside the pane). Tabs are marked by kind (codex `>`, gemini `✦`, opencode `○`, shell `$`). All four agent tabs resume their conversation on reopen; shell tabs reopen as fresh shells
 - **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items and scroll the tree; inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive. Horizontal scroll (tilt wheel) or Shift+scroll over the content pane switches session tabs
-- **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead. With the Branch field blank, if the workspace **name** matches an existing branch (local or `origin`), a prompt offers to check it out instead of forking
+- **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead. With the Branch field blank, if the workspace **name** matches an existing branch (local or `origin`), a prompt offers to check it out instead of forking. Typing an issue reference (`123`, `#123`, or an issue URL) into the **Name** field instead creates the workspace on the branch GitHub links to that issue; for a workspace literally named `123`, use `kmd workspace create 123 --repo <repo> --fork` (the Branch field only checks out an *existing* branch)
 - **Filter & archive**: press `/` to live-filter the workspace tree by name or branch (matched repos auto-expand, `Esc` clears); press `A` to archive/activate a workspace — so the tree stays navigable as you accumulate repos and workspaces
 - **Ordering**: repos and workspaces start in the order you added them. `K`/`J` move the selected one; `s` and `t` toggle a name or date-added sort (ascending → descending → off) for whichever level the cursor is on. The sorts are a view — turn one off and the hand-arranged order comes back, and moving an item while sorted keeps what you were looking at as the new saved order
 - **Git worktrees**: each workspace gets an isolated git worktree branch
@@ -168,7 +188,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `p` | Tree | Open the workspace's PR in a browser |
 | `c` | Tree | Clean up merged workspace / repo: on a workspace row, its merged worktree + branch; on a repo row, every local branch whose PR is merged (preview, then `y`); branches of kommand0 workspaces are routed to the workspace cleanup, other checkouts and `protected_branches` are skipped |
 | `a` | Tree | Add repository (modal) |
-| `w` | Tree | Add workspace to selected repo (modal) |
+| `w` | Tree | Add workspace to selected repo (modal; a `123` / `#123` / issue URL name creates the branch GitHub links to that issue) |
 | `d` / `D` | Tree | Delete / force-delete selected |
 | _typing_ | Embedded | Goes straight to the embedded Claude |
 | `Ctrl+A` then `c` | Embedded | New Claude Code session tab |

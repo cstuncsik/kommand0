@@ -1371,6 +1371,7 @@ fn c_cleans_up_a_merged_workspace() {
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
     run_git(&repo, &["config", "user.name", "t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.join("a.txt"), "1").unwrap();
     run_git(&repo, &["add", "."]);
     run_git(&repo, &["commit", "-m", "init"]);
@@ -1415,6 +1416,7 @@ fn c_on_a_repo_row_cleans_up_merged_branches() {
     run_git(&repo, &["init", "-b", "main"]);
     run_git(&repo, &["config", "user.email", "t@t"]);
     run_git(&repo, &["config", "user.name", "t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
     run_git(&repo, &["branch", "stale"]);
 
@@ -1440,6 +1442,60 @@ fn c_on_a_repo_row_cleans_up_merged_branches() {
         .status
         .success();
     assert!(!stale_exists, "the stale branch is deleted");
+
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn w_with_an_issue_ref_resolves_it_and_creates_the_workspace() {
+    // The ONLY coverage of the issue channel seam: `issue_tx`, the `select!`
+    // arm that receives on it, and `finish_issue_resolve` behind them. The unit
+    // tests can't reach it — `start_issue_resolve` deliberately short-circuits
+    // when `issue_tx` is `None`, which is exactly the shape of "a refactor drops
+    // the wiring", and every one of them would still pass with the feature dead.
+    //
+    // It also pins the off-the-render-loop contract: the stub sleeps, so the
+    // "Resolving issue" modal can only appear if the lookup is on a worker.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let origin = root.join("origin");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&origin).unwrap();
+    run_git(&origin, &["init", "-b", "main"]);
+    run_git(&origin, &["config", "user.email", "t@t"]);
+    run_git(&origin, &["config", "user.name", "t"]);
+    run_git(&origin, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(origin.join("a.txt"), "1").unwrap();
+    run_git(&origin, &["add", "."]);
+    run_git(&origin, &["commit", "-m", "init"]);
+    // The branch gh will claim is linked to the issue has to really be on
+    // origin: core fetches it before the worktree is made.
+    run_git(&origin, &["branch", "123-linked"]);
+    run_git(root, &["clone", origin.to_str().unwrap(), repo.to_str().unwrap()]);
+
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
+        "workspaces": [],
+        "sessions": []
+    })
+    .to_string();
+
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "gh-stub-issue")]);
+    tui.wait_for("demo");
+    tui.send("w"); // Add Workspace
+    tui.wait_for("Add Workspace");
+    tui.send("123");
+    tui.send("\r");
+    // Painted while the worker is still in `gh issue develop`.
+    tui.wait_for("Resolving issue");
+    // The reply crossed the channel and the workspace was named after the
+    // branch, not after the ref that was typed.
+    tui.wait_for("123-linked");
+    // The screen could show the name for other reasons; the point of the
+    // feature is that the worktree is on the branch origin carries.
+    let st = tui.read_state();
+    assert_eq!(st["workspaces"][0]["branch_name"], "123-linked", "state: {st}");
 
     tui.send("q");
     tui.wait_exit();
