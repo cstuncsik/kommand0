@@ -175,7 +175,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `{` / `}` | Tree | Jump to the previous / next repo header (skips workspace rows) |
 | `<` / `>` | Tree | Shrink / widen the tree pane (5% steps, 15–60%; this session only — set `tree_width_pct` for a persistent default) |
 | `/` | Tree | Filter workspaces by name/branch (`Esc` clears) |
-| `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it — clean up, archive/activate, new session, or jump to a session tab |
+| `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it: clean up, archive/activate, new session, or jump to a session tab; each repo also gets a `Clean up branches: <repo>` entry |
 | `n` / `N` | Tree | Jump to + open the next / previous workspace that needs you (cycles the "N waiting") |
 | `A` | Tree | Archive / activate the selected workspace |
 | `K` / `J` | Tree | Move the selected repo (or workspace, within its repo) up / down in the saved order |
@@ -186,7 +186,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `x` / `Delete` | Tree | Close the embedded Claude pane |
 | `v` | Tree | Review the workspace's diff (two-pane: file tree + selected file's diff; `Tab` switches focus) |
 | `p` | Tree | Open the workspace's PR in a browser |
-| `c` | Tree | Clean up merged workspace / repo: on a workspace row, its merged worktree + branch; on a repo row, every local branch whose PR is merged (preview, then `y`); branches of kommand0 workspaces are routed to the workspace cleanup, other checkouts and `protected_branches` are skipped |
+| `c` | Tree | Clean up merged workspace / repo: on a workspace row, its merged worktree + branch; on a repo row (or click `[Clean up branches]` in its detail pane), every local branch whose PR is merged (preview, then `y`); branches of kommand0 workspaces are routed to the workspace cleanup, other checkouts and `protected_branches` are skipped |
 | `a` | Tree | Add repository (modal) |
 | `w` | Tree | Add workspace to selected repo (modal; a `123` / `#123` / issue URL name creates the branch GitHub links to that issue) |
 | `d` / `D` | Tree | Delete / force-delete selected |

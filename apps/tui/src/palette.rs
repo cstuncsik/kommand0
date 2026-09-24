@@ -26,6 +26,8 @@ pub(crate) enum PaletteAction {
     /// Reveal + open the workspace's embedded session (the original jump).
     OpenWorkspace { ws_id: String },
     Cleanup { ws_id: String },
+    /// Clean up a repo's merged-PR branches (the repo-level scan).
+    CleanupRepo { repo_id: String },
     /// Archive an active workspace, or re-activate an archived one.
     ArchiveToggle { ws_id: String },
     /// Open a new session tab of `kind` for the workspace.

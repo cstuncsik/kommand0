@@ -2018,6 +2018,26 @@ impl App {
         }
     }
 
+    /// Make a repo row visible + selected: clear any active filter (a filtered-
+    /// out repo has no row), rebuild the tree, and select it. False for an
+    /// unknown id.
+    fn select_repo_row(&mut self, repo_id: &str) -> bool {
+        if !self.repos.iter().any(|r| r.id == repo_id) {
+            return false;
+        }
+        self.filter_query.clear();
+        self.filter_input = false;
+        self.rebuild_tree();
+        if let Some(i) = self
+            .tree_items
+            .iter()
+            .position(|n| matches!(n, TreeNode::Repo { id, .. } if id == repo_id))
+        {
+            self.selected_index = i;
+        }
+        true
+    }
+
     /// Select a workspace by id (if present in the tree) and open its sessions.
     fn embed_workspace_by_id(&mut self, ws_id: &str) {
         self.select_workspace_row(ws_id);
@@ -2026,9 +2046,10 @@ impl App {
 
     /// Build the palette entries: a jump-and-open for every workspace, then the
     /// actions you can run on each (open PR / clean up / archive·activate / new
-    /// session), then a jump for each open session tab. Each entry's match text
-    /// folds in a verb + the workspace name + branch + repo so any of them
-    /// narrows (e.g. "pr foo", "clean", "tab 2").
+    /// session), a merged-branch cleanup per repo, then a jump for each open
+    /// session tab. Each entry's match text folds in a verb + the workspace
+    /// name + branch + repo so any of them narrows (e.g. "pr foo", "clean",
+    /// "tab 2").
     fn palette_candidates(&self) -> Vec<palette::Candidate> {
         use palette::{Candidate, PaletteAction};
         let repo_name = |repo_id: &str| {
@@ -2094,6 +2115,16 @@ impl App {
             ));
         }
 
+        // Repo-level cleanup; "branches" keeps it apart from the workspace clean-ups.
+        for r in &self.repos {
+            out.push(Candidate {
+                label: format!("Clean up branches: {}", r.name),
+                detail: "repo".to_string(),
+                match_text: format!("clean up cleanup branches repo {}", r.name),
+                action: PaletteAction::CleanupRepo { repo_id: r.id.clone() },
+            });
+        }
+
         // 3) Jump to a specific session tab of each currently-open workspace.
         for w in &self.workspaces {
             let Some(sessions) = self.embedded.get(&w.id) else {
@@ -2140,6 +2171,11 @@ impl App {
             Cleanup { ws_id } => {
                 if self.reveal_workspace(&ws_id) {
                     self.cleanup_workspace_prompt(&ws_id);
+                }
+            }
+            CleanupRepo { repo_id } => {
+                if self.select_repo_row(&repo_id) {
+                    self.repo_cleanup_requested(&repo_id);
                 }
             }
             ArchiveToggle { ws_id } => self.archive_toggle(&ws_id),
@@ -5498,6 +5534,9 @@ async fn run(
                         }
                         buttons::HitAction::CleanupWorkspaceFor { workspace_id } => {
                             app.cleanup_workspace_prompt(&workspace_id);
+                        }
+                        buttons::HitAction::CleanupRepoFor { repo_id } => {
+                            app.repo_cleanup_requested(&repo_id);
                         }
                         buttons::HitAction::StopSessionFor { workspace_id } => {
                             // The mouse twin of detach: entries survive, so give
@@ -10142,15 +10181,6 @@ mod key_tests {
         );
     }
 
-    /// Move the tree selection to a repo row.
-    fn select_repo_row(app: &mut App, repo_id: &str) {
-        app.selected_index = app
-            .tree_items
-            .iter()
-            .position(|n| matches!(n, TreeNode::Repo { id, .. } if id == repo_id))
-            .expect("repo row present");
-    }
-
     /// One worker message, bounded: a hang must fail this test, not wedge the run.
     async fn recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
         tokio::time::timeout(Duration::from_secs(10), rx.recv())
@@ -10181,7 +10211,7 @@ mod key_tests {
         app.repos[0].path = tmp.path().join("missing").to_string_lossy().into_owned();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         app.repo_cleanup_tx = Some(tx);
-        select_repo_row(&mut app, "r1");
+        app.select_repo_row("r1");
 
         press(&mut app, KeyCode::Char('c')).await;
         assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("r1"));
@@ -10224,7 +10254,7 @@ mod key_tests {
         press(&mut app, KeyCode::Char('n')).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.repo_cleanup_tx = Some(tx);
-        select_repo_row(&mut app, "r1");
+        app.select_repo_row("r1");
         press(&mut app, KeyCode::Char('c')).await;
         assert!(
             matches!(app.modal, modal::ModalState::ConfirmRepoCleanup { .. }),
@@ -10263,7 +10293,7 @@ mod key_tests {
         app.repo_cleanup_result.insert("r1".into(), ("Scan done: press c to review".into(), false));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.repo_cleanup_tx = Some(tx);
-        select_repo_row(&mut app, "r2");
+        app.select_repo_row("r2");
         press(&mut app, KeyCode::Char('c')).await;
         assert!(app.repo_cleanup_pending.is_none());
         assert!(!app.repo_cleanup_result.contains_key("r1"), "the stale review hint is gone");
@@ -10544,10 +10574,67 @@ mod key_tests {
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Cleaning up"), "in-flight shows progress:\n{text}");
 
+        assert!(!text.contains("[Clean up branches]"), "the button yields to the spinner:\n{text}");
+
         app.repo_cleanup_inflight = None;
         app.repo_cleanup_result.insert("r1".into(), ("Cleanup failed: boom".into(), true));
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Cleanup failed: boom"), "shows the outcome:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn palette_clean_up_branches_entry_starts_the_repo_scan() {
+        let mut app = test_app();
+        let tmp = tempfile::TempDir::new().unwrap();
+        app.repos[0].path = tmp.path().join("missing").to_string_lossy().into_owned();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(tx);
+        app.select_repo_row("r2");
+        let candidates = app.palette_candidates();
+        app.palette = Some(palette::Palette::new(candidates));
+
+        for ch in "branches alpha".chars() {
+            press(&mut app, KeyCode::Char(ch)).await;
+        }
+        assert_eq!(
+            app.palette.as_ref().unwrap().selected_action(),
+            Some(&palette::PaletteAction::CleanupRepo { repo_id: "r1".into() }),
+            "the verb + repo name narrows to the repo entry, not ws-one's cleanup"
+        );
+
+        press(&mut app, KeyCode::Enter).await;
+        assert!(app.palette.is_none());
+        assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("r1"));
+        assert!(
+            matches!(app.tree_items.get(app.selected_index), Some(TreeNode::Repo { id, .. }) if id == "r1"),
+            "the repo row is selected so the scan's feedback lands on it"
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_clean_up_branches_queues_the_repo_cleanup() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app(); // the alpha repo row is selected
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("[Clean up branches]"), "{text}");
+        let action = buttons::HitAction::CleanupRepoFor { repo_id: "r1".into() };
+        let region = app
+            .hit_regions
+            .iter()
+            .find(|r| r.action == action)
+            .cloned()
+            .expect("the button has a hit region");
+
+        mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: region.area.x,
+                row: region.area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.pending_button_action, Some(action));
     }
 
     #[tokio::test]

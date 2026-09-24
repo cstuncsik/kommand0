@@ -16,6 +16,8 @@ All notable changes to kommand0 are documented here. The format is based on
   checked out elsewhere is skipped with its path. The outcome lands in the repo
   detail pane, and a scan that finishes while something else owns the keyboard
   is parked and reviewed on the next `c` instead of stealing the screen. The
+  repo detail pane also offers a clickable `[Clean up branches]` button, and
+  the palette lists a `Clean up branches: <repo>` entry per repo. The
   same flow is `kmd repo cleanup <repo> [--dry-run] [--force]` on the CLI:
   `--dry-run` prints the BRANCH / PR / ACTION table only, a non-interactive run
   needs `--force`, and the exit code is 1 when any item failed.

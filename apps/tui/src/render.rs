@@ -987,22 +987,40 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 ]),
             ];
 
-            // Repo cleanup: spinner while the scan/delete runs, else its last outcome.
-            let inflight = app.repo_cleanup_inflight.as_deref() == Some(id.as_str());
-            if inflight || app.repo_cleanup_result.contains_key(id) {
-                lines.push(Line::raw(""));
-                if inflight {
-                    // ponytail: one spinner for the whole scan; a per-branch
-                    // counter needs the worker to report progress.
-                    let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
-                    lines.push(Line::styled(
-                        format!("{spin} Cleaning up…"),
-                        Style::default().fg(th.dirty),
-                    ));
-                } else if let Some((msg, is_error)) = app.repo_cleanup_result.get(id) {
-                    let color = if *is_error { th.error } else { th.text };
-                    lines.push(Line::styled(msg.clone(), Style::default().fg(color)));
-                }
+            // Repo cleanup: the button (a spinner while the scan/delete runs),
+            // then its last outcome.
+            lines.push(Line::raw(""));
+            if app.repo_cleanup_inflight.as_deref() == Some(id.as_str()) {
+                // ponytail: one spinner for the whole scan; a per-branch
+                // counter needs the worker to report progress.
+                let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+                lines.push(Line::styled(
+                    format!("{spin} Cleaning up…"),
+                    Style::default().fg(th.dirty),
+                ));
+            } else {
+                let btn_y = area.y + 1 + lines.len() as u16;
+                let btn_x = area.x + 2;
+                let btn_label = "Clean up branches";
+                let btn_rect = Rect::new(btn_x, btn_y, (btn_label.len() + 2) as u16, 1);
+                let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
+                let style = if hovered {
+                    Style::default()
+                        .fg(th.inverse)
+                        .bg(th.dirty)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th.dirty).add_modifier(Modifier::BOLD)
+                };
+                lines.push(Line::styled(format!("[{btn_label}]"), style));
+                app.hit_regions.push(buttons::HitRegion {
+                    area: btn_rect,
+                    action: buttons::HitAction::CleanupRepoFor { repo_id: id.clone() },
+                });
+            }
+            if let Some((msg, is_error)) = app.repo_cleanup_result.get(id) {
+                let color = if *is_error { th.error } else { th.text };
+                lines.push(Line::styled(msg.clone(), Style::default().fg(color)));
             }
             (title, lines)
         }
