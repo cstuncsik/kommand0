@@ -817,14 +817,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
         let marker = *marker;
         let label = match app.state.embedded_session_title(ws_id, id) {
             Some(title) if !title.is_empty() => {
-                if UnicodeWidthStr::width(title) > MAX_TITLE_COLS {
-                    // Reserve one column for the ellipsis so the title block stays
-                    // within MAX_TITLE_COLS.
-                    let shown = truncate_to_width(title, MAX_TITLE_COLS - 1);
-                    format!(" {glyph}{marker} {shown}… ")
-                } else {
-                    format!(" {glyph}{marker} {title} ")
-                }
+                format!(" {glyph}{marker} {} ", ellipsize(title, MAX_TITLE_COLS))
             }
             _ => format!(" {glyph}{marker} "),
         };
@@ -1649,6 +1642,15 @@ pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
     s[..end].to_string()
 }
 
+/// `s` as is when it fits `width` display columns, else cut to `width - 1`
+/// columns plus `…`.
+pub(crate) fn ellipsize(s: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= width {
+        return s.to_string();
+    }
+    format!("{}…", truncate_to_width(s, width.saturating_sub(1)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1709,6 +1711,14 @@ mod tests {
     #[test]
     fn truncate_to_width_truncates() {
         assert_eq!(truncate_to_width("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn ellipsize_keeps_a_fit_and_spends_the_last_column_otherwise() {
+        assert_eq!(ellipsize("hello", 5), "hello");
+        assert_eq!(ellipsize("hello world", 5), "hell…");
+        // A wide char that would straddle the cut is dropped, not split.
+        assert_eq!(ellipsize("\u{4F60}\u{597D}\u{4F60}", 4), "\u{4F60}…");
     }
 
     fn make_session(status: SessionStatus) -> kommand0_core::Session {

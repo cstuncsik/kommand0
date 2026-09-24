@@ -1,11 +1,12 @@
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthStr;
 
 use kommand0_core::RepoCleanupItem;
 
@@ -712,18 +713,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     .split(popup_layout[1])[1]
 }
 
-/// Like [`centered_rect`] but exactly `height` rows tall (a content-sized modal).
-fn centered_rect_rows(percent_x: u16, height: u16, area: Rect) -> Rect {
-    let height = height.min(area.height);
-    let width = (area.width as u32 * percent_x as u32 / 100) as u16;
-    Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    )
-}
-
 /// Render the modal dialog overlay.
 pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme: Theme) {
     let th = theme;
@@ -1090,7 +1079,9 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
         ModalState::ConfirmRepoCleanup { repo_name, summary, rows, .. } => {
             // Content-sized: border 2 + summary 1 + blank 1 + footer 1 around the rows.
             let height = (rows.len() + 5).min(frame.area().height.saturating_sub(2) as usize);
-            let area = centered_rect_rows(80, height as u16, frame.area());
+            let area = frame
+                .area()
+                .centered(Constraint::Percentage(80), Constraint::Length(height as u16));
             frame.render_widget(Clear, area);
 
             let inner = Layout::vertical([
@@ -1099,12 +1090,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 Constraint::Min(0),   // rows
                 Constraint::Length(1), // footer
             ])
-            .split(Rect::new(
-                area.x + 2,
-                area.y + 1,
-                area.width.saturating_sub(4),
-                area.height.saturating_sub(2),
-            ));
+            .split(area.inner(Margin::new(2, 1)));
 
             frame.render_widget(
                 Block::default()
@@ -1121,23 +1107,30 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[0],
             );
 
+            // ponytail: fixed cap with a "+N more" marker; a scrollable list if a
+            // real repo overflows a 24-row terminal.
             let cap = inner[2].height as usize;
             let shown = if rows.len() <= cap { rows.len() } else { cap.saturating_sub(1) };
             let visible = &rows[..shown];
-            let action_max = visible.iter().map(|r| r.action.chars().count()).max().unwrap_or(0);
+            let action_max = visible
+                .iter()
+                .map(|r| UnicodeWidthStr::width(r.action.as_str()))
+                .max()
+                .unwrap_or(0);
             // 8 = the pr column (6) plus its two separating spaces; the branch
             // column takes what is left, truncating before the action ever clips.
             let branch_w = (inner[2].width as usize).saturating_sub(8 + action_max).clamp(10, 30);
             let mut lines: Vec<Line> = visible
                 .iter()
                 .map(|r| {
-                    let branch = if r.branch.chars().count() > branch_w {
-                        format!("{}…", super::render::truncate_to_width(&r.branch, branch_w - 1))
-                    } else {
-                        r.branch.clone()
-                    };
+                    // Pad by display width: `{:<w$}` counts chars, so a wide
+                    // branch would push the action off the row.
+                    let branch = super::render::ellipsize(&r.branch, branch_w);
+                    let pad = " ".repeat(
+                        branch_w.saturating_sub(UnicodeWidthStr::width(branch.as_str())),
+                    );
                     Line::styled(
-                        format!("{branch:<branch_w$} {:<6} {}", r.pr, r.action),
+                        format!("{branch}{pad} {:<6} {}", r.pr, r.action),
                         Style::default().fg(th.text),
                     )
                 })

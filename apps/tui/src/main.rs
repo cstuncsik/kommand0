@@ -68,7 +68,9 @@ type ProfileDeleteMsg =
     (String, Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>);
 
 /// Repo-cleanup worker -> event loop: the scan's routed plan, or the delete
-/// phase's per-branch results. Both carry the repo id.
+/// phase's per-branch results. Both carry the repo id. `Scanned(_, Err)` also
+/// carries a delete-phase failure that produced no per-branch results (the
+/// config read).
 #[derive(Debug)]
 enum RepoCleanupMsg {
     Scanned(String, Result<Vec<RepoCleanupItem>, String>),
@@ -3488,6 +3490,11 @@ impl App {
                 ))
             })
             .collect();
+        for id in ids {
+            if targets.iter().all(|(t, ..)| t != *id) {
+                tracing::warn!("cleanup: workspace {id} skipped (not cleanable now)");
+            }
+        }
         if targets.is_empty() {
             return; // never SIGTERM panes for a cleanup that will not start
         }
@@ -3498,6 +3505,8 @@ impl App {
         // while its entry persisted.
         self.capture_panes_on_teardown_for(|ws| targets.iter().any(|(id, ..)| id == ws));
         for (id, worktree, branch, repo) in targets {
+            // ponytail: panes are dropped on the loop like the single cleanup; move
+            // teardown to the worker if a batch of SIGHUP-ignoring panes makes this visible.
             self.embedded.remove(&id);
             self.cleanup_inflight.insert(id.clone());
             self.cleanup_result.remove(&id);
@@ -3510,32 +3519,28 @@ impl App {
                 };
                 // The file, not the startup snapshot: an edit applies to the next
                 // cleanup, and an unparseable file blocks it rather than degrading.
-                let protected = match Config::protected_branches_at(&config_path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        guard.payload = Some((id, Err(e)));
-                        return;
-                    }
-                };
-                let result =
-                    kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch, &protected);
+                let result = Config::protected_branches_at(&config_path).and_then(|protected| {
+                    kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch, &protected)
+                });
                 guard.payload = Some((id, result));
             });
         }
     }
 
+    /// Whether an overlay (modal, palette, settings, help, diff) owns the screen.
+    fn overlay_active(&self) -> bool {
+        self.modal.is_active()
+            || self.palette.is_some()
+            || self.settings.is_some()
+            || self.show_help
+            || self.show_diff
+    }
+
     /// Whether the tree owns the keyboard right now. The scan's result may open
-    /// its modal only then: otherwise a keystroke meant for a pane, another
-    /// modal, the palette, settings, help, the diff or the filter box would land
-    /// in the new modal instead.
+    /// its modal only then: otherwise a keystroke meant for a pane, an overlay
+    /// or the filter box would land in the new modal instead.
     fn can_open_repo_cleanup_modal(&self) -> bool {
-        self.focus == Focus::Tree
-            && !self.modal.is_active()
-            && self.palette.is_none()
-            && self.settings.is_none()
-            && !self.show_help
-            && !self.show_diff
-            && !self.filter_input
+        self.focus == Focus::Tree && !self.filter_input && !self.overlay_active()
     }
 
     /// `c` on a repo row: review this repo's parked plan, else start a scan.
@@ -3546,7 +3551,13 @@ impl App {
         }
         match self.repo_cleanup_pending.take() {
             Some((id, items)) if id == repo_id => self.open_repo_cleanup_modal(id, items),
-            _ => self.start_repo_cleanup_scan(repo_id),
+            other => {
+                // A dropped plan takes its "press c to review" line with it.
+                if let Some((other_id, _)) = other {
+                    self.repo_cleanup_result.remove(&other_id);
+                }
+                self.start_repo_cleanup_scan(repo_id);
+            }
         }
     }
 
@@ -3574,14 +3585,8 @@ impl App {
                     Err("the scan was interrupted".to_string()),
                 )),
             };
-            let protected = match Config::protected_branches_at(&config_path) {
-                Ok(p) => p,
-                Err(e) => {
-                    guard.payload = Some(RepoCleanupMsg::Scanned(id, Err(e)));
-                    return;
-                }
-            };
-            let result = kommand0_core::scan_merged_branches(&path, &protected)
+            let result = Config::protected_branches_at(&config_path)
+                .and_then(|protected| kommand0_core::scan_merged_branches(&path, &protected))
                 .map(|verdicts| kommand0_core::plan_repo_cleanup(verdicts, &id, &workspaces));
             guard.payload = Some(RepoCleanupMsg::Scanned(id, result));
         });
@@ -3645,9 +3650,9 @@ impl App {
     }
 
     fn repo_cleanup_row(&self, item: &RepoCleanupItem) -> modal::RepoCleanupRow {
-        let (branch, pr, action) = match item {
-            RepoCleanupItem::Delete { branch, pr, .. } => (branch, pr, "delete".to_string()),
-            RepoCleanupItem::Workspace { ws_id, branch, pr } => {
+        let action = match item {
+            RepoCleanupItem::Delete { .. } => "delete".to_string(),
+            RepoCleanupItem::Workspace { ws_id, .. } => {
                 let name = self
                     .workspaces
                     .iter()
@@ -3666,15 +3671,11 @@ impl App {
                 if self.embedded.contains_key(ws_id) {
                     action.push_str(" [live]");
                 }
-                (branch, pr, action)
+                action
             }
-            RepoCleanupItem::Skip { branch, pr, reason } => (branch, pr, format!("skip: {reason}")),
+            RepoCleanupItem::Skip { reason, .. } => format!("skip: {reason}"),
         };
-        modal::RepoCleanupRow {
-            branch: branch.clone(),
-            pr: pr.map(|n| format!("#{n}")).unwrap_or_else(|| "-".to_string()),
-            action,
-        }
+        modal::RepoCleanupRow { branch: item.branch().to_string(), pr: item.pr_label(), action }
     }
 
     /// `y` in the preview: the workspace rows go through the workspace cleanup
@@ -3689,14 +3690,8 @@ impl App {
             })
             .collect();
         self.start_cleanups(&routed);
-        let deletes: Vec<(String, String)> = plan
-            .iter()
-            .filter_map(|item| match item {
-                RepoCleanupItem::Delete { branch, tip, .. } => Some((branch.clone(), tip.clone())),
-                _ => None,
-            })
-            .collect();
-        if deletes.is_empty() || self.repo_cleanup_inflight.is_some() {
+        let deletes = RepoCleanupItem::deletes(&plan);
+        if deletes.is_empty() {
             return;
         }
         let Some(path) = self.repos.iter().find(|r| r.id == repo_id).map(|r| r.path.clone())
@@ -3716,15 +3711,13 @@ impl App {
                     Err("the delete was interrupted".to_string()),
                 )),
             };
-            let protected = match Config::protected_branches_at(&config_path) {
-                Ok(p) => p,
-                Err(e) => {
-                    guard.payload = Some(RepoCleanupMsg::Scanned(repo_id, Err(e)));
-                    return;
-                }
-            };
-            let results = kommand0_core::delete_branches(&path, &deletes, &protected);
-            guard.payload = Some(RepoCleanupMsg::Deleted(repo_id, results));
+            guard.payload = Some(match Config::protected_branches_at(&config_path) {
+                Ok(protected) => RepoCleanupMsg::Deleted(
+                    repo_id,
+                    kommand0_core::delete_branches(&path, &deletes, &protected),
+                ),
+                Err(e) => RepoCleanupMsg::Scanned(repo_id, Err(e)),
+            });
         });
     }
 
@@ -5280,11 +5273,7 @@ async fn run(
                     Event::Mouse(mouse_event) => {
                         if app.show_diff {
                             mouse::handle_diff_mouse(&mut app, mouse_event);
-                        } else if app.show_help
-                            || app.modal.is_active()
-                            || app.palette.is_some()
-                            || app.settings.is_some()
-                        {
+                        } else if app.overlay_active() {
                             // An overlay owns the screen — ignore mouse (don't leak
                             // stray clicks to the tree/embedded claude behind it; a
                             // leaked click could even open a modal and orphan the
@@ -9780,23 +9769,40 @@ mod key_tests {
         assert!(app.repo_cleanup_pending.is_none());
         assert!(app.repo_cleanup_inflight.is_none(), "no rescan");
 
-        // (ii) An embedded pane owns the keyboard.
-        let mut app = test_app();
-        app.focus = Focus::Embedded;
-        app.on_repo_cleanup_scanned("r1".into(), Ok(vec![delete_item("stale")]));
-        assert!(!app.modal.is_active(), "parked, not opened over the pane");
-        assert!(app.repo_cleanup_pending.is_some());
+        // (ii) Every other input owner parks the plan too.
+        type Owner = fn(&mut App);
+        let owners: [(&str, Owner); 6] = [
+            ("embedded focus", |app| app.focus = Focus::Embedded),
+            ("help", |app| app.show_help = true),
+            ("diff", |app| app.show_diff = true),
+            ("filter input", |app| app.filter_input = true),
+            ("palette", |app| {
+                let candidates = app.palette_candidates();
+                app.palette = Some(palette::Palette::new(candidates));
+            }),
+            ("settings", |app| app.settings = Some(settings::SettingsState::default())),
+        ];
+        for (owner, own) in owners {
+            let mut app = test_app();
+            own(&mut app);
+            app.on_repo_cleanup_scanned("r1".into(), Ok(vec![delete_item("stale")]));
+            assert!(!app.modal.is_active(), "{owner}: parked, not opened over it");
+            assert!(app.repo_cleanup_pending.is_some(), "{owner}: the plan is kept");
+        }
 
-        // (iii) `c` on another repo drops the parked plan and scans that repo.
+        // (iii) `c` on another repo drops the parked plan, and its "press c to
+        // review" line with it, then scans that repo.
         let mut app = test_app();
         let tmp = tempfile::TempDir::new().unwrap();
         app.repos[1].path = tmp.path().join("missing").to_string_lossy().into_owned();
         app.repo_cleanup_pending = Some(("r1".into(), vec![delete_item("stale")]));
+        app.repo_cleanup_result.insert("r1".into(), ("Scan done: press c to review".into(), false));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.repo_cleanup_tx = Some(tx);
         select_repo_row(&mut app, "r2");
         press(&mut app, KeyCode::Char('c')).await;
         assert!(app.repo_cleanup_pending.is_none());
+        assert!(!app.repo_cleanup_result.contains_key("r1"), "the stale review hint is gone");
         assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("r2"));
     }
 
@@ -9835,6 +9841,7 @@ mod key_tests {
     #[tokio::test]
     async fn repo_cleanup_modal_rows_fit_at_80_100_and_40_cols() {
         let long_branch = format!("feature/{}", "x".repeat(33)); // 41 chars
+        let cjk_branch = "\u{6f22}".repeat(20); // 20 chars, 40 cells
         let action = "workspace w1 [dirty] [unpushed] [live]";
         let open = || {
             let mut app = test_app();
@@ -9861,6 +9868,11 @@ mod key_tests {
                         pr: Some(7),
                     },
                     skip_item("wip", "no PR"),
+                    RepoCleanupItem::Workspace {
+                        ws_id: "w1".into(),
+                        branch: cjk_branch.clone(),
+                        pr: Some(8),
+                    },
                 ],
             );
             app
@@ -9886,11 +9898,27 @@ mod key_tests {
                 "the branch cell is exactly {branch_w} cells at {cols} cols:\n{line}"
             );
             assert!(line.contains(&format!("#7     {action}")), "pr column, then the action:\n{line}");
+            // A wide branch is padded by display width (one cell per char in
+            // the buffer text), so the action is not pushed off the row.
+            let cjk = text
+                .lines()
+                .find(|l| l.contains('\u{6f22}'))
+                .unwrap_or_else(|| panic!("CJK row visible at {cols} cols:\n{text}"));
+            let pr_at = cjk.find("#8").expect("pr column");
+            assert_eq!(
+                cjk[..pr_at].chars().count(),
+                inner_x + branch_w + 1,
+                "the CJK branch cell is exactly {branch_w} cells at {cols} cols:\n{cjk}"
+            );
+            assert!(
+                cjk.contains(&format!("#8     {action}")),
+                "the action survives a wide branch:\n{cjk}"
+            );
         }
 
         let mut app = open();
         let text = render_to_string(&mut app, 40, 12);
-        assert!(text.contains("more") || text.contains("cancel"), "renders on a tiny terminal:\n{text}");
+        assert!(text.contains("cancel"), "does not panic on a tiny terminal:\n{text}");
     }
 
     #[tokio::test]
@@ -9955,6 +9983,8 @@ mod key_tests {
             app.repo_cleanup_result["real"],
             ("Deleted 0 of 1 branches; failed: stale (moved since scan)".to_string(), true)
         );
+        app.on_repo_cleanup_deleted("real".into(), vec![("a".into(), Ok(())), ("b".into(), Ok(()))]);
+        assert_eq!(app.repo_cleanup_result["real"], ("Deleted 2 branches".to_string(), false));
     }
 
     #[tokio::test]
@@ -9967,14 +9997,9 @@ mod key_tests {
         let wt = tempfile::TempDir::new().unwrap();
         route_w1_to_real(&mut app, &wt.path().join("a"), "main");
         app.workspaces.push(Workspace {
-            id: "w2".into(),
-            name: "ws-two".into(),
-            repo_id: "real".into(),
             working_dir: wt.path().join("b").to_string_lossy().into_owned(),
-            active: true,
-            created_at: 0,
             worktree_path: Some(wt.path().join("b").to_string_lossy().into_owned()),
-            branch_name: Some("main".into()),
+            ..mk_ws("w2", "ws-two", "real", Some("main"))
         });
         for (ws, tab_id) in [("w1", "opencode:tab-1"), ("w2", "opencode:tab-2")] {
             let mut oc = tab(tab_id, &["-c", "trap '' TERM; printf READY; sleep 60"]);
