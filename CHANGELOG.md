@@ -5,6 +5,18 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Clicking a workspace that has a live session now focuses the session.** A
+  tree click always left the keyboard on the tree, so typing at the session you
+  had just clicked fired tree actions instead (`p` opened the PR, `x` detached
+  it, `s` re-sorted the list). A running workspace now takes the keyboard on
+  click, the same as pressing Enter on it, so a stray letter lands in the
+  session as text. Workspaces without a session, repo rows and the empty tree
+  space still focus the tree, so clicking back out of a session works as
+  before; to run a tree action on a running workspace after clicking it, press
+  `Ctrl+]` (or `Ctrl+A t`) first.
+
 ## [0.27.3] - 2026-09-20
 
 ### Fixed
