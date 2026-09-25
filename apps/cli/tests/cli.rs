@@ -22,7 +22,9 @@ fn kmd(state_dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
         .env("KOMMAND0_STATE_DIR", state_dir)
         // Belt + braces: the exact-dir override already ignores it, but tests
         // must not depend on the developer's shell exporting a profile.
-        .env_remove("KOMMAND0_PROFILE");
+        .env_remove("KOMMAND0_PROFILE")
+        // The config must be <state>/config.json, never the developer's file.
+        .env_remove("KOMMAND0_CONFIG");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -674,6 +676,206 @@ fn workspace_names_are_per_repo_and_ids_disambiguate() {
     assert!(show.status.success(), "by-ID show: {}", String::from_utf8_lossy(&show.stderr));
     let out = stdout(&show);
     assert!(out.contains("dev") && out.contains("alpha"), "the right row shown: {out}");
+}
+
+/// [`setup`] plus two loose branches for the repo cleanup: `stale` (merged,
+/// deletable) and `development` (merged, protected by default), and a `gh`
+/// stub that reports every branch's PR as merged at the branch tip. Returns
+/// `(state_dir, repo_path, gh_stub)`.
+fn setup_for_repo_cleanup(
+    root: &Path,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let state = setup(root);
+    let repo = root.join("repo");
+    run_git(&repo, &["branch", "stale"]);
+    run_git(&repo, &["branch", "development"]);
+    let gh = root.join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
+    );
+    (state, repo, gh)
+}
+
+fn repo_cleanup(state: &Path, gh: &Path, repo: &Path, flags: &[&str]) -> Output {
+    let mut args = vec!["repo", "cleanup", repo.to_str().unwrap()];
+    args.extend_from_slice(flags);
+    kmd(state, &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())], &args)
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// The workspace's directory, as `workspace show` prints it.
+fn workspace_dir(state: &Path, name: &str) -> std::path::PathBuf {
+    let show = stdout(&kmd(state, &[], &["workspace", "show", name]));
+    show.lines()
+        .find_map(|l| l.strip_prefix("Dir:"))
+        .expect("Dir line")
+        .trim()
+        .into()
+}
+
+/// The table row whose BRANCH column is `branch`, trailing whitespace trimmed.
+fn row<'a>(table: &'a str, branch: &str) -> &'a str {
+    table
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(branch))
+        .unwrap_or_else(|| panic!("no row for {branch} in:\n{table}"))
+        .trim_end()
+}
+
+#[test]
+fn repo_cleanup_force_deletes_stale_branches_and_routes_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let feat_dir = workspace_dir(&state, "feat");
+    let out = repo_cleanup(&state, &gh, &repo, &["--force"]);
+    assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    assert!(text.contains("Deleted branch: stale"), "{text}");
+    assert!(text.contains("Cleaned up workspace: feat"), "{text}");
+    assert!(!branch_exists(&repo, "stale") && !branch_exists(&repo, "feat"), "both branches gone");
+    assert!(branch_exists(&repo, "development"), "the protected branch survives");
+    assert!(!feat_dir.exists(), "feat's worktree removed");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(!list.contains("feat"), "workspace row dropped: {list}");
+    // Idempotent: a second run finds nothing actionable and exits 0.
+    let again = repo_cleanup(&state, &gh, &repo, &["--force"]);
+    assert!(again.status.success(), "rerun: {}", String::from_utf8_lossy(&again.stderr));
+    assert!(stdout(&again).contains("Nothing to clean up."), "{}", stdout(&again));
+}
+
+#[test]
+fn repo_cleanup_dry_run_lists_and_deletes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let feat_dir = workspace_dir(&state, "feat");
+    let out = repo_cleanup(&state, &gh, &repo, &["--dry-run"]);
+    assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    assert!(row(&text, "stale").ends_with("delete"), "{text}");
+    assert!(row(&text, "feat").ends_with("clean up workspace 'feat'"), "{text}");
+    assert!(row(&text, "development").ends_with("skip: protected branch"), "{text}");
+    for b in ["stale", "feat", "development"] {
+        assert!(branch_exists(&repo, b), "{b} intact");
+    }
+    assert!(feat_dir.exists(), "worktree intact");
+
+    // A configured list replaces the built-in default, so `[]` unprotects it.
+    std::fs::write(state.join("config.json"), r#"{ "protected_branches": [] }"#).unwrap();
+    let out = repo_cleanup(&state, &gh, &repo, &["--dry-run"]);
+    assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    assert!(row(&text, "development").ends_with("delete"), "an empty list disables the default: {text}");
+}
+
+#[test]
+fn repo_cleanup_aborts_on_invalid_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    std::fs::write(state.join("config.json"), "{ bad").unwrap();
+    let out = repo_cleanup(&state, &gh, &repo, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("invalid"), "names the problem: {err}");
+    assert!(!stdout(&out).contains("BRANCH"), "no table before the abort: {}", stdout(&out));
+}
+
+#[test]
+fn repo_cleanup_refuses_non_interactive_without_force() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let out = repo_cleanup(&state, &gh, &repo, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("refusing to clean up without --force"), "{err}");
+    for b in ["stale", "feat", "development"] {
+        assert!(branch_exists(&repo, b), "{b} intact");
+    }
+}
+
+#[test]
+fn repo_cleanup_exits_1_when_a_routed_workspace_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let feat_dir = workspace_dir(&state, "feat");
+    std::fs::write(feat_dir.join("scratch.txt"), "wip").unwrap(); // untracked => dirty
+    let out = repo_cleanup(&state, &gh, &repo, &["--force"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    assert!(text.contains("Deleted branch: stale"), "the plain delete still ran: {text}");
+    assert!(text.contains("Could not clean up workspace feat"), "{text}");
+    assert!(branch_exists(&repo, "feat") && feat_dir.exists(), "feat's branch and worktree survive");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(list.contains("feat"), "workspace row survives: {list}");
+}
+
+#[test]
+fn repo_cleanup_routes_a_workspace_whose_worktree_was_pruned() {
+    // The dir is gone AND git forgot the worktree, so the scan sees a bare
+    // branch; routing by branch name still hands it to the workspace cleanup,
+    // which deletes the branch and drops the state row instead of orphaning it.
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let feat_dir = workspace_dir(&state, "feat");
+    std::fs::remove_dir_all(&feat_dir).unwrap();
+    run_git(&repo, &["worktree", "prune"]);
+    let out = repo_cleanup(&state, &gh, &repo, &["--force"]);
+    assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("Cleaned up workspace: feat"), "{}", stdout(&out));
+    assert!(!branch_exists(&repo, "feat"), "branch gone");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(!list.contains("feat"), "workspace row dropped: {list}");
+}
+
+#[test]
+fn workspace_cleanup_refuses_a_protected_branch_and_a_bad_config() {
+    // Bare naming puts the workspace on branch `development`, which the
+    // built-in default list protects; the merged gh stub would otherwise let
+    // the cleanup through.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let create = kmd(
+        &state,
+        &[],
+        &["workspace", "create", "development", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(create.status.success(), "create: {}", String::from_utf8_lossy(&create.stderr));
+    let dir = workspace_dir(&state, "development");
+    let gh = tmp.path().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
+    );
+    let cleanup = || {
+        kmd(
+            &state,
+            &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+            &["workspace", "cleanup", "development", "--force"],
+        )
+    };
+
+    let out = cleanup();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("protected branch"), "{err}");
+    assert!(branch_exists(&repo, "development") && dir.exists(), "branch and worktree intact");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(list.contains("development"), "workspace row survives: {list}");
+
+    std::fs::write(state.join("config.json"), "{ bad").unwrap();
+    let out = cleanup();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("invalid"), "an unparseable config blocks the cleanup: {err}");
 }
 
 #[test]
