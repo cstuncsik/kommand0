@@ -138,7 +138,7 @@ impl Action {
             Action::OpenPrInBrowser => "Open the PR in a browser",
             Action::Cleanup => "Clean up merged workspace / repo",
             Action::Filter => "Filter workspaces (Esc clears)",
-            Action::Palette => "Go to workspace",
+            Action::Palette => "Command palette: go to / actions",
             Action::NextWaiting => "Next workspace that needs you",
             Action::PrevWaiting => "Previous workspace that needs you",
             Action::ArchiveToggle => "Archive / activate workspace",

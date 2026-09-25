@@ -37,6 +37,10 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ### Fixed
 
+- **The help overlay now names the command palette.** The `:` row read "Go to
+  workspace", a leftover from when the palette only jumped to workspaces; it now
+  reads "Command palette: go to / actions".
+
 - Clicking the first cell of a detail-pane button (`[Open Claude]`,
   `[Clean up]`, `[Clean up branches]`) now registers; the hit regions were
   shifted one column to the right of the rendered label.
