@@ -2549,7 +2549,9 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 // A click in the tree pane (including the empty space below the
                 // rows) focuses it — the mirror of clicking the content pane to
-                // focus claude. Delegate to the tree handler for focus + select.
+                // focus claude — except on a running workspace's row, which
+                // hands focus straight to that session. Delegate to the tree
+                // handler for focus + select.
                 if buttons::is_hovered(Some((mouse.column, mouse.row)), self.pane_areas.tree) {
                     mouse::handle_mouse(self, mouse);
                     return;
@@ -8320,6 +8322,47 @@ mod key_tests {
                 modifiers: KeyModifiers::NONE,
             },
         );
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn tree_click_on_a_running_workspace_focuses_its_session() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 20);
+        app.right_pane_area = ratatui::layout::Rect::new(30, 0, 70, 20);
+        let click = |app: &mut App, row: u16| {
+            mouse::handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 2,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        };
+        // Screen row 2 = ws-one (row 1 is the repo header). Without a live
+        // session the click selects it but keeps the tree: nothing to type into.
+        click(&mut app, 2);
+        assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w1"));
+        assert_eq!(app.focus, Focus::Tree);
+
+        // With a live session the same click hands the keyboard to it, and
+        // drops a half-typed Ctrl+A prefix like every other focus flip.
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![tab("claude-1", &["-c", "sleep 30"])], active: 0, last_active: None },
+        );
+        app.embedded_prefix = true;
+        click(&mut app, 2);
+        assert_eq!(app.focus, Focus::Embedded);
+        assert!(!app.embedded_prefix);
+
+        // A repo row has no session: it still focuses the tree.
+        click(&mut app, 1);
         assert_eq!(app.focus, Focus::Tree);
     }
 
