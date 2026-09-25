@@ -862,6 +862,29 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     }
 }
 
+/// Append a `[label]` button line and register its hit region from the
+/// paragraph's inner rect, so the clickable cells are exactly the glyphs.
+#[allow(clippy::too_many_arguments)] // positional render inputs; a struct adds more noise than it removes
+fn push_button(
+    lines: &mut Vec<Line<'_>>,
+    hit_regions: &mut Vec<buttons::HitRegion>,
+    mouse_pos: Option<(u16, u16)>,
+    inner: Rect,
+    th: Theme,
+    label: &str,
+    color: Color,
+    action: HitAction,
+) {
+    let rect = Rect::new(inner.x, inner.y + lines.len() as u16, (label.len() + 2) as u16, 1);
+    let style = if buttons::is_hovered(mouse_pos, rect) {
+        Style::default().fg(th.inverse).bg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    };
+    lines.push(Line::styled(format!("[{label}]"), style));
+    hit_regions.push(buttons::HitRegion { area: rect, action });
+}
+
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     // Remember the right-pane geometry so a newly-toggled embedded pane spawns at
@@ -938,6 +961,10 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
 
     let right_width = area.width.saturating_sub(4) as usize;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th.muted));
+    let inner = block.inner(area);
 
     // The embedded claude pane is the only session view (handled above); here we
     // show workspace/repo details for the current selection.
@@ -999,24 +1026,16 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Style::default().fg(th.dirty),
                 ));
             } else {
-                let btn_y = area.y + 1 + lines.len() as u16;
-                let btn_x = area.x + 2;
-                let btn_label = "Clean up branches";
-                let btn_rect = Rect::new(btn_x, btn_y, (btn_label.len() + 2) as u16, 1);
-                let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
-                let style = if hovered {
-                    Style::default()
-                        .fg(th.inverse)
-                        .bg(th.dirty)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(th.dirty).add_modifier(Modifier::BOLD)
-                };
-                lines.push(Line::styled(format!("[{btn_label}]"), style));
-                app.hit_regions.push(buttons::HitRegion {
-                    area: btn_rect,
-                    action: buttons::HitAction::CleanupRepoFor { repo_id: id.clone() },
-                });
+                push_button(
+                    &mut lines,
+                    &mut app.hit_regions,
+                    app.mouse_pos,
+                    inner,
+                    th,
+                    "Clean up branches",
+                    th.dirty,
+                    HitAction::CleanupRepoFor { repo_id: id.clone() },
+                );
             }
             if let Some((msg, is_error)) = app.repo_cleanup_result.get(id) {
                 let color = if *is_error { th.error } else { th.text };
@@ -1133,31 +1152,16 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 "Press Enter to open Claude here",
                 Style::default().fg(th.muted),
             ));
-            {
-                // Derive the button row from the line count so the hit
-                // region can never drift from the rendered text: +1 for the
-                // top border, lines.len() lines precede the button text.
-                let btn_y = area.y + 1 + lines.len() as u16;
-                let btn_x = area.x + 2; // inside border + 1 padding
-                let btn_label = "Open Claude";
-                let btn_rect = Rect::new(btn_x, btn_y, (btn_label.len() + 2) as u16, 1);
-                let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
-                let style = if hovered {
-                    Style::default()
-                        .fg(th.inverse)
-                        .bg(th.accent)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD)
-                };
-                lines.push(Line::styled(format!("[{btn_label}]"), style));
-                app.hit_regions.push(buttons::HitRegion {
-                    area: btn_rect,
-                    action: buttons::HitAction::StartSession,
-                });
-            }
+            push_button(
+                &mut lines,
+                &mut app.hit_regions,
+                app.mouse_pos,
+                inner,
+                th,
+                "Open Claude",
+                th.accent,
+                HitAction::StartSession,
+            );
 
             let has_branch = ws.worktree_path.is_some() && ws.branch_name.is_some();
 
@@ -1185,26 +1189,16 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         Style::default().fg(th.dirty),
                     ));
                 } else if has_branch {
-                    let btn_y = area.y + 1 + lines.len() as u16;
-                    let btn_x = area.x + 2;
-                    let btn_label = "Clean up";
-                    let btn_rect = Rect::new(btn_x, btn_y, (btn_label.len() + 2) as u16, 1);
-                    let hovered = buttons::is_hovered(app.mouse_pos, btn_rect);
-                    let style = if hovered {
-                        Style::default()
-                            .fg(th.inverse)
-                            .bg(th.dirty)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(th.dirty).add_modifier(Modifier::BOLD)
-                    };
-                    lines.push(Line::styled(format!("[{btn_label}]"), style));
-                    app.hit_regions.push(buttons::HitRegion {
-                        area: btn_rect,
-                        action: buttons::HitAction::CleanupWorkspaceFor {
-                            workspace_id: ws.id.clone(),
-                        },
-                    });
+                    push_button(
+                        &mut lines,
+                        &mut app.hit_regions,
+                        app.mouse_pos,
+                        inner,
+                        th,
+                        "Clean up",
+                        th.dirty,
+                        HitAction::CleanupWorkspaceFor { workspace_id: ws.id.clone() },
+                    );
                 }
                 if let Some(msg) = app.cleanup_result.get(&ws.id) {
                     lines.push(Line::from(vec![
@@ -1249,12 +1243,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // line count, so each line must occupy exactly one row (a wrapped line would
     // push the rendered buttons below their hit region). Value lines (Path, etc.)
     // are already truncated to fit; a rare over-long line clips instead.
-    let paragraph = Paragraph::new(right_content).block(
-            Block::default()
-                .title(right_title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(th.muted)),
-        );
+    let paragraph = Paragraph::new(right_content).block(block.title(right_title));
     frame.render_widget(paragraph, area);
 }
 /// Icon cluster for a workspace or repo line in the tree view.

@@ -10638,6 +10638,46 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn detail_pane_button_hit_regions_cover_their_labels() {
+        // A repo row offers [Clean up branches]; an own-branch workspace with no
+        // live session offers [Open Claude] and [Clean up].
+        let mut repo_app = test_app();
+        let mut ws_app = test_app();
+        ws_app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+        ws_app.workspaces[0].branch_name = Some("ws-one".into());
+        ws_app.expanded.insert("r1".to_string());
+        ws_app.rebuild_tree();
+        ws_app.select_workspace_row("w1");
+
+        let mut checked = 0;
+        for app in [&mut repo_app, &mut ws_app] {
+            let text = render_to_string(app, 100, 30);
+            for region in &app.hit_regions {
+                let label = match &region.action {
+                    buttons::HitAction::CleanupRepoFor { .. } => "Clean up branches",
+                    buttons::HitAction::CleanupWorkspaceFor { .. } => "Clean up",
+                    buttons::HitAction::StartSession => "Open Claude",
+                    _ => continue,
+                };
+                let row = text.lines().nth(region.area.y as usize).unwrap_or_default();
+                let cells: String = row
+                    .chars()
+                    .skip(region.area.x as usize)
+                    .take(region.area.width as usize)
+                    .collect();
+                assert_eq!(
+                    cells,
+                    format!("[{label}]"),
+                    "{:?} region at x={} on row {}:\n{row}",
+                    region.action, region.area.x, region.area.y
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 3, "one repo button and two workspace buttons");
+    }
+
+    #[tokio::test]
     async fn fallback_workspace_shows_shared_checkout() {
         let mut app = test_app(); // w1 has worktree_path: None
         app.expanded.insert("r1".to_string());

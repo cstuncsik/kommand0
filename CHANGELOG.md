@@ -35,6 +35,12 @@ All notable changes to kommand0 are documented here. The format is based on
   workspace's branch, since removing it would take the other branch's checkout
   with it.
 
+### Fixed
+
+- Clicking the first cell of a detail-pane button (`[Open Claude]`,
+  `[Clean up]`, `[Clean up branches]`) now registers; the hit regions were
+  shifted one column to the right of the rendered label.
+
 ## [0.28.0] - 2026-09-24
 
 ### Added
