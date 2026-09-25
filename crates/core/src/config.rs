@@ -14,8 +14,11 @@ use serde::Deserialize;
 
 use crate::AppState;
 
+/// Branches neither cleanup deletes unless `protected_branches` is configured.
+pub const DEFAULT_PROTECTED_BRANCHES: &[&str] = &["develop", "development", "staging"];
+
 /// Hand-editable settings: `claude` passthrough and a few tunables.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Extra args appended to every embedded `claude` spawn, e.g.
@@ -63,6 +66,35 @@ pub struct Config {
     /// into a sane range by the TUI (matching the `notify`/`theme` "parsed by the
     /// TUI" convention). Live `<`/`>` adjust from here.
     pub tree_width_pct: Option<u16>,
+    /// Exact branch names neither cleanup ever deletes. A configured list
+    /// REPLACES the built-in default (`develop`/`development`/`staging`), so
+    /// `[]` disables it; `main`/`master` and the origin default are refused
+    /// regardless. Read from the file at cleanup time (see
+    /// [`Config::protected_branches_at`]), not from the startup snapshot.
+    pub protected_branches: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            claude_args: Vec::new(),
+            claude_bin: None,
+            codex_args: Vec::new(),
+            codex_bin: None,
+            gemini_args: Vec::new(),
+            gemini_bin: None,
+            opencode_args: Vec::new(),
+            opencode_bin: None,
+            status_refresh_secs: None,
+            keybindings: Default::default(),
+            theme: None,
+            theme_colors: Default::default(),
+            notify: None,
+            shell: None,
+            tree_width_pct: None,
+            protected_branches: DEFAULT_PROTECTED_BRANCHES.iter().map(|b| b.to_string()).collect(),
+        }
+    }
 }
 
 impl Config {
@@ -99,6 +131,39 @@ impl Config {
     /// present config file couldn't be parsed (so the caller can surface it).
     pub fn load_checked() -> (Self, Option<String>) {
         Self::read(&Self::effective_path())
+    }
+
+    /// The protected list as the file at `path` says right now. A MISSING file
+    /// is the built-in default (as everywhere else); a present file that is
+    /// unreadable or fails to parse is an Err, because "defaults" would silently
+    /// drop a custom entry on the one path that deletes branches.
+    pub fn protected_branches_at(path: &Path) -> Result<Vec<String>, String> {
+        // Not via `read`: that treats EVERY io error as a silent default, which
+        // is right for startup but wrong here (EACCES, a directory at the path).
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink reads as NotFound too, but it is a present,
+                // broken config: only a truly absent path is the default.
+                if std::fs::symlink_metadata(path).is_ok() {
+                    return Err(format!(
+                        "{} is a dangling symlink; fix it before cleaning up",
+                        path.display()
+                    ));
+                }
+                return Ok(Self::default().protected_branches);
+            }
+            Err(e) => return Err(format!("{}: {e}; fix it before cleaning up", path.display())),
+        };
+        match serde_json::from_str::<Self>(&contents) {
+            Ok(cfg) => Ok(cfg.protected_branches),
+            Err(e) => Err(format!("{} is invalid ({e}); fix it before cleaning up", path.display())),
+        }
+    }
+
+    /// [`Self::protected_branches_at`] for the effective config path (CLI).
+    pub fn protected_branches_now() -> Result<Vec<String>, String> {
+        Self::protected_branches_at(&Self::effective_path())
     }
 
     /// `KOMMAND0_CONFIG` when set and non-empty — the global config-path
@@ -305,5 +370,52 @@ mod tests {
         // A missing file is a silent default (no warning).
         let (_, warn) = Config::read(&tmp.path().join("absent.json"));
         assert!(warn.is_none());
+    }
+
+    #[test]
+    fn protected_branches_default_and_replace_semantics() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        let default = ["develop", "development", "staging"];
+        assert_eq!(Config::default().protected_branches, default);
+        assert_eq!(Config::load_from(tmp.path()).protected_branches, default, "missing file");
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(Config::load_from(tmp.path()).protected_branches, default, "missing key");
+        // A configured list REPLACES the default rather than extending it.
+        std::fs::write(&path, r#"{ "protected_branches": [] }"#).unwrap();
+        assert!(Config::load_from(tmp.path()).protected_branches.is_empty(), "[] disables the list");
+        std::fs::write(&path, r#"{ "protected_branches": ["release"] }"#).unwrap();
+        assert_eq!(Config::load_from(tmp.path()).protected_branches, ["release"]);
+    }
+
+    #[test]
+    fn protected_branches_at_defaults_when_missing_and_fails_closed_otherwise() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        assert_eq!(
+            Config::protected_branches_at(&path).unwrap(),
+            Config::default().protected_branches,
+            "a missing file is the built-in default"
+        );
+        std::fs::write(&path, "{ bad").unwrap();
+        let err = Config::protected_branches_at(&path).unwrap_err();
+        assert!(err.contains("invalid"), "a parse error fails closed: {err}");
+        // A directory at the path: the portable present-but-unreadable case.
+        let err = Config::protected_branches_at(tmp.path()).unwrap_err();
+        assert!(err.contains("fix it before cleaning up"), "a read error fails closed: {err}");
+        std::fs::write(&path, r#"{ "protected_branches": [] }"#).unwrap();
+        assert_eq!(Config::protected_branches_at(&path).unwrap(), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_branches_at_refuses_a_dangling_symlink() {
+        // A dangling link reads as NotFound too, but it is a present, broken
+        // config (a dotfiles link whose target moved), not an absent one.
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("config.json");
+        std::os::unix::fs::symlink(tmp.path().join("missing.json"), &link).unwrap();
+        let err = Config::protected_branches_at(&link).unwrap_err();
+        assert!(err.contains("dangling"), "{err}");
     }
 }

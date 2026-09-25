@@ -7,12 +7,12 @@ expression: "render_to_string(&mut app, 100, 30)"
 │› beta                   ✕ +││Path: /tmp/alpha                                                    │
 │                            ││Workspaces: 1 active, 1 total                                       │
 │                            ││                                                                    │
-│                            ││                                                                    │
+│                            ││[Clean up branches]                                                 │
 │                            ││                                                                    │
 │                            ││                                                                    │
 │                            ││                                                                    │
 │                     ┌ Add Workspace to demo ──────────────────────────────┐                      │
-│                     │ Workspace name (blank = from branch):               │                      │
+│                     │ Name/#issue/URL (blank = from branch):              │                      │
 │                     │ review                                              │                      │
 │                     │ Branch (blank = new):                               │                      │
 │                     │ origin/feat/x█                                      │                      │

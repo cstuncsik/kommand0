@@ -83,9 +83,10 @@ kmd repo list
 kmd repo delete <name-or-path> [--force]
 kmd repo move <name-or-path> up|down    # reorder the saved order
 kmd repo sort [manual|name-asc|name-desc|added-asc|added-desc]   # omit to show
+kmd repo cleanup <name-or-path> [--dry-run] [--force]  # delete local branches whose PR is merged
 
 # Workspaces
-kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--fork] [--no-worktree]
+kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--issue <ref>] [--fork] [--no-worktree]
 kmd workspace list [--all] [--repo <name>]
 kmd workspace show <name>
 kmd workspace status [<name>]          # git branch / ahead-behind / dirty
@@ -116,6 +117,26 @@ check one out explicitly. `--no-worktree` skips the worktree entirely and uses
 the repo root as the working directory (can't be combined with `--branch` or
 `--fork`).
 
+Pass `--issue <ref>` (a number, `#123`, or an issue URL) to create the workspace
+on the branch GitHub links to that issue, via `gh issue develop`: an existing
+linked branch is reused, otherwise a new one is created on the remote and linked
+(so merging its PR closes the issue). The workspace is named after the branch. A
+positional name that looks like an issue reference is detected the same way, so
+`kmd workspace create 123 --repo x` does the same thing; pass `--branch`,
+`--fork` or `--no-worktree` when you really do want a workspace literally named
+`123`. `--issue` can't be combined with a positional name, `--branch`, `--fork`
+or `--no-worktree`. The lookup is pinned to the repo's **`origin`** remote, so a
+fork checkout that also has an `upstream` won't have the branch created on the
+wrong repo; the flip side is that an issue living only on `upstream` is reported
+as not found. An issue **URL** must point at that same `origin` repo. If `origin`
+isn't an `owner/repo` URL (a local path, or no `origin` at all) there is nothing
+to pin to, so kommand0 refuses URL refs, and leaves the targeting to gh only
+while `origin` is the sole remote: with another remote configured it refuses
+outright rather than let gh pick one. On a `--single-branch` clone the linked
+branch falls outside `origin`'s refspec, so kommand0 adds it to
+`remote.origin.fetch` in the repo's git config: one line per issue branch, left
+in place afterwards even if the branch is then refused.
+
 > Replace `kmd` with `cargo run -p kommand0-cli --` during development.
 
 ## TUI
@@ -132,7 +153,7 @@ cargo run -p kommand0-tui   # from a checkout
 - **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9), and `Ctrl+A l` toggles back to the last-active tab (tmux-style). Open a new **Claude Code** tab with `Ctrl+A c` (or the `[+]` tab), a **codex** tab with `Ctrl+A e`, a **gemini** tab with `Ctrl+A g`, an **opencode** tab with `Ctrl+A o`, or a **shell** tab with `Ctrl+A s`: a `$SHELL` session in the worktree, for running anything (lazygit, or `tmux`/`zellij` for splits inside the pane). Tabs are marked by kind (codex `>`, gemini `✦`, opencode `○`, shell `$`). All four agent tabs resume their conversation on reopen; shell tabs reopen as fresh shells
 - **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items and scroll the tree (clicking a workspace with a running session focuses that session, like Enter); inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive. Horizontal scroll (tilt wheel) or Shift+scroll over the content pane switches session tabs
-- **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead. With the Branch field blank, if the workspace **name** matches an existing branch (local or `origin`), a prompt offers to check it out instead of forking
+- **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead. With the Branch field blank, if the workspace **name** matches an existing branch (local or `origin`), a prompt offers to check it out instead of forking. Typing an issue reference (`123`, `#123`, or an issue URL) into the **Name** field instead creates the workspace on the branch GitHub links to that issue; for a workspace literally named `123`, use `kmd workspace create 123 --repo <repo> --fork` (the Branch field only checks out an *existing* branch)
 - **Filter & archive**: press `/` to live-filter the workspace tree by name or branch (matched repos auto-expand, `Esc` clears); press `A` to archive/activate a workspace — so the tree stays navigable as you accumulate repos and workspaces
 - **Ordering**: repos and workspaces start in the order you added them. `K`/`J` move the selected one; `s` and `t` toggle a name or date-added sort (ascending → descending → off) for whichever level the cursor is on. The sorts are a view — turn one off and the hand-arranged order comes back, and moving an item while sorted keeps what you were looking at as the new saved order
 - **Git worktrees**: each workspace gets an isolated git worktree branch
@@ -154,7 +175,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `{` / `}` | Tree | Jump to the previous / next repo header (skips workspace rows) |
 | `<` / `>` | Tree | Shrink / widen the tree pane (5% steps, 15–60%; this session only — set `tree_width_pct` for a persistent default) |
 | `/` | Tree | Filter workspaces by name/branch (`Esc` clears) |
-| `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it — clean up, archive/activate, new session, or jump to a session tab |
+| `:` | Tree | Command palette: fuzzy-find a workspace (across collapsed repos) and either jump to it or run an action on it: clean up, archive/activate, new session, or jump to a session tab; each repo also gets a `Clean up branches: <repo>` entry |
 | `n` / `N` | Tree | Jump to + open the next / previous workspace that needs you (cycles the "N waiting") |
 | `A` | Tree | Archive / activate the selected workspace |
 | `K` / `J` | Tree | Move the selected repo (or workspace, within its repo) up / down in the saved order |
@@ -165,9 +186,9 @@ cargo run -p kommand0-tui   # from a checkout
 | `x` / `Delete` | Tree | Close the embedded Claude pane |
 | `v` | Tree | Review the workspace's diff (two-pane: file tree + selected file's diff; `Tab` switches focus) |
 | `p` | Tree | Open the workspace's PR in a browser |
-| `c` | Tree | Clean up the selected merged workspace (worktree + branch) |
+| `c` | Tree | Clean up merged workspace / repo: on a workspace row, its merged worktree + branch; on a repo row (or click `[Clean up branches]` in its detail pane), every local branch whose PR is merged (preview, then `y`); branches of kommand0 workspaces are routed to the workspace cleanup, other checkouts and `protected_branches` are skipped |
 | `a` | Tree | Add repository (modal) |
-| `w` | Tree | Add workspace to selected repo (modal) |
+| `w` | Tree | Add workspace to selected repo (modal; a `123` / `#123` / issue URL name creates the branch GitHub links to that issue) |
 | `d` / `D` | Tree | Delete / force-delete selected |
 | _typing_ | Embedded | Goes straight to the embedded Claude |
 | `Ctrl+A` then `c` | Embedded | New Claude Code session tab |
@@ -316,6 +337,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
   "opencode_bin": "/usr/local/bin/opencode",
   "status_refresh_secs": 2,
   "tree_width_pct": 30,
+  "protected_branches": ["develop", "development", "staging"],
   "keybindings": { "quit": ["ctrl+q"], "open": ["o"] },
   "theme": "high-contrast",
   "theme_colors": { "accent": "blue", "attention": "#ff8800" },
@@ -328,6 +350,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `claude_bin` — override the `claude` binary (the `KOMMAND0_CLAUDE_BIN` env var still takes precedence).
 - `status_refresh_secs` — how often the background git-status refresh runs (default 2; floored at 1).
 - `tree_width_pct` — the tree (left) pane width as a percent of the terminal (default 30; clamped to 15–60). This is the persistent baseline; the live `<`/`>` keys adjust a per-session value seeded from it (and reset to it next launch). You can also drag the border between the tree and content panes with the mouse to resize it live.
+- `protected_branches`: exact branch names that neither cleanup ever deletes (default `["develop", "development", "staging"]`). A configured list **replaces** the default, so `[]` disables it; `main`, `master` and whatever `origin/HEAD` points at are always refused regardless. It gates the workspace cleanup (`c` on a workspace, `kmd workspace cleanup`) as well as the repo cleanup, and `--force` never bypasses it. The file is re-read when a cleanup runs (no restart needed), and an unparseable or unreadable `config.json` blocks cleanup until it is fixed instead of falling back to the default list. Note that the repo scan sends each local branch name that passes these gates to GitHub as a `gh pr list --head <branch>` filter.
 - `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `widen-tree`, `shrink-tree`, `activate`, `open`, `close`, `review-diff`, `open-pr-web`, `cleanup`, `filter`, `palette`, `next-waiting`, `prev-waiting`, `archive`, `move-item-up`, `move-item-down`, `sort-by-name`, `sort-by-added`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `settings`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
 - `theme` — a built-in palette for the app chrome: `"default"` or `"high-contrast"` (the embedded `claude` pane keeps its own colours either way). Unknown names warn and fall back to default.
 - `theme_colors` — per-role overrides applied on top of `theme`: `"<role>": "<color>"`. Roles: `accent`, `selected`, `active`, `attention`, `dirty`, `error`, `muted`, `text`, `inverse`. Colors: a named color (`cyan`, `light-red`, `darkgray`), an `#rrggbb` hex, a 0–255 palette index, or `reset`/`default` (the terminal's own default color — not the role's built-in). Unknown roles / unparseable colors are warned (tree border + log), not fatal.
@@ -335,7 +358,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `shell` — command for a shell session tab (`Ctrl+A s`); defaults to `$SHELL`, then `/bin/sh`. Can be any command — e.g. `"tmux"` to open a tmux session (with its own splits) directly. The `KOMMAND0_SHELL` env var takes precedence.
 - `codex_bin`/`codex_args`, `gemini_bin`/`gemini_args`, `opencode_bin`/`opencode_args`: the same binary-override + extra-args pair for the codex (`Ctrl+A e`), gemini (`Ctrl+A g`) and opencode (`Ctrl+A o`) session tabs (also in the command palette). The `KOMMAND0_CODEX_BIN`/`KOMMAND0_GEMINI_BIN`/`KOMMAND0_OPENCODE_BIN` env vars take precedence over the config bins. Gemini tabs resume their conversation when a workspace reopens (kommand0 manages `--session-id`/`--resume`, so don't put those in `gemini_args`); codex and opencode tabs capture the session id their CLI prints when a session closes and resume it on reopen. Quitting kommand0 (or detaching a workspace) terminates codex/opencode tabs gracefully and captures the id opencode prints on SIGTERM, and codex session ids are also captured from codex's own session store right after the tab starts, so a codex tab still open at quit (or lost to a crash) resumes too; anything uncaptured reopens fresh.
 
-The config is read once at startup, so hand-edits take effect on the next launch. Any JSON error discards the whole file and is flagged in the tree border. The simple fields above (everything except `keybindings` and `theme_colors`) can also be edited in-app on the settings page (`,`): each save rewrites only that key — preserving any hand-edited or unknown keys — and `theme`, `tree_width_pct`, and `notify` apply immediately, while `shell` and the per-tool `*_bin`/`*_args` fields apply to the next tab you open.
+The config is read once at startup, so hand-edits take effect on the next launch (except `protected_branches`, which is re-read when a cleanup runs). Any JSON error discards the whole file and is flagged in the tree border. The simple fields above (everything except `keybindings`, `theme_colors` and `protected_branches`) can also be edited in-app on the settings page (`,`): each save rewrites only that key (preserving any hand-edited or unknown keys), and `theme`, `tree_width_pct`, and `notify` apply immediately, while `shell` and the per-tool `*_bin`/`*_args` fields apply to the next tab you open.
 
 ## Troubleshooting
 

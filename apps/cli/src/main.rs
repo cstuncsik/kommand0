@@ -4,7 +4,8 @@ use std::os::unix::process::CommandExt; // for Command::process_group
 use clap::{Parser, Subcommand, ValueEnum};
 use kommand0_core::workspace::format_timestamp;
 use kommand0_core::{
-    AppState, SessionStatus, SortMode, Workspace, branch_status, cleanup_merged_workspace,
+    AppState, Config, RepoCleanupItem, SessionStatus, SortMode, Workspace, branch_status,
+    cleanup_merged_workspace, delete_branches, plan_repo_cleanup, scan_merged_branches,
 };
 
 /// Clap mirror of [`SortMode`]: keeps clap out of the core crate while giving
@@ -150,13 +151,27 @@ enum RepoAction {
         /// The mode to switch to; omit to print the current one
         mode: Option<SortArg>,
     },
+    /// Delete local branches whose PR is merged (merged kommand0 worktrees are cleaned up too)
+    Cleanup {
+        /// Repo reference (name, path, or ID)
+        name: String,
+        /// Print the plan and exit
+        #[arg(long, conflicts_with = "force")]
+        dry_run: bool,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum WorkspaceAction {
     /// Create a new workspace
     Create {
-        /// Workspace name (auto-generated from the repo or branch if omitted)
+        /// Workspace name, or an issue reference (`123`, `#123`, an issue URL),
+        /// which is resolved like `--issue`. Auto-generated from the repo or
+        /// branch if omitted; pass `--branch`, `--fork` or `--no-worktree` to
+        /// force a workspace literally named `123`
         name: Option<String>,
         /// Repo reference (name, path, or ID)
         #[arg(long)]
@@ -172,6 +187,10 @@ enum WorkspaceAction {
         /// gets a `-2`/`-3` suffix then; skips the existing-branch checkout prompt)
         #[arg(long, conflicts_with_all = ["branch", "no_worktree"])]
         fork: bool,
+        /// Create the workspace on the branch GitHub links to an issue (a
+        /// number, `#123`, or an issue URL), via `gh issue develop`
+        #[arg(long, conflicts_with_all = ["name", "branch", "no_worktree", "fork"])]
+        issue: Option<String>,
     },
     /// List workspaces
     List {
@@ -420,6 +439,86 @@ fn main() -> anyhow::Result<()> {
                 state.save()?;
                 println!("Moved repo '{}' {}.", repo.name, direction.word());
             }
+            RepoAction::Cleanup { name, dry_run, force } => {
+                let protected = Config::protected_branches_now().map_err(anyhow::Error::msg)?;
+                let mut state = AppState::load()?;
+                let repo = state.resolve_repo(&name)?.clone();
+                let verdicts =
+                    scan_merged_branches(&repo.path, &protected).map_err(anyhow::Error::msg)?;
+                let plan = plan_repo_cleanup(verdicts, &repo.id, &state.workspaces);
+
+                fn ws_of<'a>(state: &'a AppState, id: &str) -> Option<&'a Workspace> {
+                    state.workspaces.iter().find(|w| w.id == id)
+                }
+                println!("{:<30} {:<7} ACTION", "BRANCH", "PR");
+                for item in &plan {
+                    let action = match item {
+                        RepoCleanupItem::Delete { .. } => "delete".to_string(),
+                        RepoCleanupItem::Workspace { ws_id, .. } => format!(
+                            "clean up workspace '{}'",
+                            ws_of(&state, ws_id).map(|w| w.name.as_str()).unwrap_or("(unknown)")
+                        ),
+                        RepoCleanupItem::Skip { reason, .. } => format!("skip: {reason}"),
+                    };
+                    println!("{:<30} {:<7} {action}", item.branch(), item.pr_label());
+                }
+                let actionable =
+                    plan.iter().filter(|i| !matches!(i, RepoCleanupItem::Skip { .. })).count();
+                if actionable == 0 {
+                    println!("Nothing to clean up.");
+                    return Ok(());
+                }
+                if dry_run {
+                    return Ok(());
+                }
+                if !force
+                    && !confirm_or_exit("clean up", || {
+                        Ok(format!("Clean up {actionable} branch(es) in '{}'?", repo.name))
+                    })?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+
+                let mut failed = 0;
+                for (branch, result) in
+                    delete_branches(&repo.path, &RepoCleanupItem::deletes(&plan), &protected)
+                {
+                    match result {
+                        Ok(()) => println!("Deleted branch: {branch}"),
+                        Err(e) => {
+                            failed += 1;
+                            println!("Could not delete branch {branch}: {e}");
+                        }
+                    }
+                }
+                for item in &plan {
+                    let RepoCleanupItem::Workspace { ws_id, branch, .. } = item else {
+                        continue;
+                    };
+                    let Some((ws_name, worktree)) = ws_of(&state, ws_id)
+                        .and_then(|w| Some((w.name.clone(), w.worktree_path.clone()?)))
+                    else {
+                        failed += 1;
+                        println!("Could not clean up workspace {ws_id}: workspace not found");
+                        continue;
+                    };
+                    match cleanup_merged_workspace(&repo.path, &worktree, branch, &protected) {
+                        Ok(()) => {
+                            // Exact id, never the name: see WorkspaceAction::Cleanup.
+                            state.delete_workspace_by_id(ws_id)?;
+                            println!("Cleaned up workspace: {ws_name}");
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            println!("Could not clean up workspace {ws_name}: {e}");
+                        }
+                    }
+                }
+                if failed > 0 {
+                    anyhow::bail!("{failed} item(s) failed");
+                }
+            }
             RepoAction::Sort { mode } => {
                 let mut state = AppState::load()?;
                 match mode {
@@ -433,8 +532,60 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Workspace { action } => match action {
-            WorkspaceAction::Create { name, repo, branch, no_worktree, fork } => {
+            WorkspaceAction::Create { name, repo, branch, no_worktree, fork, issue } => {
                 let mut state = AppState::load()?;
+                // `--issue`, or a positional that looks like an issue reference.
+                // Anything that already says what branch to use suppresses the
+                // detection (and the remote write with it): `--branch` names one
+                // explicitly, `--fork` means "fork a fresh branch", `--no-worktree`
+                // means "no branch at all". In all three the positional is a NAME.
+                // An implicitly detected ref has an escape hatch worth naming
+                // when it fails, but only for the bare-number shape: `--fork`
+                // with a URL positional dies on `validate_new_workspace_name`
+                // instead (a workspace name can't contain `/`), so the advice
+                // would be wrong. Restricting it also keeps the ref out of the
+                // message, which a URL must stay out of: it can carry
+                // credentials, and a percent-encoded `user%3Atoken%40` passes
+                // the parser's literal-`@` check.
+                let hint_ref = issue
+                    .is_none()
+                    .then_some(name.as_deref())
+                    .flatten()
+                    .filter(|n| n.trim_start_matches('#').bytes().all(|b| b.is_ascii_digit()))
+                    .map(str::to_string);
+                let from_issue = issue.or_else(|| {
+                    name.clone().filter(|n| {
+                        !fork && !no_worktree && branch.is_none() && kommand0_core::is_issue_ref(n)
+                    })
+                });
+                let (name, branch) = match &from_issue {
+                    Some(r) => {
+                        let repo_path = state.resolve_repo(&repo)?.path.clone();
+                        // stderr: this performs a REMOTE WRITE and can take ~60s
+                        // worst case (three bounded calls: --list, create, fetch).
+                        // The ref is NOT interpolated: a URL can carry
+                        // `user:token@`.
+                        eprintln!("Resolving issue...");
+                        let b = kommand0_core::issue_branch(&repo_path, r)
+                            .map_err(|e| match &hint_ref {
+                                // The user typed a name, not `--issue`. Say how
+                                // to get the old, purely local behaviour back.
+                                Some(n) => anyhow::anyhow!(
+                                    "{e}\n({n} was read as an issue reference; \
+                                     pass --fork for a workspace literally named {n})"
+                                ),
+                                None => anyhow::Error::msg(e),
+                            })?;
+                        if b.reused {
+                            eprintln!("Using existing linked branch {}", b.branch);
+                        } else {
+                            eprintln!("Created linked branch {} on origin", b.branch);
+                        }
+                        // None: the workspace is named after the branch.
+                        (None, Some(b.branch))
+                    }
+                    None => (name, branch),
+                };
                 let ws = match (branch, no_worktree) {
                     (Some(_), true) => {
                         anyhow::bail!("--branch and --no-worktree can't be combined")
@@ -627,6 +778,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             WorkspaceAction::Cleanup { name, force } => {
+                let protected = Config::protected_branches_now().map_err(anyhow::Error::msg)?;
                 let mut state = AppState::load()?;
                 let ws = state.show_workspace(&name)?.clone();
                 let (Some(worktree), Some(branch)) =
@@ -652,7 +804,7 @@ fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                match cleanup_merged_workspace(&repo, &worktree, &branch) {
+                match cleanup_merged_workspace(&repo, &worktree, &branch, &protected) {
                     Ok(()) => {
                         // The worktree + branch are gone; drop the workspace
                         // entry by exact id (never re-resolve the user's string
@@ -906,5 +1058,28 @@ mod tests {
             .is_err(),
             "--fork + --no-worktree must be rejected"
         );
+    }
+
+    #[test]
+    fn dry_run_conflicts_with_force() {
+        assert!(Cli::try_parse_from(["kmd", "repo", "cleanup", "r", "--dry-run"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kmd", "repo", "cleanup", "r", "--dry-run", "--force"]).is_err(),
+            "--dry-run + --force must be rejected"
+        );
+    }
+
+    #[test]
+    fn issue_conflicts_with_anything_that_already_names_a_branch() {
+        // Asserted by error KIND: an out-of-process check would pass on a
+        // MISSING declaration by invoking the developer's real gh.
+        for extra in [vec!["x"], vec!["--branch", "b"], vec!["--fork"], vec!["--no-worktree"]] {
+            let mut args = vec!["kmd", "workspace", "create", "--repo", "r", "--issue", "1"];
+            args.extend(extra.iter().copied());
+            let err = Cli::try_parse_from(&args)
+                .err()
+                .unwrap_or_else(|| panic!("--issue + {extra:?} must be rejected"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{extra:?}: {err}");
+        }
     }
 }

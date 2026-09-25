@@ -19,7 +19,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyEvent, KeyEventKind};
-use kommand0_core::{AppState, Config, DEFAULT_PROFILE, RepoEntry, SessionStatus, Workspace};
+use kommand0_core::{
+    AppState, Config, DEFAULT_PROFILE, RepoCleanupItem, RepoEntry, SessionStatus, Workspace,
+};
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent},
@@ -45,7 +47,7 @@ const PR_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Carries a background worker's result to the event loop, sending on drop
 /// so the loop always gets a message (and clears the matching `*_inflight`
 /// flag) even if the worker thread panics before finishing. Shared by the
-/// status/PR refreshes, cleanup, and profile delete.
+/// status/PR refreshes, cleanup, the issue resolve, and profile delete.
 struct SendOnDrop<T> {
     tx: tokio::sync::mpsc::UnboundedSender<T>,
     payload: Option<T>,
@@ -64,6 +66,29 @@ impl<T> Drop for SendOnDrop<T> {
 /// core's result, stringly on the error side (it crosses a thread).
 type ProfileDeleteMsg =
     (String, Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>);
+
+/// Repo-cleanup worker -> event loop: the scan's routed plan, or the delete
+/// phase's per-branch results. Both carry the repo id. `Scanned(_, Err)` also
+/// carries a delete-phase failure that produced no per-branch results (the
+/// config read).
+#[derive(Debug)]
+enum RepoCleanupMsg {
+    Scanned(String, Result<Vec<RepoCleanupItem>, String>),
+    Deleted(String, Vec<(String, Result<(), String>)>),
+}
+
+/// `(to delete, via workspace cleanup, skipped)` for a repo cleanup plan.
+fn repo_cleanup_counts(items: &[RepoCleanupItem]) -> (usize, usize, usize) {
+    items.iter().fold((0, 0, 0), |(d, w, s), item| match item {
+        RepoCleanupItem::Delete { .. } => (d + 1, w, s),
+        RepoCleanupItem::Workspace { .. } => (d, w + 1, s),
+        RepoCleanupItem::Skip { .. } => (d, w, s + 1),
+    })
+}
+
+/// What the issue-resolve worker sends back: the request id (the newest one
+/// wins) and the branch GitHub links to the issue.
+type IssueMsg = (u64, Result<kommand0_core::IssueBranch, String>);
 
 /// The `(message, is_error)` notice for a finished profile delete: clean,
 /// with warnings (their full texts go to the log), or failed. Each names the
@@ -868,6 +893,18 @@ pub(crate) struct App {
     /// Cleanup worker → event-loop channel carrying `(workspace_id, result)`.
     cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>>,
 
+    /// The repo whose merged-branch scan or delete is running (at most one).
+    pub(crate) repo_cleanup_inflight: Option<String>,
+    /// One-line repo-cleanup outcome `(message, is_error)` per repo id, shown
+    /// in that repo's detail pane.
+    pub(crate) repo_cleanup_result: HashMap<String, (String, bool)>,
+    /// A finished scan the user has not reviewed yet: parked when the result
+    /// landed while something else owned the keyboard; the next `c` on that
+    /// repo row opens it without rescanning.
+    repo_cleanup_pending: Option<(String, Vec<RepoCleanupItem>)>,
+    /// Repo-cleanup worker → event-loop channel.
+    repo_cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<RepoCleanupMsg>>,
+
     /// A profile delete is running on the background thread (gates
     /// re-triggering; at most one at a time).
     profile_delete_inflight: bool,
@@ -887,6 +924,19 @@ pub(crate) struct App {
     /// when not wired (unit tests), which also disables the pollers
     /// entirely; see [`Self::request_codex_early_capture`].
     codex_capture_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String, String, Instant)>>,
+
+    /// Monotonic id for issue-resolve requests; the newest one wins.
+    issue_seq: u64,
+    /// The in-flight issue resolve's id (`Some` == the reply is still wanted).
+    issue_req: Option<u64>,
+    /// When the running resolve WORKER was started. Distinct from `issue_req`,
+    /// which Esc clears: Esc stops the waiting, not the `gh issue develop`.
+    /// A time rather than a bool so a worker that never replies (the issue path
+    /// has unbounded local git calls around the bounded gh ones, and one on a
+    /// hung mount parks forever) can't wedge the feature until restart.
+    issue_worker_started: Option<Instant>,
+    /// Issue-resolve worker → event-loop channel. `None` when not wired (unit tests).
+    issue_tx: Option<tokio::sync::mpsc::UnboundedSender<IssueMsg>>,
 
     /// User config (claude passthrough + tunables), loaded once at startup.
     pub(crate) config: Config,
@@ -981,11 +1031,19 @@ impl App {
             cleanup_inflight: HashSet::new(),
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
+            repo_cleanup_inflight: None,
+            repo_cleanup_result: HashMap::new(),
+            repo_cleanup_pending: None,
+            repo_cleanup_tx: None,
             profile_delete_inflight: false,
             profile_delete_tx: None,
             profile_delete_join: None,
             profile_notice: None,
             codex_capture_tx: None,
+            issue_seq: 0,
+            issue_req: None,
+            issue_worker_started: None,
+            issue_tx: None,
             config: Config::default(),
             config_path: Config::effective_path(),
             settings: None,
@@ -1960,6 +2018,26 @@ impl App {
         }
     }
 
+    /// Make a repo row visible + selected: clear any active filter (a filtered-
+    /// out repo has no row), rebuild the tree, and select it. False for an
+    /// unknown id.
+    fn select_repo_row(&mut self, repo_id: &str) -> bool {
+        if !self.repos.iter().any(|r| r.id == repo_id) {
+            return false;
+        }
+        self.filter_query.clear();
+        self.filter_input = false;
+        self.rebuild_tree();
+        if let Some(i) = self
+            .tree_items
+            .iter()
+            .position(|n| matches!(n, TreeNode::Repo { id, .. } if id == repo_id))
+        {
+            self.selected_index = i;
+        }
+        true
+    }
+
     /// Select a workspace by id (if present in the tree) and open its sessions.
     fn embed_workspace_by_id(&mut self, ws_id: &str) {
         self.select_workspace_row(ws_id);
@@ -1968,9 +2046,10 @@ impl App {
 
     /// Build the palette entries: a jump-and-open for every workspace, then the
     /// actions you can run on each (open PR / clean up / archive·activate / new
-    /// session), then a jump for each open session tab. Each entry's match text
-    /// folds in a verb + the workspace name + branch + repo so any of them
-    /// narrows (e.g. "pr foo", "clean", "tab 2").
+    /// session), a merged-branch cleanup per repo, then a jump for each open
+    /// session tab. Each entry's match text folds in a verb + the workspace
+    /// name + branch + repo so any of them narrows (e.g. "pr foo", "clean",
+    /// "tab 2").
     fn palette_candidates(&self) -> Vec<palette::Candidate> {
         use palette::{Candidate, PaletteAction};
         let repo_name = |repo_id: &str| {
@@ -2036,6 +2115,16 @@ impl App {
             ));
         }
 
+        // Repo-level cleanup; "branches" keeps it apart from the workspace clean-ups.
+        for r in &self.repos {
+            out.push(Candidate {
+                label: format!("Clean up branches: {}", r.name),
+                detail: "repo".to_string(),
+                match_text: format!("clean up cleanup branches repo {}", r.name),
+                action: PaletteAction::CleanupRepo { repo_id: r.id.clone() },
+            });
+        }
+
         // 3) Jump to a specific session tab of each currently-open workspace.
         for w in &self.workspaces {
             let Some(sessions) = self.embedded.get(&w.id) else {
@@ -2082,6 +2171,11 @@ impl App {
             Cleanup { ws_id } => {
                 if self.reveal_workspace(&ws_id) {
                     self.cleanup_workspace_prompt(&ws_id);
+                }
+            }
+            CleanupRepo { repo_id } => {
+                if self.select_repo_row(&repo_id) {
+                    self.repo_cleanup_requested(&repo_id);
                 }
             }
             ArchiveToggle { ws_id } => self.archive_toggle(&ws_id),
@@ -2915,7 +3009,12 @@ impl App {
     /// scope this returns immediately, so claude/shell-only teardowns stay
     /// instant; the worst case adds [`TEARDOWN_CAPTURE_GRACE`] once.
     fn capture_panes_on_teardown(&mut self, only_ws: Option<&str>) {
-        let in_scope = |ws_id: &str| only_ws.is_none_or(|w| w == ws_id);
+        self.capture_panes_on_teardown_for(|ws_id| only_ws.is_none_or(|w| w == ws_id));
+    }
+
+    /// [`Self::capture_panes_on_teardown`] over an arbitrary workspace set (the
+    /// routed repo cleanup pays the grace once for all of them).
+    fn capture_panes_on_teardown_for(&mut self, in_scope: impl Fn(&str) -> bool) {
         let mut targets = 0usize;
         for (ws_id, sessions) in self.embedded.iter_mut() {
             if !in_scope(ws_id) {
@@ -3426,45 +3525,410 @@ impl App {
     /// branch deletion happen in core, which enforces the safety guards). Tears
     /// down any live embedded pane first so its cwd isn't yanked out from under it.
     fn start_cleanup(&mut self, ws_id: &str) {
-        if self.cleanup_inflight.contains(ws_id) {
-            return;
-        }
-        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
-            return;
-        };
-        let (Some(worktree), Some(branch)) = (ws.worktree_path.clone(), ws.branch_name.clone())
-        else {
-            return;
-        };
-        let Some(repo) = self
-            .repos
-            .iter()
-            .find(|r| r.id == ws.repo_id)
-            .map(|r| r.path.clone())
-        else {
-            return;
-        };
+        self.start_cleanups(&[ws_id]);
+    }
+
+    /// [`Self::start_cleanup`] for a set: the workspaces that can start one
+    /// (own-branch, repo known, not already in flight) get ONE shared pane-capture
+    /// grace, then each is torn down and handed to its own worker.
+    fn start_cleanups(&mut self, ids: &[&str]) {
         let Some(tx) = self.cleanup_tx.clone() else {
             return; // not wired (unit tests)
         };
-        // Tear down the embedded pane synchronously (Drop terminates the child),
-        // so the worktree dir isn't removed while a claude is running inside it.
+        let targets: Vec<(String, String, String, String)> = ids
+            .iter()
+            .filter(|id| !self.cleanup_inflight.contains(**id))
+            .filter_map(|id| {
+                let ws = self.workspaces.iter().find(|w| w.id == *id)?;
+                let repo = self.repos.iter().find(|r| r.id == ws.repo_id)?;
+                Some((
+                    ws.id.clone(),
+                    ws.worktree_path.clone()?,
+                    ws.branch_name.clone()?,
+                    repo.path.clone(),
+                ))
+            })
+            .collect();
+        for id in ids {
+            if targets.iter().all(|(t, ..)| t != *id) {
+                tracing::warn!("cleanup: workspace {id} skipped (not cleanable now)");
+            }
+        }
+        if targets.is_empty() {
+            return; // never SIGTERM panes for a cleanup that will not start
+        }
+        // Tear down the embedded panes synchronously (Drop terminates the child),
+        // so a worktree dir isn't removed while a claude is running inside it.
         // Capture first: on a cleanup FAILURE the workspace and its entries
         // survive, and a live codex/opencode session would otherwise be lost
         // while its entry persisted.
-        self.capture_panes_on_teardown(Some(ws_id));
-        self.embedded.remove(ws_id);
-        self.cleanup_inflight.insert(ws_id.to_string());
-        self.cleanup_result.remove(ws_id);
-        let id = ws_id.to_string();
+        self.capture_panes_on_teardown_for(|ws| targets.iter().any(|(id, ..)| id == ws));
+        for (id, worktree, branch, repo) in targets {
+            // ponytail: panes are dropped on the loop like the single cleanup; move
+            // teardown to the worker if a batch of SIGHUP-ignoring panes makes this visible.
+            self.embedded.remove(&id);
+            self.cleanup_inflight.insert(id.clone());
+            self.cleanup_result.remove(&id);
+            let tx = tx.clone();
+            let config_path = self.config_path.clone();
+            std::thread::spawn(move || {
+                let mut guard = SendOnDrop {
+                    tx,
+                    payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
+                };
+                // The file, not the startup snapshot: an edit applies to the next
+                // cleanup, and an unparseable file blocks it rather than degrading.
+                let result = Config::protected_branches_at(&config_path).and_then(|protected| {
+                    kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch, &protected)
+                });
+                guard.payload = Some((id, result));
+            });
+        }
+    }
+
+    /// Whether an overlay (modal, palette, settings, help, diff) owns the screen.
+    fn overlay_active(&self) -> bool {
+        self.modal.is_active()
+            || self.palette.is_some()
+            || self.settings.is_some()
+            || self.show_help
+            || self.show_diff
+    }
+
+    /// Whether the tree owns the keyboard right now. The scan's result may open
+    /// its modal only then: otherwise a keystroke meant for a pane, an overlay
+    /// or the filter box would land in the new modal instead.
+    fn can_open_repo_cleanup_modal(&self) -> bool {
+        self.focus == Focus::Tree && !self.filter_input && !self.overlay_active()
+    }
+
+    /// `c` on a repo row: review this repo's parked plan, else start a scan.
+    /// One scan/delete at a time; a parked plan for another repo is dropped.
+    fn repo_cleanup_requested(&mut self, repo_id: &str) {
+        if self.repo_cleanup_inflight.is_some() {
+            return;
+        }
+        match self.repo_cleanup_pending.take() {
+            Some((id, items)) if id == repo_id => self.open_repo_cleanup_modal(id, items),
+            other => {
+                // A dropped plan takes its "press c to review" line with it.
+                if let Some((other_id, _)) = other {
+                    self.repo_cleanup_result.remove(&other_id);
+                }
+                self.start_repo_cleanup_scan(repo_id);
+            }
+        }
+    }
+
+    /// Scan the repo's local branches for merged PRs off the render loop (one gh
+    /// call per branch) and route the verdicts against a snapshot of its workspaces.
+    fn start_repo_cleanup_scan(&mut self, repo_id: &str) {
+        let Some(path) = self.repos.iter().find(|r| r.id == repo_id).map(|r| r.path.clone())
+        else {
+            return;
+        };
+        let Some(tx) = self.repo_cleanup_tx.clone() else {
+            return; // not wired (unit tests)
+        };
+        let workspaces: Vec<Workspace> =
+            self.workspaces.iter().filter(|w| w.repo_id == repo_id).cloned().collect();
+        let config_path = self.config_path.clone();
+        self.repo_cleanup_inflight = Some(repo_id.to_string());
+        self.repo_cleanup_result.remove(repo_id);
+        let id = repo_id.to_string();
         std::thread::spawn(move || {
             let mut guard = SendOnDrop {
                 tx,
-                payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
+                payload: Some(RepoCleanupMsg::Scanned(
+                    id.clone(),
+                    Err("the scan was interrupted".to_string()),
+                )),
             };
-            let result = kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch);
-            guard.payload = Some((id, result));
+            let result = Config::protected_branches_at(&config_path)
+                .and_then(|protected| kommand0_core::scan_merged_branches(&path, &protected))
+                .map(|verdicts| kommand0_core::plan_repo_cleanup(verdicts, &id, &workspaces));
+            guard.payload = Some(RepoCleanupMsg::Scanned(id, result));
         });
+    }
+
+    /// A scan landed. Nothing actionable: say so in the repo detail line. Else
+    /// open the preview while the tree is idle, or park the plan and point at `c`.
+    fn on_repo_cleanup_scanned(
+        &mut self,
+        repo_id: String,
+        result: Result<Vec<RepoCleanupItem>, String>,
+    ) {
+        let items = match result {
+            Ok(items) => items,
+            Err(e) => {
+                self.repo_cleanup_result.insert(repo_id, (format!("Cleanup failed: {e}"), true));
+                return;
+            }
+        };
+        let (deletes, routed, skipped) = repo_cleanup_counts(&items);
+        if deletes + routed == 0 {
+            self.repo_cleanup_result
+                .insert(repo_id, (format!("Nothing to clean up ({skipped} skipped)"), false));
+        } else if self.can_open_repo_cleanup_modal() {
+            self.open_repo_cleanup_modal(repo_id, items);
+        } else {
+            self.repo_cleanup_result.insert(
+                repo_id.clone(),
+                (
+                    format!(
+                        "Scan done: {deletes} to delete, {routed} workspace(s); press c to review"
+                    ),
+                    false,
+                ),
+            );
+            self.repo_cleanup_pending = Some((repo_id, items));
+        }
+    }
+
+    /// Open the preview for a scanned plan. Rows are built now, not at scan
+    /// time, so a parked plan shows the current dirty/unpushed/live markers.
+    fn open_repo_cleanup_modal(&mut self, repo_id: String, items: Vec<RepoCleanupItem>) {
+        self.repo_cleanup_result.remove(&repo_id);
+        let repo_name = self
+            .repos
+            .iter()
+            .find(|r| r.id == repo_id)
+            .map(|r| r.name.clone())
+            .unwrap_or_default();
+        let (deletes, routed, skipped) = repo_cleanup_counts(&items);
+        let rows = items.iter().map(|item| self.repo_cleanup_row(item)).collect();
+        let summary =
+            format!("{deletes} to delete, {routed} via workspace cleanup, {skipped} skipped");
+        self.modal = modal::ModalState::ConfirmRepoCleanup {
+            repo_id,
+            repo_name,
+            summary,
+            rows,
+            plan: items,
+        };
+    }
+
+    fn repo_cleanup_row(&self, item: &RepoCleanupItem) -> modal::RepoCleanupRow {
+        let action = match item {
+            RepoCleanupItem::Delete { .. } => "delete".to_string(),
+            RepoCleanupItem::Workspace { ws_id, .. } => {
+                let name = self
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id == *ws_id)
+                    .map(|w| w.name.as_str())
+                    .unwrap_or("(unknown)");
+                let mut action = format!("workspace {name}");
+                if let Some(st) = self.branch_status.get(ws_id) {
+                    if st.dirty {
+                        action.push_str(" [dirty]");
+                    }
+                    if st.ahead > 0 {
+                        action.push_str(" [unpushed]");
+                    }
+                }
+                if self.embedded.contains_key(ws_id) {
+                    action.push_str(" [live]");
+                }
+                action
+            }
+            RepoCleanupItem::Skip { reason, .. } => format!("skip: {reason}"),
+        };
+        modal::RepoCleanupRow { branch: item.branch().to_string(), pr: item.pr_label(), action }
+    }
+
+    /// `y` in the preview: the workspace rows go through the workspace cleanup
+    /// (one shared pane-capture grace for the set), the plain branches are
+    /// deleted off the render loop (fast, but the loop never waits on git).
+    fn confirm_repo_cleanup(&mut self, repo_id: String, plan: Vec<RepoCleanupItem>) {
+        let routed: Vec<&str> = plan
+            .iter()
+            .filter_map(|item| match item {
+                RepoCleanupItem::Workspace { ws_id, .. } => Some(ws_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.start_cleanups(&routed);
+        let deletes = RepoCleanupItem::deletes(&plan);
+        if deletes.is_empty() {
+            return;
+        }
+        let Some(path) = self.repos.iter().find(|r| r.id == repo_id).map(|r| r.path.clone())
+        else {
+            return;
+        };
+        let Some(tx) = self.repo_cleanup_tx.clone() else {
+            return; // not wired (unit tests)
+        };
+        self.repo_cleanup_inflight = Some(repo_id.clone());
+        let config_path = self.config_path.clone();
+        std::thread::spawn(move || {
+            let mut guard = SendOnDrop {
+                tx,
+                payload: Some(RepoCleanupMsg::Scanned(
+                    repo_id.clone(),
+                    Err("the delete was interrupted".to_string()),
+                )),
+            };
+            guard.payload = Some(match Config::protected_branches_at(&config_path) {
+                Ok(protected) => RepoCleanupMsg::Deleted(
+                    repo_id,
+                    kommand0_core::delete_branches(&path, &deletes, &protected),
+                ),
+                Err(e) => RepoCleanupMsg::Scanned(repo_id, Err(e)),
+            });
+        });
+    }
+
+    /// The delete phase landed: one result line for the repo (the pane clips
+    /// it); every failure also goes to the log in full.
+    fn on_repo_cleanup_deleted(
+        &mut self,
+        repo_id: String,
+        results: Vec<(String, Result<(), String>)>,
+    ) {
+        let mut failed = Vec::new();
+        for (branch, result) in &results {
+            if let Err(e) = result {
+                tracing::warn!("repo cleanup: {branch}: {e}");
+                failed.push(format!("{branch} ({e})"));
+            }
+        }
+        let total = results.len();
+        let line = if !failed.is_empty() {
+            format!(
+                "Deleted {} of {total} branches; failed: {}",
+                total - failed.len(),
+                failed.join(", ")
+            )
+        } else if total == 1 {
+            "Deleted 1 branch".to_string()
+        } else {
+            format!("Deleted {total} branches")
+        };
+        self.repo_cleanup_result.insert(repo_id, (line, !failed.is_empty()));
+    }
+
+    /// Resolve an issue reference to its linked branch off the render loop (up
+    /// to two gh network calls plus a fetch). The latch and the modal are set
+    /// before the `tx` check, so unit tests (no `tx`) still see the routing.
+    fn start_issue_resolve(&mut self, repo: &RepoEntry, issue: String) {
+        // Esc stops us WAITING, it does not stop the worker, so without this a
+        // resubmit runs a second `gh issue develop` against the same issue. If
+        // the second `--list` beats the first create, BOTH create: the issue
+        // ends up with two linked branches and every later lookup dead-ends on
+        // "has 2 linked branches", with no way back from inside kommand0.
+        // `start_cleanup` and `start_profile_delete` guard the same way.
+        // The latch is global, not per-repo, so the message must not claim
+        // otherwise. It expires so a worker that never replies can't wedge the
+        // feature for the session: every bounded call on the path has landed
+        // well inside this.
+        const ISSUE_WORKER_MAX: Duration = Duration::from_secs(180);
+        if self.issue_worker_started.is_some_and(|t| t.elapsed() < ISSUE_WORKER_MAX) {
+            let (repo_id, repo_name) = (repo.id.clone(), repo.name.clone());
+            self.finish_add_workspace(
+                Err(anyhow::anyhow!(
+                    "an issue lookup is still running; \
+                     wait for it to finish before starting another"
+                )),
+                repo_id,
+                repo_name,
+                issue,
+                String::new(),
+            );
+            return;
+        }
+        self.issue_seq += 1;
+        let req = self.issue_seq;
+        self.issue_req = Some(req);
+        self.modal = modal::ModalState::ResolvingIssue {
+            repo_id: repo.id.clone(),
+            repo_name: repo.name.clone(),
+            issue: issue.clone(),
+        };
+        let Some(tx) = self.issue_tx.clone() else {
+            return; // not wired (unit tests)
+        };
+        // Only once a worker really exists, so the unwired unit-test path never
+        // latches something nothing would clear.
+        self.issue_worker_started = Some(Instant::now());
+        let repo_path = repo.path.clone();
+        std::thread::spawn(move || {
+            let mut guard = SendOnDrop {
+                tx,
+                payload: Some((req, Err("the issue lookup was interrupted".to_string()))),
+            };
+            let result = kommand0_core::issue_branch(&repo_path, &issue);
+            guard.payload = Some((req, result));
+        });
+    }
+
+    /// Adopt the branch an issue resolved to (or surface the failure).
+    fn finish_issue_resolve(&mut self, req: u64, result: Result<kommand0_core::IssueBranch, String>) {
+        // FIRST, before any early return: the worker that produced this reply is
+        // done, so a dropped stale reply still releases the re-entry guard.
+        self.issue_worker_started = None;
+        // Stale reply (Esc stopped the wait, or a newer request superseded it):
+        // drop it BEFORE clearing the latch, showing an error, or creating
+        // anything. Log the outcome either way: a cancelled request may already
+        // have created a branch on origin (or failed naming one), and this is
+        // the only record of it.
+        if self.issue_req != Some(req) {
+            match &result {
+                Ok(b) => tracing::info!(
+                    "dropping a stale issue resolve (req {req}): branch {}",
+                    b.branch
+                ),
+                Err(e) => tracing::info!("dropping a stale issue resolve (req {req}): {e}"),
+            }
+            return;
+        }
+        self.issue_req = None;
+        // Take the create context off the in-flight modal. The latch check above
+        // already proved this reply is the current one, so no id is needed here.
+        let (repo_id, repo_name, issue) = match std::mem::take(&mut self.modal) {
+            modal::ModalState::ResolvingIssue { repo_id, repo_name, issue } => {
+                (repo_id, repo_name, issue)
+            }
+            other => {
+                // Defensive: some other modal replaced ours without clearing the
+                // latch. Log the outcome for the same reason as above.
+                match &result {
+                    Ok(b) => tracing::info!(
+                        "discarding a resolved issue branch (req {req}): {}",
+                        b.branch
+                    ),
+                    Err(e) => tracing::info!("discarding a failed issue resolve (req {req}): {e}"),
+                }
+                self.modal = other;
+                return;
+            }
+        };
+        // The workspace name comes from the branch; `finish_add_workspace`
+        // reopens Add Workspace with the typed ref + the error on failure, so
+        // gh's own message is what the user sees.
+        let created = result.as_ref().ok().map(|b| (b.branch.clone(), b.reused));
+        let result = result
+            .map_err(anyhow::Error::msg)
+            .and_then(|b| self.state.create_workspace_from_branch(None, &repo_id, &b.branch));
+        let ok = result.is_ok();
+        self.finish_add_workspace(result, repo_id, repo_name, issue, String::new());
+        // The resolving modal is gone by now, and its "may create a new linked
+        // branch" warning with it. On the create path this notice is the user's
+        // only record that kommand0 just wrote to their remote (the CLI prints
+        // the same thing on stderr).
+        if let Some((branch, reused)) = created
+            && ok
+        {
+            self.profile_notice = Some((
+                if reused {
+                    format!("Using existing linked branch {branch}")
+                } else {
+                    format!("Created linked branch {branch} on origin")
+                },
+                false,
+            ));
+        }
     }
 
     /// While a profile delete runs, quitting would kill the worker mid
@@ -3958,8 +4422,22 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
 
     // Modal dialog: swallow all keys
     if app.modal.is_active() {
+        // Read before the handler runs: it replaces the state with `None`.
+        let was_resolving_issue = matches!(app.modal, modal::ModalState::ResolvingIssue { .. });
         match modal::handle_modal_key(&mut app.modal, key) {
-            modal::ModalResult::Consumed | modal::ModalResult::Cancelled => {}
+            modal::ModalResult::Consumed => {}
+            // Esc during an in-flight issue resolve stops kommand0 WAITING,
+            // nothing more: gh may already have created the linked branch, and
+            // the next attempt adopts it through `--list` once the worker has
+            // finished (`issue_worker_started` holds the retry until then).
+            // Clearing the latch on `Consumed` too would let one stray keypress
+            // during the wait drop the real reply as stale. Scoped to the
+            // resolving modal so cancelling any OTHER modal can't reach in here.
+            modal::ModalResult::Cancelled => {
+                if was_resolving_issue {
+                    app.issue_req = None;
+                }
+            }
             modal::ModalResult::SubmitRepo(path) => match app.state.add_repo(&path) {
                 Ok(repo) => {
                     // Expand the just-added repo so its "(no workspaces — press w)"
@@ -4050,11 +4528,20 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     );
                     app.finish_add_workspace(result, repo_id, repo_name, name, branch);
                 } else if let Some(repo) = repo {
+                    // An issue reference (123, #123, or an issue URL) in the Name
+                    // field means "the branch GitHub links to that issue".
+                    // Resolved off the render loop. Checked BEFORE the
+                    // slash-means-branch rule (an issue URL has slashes) and
+                    // before name validation (a bare number would pass it), but
+                    // AFTER the filled-Branch-field check above, which still wins.
+                    if kommand0_core::is_issue_ref(&name) {
+                        app.start_issue_resolve(&repo, name);
+                    }
                     // A name with a '/' can only mean an existing branch (workspace
                     // names ban path separators): check it out directly, the
                     // workspace name derived by core. A missing branch surfaces
                     // core's error, with the typed name preserved for a retry.
-                    if name.contains('/') {
+                    else if name.contains('/') {
                         let result =
                             app.state.create_workspace_from_branch(None, &repo_id, &name);
                         app.finish_add_workspace(result, repo_id, repo.name, name, String::new());
@@ -4117,6 +4604,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             }
             modal::ModalResult::ConfirmCleanup(ws_id) => {
                 app.start_cleanup(&ws_id);
+            }
+            modal::ModalResult::ConfirmRepoCleanup(repo_id, plan) => {
+                app.confirm_repo_cleanup(repo_id, plan);
             }
         }
         return Ok(KeyOutcome::Continue);
@@ -4282,11 +4772,17 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         open_url(&url);
                     }
                 }
-                Action::Cleanup => {
-                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                Action::Cleanup => match app.tree_items.get(app.selected_index) {
+                    Some(TreeNode::Repo { id, .. }) => {
+                        let id = id.clone();
+                        app.repo_cleanup_requested(&id);
+                    }
+                    Some(TreeNode::Workspace { ws, .. }) => {
+                        let ws_id = ws.id.clone();
                         app.cleanup_workspace_prompt(&ws_id);
                     }
-                }
+                    _ => {}
+                },
                 Action::Filter => {
                     // Enter the tree filter; keep any existing query to edit.
                     app.filter_input = true;
@@ -4774,10 +5270,19 @@ async fn run(
         tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
     app.cleanup_tx = Some(cleanup_tx);
 
+    // Repo-cleanup worker → event loop (the scan's plan, then the delete results).
+    let (repo_cleanup_tx, mut repo_cleanup_rx) =
+        tokio::sync::mpsc::unbounded_channel::<RepoCleanupMsg>();
+    app.repo_cleanup_tx = Some(repo_cleanup_tx);
+
     // Profile-delete worker → event loop, carrying `(profile name, result)`.
     let (profile_delete_tx, mut profile_delete_rx) =
         tokio::sync::mpsc::unbounded_channel::<ProfileDeleteMsg>();
     app.profile_delete_tx = Some(profile_delete_tx);
+
+    // Issue-resolve worker → event loop, carrying `(request id, result)`.
+    let (issue_tx, mut issue_rx) = tokio::sync::mpsc::unbounded_channel::<IssueMsg>();
+    app.issue_tx = Some(issue_tx);
 
     // Codex early-capture pollers → event loop, carrying the captured entry
     // as `(workspace_id, tab_id, "codex:<uuid>", spawn generation)`.
@@ -4853,6 +5358,9 @@ async fn run(
                 app.pr_status = pr_status;
                 app.pr_status_inflight = false;
             }
+            Some((req, result)) = issue_rx.recv() => {
+                app.finish_issue_resolve(req, result);
+            }
             Some((ws_id, result)) = cleanup_rx.recv() => {
                 app.cleanup_inflight.remove(&ws_id);
                 match result {
@@ -4883,6 +5391,15 @@ async fn run(
                     }
                 }
                 app.request_branch_status_refresh();
+            }
+            Some(msg) = repo_cleanup_rx.recv() => {
+                app.repo_cleanup_inflight = None;
+                match msg {
+                    RepoCleanupMsg::Scanned(id, result) => app.on_repo_cleanup_scanned(id, result),
+                    RepoCleanupMsg::Deleted(id, results) => {
+                        app.on_repo_cleanup_deleted(id, results);
+                    }
+                }
             }
             Some((name, result)) = profile_delete_rx.recv() => {
                 app.profile_delete_inflight = false;
@@ -4967,11 +5484,7 @@ async fn run(
                     Event::Mouse(mouse_event) => {
                         if app.show_diff {
                             mouse::handle_diff_mouse(&mut app, mouse_event);
-                        } else if app.show_help
-                            || app.modal.is_active()
-                            || app.palette.is_some()
-                            || app.settings.is_some()
-                        {
+                        } else if app.overlay_active() {
                             // An overlay owns the screen — ignore mouse (don't leak
                             // stray clicks to the tree/embedded claude behind it; a
                             // leaked click could even open a modal and orphan the
@@ -5023,6 +5536,9 @@ async fn run(
                         }
                         buttons::HitAction::CleanupWorkspaceFor { workspace_id } => {
                             app.cleanup_workspace_prompt(&workspace_id);
+                        }
+                        buttons::HitAction::CleanupRepoFor { repo_id } => {
+                            app.repo_cleanup_requested(&repo_id);
                         }
                         buttons::HitAction::StopSessionFor { workspace_id } => {
                             // The mouse twin of detach: entries survive, so give
@@ -5889,6 +6405,7 @@ mod key_tests {
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
         git(&["branch", branch]);
     }
@@ -6014,6 +6531,243 @@ mod key_tests {
         assert!(matches!(app.modal, modal::ModalState::None), "modal closes");
         let ws = app.workspaces.iter().find(|w| w.name == "team-derive-me").expect("workspace created");
         assert_eq!(ws.branch_name.as_deref(), Some("team/derive-me"));
+    }
+
+    #[tokio::test]
+    async fn an_issue_ref_routes_to_the_resolver_not_the_branch_path() {
+        // Detection beats the '/'-means-branch rule (an issue URL has slashes)
+        // and name validation (a bare number would pass it).
+        for issue_ref in ["https://github.com/o/r/issues/7", "123"] {
+            let mut app = test_app();
+            let _repo = add_real_repo(&mut app, "issueroute");
+            app.modal = add_workspace_modal_for("real", issue_ref);
+            press(&mut app, KeyCode::Enter).await;
+
+            match &app.modal {
+                modal::ModalState::ResolvingIssue { issue, .. } => assert_eq!(issue, issue_ref),
+                _ => panic!("{issue_ref}: expected ResolvingIssue"),
+            }
+            assert!(app.issue_req.is_some(), "{issue_ref}: the resolve is latched in flight");
+            assert!(
+                !app.workspaces.iter().any(|w| w.repo_id == "real"),
+                "{issue_ref}: nothing created yet"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_filled_branch_field_beats_an_issue_like_name() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuebranchwins");
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            input: "123".into(),
+            cursor: 3,
+            branch: "issuebranchwins".into(),
+            branch_cursor: "issuebranchwins".len(),
+            field: modal::AddWorkspaceField::Branch,
+            error: None,
+        };
+        press(&mut app, KeyCode::Enter).await;
+
+        assert!(matches!(app.modal, modal::ModalState::None), "modal closes");
+        assert!(app.issue_req.is_none(), "no issue lookup, so no remote write");
+        let ws = app.workspaces.iter().find(|w| w.name == "123").expect("workspace created");
+        assert_eq!(ws.branch_name.as_deref(), Some("issuebranchwins"));
+    }
+
+    #[tokio::test]
+    async fn a_stale_issue_reply_creates_nothing() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuestale");
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Esc).await;
+        assert!(app.issue_req.is_none(), "Esc releases the latch");
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+
+        // Request 1's reply lands after Esc + a resubmit.
+        app.finish_issue_resolve(
+            1,
+            Ok(kommand0_core::IssueBranch { branch: "issuestale".into(), reused: true }),
+        );
+
+        assert!(!app.workspaces.iter().any(|w| w.name == "issuestale"), "stale reply creates nothing");
+        assert_eq!(app.issue_req, Some(2), "the live request is untouched");
+        assert!(matches!(app.modal, modal::ModalState::ResolvingIssue { .. }), "still waiting");
+    }
+
+    #[tokio::test]
+    async fn a_live_issue_reply_creates_the_workspace() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuelive");
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        let req = app.issue_req.unwrap();
+        // A stray key during the wait must not orphan the in-flight reply.
+        press(&mut app, KeyCode::Char('x')).await;
+        app.finish_issue_resolve(
+            req,
+            Ok(kommand0_core::IssueBranch { branch: "issuelive".into(), reused: true }),
+        );
+
+        assert!(matches!(app.modal, modal::ModalState::None), "modal closes");
+        assert!(app.issue_req.is_none(), "latch cleared");
+        let ws = app.workspaces.iter().find(|w| w.name == "issuelive").expect("workspace created");
+        assert_eq!(ws.branch_name.as_deref(), Some("issuelive"));
+        // The modal (and its remote-write warning) is gone, so the notice is
+        // the only remaining record of what happened on origin.
+        let (msg, is_error) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("Using existing linked branch issuelive"), "{msg}");
+        assert!(!is_error, "a successful adopt is not an error");
+    }
+
+    #[tokio::test]
+    async fn a_created_linked_branch_says_so_in_the_tree_notice() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuecreated");
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        let req = app.issue_req.unwrap();
+        app.finish_issue_resolve(
+            req,
+            Ok(kommand0_core::IssueBranch { branch: "issuecreated".into(), reused: false }),
+        );
+
+        let (msg, _) = app.profile_notice.clone().expect("notice set");
+        assert!(
+            msg.contains("Created linked branch issuecreated on origin"),
+            "names the remote write: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resubmit_while_a_worker_is_alive_is_refused() {
+        // Esc stops the waiting, not the `gh issue develop`. A second resolve
+        // launched on top of the first can make GitHub link two branches to the
+        // issue, which dead-ends every later lookup. The worker latch outlives
+        // Esc precisely so the retry is held until the first one lands.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuereentry");
+        // Wire a channel so the worker path is taken (the unwired unit-test
+        // path deliberately never latches).
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<IssueMsg>();
+        app.issue_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        assert!(app.issue_worker_started.is_some(), "the worker is latched");
+
+        press(&mut app, KeyCode::Esc).await;
+        assert!(app.issue_req.is_none(), "Esc stops the waiting");
+        assert!(app.issue_worker_started.is_some(), "but the worker is still running");
+
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        match &app.modal {
+            modal::ModalState::AddWorkspace { error: Some(e), input, .. } => {
+                assert!(e.contains("still running"), "says why it refused: {e}");
+                assert_eq!(input, "1", "the typed ref is preserved for a retry");
+            }
+            _ => panic!("expected AddWorkspace reopened with an error"),
+        }
+
+        // The first worker's reply releases the latch, so the retry can proceed.
+        app.finish_issue_resolve(1, Err("boom".into()));
+        assert!(app.issue_worker_started.is_none(), "a reply releases the worker latch");
+    }
+
+    #[tokio::test]
+    async fn a_stale_reply_still_releases_the_worker_latch() {
+        // Otherwise Esc + a reply that arrives as stale would wedge the feature
+        // for the rest of the session.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuerelease");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<IssueMsg>();
+        app.issue_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Esc).await;
+
+        app.finish_issue_resolve(1, Ok(kommand0_core::IssueBranch {
+            branch: "issuerelease".into(),
+            reused: true,
+        }));
+        assert!(
+            app.issue_worker_started.is_none(),
+            "the latch is released before the staleness check"
+        );
+        assert!(
+            !app.workspaces.iter().any(|w| w.name == "issuerelease"),
+            "and the stale reply still creates nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_landing_under_a_foreign_modal_changes_nothing() {
+        // Defensive arm: some other modal replaced ours without clearing the
+        // latch. It must not create a workspace, and must leave that modal up.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issueforeign");
+        app.issue_req = Some(5);
+        app.modal = modal::ModalState::ConfirmDelete {
+            target: modal::DeleteTarget::Workspace {
+                id: "x".into(),
+                name: "x".into(),
+                repo: "real".into(),
+            },
+        };
+        app.finish_issue_resolve(5, Ok(kommand0_core::IssueBranch {
+            branch: "issueforeign".into(),
+            reused: true,
+        }));
+
+        assert!(matches!(app.modal, modal::ModalState::ConfirmDelete { .. }), "modal survives");
+        assert!(
+            !app.workspaces.iter().any(|w| w.name == "issueforeign"),
+            "nothing created"
+        );
+        assert!(app.issue_req.is_none(), "the latch is released either way");
+    }
+
+    #[tokio::test]
+    async fn a_failed_issue_reply_reopens_add_workspace_with_the_error() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuefail");
+        app.modal = add_workspace_modal_for("real", "#42");
+        press(&mut app, KeyCode::Enter).await;
+        let req = app.issue_req.unwrap();
+        app.finish_issue_resolve(req, Err("couldn't look up issue 42: boom".into()));
+
+        match &app.modal {
+            modal::ModalState::AddWorkspace { error: Some(e), input, .. } => {
+                assert!(e.contains("couldn't look up issue 42"), "surfaces gh's message: {e}");
+                assert_eq!(input, "#42", "the typed ref is preserved for a retry");
+            }
+            _ => panic!("expected AddWorkspace reopened with an error"),
+        }
+        assert!(!app.workspaces.iter().any(|w| w.repo_id == "real"), "nothing created");
+    }
+
+    #[tokio::test]
+    async fn cancelling_another_modal_does_not_drop_an_in_flight_issue_reply() {
+        // `Cancelled` is returned by every modal. Clearing the latch on all of
+        // them would make one Esc elsewhere discard the real reply as stale.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "issuescope");
+        app.issue_req = Some(1);
+        app.modal = modal::ModalState::ConfirmDelete {
+            target: modal::DeleteTarget::Workspace {
+                id: "x".into(),
+                name: "x".into(),
+                repo: "real".into(),
+            },
+        };
+        press(&mut app, KeyCode::Esc).await;
+
+        assert!(matches!(app.modal, modal::ModalState::None), "the other modal closed");
+        assert_eq!(app.issue_req, Some(1), "the issue latch is untouched");
     }
 
     #[tokio::test]
@@ -8732,6 +9486,59 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn the_resolving_modal_names_its_target_and_keeps_its_footer() {
+        // The modal is 55% wide and 20% high, so both axes bite at the small
+        // end: at 80 columns the first line (41 chars) wraps into a 40-wide
+        // paragraph and would push the remote-write notice out, and at 24 rows
+        // the inner area is 2-3 rows, where a fixed-height message would eat
+        // the footer. The footer is the only thing telling the user Esc does
+        // not undo the remote write, so it must survive everywhere.
+        // (width, height, repo, whether the modal is tall enough to warn)
+        let rows = [
+            (100u16, 30u16, "real", true),
+            (80, 30, "kommand0", true),
+            (80, 24, "kommand0", false),
+        ];
+        for (w, h, repo, expect_warning) in rows {
+            let mut app = test_app();
+            app.modal = modal::ModalState::ResolvingIssue {
+                repo_id: "real".into(),
+                repo_name: repo.into(),
+                issue: "123".into(),
+            };
+            let text = render_to_string(&mut app, w, h);
+            let at = format!("at {w}x{h}");
+            // The full sentence, not just the repo name: a bare `contains(repo)`
+            // is satisfied by the block title alone.
+            assert!(
+                text.contains(&format!("Resolving issue 123 on {repo}'s")),
+                "{at}: names the issue and the repo whose origin is targeted:\n{text}"
+            );
+            assert!(text.contains("stop waiting"), "{at}: footer survives:\n{text}");
+            // The pre-hoc notice that this writes to origin. At 24 rows the
+            // modal is too short for it; the footer is what must not go.
+            assert_eq!(
+                text.contains("may create a new linked branch"),
+                expect_warning,
+                "{at}: warning presence:\n{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_workspace_label_fits_80_columns() {
+        // The modal is 55% wide, so 80 columns is the floor: the label has no
+        // wrap and would clip.
+        let mut app = test_app();
+        app.modal = add_workspace_modal_for("r1", "");
+        let text = render_to_string(&mut app, 80, 30);
+        assert!(
+            text.contains("Name/#issue/URL (blank = from branch):"),
+            "the full label fits at 80 columns:\n{text}"
+        );
+    }
+
+    #[tokio::test]
     async fn confirm_delete_profile_message_wraps() {
         // The profile message carries the workspace/worktree/session counts;
         // it exceeds the modal's inner width and must wrap, not clip.
@@ -9415,6 +10222,502 @@ mod key_tests {
             text.contains("Cleanup blocked:") && text.contains("uncommitted"),
             "shows the refusal reason:\n{text}"
         );
+    }
+
+    /// One worker message, bounded: a hang must fail this test, not wedge the run.
+    async fn recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("worker message within 10s")
+            .expect("channel open")
+    }
+
+    fn delete_item(branch: &str) -> RepoCleanupItem {
+        RepoCleanupItem::Delete { branch: branch.into(), tip: "t".into(), pr: Some(12) }
+    }
+
+    fn skip_item(branch: &str, reason: &str) -> RepoCleanupItem {
+        RepoCleanupItem::Skip { branch: branch.into(), pr: None, reason: reason.into() }
+    }
+
+    /// Point w1 at the real repo as an own-branch workspace on `branch`.
+    fn route_w1_to_real(app: &mut App, wt: &std::path::Path, branch: &str) {
+        app.workspaces[0].repo_id = "real".into();
+        app.workspaces[0].worktree_path = Some(wt.to_string_lossy().into_owned());
+        app.workspaces[0].branch_name = Some(branch.into());
+    }
+
+    #[tokio::test]
+    async fn c_on_repo_row_starts_a_scan_and_reports_over_the_channel() {
+        let mut app = test_app();
+        let tmp = tempfile::TempDir::new().unwrap();
+        app.repos[0].path = tmp.path().join("missing").to_string_lossy().into_owned();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(tx);
+        app.select_repo_row("r1");
+
+        press(&mut app, KeyCode::Char('c')).await;
+        assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("r1"));
+        assert!(
+            !matches!(app.modal, modal::ModalState::ConfirmCleanup { .. }),
+            "a repo row never opens the workspace modal"
+        );
+
+        let msg = recv(&mut rx).await;
+        app.repo_cleanup_inflight = None;
+        match msg {
+            RepoCleanupMsg::Scanned(id, Err(e)) => {
+                assert_eq!(id, "r1");
+                assert_ne!(e, "the scan was interrupted", "the worker ran, not just the drop guard");
+            }
+            other => panic!("expected a failed scan of a missing repo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_result_parks_the_plan_while_input_is_owned_elsewhere() {
+        // (i) A modal owns the keyboard: the plan is parked and announced; the
+        // next `c` on that repo row reviews it without rescanning.
+        let mut app = test_app();
+        app.modal = modal::ModalState::ConfirmCleanup {
+            ws_id: "w1".into(),
+            ws_name: "ws-one".into(),
+            branch: "b".into(),
+            dirty: false,
+            unpushed: false,
+        };
+        app.on_repo_cleanup_scanned("r1".into(), Ok(vec![delete_item("stale")]));
+        assert!(
+            matches!(app.modal, modal::ModalState::ConfirmCleanup { .. }),
+            "the open modal is not replaced"
+        );
+        assert!(matches!(&app.repo_cleanup_pending, Some((id, _)) if id == "r1"));
+        assert!(app.repo_cleanup_result["r1"].0.contains("press c to review"));
+
+        press(&mut app, KeyCode::Char('n')).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(tx);
+        app.select_repo_row("r1");
+        press(&mut app, KeyCode::Char('c')).await;
+        assert!(
+            matches!(app.modal, modal::ModalState::ConfirmRepoCleanup { .. }),
+            "c reviews the parked plan"
+        );
+        assert!(app.repo_cleanup_pending.is_none());
+        assert!(app.repo_cleanup_inflight.is_none(), "no rescan");
+
+        // (ii) Every other input owner parks the plan too.
+        type Owner = fn(&mut App);
+        let owners: [(&str, Owner); 6] = [
+            ("embedded focus", |app| app.focus = Focus::Embedded),
+            ("help", |app| app.show_help = true),
+            ("diff", |app| app.show_diff = true),
+            ("filter input", |app| app.filter_input = true),
+            ("palette", |app| {
+                let candidates = app.palette_candidates();
+                app.palette = Some(palette::Palette::new(candidates));
+            }),
+            ("settings", |app| app.settings = Some(settings::SettingsState::default())),
+        ];
+        for (owner, own) in owners {
+            let mut app = test_app();
+            own(&mut app);
+            app.on_repo_cleanup_scanned("r1".into(), Ok(vec![delete_item("stale")]));
+            assert!(!app.modal.is_active(), "{owner}: parked, not opened over it");
+            assert!(app.repo_cleanup_pending.is_some(), "{owner}: the plan is kept");
+        }
+
+        // (iii) `c` on another repo drops the parked plan, and its "press c to
+        // review" line with it, then scans that repo.
+        let mut app = test_app();
+        let tmp = tempfile::TempDir::new().unwrap();
+        app.repos[1].path = tmp.path().join("missing").to_string_lossy().into_owned();
+        app.repo_cleanup_pending = Some(("r1".into(), vec![delete_item("stale")]));
+        app.repo_cleanup_result.insert("r1".into(), ("Scan done: press c to review".into(), false));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(tx);
+        app.select_repo_row("r2");
+        press(&mut app, KeyCode::Char('c')).await;
+        assert!(app.repo_cleanup_pending.is_none());
+        assert!(!app.repo_cleanup_result.contains_key("r1"), "the stale review hint is gone");
+        assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("r2"));
+    }
+
+    #[tokio::test]
+    async fn repo_cleanup_scan_result_opens_the_modal_or_reports_idle() {
+        let mut app = test_app();
+        app.on_repo_cleanup_scanned("r1".into(), Ok(vec![skip_item("main", "default branch")]));
+        assert!(!app.modal.is_active(), "nothing actionable opens no modal");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Nothing to clean up (1 skipped)"), "{text}");
+
+        let mut app = test_app();
+        app.on_repo_cleanup_scanned(
+            "r1".into(),
+            Ok(vec![
+                delete_item("stale"),
+                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "ws-one".into(), pr: Some(13) },
+                skip_item("wip", "no PR"),
+            ]),
+        );
+        assert!(app.modal.is_active());
+        let text = render_to_string(&mut app, 100, 30);
+        for needle in [
+            " Clean Up Repo alpha ",
+            "1 to delete, 1 via workspace cleanup, 1 skipped",
+            "stale",
+            "workspace ws-one",
+            "skip: no PR",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
+        press(&mut app, KeyCode::Char('n')).await;
+        assert!(!app.modal.is_active(), "n closes the preview");
+    }
+
+    #[tokio::test]
+    async fn repo_cleanup_modal_rows_fit_at_80_100_and_40_cols() {
+        let long_branch = format!("feature/{}", "x".repeat(33)); // 41 chars
+        let cjk_branch = "\u{6f22}".repeat(20); // 20 chars, 40 cells
+        let action = "workspace w1 [dirty] [unpushed] [live]";
+        let open = || {
+            let mut app = test_app();
+            app.workspaces[0].name = "w1".into();
+            app.branch_status.insert(
+                "w1".into(),
+                kommand0_core::BranchStatus { dirty: true, ahead: 1, ..Default::default() },
+            );
+            app.embedded.insert(
+                "w1".to_string(),
+                WorkspaceSessions {
+                    tabs: vec![tab("s1", &["-c", "sleep 30"])],
+                    active: 0,
+                    last_active: None,
+                },
+            );
+            app.open_repo_cleanup_modal(
+                "r1".into(),
+                vec![
+                    delete_item("stale"),
+                    RepoCleanupItem::Workspace {
+                        ws_id: "w1".into(),
+                        branch: long_branch.clone(),
+                        pr: Some(7),
+                    },
+                    skip_item("wip", "no PR"),
+                    RepoCleanupItem::Workspace {
+                        ws_id: "w1".into(),
+                        branch: cjk_branch.clone(),
+                        pr: Some(8),
+                    },
+                ],
+            );
+            app
+        };
+
+        for (cols, rows) in [(100u16, 30u16), (80, 24)] {
+            let mut app = open();
+            let text = render_to_string(&mut app, cols, rows);
+            // The modal geometry: 80% wide, border + 1 col of padding on each side.
+            let width = cols as usize * 80 / 100;
+            let inner_x = (cols as usize - width) / 2 + 2;
+            let inner_w = width - 4;
+            let branch_w = inner_w.saturating_sub(8 + action.len()).clamp(10, 30);
+            let line = text
+                .lines()
+                .find(|l| l.contains(action))
+                .unwrap_or_else(|| panic!("full action visible at {cols} cols:\n{text}"));
+            let cell: String = line.chars().skip(inner_x).take(branch_w).collect();
+            assert!(cell.ends_with('…'), "branch truncated with an ellipsis at {cols} cols: {cell:?}");
+            assert_eq!(
+                line.chars().nth(inner_x + branch_w),
+                Some(' '),
+                "the branch cell is exactly {branch_w} cells at {cols} cols:\n{line}"
+            );
+            assert!(line.contains(&format!("#7     {action}")), "pr column, then the action:\n{line}");
+            // A wide branch is padded by display width (one cell per char in
+            // the buffer text), so the action is not pushed off the row.
+            let cjk = text
+                .lines()
+                .find(|l| l.contains('\u{6f22}'))
+                .unwrap_or_else(|| panic!("CJK row visible at {cols} cols:\n{text}"));
+            let pr_at = cjk.find("#8").expect("pr column");
+            assert_eq!(
+                cjk[..pr_at].chars().count(),
+                inner_x + branch_w + 1,
+                "the CJK branch cell is exactly {branch_w} cells at {cols} cols:\n{cjk}"
+            );
+            assert!(
+                cjk.contains(&format!("#8     {action}")),
+                "the action survives a wide branch:\n{cjk}"
+            );
+        }
+
+        let mut app = open();
+        let text = render_to_string(&mut app, 40, 12);
+        assert!(text.contains("cancel"), "does not panic on a tiny terminal:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn repo_cleanup_modal_caps_rows_with_an_exact_more_marker() {
+        let mut app = test_app();
+        let mut items = vec![delete_item("stale")];
+        items.extend((0..40).map(|i| skip_item(&format!("skip-{i:02}"), "no PR")));
+        app.open_repo_cleanup_modal("r1".into(), items);
+
+        // 41 rows + 5 = 46 > 22 (24 - 2): height 22, interior 20, rows area 17,
+        // so 16 rows show and the marker takes the last line.
+        let text = render_to_string(&mut app, 100, 24);
+        assert!(text.contains("skip-14"), "{text}");
+        assert!(!text.contains("skip-15"), "{text}");
+        assert!(text.contains("+25 more: kmd repo cleanup alpha --dry-run lists all"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn y_in_repo_cleanup_modal_routes_workspaces_and_spawns_the_delete() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "release");
+        let wt = tempfile::TempDir::new().unwrap();
+        route_w1_to_real(&mut app, &wt.path().join("wt"), "main");
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cleanup_tx = Some(cleanup_tx);
+        let (repo_tx, mut repo_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(repo_tx);
+        app.open_repo_cleanup_modal(
+            "real".into(),
+            vec![
+                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into(), pr: Some(1) },
+                RepoCleanupItem::Delete {
+                    branch: "stale".into(),
+                    tip: "0000000000000000000000000000000000000000".into(),
+                    pr: Some(2),
+                },
+            ],
+        );
+
+        press(&mut app, KeyCode::Char('y')).await;
+
+        assert!(app.cleanup_inflight.contains("w1"), "the workspace row is routed");
+        let (ws_id, result) = recv(&mut cleanup_rx).await;
+        assert_eq!(ws_id, "w1");
+        assert!(
+            result.unwrap_err().contains("default branch"),
+            "the workspace gate fires before any gh spawn"
+        );
+
+        assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("real"));
+        let msg = recv(&mut repo_rx).await;
+        app.repo_cleanup_inflight = None;
+        match msg {
+            RepoCleanupMsg::Deleted(id, results) => {
+                assert_eq!(id, "real");
+                assert_eq!(results, vec![("stale".to_string(), Err("moved since scan".to_string()))]);
+                app.on_repo_cleanup_deleted(id, results);
+            }
+            other => panic!("expected the delete results, got {other:?}"),
+        }
+        assert_eq!(
+            app.repo_cleanup_result["real"],
+            ("Deleted 0 of 1 branches; failed: stale (moved since scan)".to_string(), true)
+        );
+        app.on_repo_cleanup_deleted("real".into(), vec![("a".into(), Ok(())), ("b".into(), Ok(()))]);
+        assert_eq!(app.repo_cleanup_result["real"], ("Deleted 2 branches".to_string(), false));
+    }
+
+    #[tokio::test]
+    async fn y_routes_workspaces_with_one_shared_capture_grace() {
+        // Two routed workspaces, each with a live TERM-ignoring opencode tab
+        // (the kind whose exit hint gets captured): the teardown capture must
+        // wait ONE grace for the set, not one per workspace.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "release");
+        let wt = tempfile::TempDir::new().unwrap();
+        route_w1_to_real(&mut app, &wt.path().join("a"), "main");
+        app.workspaces.push(Workspace {
+            working_dir: wt.path().join("b").to_string_lossy().into_owned(),
+            worktree_path: Some(wt.path().join("b").to_string_lossy().into_owned()),
+            ..mk_ws("w2", "ws-two", "real", Some("main"))
+        });
+        for (ws, tab_id) in [("w1", "opencode:tab-1"), ("w2", "opencode:tab-2")] {
+            let mut oc = tab(tab_id, &["-c", "trap '' TERM; printf READY; sleep 60"]);
+            oc.kind = TabKind::Opencode;
+            wait_screen_contains(&oc.pane, "READY");
+            app.embedded.insert(
+                ws.to_string(),
+                WorkspaceSessions { tabs: vec![oc], active: 0, last_active: None },
+            );
+        }
+        let (cleanup_tx, _cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cleanup_tx = Some(cleanup_tx);
+        app.open_repo_cleanup_modal(
+            "real".into(),
+            vec![
+                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into(), pr: Some(1) },
+                RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "main".into(), pr: Some(2) },
+            ],
+        );
+
+        let start = Instant::now();
+        press(&mut app, KeyCode::Char('y')).await;
+        let elapsed = start.elapsed();
+
+        assert!(elapsed >= TEARDOWN_CAPTURE_GRACE, "the grace was paid, so the tabs were in scope ({elapsed:?})");
+        assert!(elapsed < 2 * TEARDOWN_CAPTURE_GRACE, "paid once, not per workspace ({elapsed:?})");
+        assert!(app.cleanup_inflight.contains("w1") && app.cleanup_inflight.contains("w2"));
+    }
+
+    #[tokio::test]
+    async fn repo_cleanup_threads_the_protected_list_from_the_config_file() {
+        // A non-default name, so the built-in list cannot mask a missing read.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "release");
+        std::fs::write(&app.config_path, r#"{ "protected_branches": ["release"] }"#).unwrap();
+        let (repo_tx, mut repo_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(repo_tx);
+
+        app.start_repo_cleanup_scan("real");
+        let msg = recv(&mut repo_rx).await;
+        app.repo_cleanup_inflight = None;
+        match msg {
+            RepoCleanupMsg::Scanned(_, Ok(items)) => assert_eq!(
+                items,
+                vec![
+                    skip_item("main", "default branch"),
+                    skip_item("release", "protected branch"),
+                ],
+                "nothing reached gh"
+            ),
+            other => panic!("expected a successful scan, got {other:?}"),
+        }
+
+        // The workspace cleanup reads the same file.
+        let wt = tempfile::TempDir::new().unwrap();
+        route_w1_to_real(&mut app, &wt.path().join("wt"), "release");
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cleanup_tx = Some(cleanup_tx);
+        app.start_cleanup("w1");
+        let (_, result) = recv(&mut cleanup_rx).await;
+        assert!(result.unwrap_err().contains("protected branch"));
+
+        // An unparseable file blocks the scan instead of degrading to the default list.
+        std::fs::write(&app.config_path, "{ bad").unwrap();
+        app.start_repo_cleanup_scan("real");
+        let msg = recv(&mut repo_rx).await;
+        app.repo_cleanup_inflight = None;
+        match msg {
+            RepoCleanupMsg::Scanned(_, Err(e)) => assert!(e.contains("invalid"), "{e}"),
+            other => panic!("expected a blocked scan, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_detail_shows_the_cleanup_spinner_and_result_line() {
+        let mut app = test_app();
+        app.repo_cleanup_inflight = Some("r1".into());
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Cleaning up"), "in-flight shows progress:\n{text}");
+
+        assert!(!text.contains("[Clean up branches]"), "the button yields to the spinner:\n{text}");
+
+        app.repo_cleanup_inflight = None;
+        app.repo_cleanup_result.insert("r1".into(), ("Cleanup failed: boom".into(), true));
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Cleanup failed: boom"), "shows the outcome:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn palette_clean_up_branches_entry_starts_the_repo_scan() {
+        let mut app = test_app();
+        let tmp = tempfile::TempDir::new().unwrap();
+        app.repos[0].path = tmp.path().join("missing").to_string_lossy().into_owned();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(tx);
+        app.select_repo_row("r2");
+        let candidates = app.palette_candidates();
+        app.palette = Some(palette::Palette::new(candidates));
+
+        for ch in "branches alpha".chars() {
+            press(&mut app, KeyCode::Char(ch)).await;
+        }
+        assert_eq!(
+            app.palette.as_ref().unwrap().selected_action(),
+            Some(&palette::PaletteAction::CleanupRepo { repo_id: "r1".into() }),
+            "the verb + repo name narrows to the repo entry, not ws-one's cleanup"
+        );
+
+        press(&mut app, KeyCode::Enter).await;
+        assert!(app.palette.is_none());
+        assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("r1"));
+        assert!(
+            matches!(app.tree_items.get(app.selected_index), Some(TreeNode::Repo { id, .. }) if id == "r1"),
+            "the repo row is selected so the scan's feedback lands on it"
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_clean_up_branches_queues_the_repo_cleanup() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app(); // the alpha repo row is selected
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("[Clean up branches]"), "{text}");
+        let action = buttons::HitAction::CleanupRepoFor { repo_id: "r1".into() };
+        let region = app
+            .hit_regions
+            .iter()
+            .find(|r| r.action == action)
+            .cloned()
+            .expect("the button has a hit region");
+
+        mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: region.area.x,
+                row: region.area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.pending_button_action, Some(action));
+    }
+
+    #[tokio::test]
+    async fn detail_pane_button_hit_regions_cover_their_labels() {
+        // A repo row offers [Clean up branches]; an own-branch workspace with no
+        // live session offers [Open Claude] and [Clean up].
+        let mut repo_app = test_app();
+        let mut ws_app = test_app();
+        ws_app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+        ws_app.workspaces[0].branch_name = Some("ws-one".into());
+        ws_app.expanded.insert("r1".to_string());
+        ws_app.rebuild_tree();
+        ws_app.select_workspace_row("w1");
+
+        let mut checked = 0;
+        for app in [&mut repo_app, &mut ws_app] {
+            let text = render_to_string(app, 100, 30);
+            for region in &app.hit_regions {
+                let label = match &region.action {
+                    buttons::HitAction::CleanupRepoFor { .. } => "Clean up branches",
+                    buttons::HitAction::CleanupWorkspaceFor { .. } => "Clean up",
+                    buttons::HitAction::StartSession => "Open Claude",
+                    _ => continue,
+                };
+                let row = text.lines().nth(region.area.y as usize).unwrap_or_default();
+                let cells: String = row
+                    .chars()
+                    .skip(region.area.x as usize)
+                    .take(region.area.width as usize)
+                    .collect();
+                assert_eq!(
+                    cells,
+                    format!("[{label}]"),
+                    "{:?} region at x={} on row {}:\n{row}",
+                    region.action, region.area.x, region.area.y
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 3, "one repo button and two workspace buttons");
     }
 
     #[tokio::test]

@@ -17,6 +17,86 @@ All notable changes to kommand0 are documented here. The format is based on
   before; to run a tree action on a running workspace after clicking it, press
   `Ctrl+]` (or `Ctrl+A t`) first.
 
+## [0.29.0] - 2026-09-25
+
+### Added
+
+- **Repo-level cleanup of merged-PR branches.** `c` on a repo row in the TUI
+  scans the repo's local branches off the render loop (one `gh pr list` per
+  branch), previews the plan in a `Clean Up Repo` modal and, on `y`, deletes
+  every branch whose PR is merged and whose tip is exactly the merged commit.
+  Branches that belong to a kommand0 workspace are routed through the existing
+  workspace cleanup (one shared pane-capture grace for the set); a branch
+  checked out elsewhere is skipped with its path. The outcome lands in the repo
+  detail pane, and a scan that finishes while something else owns the keyboard
+  is parked and reviewed on the next `c` instead of stealing the screen. The
+  repo detail pane also offers a clickable `[Clean up branches]` button, and
+  the palette lists a `Clean up branches: <repo>` entry per repo. The
+  same flow is `kmd repo cleanup <repo> [--dry-run] [--force]` on the CLI:
+  `--dry-run` prints the BRANCH / PR / ACTION table only, a non-interactive run
+  needs `--force`, and the exit code is 1 when any item failed.
+- **`protected_branches` config key**: exact branch names neither cleanup
+  deletes. Default `develop`, `development`, `staging`; a configured list
+  replaces it, so `[]` disables it, while `main`/`master`/`origin/HEAD` stay
+  refused regardless. `--force` never bypasses it.
+
+### Changed
+
+- **Workspace cleanup honors `protected_branches`** (default
+  `develop`/`development`/`staging`), re-reads `config.json` when it runs and
+  aborts on an unparseable or unreadable file instead of degrading to the
+  default list, and refuses a worktree whose HEAD is no longer on the
+  workspace's branch, since removing it would take the other branch's checkout
+  with it.
+
+### Fixed
+
+- **The help overlay now names the command palette.** The `:` row read "Go to
+  workspace", a leftover from when the palette only jumped to workspaces; it now
+  reads "Command palette: go to / actions".
+
+- Clicking the first cell of a detail-pane button (`[Open Claude]`,
+  `[Clean up]`, `[Clean up branches]`) now registers; the hit regions were
+  shifted one column to the right of the rendered label.
+
+## [0.28.0] - 2026-09-24
+
+### Added
+
+- **Create a workspace straight from a GitHub issue.** Type an issue reference (`123`,
+  `#123`, or an issue URL) into the Add Workspace **Name** field, or pass
+  `kmd workspace create --issue <ref>` (a positional name is detected the same way):
+  `gh issue develop` adopts the issue's linked branch or creates one on `origin`, and the
+  workspace is named after it. The lookup runs off the render loop behind a dialog you can
+  Esc out of, and every failure reports gh's own reason rather than quietly forking a
+  local branch. Esc stops the waiting, not the lookup, so a resubmit is held until the
+  running one lands (two concurrent lookups could otherwise link two branches to the
+  same issue). A linked branch that lives in another repository is refused rather than
+  matched by name against `origin`. gh is pinned to `origin` whenever its URL names a
+  repo, port included; where it doesn't
+  and another remote could be picked instead, kommand0 refuses rather than write to a repo
+  you didn't name. On a `--single-branch` clone the linked branch is outside `origin`'s
+  refspec, so kommand0 adds it to `remote.origin.fetch` in your repo's git config: one
+  line per issue branch, left in place afterwards.
+
+### Changed
+
+- **An all-digit workspace name now means an issue.** In the TUI's Add Workspace dialog, a
+  Name like `2024` creates the workspace on the branch GitHub links to issue 2024 instead
+  of a workspace called `2024`; fill the **Branch** field to get a plain workspace on a
+  named branch. `kmd workspace create <digits> --repo x` changes the same way, with
+  `--fork`, `--no-worktree` or `--branch` to keep the old behaviour.
+
+### Fixed
+
+- **A stray `GH_REPO` no longer retargets kommand0's `gh` calls.** It overrides the
+  repository gh would infer from your remotes, so PR/CI status and the merged-PR
+  cleanup could read a different repository than the one you're in.
+- **`core.sshCommand` is honoured again when kommand0 fetches or calls `gh`.** Forcing
+  ssh into batch mode used to replace a repo-scoped identity with the default key, so
+  on an SSH origin with `core.sshCommand` set the issue fetch failed with
+  `Permission denied` *after* the linked branch had already been created.
+
 ## [0.27.3] - 2026-09-20
 
 ### Fixed
@@ -882,7 +962,9 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.27.3...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/cstuncsik/kommand0/compare/v0.28.0...v0.29.0
+[0.28.0]: https://github.com/cstuncsik/kommand0/compare/v0.27.3...v0.28.0
 [0.27.3]: https://github.com/cstuncsik/kommand0/compare/v0.27.2...v0.27.3
 [0.27.2]: https://github.com/cstuncsik/kommand0/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/cstuncsik/kommand0/compare/v0.27.0...v0.27.1

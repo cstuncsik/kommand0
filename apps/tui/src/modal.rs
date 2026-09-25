@@ -1,11 +1,14 @@
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthStr;
+
+use kommand0_core::RepoCleanupItem;
 
 use super::theme::Theme;
 
@@ -70,6 +73,14 @@ impl AddWorkspaceField {
     }
 }
 
+/// One preview row: rendered as `<branch> <pr> <action>` with the branch column
+/// sized to the width left over, so the action is never pushed off-screen.
+pub(crate) struct RepoCleanupRow {
+    pub branch: String,
+    pub pr: String,
+    pub action: String,
+}
+
 /// Modal dialog state.
 #[derive(Default)]
 pub(crate) enum ModalState {
@@ -111,12 +122,27 @@ pub(crate) enum ModalState {
         dirty: bool,
         unpushed: bool,
     },
+    /// Preview of a repo's merged-branch scan; `y` hands `plan` back to the app.
+    ConfirmRepoCleanup {
+        repo_id: String,
+        repo_name: String,
+        summary: String,
+        rows: Vec<RepoCleanupRow>,
+        plan: Vec<RepoCleanupItem>,
+    },
     /// A branch named `name` already exists (local or origin); offer to check it
     /// out instead of forking a fresh branch (which would be suffixed `-2`, …).
     ConfirmBranchCheckout {
         repo_id: String,
         repo_name: String,
         name: String,
+    },
+    /// A `gh issue develop` lookup is in flight for `issue`. Nothing is
+    /// editable: Esc stops kommand0 waiting, every other key is swallowed.
+    ResolvingIssue {
+        repo_id: String,
+        repo_name: String,
+        issue: String,
     },
 }
 
@@ -143,6 +169,8 @@ pub(crate) enum ModalResult {
     SubmitRename(String, String, String),
     /// Cleanup confirmed for a workspace id.
     ConfirmCleanup(String),
+    /// Repo cleanup confirmed: (repo_id, the plan to execute).
+    ConfirmRepoCleanup(String, Vec<RepoCleanupItem>),
     /// Choice from the branch-exists prompt: check out the existing branch when
     /// `checkout`, else fork a fresh (suffixed) branch.
     BranchCheckoutChoice { repo_id: String, name: String, checkout: bool },
@@ -429,6 +457,22 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
             }
             _ => ModalResult::Consumed,
         },
+        ModalState::ConfirmRepoCleanup { repo_id, plan, .. } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let result = ModalResult::ConfirmRepoCleanup(repo_id.clone(), std::mem::take(plan));
+                *modal = ModalState::None;
+                result
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                *modal = ModalState::None;
+                ModalResult::Cancelled
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                *modal = ModalState::None;
+                ModalResult::Cancelled
+            }
+            _ => ModalResult::Consumed,
+        },
         ModalState::ConfirmBranchCheckout { repo_id, name, .. } => {
             match key.code {
                 // Ctrl+C cancels (every modal treats it so). Guard arms are tried
@@ -454,6 +498,18 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                 _ => ModalResult::Consumed,
             }
         }
+        ModalState::ResolvingIssue { .. } => match key.code {
+            KeyCode::Esc => {
+                *modal = ModalState::None;
+                ModalResult::Cancelled
+            }
+            // Ctrl+C cancels in every modal; keep that here too.
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                *modal = ModalState::None;
+                ModalResult::Cancelled
+            }
+            _ => ModalResult::Consumed,
+        },
     }
 }
 
@@ -522,7 +578,9 @@ pub(crate) fn handle_modal_paste(modal: &mut ModalState, text: &str) {
         ModalState::None
         | ModalState::ConfirmDelete { .. }
         | ModalState::ConfirmCleanup { .. }
-        | ModalState::ConfirmBranchCheckout { .. } => {
+        | ModalState::ConfirmRepoCleanup { .. }
+        | ModalState::ConfirmBranchCheckout { .. }
+        | ModalState::ResolvingIssue { .. } => {
             return;
         }
     };
@@ -813,7 +871,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
 
             // Name field — the cursor is drawn only on the focused field.
             frame.render_widget(
-                Paragraph::new(Line::styled("Workspace name (blank = from branch):", lbl(name_focused))),
+                Paragraph::new(Line::styled("Name/#issue/URL (blank = from branch):", lbl(name_focused))),
                 inner[0],
             );
             if name_focused {
@@ -1038,6 +1096,86 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[5],
             );
         }
+        ModalState::ConfirmRepoCleanup { repo_name, summary, rows, .. } => {
+            // Content-sized: border 2 + summary 1 + blank 1 + footer 1 around the rows.
+            let height = (rows.len() + 5).min(frame.area().height.saturating_sub(2) as usize);
+            let area = frame
+                .area()
+                .centered(Constraint::Percentage(80), Constraint::Length(height as u16));
+            frame.render_widget(Clear, area);
+
+            let inner = Layout::vertical([
+                Constraint::Length(1), // summary
+                Constraint::Length(1), // blank
+                Constraint::Min(0),   // rows
+                Constraint::Length(1), // footer
+            ])
+            .split(area.inner(Margin::new(2, 1)));
+
+            frame.render_widget(
+                Block::default()
+                    .title(format!(" Clean Up Repo {repo_name} "))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(th.dirty)),
+                area,
+            );
+
+            // No `.wrap()` anywhere below: a wrapping row would break the cap
+            // math and could hide the `+N more` marker, so long text clips.
+            frame.render_widget(
+                Paragraph::new(Line::styled(summary.as_str(), Style::default().fg(th.text))),
+                inner[0],
+            );
+
+            // ponytail: fixed cap with a "+N more" marker; a scrollable list if a
+            // real repo overflows a 24-row terminal.
+            let cap = inner[2].height as usize;
+            let shown = if rows.len() <= cap { rows.len() } else { cap.saturating_sub(1) };
+            let visible = &rows[..shown];
+            let action_max = visible
+                .iter()
+                .map(|r| UnicodeWidthStr::width(r.action.as_str()))
+                .max()
+                .unwrap_or(0);
+            // 8 = the pr column (6) plus its two separating spaces; the branch
+            // column takes what is left, truncating before the action ever clips.
+            let branch_w = (inner[2].width as usize).saturating_sub(8 + action_max).clamp(10, 30);
+            let mut lines: Vec<Line> = visible
+                .iter()
+                .map(|r| {
+                    // Pad by display width: `{:<w$}` counts chars, so a wide
+                    // branch would push the action off the row.
+                    let branch = super::render::ellipsize(&r.branch, branch_w);
+                    let pad = " ".repeat(
+                        branch_w.saturating_sub(UnicodeWidthStr::width(branch.as_str())),
+                    );
+                    Line::styled(
+                        format!("{branch}{pad} {:<6} {}", r.pr, r.action),
+                        Style::default().fg(th.text),
+                    )
+                })
+                .collect();
+            if shown < rows.len() {
+                lines.push(Line::styled(
+                    format!(
+                        "+{} more: kmd repo cleanup {repo_name} --dry-run lists all",
+                        rows.len() - shown
+                    ),
+                    Style::default().fg(th.muted),
+                ));
+            }
+            frame.render_widget(Paragraph::new(lines), inner[2]);
+
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("y", Style::default().fg(th.dirty).add_modifier(Modifier::BOLD)),
+                    Span::raw(": clean up  "),
+                    Span::styled("n/Esc", Style::default().fg(th.accent)),
+                    Span::raw(": cancel"),
+                ])),
+                inner[3],
+            );
+        }
         ModalState::ConfirmBranchCheckout { repo_name, name, .. } => {
             let area = centered_rect(55, 20, frame.area());
             frame.render_widget(Clear, area);
@@ -1077,6 +1215,59 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                     Span::raw(" fork a new branch   ".to_string()),
                     Span::styled("Esc", Style::default().fg(th.accent)),
                     Span::raw(" cancel"),
+                ])),
+                inner[2],
+            );
+        }
+        ModalState::ResolvingIssue { repo_name, issue, .. } => {
+            let area = centered_rect(55, 20, frame.area());
+            frame.render_widget(Clear, area);
+
+            let inner = Layout::vertical([
+                // Three rows, not two: at 80 columns the first line wraps, and
+                // the remote-write notice below it must not be pushed out. The
+                // footer still survives a short terminal (checked down to 16
+                // rows): when the three rows don't fit, the solver shrinks this
+                // one rather than dropping the trailing `Length(1)`.
+                Constraint::Length(3), // message
+                Constraint::Min(0),   // spacer
+                Constraint::Length(1), // footer
+            ])
+            .split(Rect::new(
+                area.x + 2,
+                area.y + 1,
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(2),
+            ));
+
+            let block = Block::default()
+                .title(format!(" Add Workspace to {repo_name} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th.accent));
+            frame.render_widget(block, area);
+
+            // Name the target: this can perform a remote write.
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(
+                        format!("Resolving issue {issue} on {repo_name}'s origin."),
+                        Style::default().fg(th.text),
+                    ),
+                    Line::styled(
+                        "GitHub may create a new linked branch.",
+                        Style::default().fg(th.muted),
+                    ),
+                ])
+                .wrap(Wrap { trim: true }),
+                inner[0],
+            );
+
+            // Esc does NOT cancel the remote operation, so the footer must not
+            // imply it does.
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Esc", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+                    Span::raw(" stop waiting"),
                 ])),
                 inner[2],
             );
@@ -1238,6 +1429,16 @@ mod tests {
         };
         handle_modal_paste(&mut modal, "ignored");
         assert!(matches!(modal, ModalState::ConfirmDelete { .. }));
+
+        let mut modal = ModalState::ConfirmRepoCleanup {
+            repo_id: "r1".into(),
+            repo_name: "demo".into(),
+            summary: String::new(),
+            rows: vec![],
+            plan: vec![],
+        };
+        handle_modal_paste(&mut modal, "ignored");
+        assert!(matches!(modal, ModalState::ConfirmRepoCleanup { .. }));
     }
 
     #[test]
@@ -1422,6 +1623,33 @@ mod tests {
         let mut modal = confirm_branch_checkout_modal();
         assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Char('n'))), ModalResult::Consumed), "n is a no-op");
         assert!(matches!(modal, ModalState::ConfirmBranchCheckout { .. }), "n leaves the prompt open");
+    }
+
+    #[test]
+    fn resolving_issue_esc_cancels_and_other_keys_are_consumed() {
+        let resolving = || ModalState::ResolvingIssue {
+            repo_id: "r1".into(),
+            repo_name: "demo".into(),
+            issue: "123".into(),
+        };
+        let mut modal = resolving();
+        assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Esc)), ModalResult::Cancelled));
+        assert!(matches!(modal, ModalState::None), "Esc closes the modal");
+
+        let mut modal = resolving();
+        let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(handle_modal_key(&mut modal, ev), ModalResult::Cancelled));
+        assert!(matches!(modal, ModalState::None), "Ctrl+C closes the modal");
+
+        // Nothing is editable while the lookup is in flight.
+        for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Tab, KeyCode::Backspace] {
+            let mut modal = resolving();
+            assert!(
+                matches!(handle_modal_key(&mut modal, key(code)), ModalResult::Consumed),
+                "{code:?} is swallowed"
+            );
+            assert!(matches!(modal, ModalState::ResolvingIssue { .. }), "{code:?} leaves it open");
+        }
     }
 
     #[test]

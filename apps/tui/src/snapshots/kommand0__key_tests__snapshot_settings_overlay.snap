@@ -1,6 +1,6 @@
 ---
 source: apps/tui/src/main.rs
-assertion_line: 6414
+assertion_line: 8940
 expression: "render_to_string(&mut app, 100, 30)"
 ---
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
@@ -19,10 +19,10 @@ expression: "render_to_string(&mut app, 100, 30)"
 │    status_refresh_secs   (default)                                                               │
 │    tree_width_pct        (default)                                                               │
 │                                                                                                  │
-│    keybindings / theme_colors: edit /home/user/.config/kommand0/config.json                      │
+│    keybindings / theme_colors / protected_branches:                                              │
+│      edit /home/user/.config/kommand0/config.json                                                │
 │                                                                                                  │
 │    j/k move · Enter edit · Esc close                                                             │
-│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
