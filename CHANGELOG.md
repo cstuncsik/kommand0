@@ -5,6 +5,29 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cleanup no longer calls the GitHub API, so a rate limit can't stop it.**
+  The repo scan ran one `gh pr list` per branch and aborted on the first
+  failure (`API rate limit exceeded`) in repos with many branches. Both
+  cleanups now decide "merged" from local git: a branch is merged when its
+  changes are already on the default branch, by a merge commit, or by a squash
+  (or a one-commit rebase) that replays to exactly the commit on the default
+  branch. Squash detection needs git 2.38 or newer. A branch with no commits
+  of its own, including one just created at a merged tip, never qualifies. The
+  repo scan fetches the default branch first and, when that fails, says so
+  once (the detail pane, the preview, or a `kmd` warning); the workspace
+  cleanup fetches only when the local copy says not merged. That fetch, shared
+  with issue branches, no longer pulls tags, and a failed fetch now shows
+  git's own error line.
+
+### Changed
+
+- **Both cleanups need a default branch** (`origin/HEAD`, `origin/main`,
+  `origin/master`, `main` or `master`) and stop with an error without one.
+  `kmd repo cleanup --dry-run` fetches the default branch too, and the plan
+  table drops its PR column (BRANCH / ACTION), as does the TUI preview.
+
 ## [0.29.1] - 2026-09-25
 
 ### Changed
