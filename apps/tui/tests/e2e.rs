@@ -1357,12 +1357,28 @@ fn run_git(cwd: &std::path::Path, args: &[&str]) {
     assert!(ok, "git {args:?} in {cwd:?} failed");
 }
 
+/// Give `branch` one commit of its own in `dir` (its worktree, or the repo
+/// itself, which switches to it and back), then squash-merge it into main.
+fn squash_merge(repo: &std::path::Path, dir: &std::path::Path, branch: &str) {
+    if dir == repo {
+        run_git(repo, &["switch", branch]);
+    }
+    std::fs::write(dir.join("work.txt"), branch).unwrap();
+    run_git(dir, &["add", "."]);
+    run_git(dir, &["commit", "-m", "work"]);
+    if dir == repo {
+        run_git(repo, &["switch", "main"]);
+    }
+    run_git(repo, &["merge", "--squash", branch]);
+    run_git(repo, &["commit", "-m", &format!("squash {branch}")]);
+}
+
 #[test]
 fn c_cleans_up_a_merged_workspace() {
     // A real repo + worktree on a LEGACY `kommand0/`-prefixed branch (regression
     // guard: workspaces created before the prefix was dropped must keep cleaning
-    // up); `gh` (stubbed) reports the PR merged, so confirming cleanup removes
-    // the worktree + branch and drops the workspace from the tree.
+    // up), squash-merged into main, so confirming cleanup removes the worktree
+    // + branch and drops the workspace from the tree.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let repo = root.join("repo");
@@ -1376,6 +1392,7 @@ fn c_cleans_up_a_merged_workspace() {
     run_git(&repo, &["add", "."]);
     run_git(&repo, &["commit", "-m", "init"]);
     run_git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "kommand0/demo-ws"]);
+    squash_merge(&repo, &wt, "kommand0/demo-ws");
 
     let state = serde_json::json!({
         "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
@@ -1388,7 +1405,7 @@ fn c_cleans_up_a_merged_workspace() {
     })
     .to_string();
 
-    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "gh-stub-merged")]);
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "false")]);
     tui.wait_for("demo");
     tui.send("l");
     tui.wait_for("demo-ws");
@@ -1406,9 +1423,9 @@ fn c_cleans_up_a_merged_workspace() {
 
 #[test]
 fn c_on_a_repo_row_cleans_up_merged_branches() {
-    // A repo with a plain `stale` branch (no workspace) whose PR the stubbed gh
-    // reports merged: `c` on the repo row scans in the background, the preview
-    // opens, `y` deletes the branch and the repo detail line reports it (the
+    // A repo with a plain `stale` branch (no workspace) squash-merged into
+    // main: `c` on the repo row scans in the background, the preview opens,
+    // `y` deletes the branch and the repo detail line reports it (the
     // worker -> channel -> select! path has no other automated coverage).
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
@@ -1419,6 +1436,7 @@ fn c_on_a_repo_row_cleans_up_merged_branches() {
     run_git(&repo, &["config", "commit.gpgsign", "false"]);
     run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
     run_git(&repo, &["branch", "stale"]);
+    squash_merge(&repo, &repo, "stale");
 
     let state = serde_json::json!({
         "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
@@ -1427,7 +1445,7 @@ fn c_on_a_repo_row_cleans_up_merged_branches() {
     })
     .to_string();
 
-    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "gh-stub-merged")]);
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "false")]);
     tui.wait_for("demo");
     tui.send("c"); // repo row selected: scan -> preview modal
     tui.wait_for("Clean Up Repo");

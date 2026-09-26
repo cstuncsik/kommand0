@@ -6,11 +6,13 @@
 //! returns `None` (rather than erroring) when the directory isn't a git repo,
 //! so the caller can run it across every workspace without special-casing.
 //!
-//! [`cleanup_merged_workspace`] removes a merged workspace's worktree and branch
-//! via the `gh` CLI. It runs synchronously and is meant to be called off the UI
-//! thread (it makes a network call). [`scan_merged_branches`] and
-//! [`delete_branches`] are its repo-wide counterpart: a verdict per local branch
-//! (one gh call each), then a local delete that re-checks every gate.
+//! [`cleanup_merged_workspace`] removes a merged workspace's worktree and branch,
+//! where merged means its changes are already on the default branch. That is
+//! decided from local git, with no GitHub API call (`gh pr list`), after at most
+//! one bounded fetch of the default branch. It runs synchronously and is meant
+//! to be called off the UI thread. [`scan_merged_branches`] and
+//! [`delete_branches`] are its repo-wide counterpart: a verdict per local
+//! branch, then a local delete that re-checks every gate.
 //!
 //! [`pr_statuses`] batches each workspace's PR/CI state out of `gh pr list`, and
 //! [`issue_branch`] resolves a GitHub issue reference to the branch GitHub links
@@ -80,14 +82,15 @@ pub fn branch_status(working_dir: &str) -> Option<BranchStatus> {
     Some(s)
 }
 
-/// Resolve the ref to diff a branch against: the repository's default branch.
+/// Resolve the ref to diff a branch against, and the cleanups' merge target:
+/// the repository's default branch.
 /// Prefer the remote's advertised default (`origin/HEAD`), then the common
 /// remote/local names, returning the first ref that actually exists. `None`
 /// when none resolve (e.g. not a git repo).
 ///
 /// Counterpart of [`is_default_branch`], which is the cleanup gate's check:
-/// this wants precision (the one true diff base), that wants recall (over-block
-/// anything plausibly the default). Don't unify them.
+/// this wants precision (the one true diff and merge base), that wants recall
+/// (over-block anything plausibly the default). Don't unify them.
 fn default_branch_ref(working_dir: &str) -> Option<String> {
     // Fully-qualified refs (`refs/remotes/…`, `refs/heads/…`) so a tag or local
     // branch named e.g. `origin/main` can't shadow the intended ref — gitrevisions
@@ -569,72 +572,39 @@ fn pr_supersedes(a: &PrStatus, b: &PrStatus) -> bool {
     (open_rank(a.state), a.number) > (open_rank(b.state), b.number)
 }
 
-/// Remove a merged workspace's worktree and delete its branch — but only when it
-/// is provably safe. Returns a message (deleting nothing) unless ALL hold:
-/// - the branch is not the repo's default branch (see [`is_default_branch`]),
-///   not a malformed name (empty, `..`, leading `-`), and not one of the
-///   `protected` names (the config's `protected_branches`). Any *other* branch,
-///   including one kommand0 didn't create, is fair game once the checks below
-///   hold: adopting and cleaning up your own branches is deliberate behavior;
-/// - its PR is `MERGED` (per `gh`);
-/// - the worktree, if it still exists, is live and its HEAD is still on
-///   `branch` (a `git switch` inside it made the dir another branch's checkout);
-/// - the worktree is clean (no uncommitted/untracked changes; an unreadable
-///   status aborts rather than assuming clean); and
-/// - the branch tip equals the last commit the PR merged (so there are no
-///   commits beyond the PR — squash-safe, and catches pushed or unpushed extras).
-///
-/// The worktree is removed WITHOUT `--force` (a last-moment dirty state still
-/// fails safe), and only then is the branch deleted — locally only; the remote
-/// branch is never touched.
-///
-/// A removal that *fails* has two shapes, told apart by [`is_live_worktree`]:
-/// git refused and touched nothing (its own reason is reported, nothing is
-/// deleted), or it died mid-delete after dropping the admin entry, leaving an
-/// unusable half-deleted tree that this finishes deleting. Either way the branch
-/// survives an `Err`, so a retry re-runs every gate: `Ok`/`Err` is the caller's
-/// deregister signal, so a path that deletes the branch must return `Ok`.
-pub fn cleanup_merged_workspace(
-    repo_path: &str,
-    worktree_path: &str,
-    branch: &str,
-    protected: &[String],
-) -> Result<(), String> {
-    cleanup_merged_workspace_with(repo_path, worktree_path, branch, protected, &gh_bin())
-}
-
 /// Whether `branch` is (or plausibly is) the repo's default branch — the
 /// cleanup gate's trunk protection. Best-effort: a failed probe just doesn't
 /// match, so an offline/remote-less repo never blocks on this. Two checks:
 /// - the literals `main`/`master`, unconditionally — even when the actual
-///   default is something else, since e.g. a gitflow back-merge PR with
-///   `headRefName == main` would pass the merged-PR check. Accepted flip side:
+///   default is something else, since e.g. in a gitflow repo whose default is
+///   `develop`, a `main` back-merged into it sits off its first-parent line
+///   and would read as merged. Accepted flip side:
 ///   a branch literally named `master` in a `main`-default repo is refused
 ///   (delete it by hand).
 /// - whatever `origin/HEAD` points at, when resolvable — covers `trunk`/
 ///   `develop`-style defaults. Residual: a default named neither main/master
-///   in a repo without `origin/HEAD` is unprotected here; the merged-PR +
-///   tip-equality checks still apply, the delete is local-only, and the branch
-///   is restorable from the remote.
+///   in a repo without `origin/HEAD` is unprotected here; the merged check
+///   still applies, the delete is local-only, and the branch is restorable
+///   from the remote.
 ///
 /// Counterpart of [`default_branch_ref`] (the diff base): that wants precision,
 /// this wants recall. Don't unify them.
 fn is_default_branch(repo_path: &str, branch: &str) -> bool {
-    if branch == "main" || branch == "master" {
-        return true;
-    }
     // ponytail: one `symbolic-ref` spawn per gated branch; resolve origin/HEAD
     // once per scan if a huge repo makes the local gates measurable.
-    match Command::new("git")
-        .args(["-C", repo_path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let name = last_line(&o.stdout);
-            name.strip_prefix("origin/").unwrap_or(&name) == branch
-        }
-        _ => false,
-    }
+    branch == "main"
+        || branch == "master"
+        || origin_head_branch(repo_path).as_deref() == Some(branch)
+}
+
+/// The branch `origin/HEAD` points at, read from the full symref (`--short`
+/// prints `remotes/origin/<b>` once a local branch named `origin/<b>` exists).
+/// None when origin/HEAD is missing or isn't a plain origin branch.
+fn origin_head_branch(repo_path: &str) -> Option<String> {
+    // `-q`: a missing origin/HEAD exits 1 quietly, not 128.
+    let target = git_stdout(repo_path, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], &[])?;
+    let branch = target.strip_prefix("refs/remotes/origin/")?;
+    is_valid_branch_name(branch).then(|| branch.to_string())
 }
 
 /// Whether `worktree_path` is still a worktree git knows about.
@@ -655,50 +625,251 @@ fn is_live_worktree(worktree_path: &str) -> bool {
     }
 }
 
-/// The newest PR whose head is a branch, as `gh` reports it.
-struct PrLookup {
-    state: String,
-    /// The oid of the PR's last commit (empty when it has none).
-    tip: String,
-    /// Absent when gh printed the older two-line shape.
-    number: Option<u64>,
+/// Env for every merged-check spawn: replace refs and grafts can't fake a
+/// merge, a partial clone never fetches (or prompts) mid-check, and no
+/// system-wide attributes apply.
+const CHECK_ENV: [(&str, &str); 4] = [
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    // Not `/dev/null`, which makes git print its grafts deprecation hint on
+    // every spawn; a path under it can't exist, so it is silently ignored.
+    ("GIT_GRAFT_FILE", "/dev/null/none"),
+    ("GIT_NO_LAZY_FETCH", "1"),
+    ("GIT_ATTR_NOSYSTEM", "1"),
+];
+
+/// `git -C <repo_path> <args>` under [`CHECK_ENV`] plus `envs`: the trimmed
+/// stdout, or None when git can't run or exits non-zero. A failure is logged
+/// with the args and git's first stderr line: debug for a plain "no" (exit 1),
+/// warn from exit 128 up, where git broke rather than answered.
+fn git_stdout(repo_path: &str, args: &[&str], envs: &[(&str, &str)]) -> Option<String> {
+    let out = match Command::new("git")
+        .args(["-C", repo_path])
+        .args(args)
+        .envs(CHECK_ENV)
+        .envs(envs.iter().copied())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("git {}: {e}", args.join(" "));
+            return None;
+        }
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let first = stderr.lines().next().unwrap_or("").trim();
+        if out.status.code().is_none_or(|c| c >= 128) {
+            tracing::warn!("git {} failed ({}): {first}", args.join(" "), out.status);
+        } else {
+            tracing::debug!("git {} failed ({}): {first}", args.join(" "), out.status);
+        }
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// `Ok(None)` = no PR has that head. `Err` = gh itself failed: not installed or
-/// timed out, or a non-zero exit (not authenticated, not a GitHub repo). Looks
-/// up by `--head <branch>` (a bare positional would be parsed as a PR NUMBER for
-/// an all-digit branch name); several PRs can share a head over time, so the
-/// newest by number wins, mirroring the pr-status view.
-fn lookup_pr(gh_bin: &str, repo_path: &str, branch: &str) -> Result<Option<PrLookup>, String> {
-    let out = match run_gh(
-        gh_bin,
-        repo_path,
-        &[
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--json",
-            "number,state,commits",
-            "-q",
-            "(sort_by(.number) | last) // {} | (.state // \"NONE\"), (.commits[-1].oid // \"\"), (.number // \"\")",
-        ],
-    ) {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => return Err(format!("gh pr list failed ({})", last_line(&o.stderr))),
-        Err(_) => return Err("gh CLI not found — install GitHub CLI to clean up".to_string()),
+/// The default branch the cleanups compare against, pinned to one commit for a
+/// whole scan or cleanup.
+struct Target {
+    /// `origin/main`, or the local `main`: what messages call it.
+    name: String,
+    /// The origin branch that refreshes it; None for a local base.
+    origin_branch: Option<String>,
+    /// `<ref>^{commit}`, resolved once, after any fetch.
+    oid: String,
+    /// `GIT_ATTR_SOURCE` for every check, so no in-tree attributes apply (git
+    /// before 2.40 ignores it).
+    empty_tree: String,
+    /// Whether squash merges can be detected: `merge-tree --write-tree` works
+    /// and this isn't a partial clone.
+    squash: bool,
+    /// The `-c key=value` pairs every replay runs with.
+    merge_config: Vec<String>,
+    /// What the answers can't show on their own (squash detection off, a
+    /// failed refresh), `"; "`-joined.
+    note: Option<String>,
+}
+
+/// Resolve and pin the default branch (see [`default_branch_ref`]), fetching it
+/// from origin first when `fetch` is set and it is an origin branch. A failed
+/// fetch isn't an error: the checks run against the local copy, and the
+/// failure goes into the note.
+fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
+    let git_ref = default_branch_ref(repo_path).ok_or_else(|| {
+        "couldn't find the default branch to compare against (no origin/HEAD, origin/main, \
+         origin/master, main or master)"
+            .to_string()
+    })?;
+    let origin_branch = if git_ref == "refs/remotes/origin/HEAD" {
+        origin_head_branch(repo_path)
+    } else {
+        git_ref
+            .strip_prefix("refs/remotes/origin/")
+            .filter(|b| is_valid_branch_name(b))
+            .map(str::to_string)
     };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = text.lines();
-    let state = lines.next().unwrap_or("").trim().to_string();
-    if state == "NONE" {
-        return Ok(None);
+    let name = match &origin_branch {
+        Some(b) => format!("origin/{b}"),
+        None => {
+            let short = git_ref.strip_prefix("refs/heads/");
+            short.or(git_ref.strip_prefix("refs/remotes/")).unwrap_or(&git_ref).to_string()
+        }
+    };
+    let mut refresh_note = None;
+    if fetch
+        && let Some(b) = &origin_branch
+        && let Err(e) = fetch_origin_branch(repo_path, b, &gh_bin(), false)
+    {
+        tracing::warn!("cleanup: {name} not refreshed: {e}");
+        refresh_note = Some(format!("{name} not refreshed: {e}"));
     }
-    let tip = lines.next().unwrap_or("").trim().to_string();
-    let number = lines.next().and_then(|l| l.trim().parse().ok());
-    Ok(Some(PrLookup { state, tip, number }))
+    let oid = git_stdout(
+        repo_path,
+        &["rev-parse", "--verify", "--quiet", &format!("{git_ref}^{{commit}}")],
+        &[],
+    )
+    .ok_or_else(|| format!("couldn't resolve {name}"))?;
+    let empty_tree = git_stdout(repo_path, &["hash-object", "-t", "tree", "/dev/null"], &[])
+        .ok_or_else(|| "couldn't compute git's empty tree".to_string())?;
+    let squash_note = if git_config_value(repo_path, "extensions.partialclone").is_some() {
+        Some("squash merges not detected in a partial clone")
+    } else if git_stdout(repo_path, &["merge-tree", "--write-tree", &oid, &oid], &[]).is_none() {
+        Some("squash merges not detected (needs git 2.38 or newer)")
+    } else {
+        None
+    };
+    let mut merge_config =
+        ["core.attributesFile=/dev/null", "merge.renormalize=false", "merge.default=text"]
+            .map(String::from)
+            .to_vec();
+    // Every configured driver becomes `false`: attribute pins can't cover
+    // `$GIT_DIR/info/attributes`, and no custom driver may run in a background check.
+    let drivers = ["config", "--name-only", "--get-regexp", r"^merge\..*\.driver$"];
+    if let Some(keys) = git_stdout(repo_path, &drivers, &[]) {
+        merge_config.extend(keys.lines().map(|k| format!("{k}=false")));
+    }
+    let notes: Vec<String> =
+        squash_note.map(str::to_string).into_iter().chain(refresh_note).collect();
+    Ok(Target {
+        name,
+        origin_branch,
+        oid,
+        empty_tree,
+        squash: squash_note.is_none(),
+        merge_config,
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
+    })
+}
+
+/// A local branch as [`merged_into`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Merged {
+    /// Its changes are on the default branch. The only answer that deletes.
+    Yes,
+    /// Nothing of its own: the default branch's own history, changes that
+    /// cancel out, or a branch created at a merged tip.
+    NoCommits,
+    /// Not merged, or git couldn't tell.
+    No,
+}
+
+/// Whether `branch` (at `tip`) is merged into `target`. Every failure lands on
+/// No or NoCommits, never Yes. Yes needs one of:
+/// - the tip is an ancestor of the base but off its first-parent line (merged
+///   by a merge commit; on that line it is the base's own history);
+/// - a commit on the base since the fork point carries the branch's net change
+///   (same patch-id), and replaying the branch onto that commit's parent
+///   reproduces its tree exactly (a squash, or a one-commit rebase).
+///
+/// Then [`fresh_by_reflog`] can still veto it.
+fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Merged {
+    let env = [("GIT_ATTR_SOURCE", target.empty_tree.as_str())];
+    let git = |args: &[&str]| git_stdout(repo_path, args, &env);
+    let base = target.oid.as_str();
+    let Some(fork) = git(&["merge-base", base, tip]) else { return Merged::No };
+    if fork == tip {
+        // On the first-parent line, the walk ends on the commit whose first parent is the tip.
+        let Some(walk) = git(&["rev-list", "--first-parent", "--parents", base, &format!("^{tip}")])
+        else {
+            return Merged::No;
+        };
+        if walk.lines().last().is_none_or(|l| l.split(' ').nth(1) == Some(tip)) {
+            return Merged::NoCommits;
+        }
+    } else {
+        let tip_tree = format!("{tip}^{{tree}}");
+        let Some(trees) = git(&["rev-parse", &tip_tree, &format!("{fork}^{{tree}}")]) else {
+            return Merged::No;
+        };
+        let mut t = trees.lines();
+        match (t.next(), t.next()) {
+            (Some(a), Some(b)) if a == b => return Merged::NoCommits, // changes that cancel out
+            (Some(_), Some(_)) => {}
+            _ => return Merged::No,
+        }
+        if !target.squash {
+            return Merged::No;
+        }
+        // The branch's net change as one commit on the fork point. A fixed
+        // identity and date: deterministic, and no user config can block it.
+        let probe_env = [
+            ("GIT_ATTR_SOURCE", target.empty_tree.as_str()),
+            ("GIT_AUTHOR_NAME", "kommand0"),
+            ("GIT_AUTHOR_EMAIL", "kommand0@localhost"),
+            ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+            ("GIT_COMMITTER_NAME", "kommand0"),
+            ("GIT_COMMITTER_EMAIL", "kommand0@localhost"),
+            ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+        ];
+        let probe_args = [
+            "commit-tree",
+            "--no-gpg-sign",
+            tip_tree.as_str(),
+            "-p",
+            fork.as_str(),
+            "-m",
+            "kommand0 cleanup probe",
+        ];
+        let Some(probe) = git_stdout(repo_path, &probe_args, &probe_env) else { return Merged::No };
+        let range = format!("{probe}...{base}");
+        let Some(marks) = git(&["rev-list", "--cherry-mark", "--right-only", "--no-merges", &range])
+        else {
+            return Merged::No;
+        };
+        // Patch-ids ignore whitespace and position, so a candidate counts only
+        // if replaying the branch onto its parent reproduces its tree exactly.
+        let replayed = marks.lines().filter_map(|l| l.strip_prefix('=')).any(|c| {
+            let parent = format!("{c}^");
+            let mut args: Vec<&str> =
+                target.merge_config.iter().flat_map(|kv| ["-c", kv.as_str()]).collect();
+            args.extend(["merge-tree", "--write-tree", parent.as_str(), tip]);
+            let tree = git(&["rev-parse", &format!("{c}^{{tree}}")]);
+            let (Some(tree), Some(out)) = (tree, git(&args)) else { return false };
+            out.lines().next() == Some(tree.as_str())
+        });
+        if !replayed {
+            return Merged::No;
+        }
+    }
+    if fresh_by_reflog(repo_path, branch, tip) { Merged::NoCommits } else { Merged::Yes }
+}
+
+/// Whether `branch` was created at `tip` and never moved: its only reflog
+/// entry is its creation, at the current tip. Its tip can read as merged (a
+/// `worktree add -b` from a merged checkout) while it has no commits of its
+/// own. An adopted `origin/<same name>` isn't fresh: that is the merged branch
+/// itself, fetched. An unreadable reflog counts as fresh; an empty one (expired,
+/// or logging off) leaves the graph's answer.
+fn fresh_by_reflog(repo_path: &str, branch: &str, tip: &str) -> bool {
+    let refname = format!("refs/heads/{branch}");
+    let args = ["reflog", "show", "--no-show-signature", "--format=%H%x00%gs", refname.as_str()];
+    let Some(log) = git_stdout(repo_path, &args, &[]) else { return true };
+    let mut entries = log.lines();
+    let (Some(only), None) = (entries.next(), entries.next()) else { return false };
+    let Some((oid, subject)) = only.split_once('\0') else { return true };
+    oid == tip
+        && subject.starts_with("branch: Created from ")
+        && subject != format!("branch: Created from origin/{branch}")
 }
 
 /// Why a local branch must not be deleted, in gate order.
@@ -759,9 +930,10 @@ fn refuse_branch_delete(
 }
 
 /// `git branch -D -- <branch>`: force, because a squash-merge leaves the branch
-/// "unmerged" locally (the callers' tip checks proved nothing lies beyond the
-/// merge). `--` makes the gate's leading-dash refusal belt-and-braces, not
-/// load-bearing. Err is git's last stderr line or the io error.
+/// "unmerged" to git (the callers proved this tip merged and re-checked that
+/// the branch is still on it). `--` makes the gate's leading-dash refusal
+/// belt-and-braces, not load-bearing. Err is git's last stderr line or the io
+/// error.
 fn delete_local_branch(repo_path: &str, branch: &str) -> Result<(), String> {
     match Command::new("git")
         .args(["-C", repo_path, "branch", "-D", "--", branch])
@@ -784,25 +956,67 @@ fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
     }
 }
 
-fn cleanup_merged_workspace_with(
+/// Remove a merged workspace's worktree and delete its branch, but only when
+/// every check holds. Returns a message (deleting nothing) unless ALL hold:
+/// - the branch is not the repo's default branch (see [`is_default_branch`]),
+///   not a malformed name (empty, `..`, leading `-`), and not one of the
+///   `protected` names (the config's `protected_branches`). Any *other* branch,
+///   including one kommand0 didn't create, is fair game once the checks below
+///   hold: adopting and cleaning up your own branches is deliberate behavior;
+/// - it is merged into the default branch (see [`merged_into`]), decided from
+///   local git. The default branch is fetched only when that could change the
+///   answer, i.e. when the local copy says not merged;
+/// - it isn't a branch created at a merged tip without a commit of its own
+///   (see [`fresh_by_reflog`]);
+/// - the worktree, if it still exists, is live and its HEAD is still on
+///   `branch` (a `git switch` inside it made the dir another branch's checkout);
+/// - the worktree is clean (no uncommitted/untracked changes; an unreadable
+///   status aborts rather than assuming clean); and
+/// - the branch is still at the checked tip right before the worktree is
+///   removed, and again right before the branch is deleted.
+///
+/// The worktree is removed WITHOUT `--force` (a last-moment dirty state still
+/// fails safe), and only then is the branch deleted, locally only: the remote
+/// branch is never touched.
+///
+/// A removal that *fails* has two shapes, told apart by [`is_live_worktree`]:
+/// git refused and touched nothing (its own reason is reported, nothing is
+/// deleted), or it died mid-delete after dropping the admin entry, leaving an
+/// unusable half-deleted tree that this finishes deleting. Either way the branch
+/// survives an `Err`, so a retry re-runs every gate: `Ok`/`Err` is the caller's
+/// deregister signal, so a path that deletes the branch must return `Ok`.
+pub fn cleanup_merged_workspace(
     repo_path: &str,
     worktree_path: &str,
     branch: &str,
     protected: &[String],
-    gh_bin: &str,
 ) -> Result<(), String> {
     refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
 
-    // The PR must be merged; capture the oid of the last commit it merged. Run
-    // gh from the repo (not the worktree) so a partial-cleanup retry (worktree
-    // already gone) still works instead of failing with a bogus "gh not found".
-    let Some(PrLookup { state, tip: pr_tip, .. }) = lookup_pr(gh_bin, repo_path, branch)? else {
-        return Err("no PR found for this branch — not cleaning up".to_string());
+    let Some(tip) = branch_tip(repo_path, branch) else {
+        return Err("couldn't resolve the branch tip; not cleaning up".to_string());
     };
-    if state != "MERGED" {
-        return Err(format!(
-            "the PR for this branch isn't merged (state: {state}) — not cleaning up"
-        ));
+    let mut target = merge_target(repo_path, false)?;
+    let mut merged = merged_into(repo_path, &target, branch, &tip);
+    // Fetch only when it could change the answer: a routed row was scanned
+    // after a fetch and read merged, so a batch of them never fires N fetches
+    // racing on one ref lock. The target is re-resolved and re-pinned.
+    if merged == Merged::No && target.origin_branch.is_some() {
+        target = merge_target(repo_path, true)?;
+        merged = merged_into(repo_path, &target, branch, &tip);
+    }
+    match merged {
+        Merged::Yes => {}
+        Merged::NoCommits => {
+            return Err("the branch has no commits of its own; not cleaning up".to_string());
+        }
+        Merged::No => {
+            let refusal = format!("the branch isn't merged into {}; not cleaning up", target.name);
+            return Err(match &target.note {
+                Some(note) => format!("{refusal}\n{note}"),
+                None => refusal,
+            });
+        }
     }
 
     // The worktree must be clean — but only check if it still exists (a retry
@@ -849,13 +1063,10 @@ fn cleanup_merged_workspace_with(
         }
     }
 
-    // The branch tip must be exactly what the PR merged: no commits beyond it
-    // (pushed OR unpushed). This is the guard that makes the force-delete safe.
-    let Some(local_tip) = branch_tip(repo_path, branch) else {
-        return Err("couldn't resolve the branch tip — not cleaning up".to_string());
-    };
-    if pr_tip.is_empty() || local_tip != pr_tip {
-        return Err("the branch has commits beyond its merged PR — not cleaning up".to_string());
+    // Still the tip that was checked: a commit made meanwhile (an agent in the
+    // worktree) isn't merged, and removing the worktree would strand it.
+    if branch_tip(repo_path, branch).as_deref() != Some(tip.as_str()) {
+        return Err("the branch moved while it was being checked; clean up again".to_string());
     }
 
     // Remove the worktree (no --force, so a last-moment dirty state still fails
@@ -881,7 +1092,7 @@ fn cleanup_merged_workspace_with(
             }
             // Live at the gate, not live now: git dropped the admin entry and
             // unlinked an arbitrary subset of the files, so the tree is unusable
-            // and its tracked content was just proven identical to the merged PR
+            // and its tracked content was just proven identical to a merged
             // tip. Finish the delete git started; leaving it is what made this
             // state unrecoverable.
             if let Err(e) = std::fs::remove_dir_all(worktree_path) {
@@ -897,8 +1108,14 @@ fn cleanup_merged_workspace_with(
         .args(["-C", repo_path, "worktree", "prune"])
         .output();
 
-    // The PR-tip check above proved there's nothing beyond the merge.
-    delete_local_branch(repo_path, branch).map_err(|e| {
+    // Checked again because kmd doesn't stop a live agent: a commit landed
+    // since the first check is kept, and so is the branch.
+    let delete = if branch_tip(repo_path, branch).as_deref() == Some(tip.as_str()) {
+        delete_local_branch(repo_path, branch)
+    } else {
+        Err("it moved during the cleanup, so it is kept".to_string())
+    };
+    delete.map_err(|e| {
         if worktree_exists {
             format!("worktree removed, but couldn't delete branch {branch}: {e}")
         } else {
@@ -910,7 +1127,7 @@ fn cleanup_merged_workspace_with(
 /// What the repo-wide scan decided for one local branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Merged PR, tip equals the PR's last commit, checked out nowhere.
+    /// Merged into the default branch, checked out nowhere.
     Delete,
     /// Same, but checked out at `worktree` (git refuses `branch -D` there).
     CheckedOut { worktree: String },
@@ -925,29 +1142,24 @@ pub struct BranchVerdict {
     pub branch: String,
     /// The tip at scan time; [`delete_branches`] refuses a branch that moved.
     pub tip: String,
-    /// The PR number, whenever a PR was found.
-    pub pr: Option<u64>,
     /// What the scan decided for it.
     pub verdict: Verdict,
 }
 
 /// Classify every local branch of `repo_path` for deletion: the name gates of
-/// [`cleanup_merged_workspace`] first (default/malformed/protected names never
-/// reach gh), then one PR lookup per remaining branch. Deletes and prunes
-/// nothing. The first gh failure aborts the whole scan, so a missing or wedged
-/// gh can't read as "no PR" for every branch.
+/// [`cleanup_merged_workspace`] first, then its merged check against the
+/// default branch, fetched first. The default branch is resolved at the first
+/// branch past the gates, so an unborn or all-gated repo needs none and pays no
+/// fetch. Deletes and prunes nothing. Returns the target's note (a failed
+/// refresh, squash detection off) once, beside the verdicts.
+///
+/// A stale default branch (the fetch failed) only under-reports, except after
+/// an upstream force-push: the dropped commits stay reachable from
+/// `refs/remotes/origin/<b>` until the next fetch, so a branch can read merged.
 pub fn scan_merged_branches(
     repo_path: &str,
     protected: &[String],
-) -> Result<Vec<BranchVerdict>, String> {
-    scan_merged_branches_with(repo_path, protected, &gh_bin())
-}
-
-fn scan_merged_branches_with(
-    repo_path: &str,
-    protected: &[String],
-    gh_bin: &str,
-) -> Result<Vec<BranchVerdict>, String> {
+) -> Result<(Vec<BranchVerdict>, Option<String>), String> {
     // NUL-separated, NUL-terminated records: a newline in a foreign worktree
     // path can't truncate one. `%(refname)` + strip, not `refname:short`, so a
     // same-named tag can't shadow the branch.
@@ -967,6 +1179,7 @@ fn scan_merged_branches_with(
     let text = String::from_utf8_lossy(&out.stdout);
     let fields: Vec<&str> = text.split('\0').collect();
     let mut verdicts = Vec::new();
+    let mut target: Option<Target> = None;
     // for-each-ref ends each record with '\n', which lands in front of the next
     // refname; the newline-only remainder after the last NUL is dropped.
     let (records, _) = fields.as_chunks::<3>();
@@ -974,30 +1187,29 @@ fn scan_merged_branches_with(
         let Some(branch) = refname.trim_start_matches('\n').strip_prefix("refs/heads/") else {
             continue;
         };
-        let tip = tip.to_string();
-        let (pr, verdict) = match refuse_branch_delete(repo_path, branch, protected) {
-            Err(r) => (None, Verdict::Skip(r.short().to_string())),
-            // ponytail: one gh round-trip per branch; batch them through `gh api graphql`
-            // if a repo with hundreds of branches makes the scan too slow.
-            Ok(()) => match lookup_pr(gh_bin, repo_path, branch).map_err(|e| format!("{branch}: {e}"))? {
-                None => (None, Verdict::Skip("no PR".to_string())),
-                Some(pr) => {
-                    let verdict = if pr.state != "MERGED" {
-                        Verdict::Skip(format!("PR not merged ({})", pr.state))
-                    } else if pr.tip.is_empty() || pr.tip != tip {
-                        Verdict::Skip("commits beyond the merged PR".to_string())
-                    } else if !worktree.is_empty() {
+        let verdict = match refuse_branch_delete(repo_path, branch, protected) {
+            Err(r) => Verdict::Skip(r.short().to_string()),
+            Ok(()) => {
+                let t = match &mut target {
+                    Some(t) => t,
+                    slot @ None => slot.insert(merge_target(repo_path, true)?),
+                };
+                // ponytail: ~5 git spawns per branch plus one cherry-mark walk over every base
+                // commit since its fork; fold all probes into one octopus for a single
+                // rev-list --cherry-mark pass if hundreds of branches make the scan slow.
+                match merged_into(repo_path, t, branch, tip) {
+                    Merged::NoCommits => Verdict::Skip("no commits of its own".to_string()),
+                    Merged::No => Verdict::Skip(format!("not merged into {}", t.name)),
+                    Merged::Yes if !worktree.is_empty() => {
                         Verdict::CheckedOut { worktree: worktree.to_string() }
-                    } else {
-                        Verdict::Delete
-                    };
-                    (pr.number, verdict)
+                    }
+                    Merged::Yes => Verdict::Delete,
                 }
-            },
+            }
         };
-        verdicts.push(BranchVerdict { branch: branch.to_string(), tip, pr, verdict });
+        verdicts.push(BranchVerdict { branch: branch.to_string(), tip: tip.to_string(), verdict });
     }
-    Ok(verdicts)
+    Ok((verdicts, target.and_then(|t| t.note)))
 }
 
 /// Delete local branches, each only while it still points at its scan-time
@@ -1184,7 +1396,7 @@ fn other_remote(repo_dir: &str) -> Option<String> {
 
 /// Whether a branch name is safe to interpolate into a refspec or hand to
 /// `git worktree add`. Shared by the issue resolver (names come from the remote)
-/// and by [`cleanup_merged_workspace_with`] (names come from state, possibly
+/// and by [`cleanup_merged_workspace`] (names come from state, possibly
 /// adopted). Not a full `git check-ref-format`: the point is that everything
 /// reaching a refspec, a `-`-leading argv slot or `create_worktree_from_branch`
 /// is boring. A `-evil` branch name really does create a junk tracking ref, and
@@ -1257,7 +1469,7 @@ fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
 /// Fetch the linked branch, then refuse the two ways adopting it could pick the
 /// wrong commit. Runs after the name gate: the branch reaches a refspec here.
 fn prepare_linked_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(), String> {
-    fetch_origin_branch(repo_dir, branch, gh_bin)?;
+    fetch_origin_branch(repo_dir, branch, gh_bin, true)?;
     // `create_worktree_from_branch` resolves `refs/remotes/<ref>` BEFORE
     // `refs/remotes/origin/<ref>`, so a linked branch named `alice/fix` would
     // adopt remote `alice`'s `fix` instead. Only an existing ref shadows, hence
@@ -1306,17 +1518,24 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Refresh `refs/remotes/origin/<branch>` from origin, bounded and
-/// non-interactive. Explicit refspec: a bare `git fetch origin <branch>` leaves
-/// the tracking ref to the configured refspec, and a STALE tracking ref passes
-/// `verify_ref` and silently yields a worktree behind origin.
-fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(), String> {
+/// non-interactive, without tags. Explicit refspec: a bare `git fetch origin
+/// <branch>` leaves the tracking ref to the configured refspec, and a STALE
+/// tracking ref passes `verify_ref` and silently yields a worktree behind
+/// origin. `widen` adds the branch to `remote.origin.fetch` when no refspec
+/// covers it yet (a branch about to be checked out needs that).
+fn fetch_origin_branch(
+    repo_dir: &str,
+    branch: &str,
+    gh_bin: &str,
+    widen: bool,
+) -> Result<(), String> {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
     // A `--single-branch` clone maps only its own branch, and `worktree add
     // --track` then dies with "not a branch" on the tracking ref we just
     // fetched. Widen the remote first, unless a refspec already covers it (a
     // second `set-branches --add` would duplicate the entry). Best-effort: the
     // fetch may still work, and its own error is the one worth showing.
-    if !origin_fetches(repo_dir, branch) {
+    if widen && !origin_fetches(repo_dir, branch) {
         match Command::new("git")
             .args(["-C", repo_dir, "remote", "set-branches", "--add", "origin", branch])
             .stdout(Stdio::null())
@@ -1334,7 +1553,8 @@ fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(),
         // private origin + a bare GH_TOKEN fetches only with this. `-c` APPENDS
         // to the helper list, so a user's own helper still runs first, and it's
         // never consulted for an ssh or local origin.
-        .args(["-C", repo_dir, "-c", &helper, "fetch", "origin", &refspec])
+        // `--no-tags`: an explicit refspec would still auto-follow tags.
+        .args(["-C", repo_dir, "-c", &helper, "fetch", "origin", &refspec, "--no-tags"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_SSH_COMMAND", batch_ssh_command(repo_dir))
         .stdin(Stdio::null())
@@ -1343,7 +1563,17 @@ fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(),
         .spawn();
     match spawned.and_then(wait_bounded) {
         Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(format!("couldn't fetch {branch} from origin: {}", last_line(&o.stderr))),
+        Ok(o) => {
+            // The cause is git's `fatal:`/`error:` line; the last line is often
+            // a generic hint ("and the repository exists.").
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let cause = stderr
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with("fatal:") || l.starts_with("error:"));
+            let detail = cause.map(str::to_string).unwrap_or_else(|| last_line(&o.stderr));
+            Err(format!("couldn't fetch {branch} from origin: {detail}"))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             Err("git fetch timed out: check your network and try again".to_string())
         }
@@ -1576,6 +1806,8 @@ mod tests {
         // A developer with global `commit.gpgsign = true` would otherwise have
         // every commit here block on a signing agent.
         git(dir, &["config", "commit.gpgsign", "false"]);
+        // A global `false` would leave the cleanup's reflog check nothing to read.
+        git(dir, &["config", "core.logAllRefUpdates", "true"]);
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         git(dir, &["add", "."]);
         git(dir, &["commit", "-m", "init"]);
@@ -1865,50 +2097,71 @@ mod tests {
 
     /// A repo (no remote — pins that an unresolvable `origin/HEAD` never blocks
     /// the gate) with a linked worktree on `branch`. Returns
-    /// `(repo_path, worktree_path, branch, branch_tip_sha)`.
+    /// `(repo_path, worktree_path, branch)`.
     fn repo_with_worktree_on(
         root: &Path,
         branch: &str,
-    ) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
+    ) -> (std::path::PathBuf, std::path::PathBuf, String) {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "t@t"]);
-        git(&repo, &["config", "commit.gpgsign", "false"]);
-        git(&repo, &["config", "user.name", "t"]);
-        std::fs::write(repo.join("a.txt"), "1").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-m", "init"]);
+        init_repo(&repo);
         let wt = root.join("wt");
         git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", branch]);
-        let sha = tip_of(&repo, branch);
-        (repo, wt, branch.to_string(), sha)
+        (repo, wt, branch.to_string())
     }
 
     /// [`repo_with_worktree_on`] with the post-prefix default shape: bare `feat`.
-    fn repo_with_worktree(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
+    fn repo_with_worktree(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, String) {
         repo_with_worktree_on(root, "feat")
     }
 
-    /// A `gh` stub answering the cleanup lookup (`pr list --head <branch> …`)
-    /// with `<state>\n<oid>`.
-    fn gh_pr_stub(path: &Path, state: &str, oid: &str) {
-        write_stub(
-            path,
-            &format!(
-                "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then\n  printf '{state}\\n{oid}\\n'\n  exit 0\nfi\nexit 1\n"
-            ),
-        );
+    /// Write `name` in `dir` and commit it.
+    fn commit_file(dir: &Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", name]);
     }
 
-    fn cleanup(repo: &Path, wt: &Path, branch: &str, gh: &Path) -> Result<(), String> {
-        cleanup_merged_workspace_with(
-            repo.to_str().unwrap(),
-            wt.to_str().unwrap(),
-            branch,
-            &[],
-            gh.to_str().unwrap(),
-        )
+    /// Squash-merge `branch` into main, which `repo` has checked out.
+    fn squash_merge(repo: &Path, branch: &str) {
+        git(repo, &["merge", "--squash", branch]);
+        git(repo, &["commit", "-m", &format!("squash {branch}")]);
+    }
+
+    /// [`repo_with_worktree_on`] whose branch has a commit of its own that main
+    /// squash-merged.
+    fn merged_worktree_on(
+        root: &Path,
+        branch: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let (repo, wt, branch) = repo_with_worktree_on(root, branch);
+        commit_file(&wt, "work.txt", "work");
+        squash_merge(&repo, &branch);
+        (repo, wt, branch)
+    }
+
+    /// [`issue_fixture`] plus a clone worktree on `feat` whose one commit origin
+    /// squash-merged after the clone last fetched. Returns
+    /// `(origin, clone, worktree)`.
+    fn clone_with_upstream_squash(
+        root: &Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let (origin, clone) = issue_fixture(root);
+        let wt = root.join("wt");
+        git(&clone, &["worktree", "add", wt.to_str().unwrap(), "-b", "feat"]);
+        commit_file(&wt, "feat.txt", "feat");
+        git(&wt, &["push", "origin", "feat"]);
+        squash_merge(&origin, "feat");
+        (origin, clone, wt)
+    }
+
+    /// Point the clone's origin at a path that doesn't exist.
+    fn break_origin(clone: &Path, root: &Path) {
+        git(clone, &["remote", "set-url", "origin", root.join("gone").to_str().unwrap()]);
+    }
+
+    fn cleanup(repo: &Path, wt: &Path, branch: &str) -> Result<(), String> {
+        cleanup_merged_workspace(repo.to_str().unwrap(), wt.to_str().unwrap(), branch, &[])
     }
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {
@@ -1923,77 +2176,93 @@ mod tests {
     #[test]
     fn cleanup_merged_clean_removes_worktree_and_branch() {
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()));
         assert!(!wt.exists(), "worktree dir removed");
         assert!(!branch_exists(&repo, &branch), "branch deleted");
     }
 
     #[test]
-    fn cleanup_refuses_when_pr_open_and_destroys_nothing() {
+    fn cleanup_refuses_an_unmerged_branch_and_destroys_nothing() {
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "OPEN", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains("isn't merged"), "expected 'isn't merged', got: {err}");
+        let (repo, wt, branch) = repo_with_worktree(tmp.path());
+        commit_file(&wt, "work.txt", "work");
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert_eq!(err, "the branch isn't merged into main; not cleaning up");
         assert!(wt.exists(), "worktree untouched");
         assert!(branch_exists(&repo, &branch), "branch untouched");
     }
 
     #[test]
-    fn cleanup_refuses_when_no_pr() {
+    fn cleanup_refuses_a_fresh_branch_with_no_commits_of_its_own() {
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, _) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh");
-        write_stub(&gh, "#!/bin/sh\nexit 1\n"); // gh finds no PR
-        assert!(cleanup(&repo, &wt, &branch, &gh).is_err());
+        let (repo, wt, branch) = repo_with_worktree(tmp.path());
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert_eq!(err, "the branch has no commits of its own; not cleaning up");
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
+
+    #[test]
+    fn cleanup_refuses_a_branch_created_at_a_merged_tip() {
+        // Its tip reads as merged, but its only reflog entry is its creation:
+        // nothing of its own was ever committed. Off a squash-merged checkout...
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, _) = merged_worktree_on(tmp.path(), "feat");
+        let wt2 = tmp.path().join("wt2");
+        git(&wt, &["worktree", "add", wt2.to_str().unwrap(), "-b", "feat2"]);
+        let err = cleanup(&repo, &wt2, "feat2").unwrap_err();
+        assert!(err.contains("no commits of its own"), "{err}");
+
+        // ...and off a detached side commit that main merged with --no-ff.
+        git(&repo, &["switch", "-c", "side"]);
+        commit_file(&repo, "side.txt", "side");
+        git(&repo, &["switch", "main"]);
+        git(&repo, &["merge", "--no-ff", "-m", "merge side", "side"]);
+        git(&repo, &["switch", "--detach", "side"]);
+        let wt3 = tmp.path().join("wt3");
+        git(&repo, &["worktree", "add", wt3.to_str().unwrap(), "-b", "side2"]);
+        let err = cleanup(&repo, &wt3, "side2").unwrap_err();
+        assert!(err.contains("no commits of its own"), "{err}");
+        assert!(wt2.exists() && wt3.exists(), "worktrees untouched");
+        assert!(branch_exists(&repo, "feat2") && branch_exists(&repo, "side2"), "branches untouched");
+    }
+
+    #[test]
+    fn cleanup_removes_a_merged_adopted_pr_head() {
+        // Adopting a remote branch logs `Created from origin/<same name>`: that
+        // is the merged branch itself, fetched, not a fresh one.
+        let tmp = TempDir::new().unwrap();
+        let (origin, clone) = issue_fixture(tmp.path());
+        git(&origin, &["switch", "-c", "pr-head"]);
+        commit_file(&origin, "pr.txt", "pr");
+        git(&origin, &["switch", "main"]);
+        squash_merge(&origin, "pr-head");
+        git(&clone, &["fetch", "origin"]);
+        let wt = tmp.path().join("wt");
+        let wt_arg = wt.to_str().unwrap();
+        git(&clone, &["worktree", "add", "--track", "-b", "pr-head", wt_arg, "origin/pr-head"]);
+        assert_eq!(cleanup(&clone, &wt, "pr-head"), Ok(()));
+        assert!(!wt.exists() && !branch_exists(&clone, "pr-head"), "adopted branch cleaned up");
     }
 
     #[test]
     fn cleanup_refuses_dirty_worktree() {
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         std::fs::write(wt.join("scratch.txt"), "wip").unwrap(); // untracked => dirty
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert!(err.contains("uncommitted"), "expected 'uncommitted', got: {err}");
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
     }
 
     #[test]
-    fn cleanup_refuses_commits_beyond_the_merged_pr() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        // The PR's last merged commit is the original tip; the local branch has
-        // since advanced (a commit beyond the PR).
-        std::fs::write(wt.join("more.txt"), "x").unwrap();
-        git(&wt, &["config", "user.email", "t@t"]);
-        git(&wt, &["config", "commit.gpgsign", "false"]);
-        git(&wt, &["config", "user.name", "t"]);
-        git(&wt, &["add", "."]);
-        git(&wt, &["commit", "-m", "beyond"]);
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha); // stale (pre-extra-commit) oid
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains("beyond its merged PR"), "expected 'beyond its merged PR', got: {err}");
-        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-    }
-
-    #[test]
     fn cleanup_refuses_default_branch() {
-        // Literal main/master arm, unconditional. The gh path doesn't exist, so
-        // passing proves the gate fires before any network call. The fixture
-        // repo has no remote → origin/HEAD is unresolvable → only the literal
-        // arm can refuse.
+        // Literal main/master arm, unconditional. The fixture repo has no
+        // remote → origin/HEAD is unresolvable → only the literal arm can refuse.
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, _, _) = repo_with_worktree(tmp.path());
+        let (repo, wt, _) = repo_with_worktree(tmp.path());
         for default in ["main", "master"] {
-            let err = cleanup(&repo, &wt, default, &tmp.path().join("gh")).unwrap_err();
+            let err = cleanup(&repo, &wt, default).unwrap_err();
             assert!(err.contains("default branch"), "expected default-branch refusal, got: {err}");
         }
         assert!(branch_exists(&repo, "main"), "main untouched");
@@ -2002,8 +2271,9 @@ mod tests {
     #[test]
     fn cleanup_refuses_default_branch_via_origin_head() {
         // origin/HEAD arm: the origin's default is `trunk` (NOT main/master, or
-        // the literal arm would make this vacuous). A sibling branch must get
-        // PAST the gate (failing later on the absent gh) — the refusal is "is
+        // the literal arm would make this vacuous), and a local branch named
+        // `origin/trunk` must not hide it. A sibling branch must get PAST the
+        // gate (failing later, with nothing of its own): the refusal is "is
         // the default", not "refuses everything".
         let tmp = TempDir::new().unwrap();
         let origin = tmp.path().join("origin");
@@ -2018,113 +2288,67 @@ mod tests {
         let clone = tmp.path().join("clone");
         git(tmp.path(), &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()]);
         git(&clone, &["branch", "sibling"]);
+        git(&clone, &["branch", "origin/trunk"]);
 
         let wt = tmp.path().join("no-wt"); // gate fires before any worktree use
-        let gh = tmp.path().join("gh"); // absent
-        let err = cleanup(&clone, &wt, "trunk", &gh).unwrap_err();
+        let err = cleanup(&clone, &wt, "trunk").unwrap_err();
         assert!(err.contains("default branch"), "trunk refused via origin/HEAD: {err}");
-        let err = cleanup(&clone, &wt, "sibling", &gh).unwrap_err();
-        assert!(err.contains("gh CLI not found"), "sibling passes the gate: {err}");
+        let err = cleanup(&clone, &wt, "sibling").unwrap_err();
+        assert!(err.contains("no commits of its own"), "sibling passes the gate: {err}");
     }
 
     #[test]
     fn cleanup_refuses_empty_dotdot_and_dash_names() {
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, _, _) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh"); // absent — gate must fire first
+        let (repo, wt, _) = repo_with_worktree(tmp.path());
         for bad in ["", "a..b", "-feat"] {
-            let err = cleanup(&repo, &wt, bad, &gh).unwrap_err();
+            let err = cleanup(&repo, &wt, bad).unwrap_err();
             assert!(err.contains("malformed"), "{bad:?} refused as malformed, got: {err}");
         }
     }
 
     #[test]
-    fn cleanup_deletes_an_adopted_branch_when_merged() {
-        // The feature's core semantic: a branch kommand0 didn't name (adopted
-        // via --branch / the checkout offer) is cleanable once merged — the
-        // old `kommand0/` ownership gate is gone by design.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree_on(tmp.path(), "feat/login");
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
-        assert!(!wt.exists() && !branch_exists(&repo, &branch), "adopted branch cleaned up");
-    }
-
-    #[test]
-    fn cleanup_accepts_a_legacy_prefixed_branch() {
-        // Workspaces created before the prefix was dropped keep working.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree_on(tmp.path(), "kommand0/legacy");
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
-        assert!(!wt.exists() && !branch_exists(&repo, &branch), "legacy branch cleaned up");
-    }
-
-    #[test]
-    fn cleanup_pr_lookup_handles_numeric_branch() {
-        // An all-digit branch must be looked up via `--head <branch>` — a bare
-        // positional would be parsed by gh as a PR NUMBER. The stub records its
-        // argv and only answers the --head form.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree_on(tmp.path(), "123");
-        let gh = tmp.path().join("gh");
-        write_stub(
-            &gh,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ] && [ \"$4\" = 123 ]; then\n  printf 'MERGED\\n{sha}\\n'\n  exit 0\nfi\nexit 1\n"
-            ),
-        );
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
-        let args = std::fs::read_to_string(format!("{}.args", gh.display())).unwrap();
-        let args: Vec<&str> = args.lines().collect();
-        assert_eq!(&args[..4], &["pr", "list", "--head", "123"], "lookup is --head-based");
+    fn cleanup_deletes_adopted_and_legacy_branches_when_merged() {
+        // A branch kommand0 didn't name (adopted via --branch / the checkout
+        // offer) is cleanable once merged, and so is a pre-0.11 `kommand0/` one.
+        for name in ["feat/login", "kommand0/legacy"] {
+            let tmp = TempDir::new().unwrap();
+            let (repo, wt, branch) = merged_worktree_on(tmp.path(), name);
+            assert_eq!(cleanup(&repo, &wt, &branch), Ok(()), "{name}");
+            assert!(!wt.exists() && !branch_exists(&repo, &branch), "{name} cleaned up");
+        }
     }
 
     #[test]
     fn cleanup_refuses_a_worktree_switched_to_another_branch() {
         // The workspace's dir is live but a `git switch` inside it moved HEAD off
         // the workspace's branch: removing the dir would destroy the OTHER
-        // branch's checkout (and its ignored files) on a merged-PR verdict that
+        // branch's checkout (and its ignored files) on a merged verdict that
         // was never about it.
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         git(&wt, &["switch", "-c", "elsewhere"]);
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert!(err.contains("is on elsewhere, not"), "names both branches: {err}");
         assert!(wt.exists(), "worktree untouched");
         assert!(branch_exists(&repo, &branch) && branch_exists(&repo, "elsewhere"), "both branches intact");
         // Detached HEAD is the same refusal.
         git(&wt, &["switch", "--detach"]);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert!(err.contains("detached HEAD"), "detached is refused too: {err}");
-        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-    }
-
-    #[test]
-    fn cleanup_refuses_when_pr_has_no_commits() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, _) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", ""); // empty oid (no commits)
-        assert!(cleanup(&repo, &wt, &branch, &gh).unwrap_err().contains("beyond its merged PR"));
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
     }
 
     #[test]
     fn cleanup_completes_when_worktree_dir_already_gone() {
         // A retry after a partial cleanup (worktree removed, branch left) must
-        // still delete the orphaned branch — gh runs from the repo, the missing
-        // worktree skips the dirty check, and `worktree prune` clears the entry.
+        // still delete the orphaned branch: the merged check runs in the repo,
+        // the missing worktree skips the dirty check, and `worktree prune`
+        // clears the entry.
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         std::fs::remove_dir_all(&wt).unwrap(); // worktree dir vanished
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()));
         assert!(!branch_exists(&repo, &branch), "orphaned branch deleted");
     }
 
@@ -2133,13 +2357,11 @@ mod tests {
         // Nothing was removed on this path, so a failed `branch -D` (the branch
         // is checked out in the main repo by now) must not say "worktree removed".
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         std::fs::remove_dir_all(&wt).unwrap();
         git(&repo, &["worktree", "prune"]);
         git(&repo, &["switch", &branch]);
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert!(err.starts_with(&format!("couldn't delete branch {branch}:")), "{err}");
         assert!(branch_exists(&repo, &branch), "the branch survives the refusal");
     }
@@ -2150,7 +2372,7 @@ mod tests {
         // recognizing may be deleted outright, and every adjacent shape has to
         // land on the protected side.
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, _branch, _sha) = repo_with_worktree(tmp.path());
+        let (repo, wt, _branch) = repo_with_worktree(tmp.path());
         assert!(is_live_worktree(wt.to_str().unwrap()), "a linked worktree is live");
         assert!(is_live_worktree(repo.to_str().unwrap()), "so is the repo itself");
         let sub = wt.join("sub");
@@ -2176,18 +2398,16 @@ mod tests {
         // worktree's git status") with no way to finish from kommand0 at all.
         // It must name what to delete and keep the branch, so the retry works.
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         std::fs::remove_dir_all(repo.join(".git/worktrees/wt")).unwrap();
         std::fs::remove_file(wt.join("a.txt")).unwrap(); // git got this far
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert!(err.contains(wt.to_str().unwrap()), "names the dir to delete: {err}");
         assert!(wt.exists(), "the leftovers are NOT deleted for us");
         assert!(branch_exists(&repo, &branch), "branch survives, so a retry can run");
         // And once the user deletes it, the retry finishes the job.
         std::fs::remove_dir_all(&wt).unwrap();
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()));
         assert!(!branch_exists(&repo, &branch), "retry deletes the orphaned branch");
     }
 
@@ -2203,16 +2423,14 @@ mod tests {
         // root test runner ignores mode 555 and git just succeeds.
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         // `info/exclude` lives in the common dir, so it covers the worktree too
-        // (no commit, so the branch tip still matches the stubbed PR).
+        // (no commit, so the branch stays merged).
         std::fs::write(repo.join(".git/info/exclude"), ".certs/\n").unwrap();
         std::fs::create_dir_all(wt.join(".certs")).unwrap();
         std::fs::write(wt.join(".certs/k.pem"), "key").unwrap();
         std::fs::set_permissions(wt.join(".certs"), std::fs::Permissions::from_mode(0o555)).unwrap();
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let res = cleanup(&repo, &wt, &branch, &gh);
+        let res = cleanup(&repo, &wt, &branch);
         // Restore before the TempDir drop, or the fixture leaks a temp dir.
         let _ =
             std::fs::set_permissions(wt.join(".certs"), std::fs::Permissions::from_mode(0o755));
@@ -2230,25 +2448,61 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_refuses_protected_branch_before_gh() {
-        // gh is absent, so passing proves the gate fires before any network
-        // call; with an empty list the same branch reaches gh (the list is
-        // honored, not hardcoded).
+    fn cleanup_refuses_a_protected_branch_even_when_merged() {
+        // A listed name is refused whatever its merge state (the gate fires
+        // before the worktree is looked at); with an empty list the same merged
+        // branch goes through, so the list is honored, not hardcoded.
         let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, _) = repo_with_worktree_on(tmp.path(), "development");
-        let gh = tmp.path().join("gh");
-        let err = cleanup_merged_workspace_with(
-            repo.to_str().unwrap(),
-            wt.to_str().unwrap(),
-            &branch,
-            &["development".to_string()],
-            gh.to_str().unwrap(),
-        )
-        .unwrap_err();
-        assert!(err.contains("protected branch"), "expected protected refusal, got: {err}");
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "development");
+        git(&repo, &["switch", "-c", "staging"]);
+        commit_file(&repo, "staging.txt", "staging");
+        git(&repo, &["switch", "main"]);
+        let protected = ["development".to_string(), "staging".to_string()];
+        for name in ["development", "staging"] {
+            let err = cleanup_merged_workspace(
+                repo.to_str().unwrap(),
+                wt.to_str().unwrap(),
+                name,
+                &protected,
+            )
+            .unwrap_err();
+            assert!(err.contains("protected branch"), "{name}: expected protected refusal, got: {err}");
+        }
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains("gh CLI not found"), "an empty list lets it through to gh: {err}");
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()), "an empty list lets it through");
+    }
+
+    #[test]
+    fn cleanup_fetches_when_the_squash_landed_after_the_last_fetch() {
+        let tmp = TempDir::new().unwrap();
+        let (_origin, clone, wt) = clone_with_upstream_squash(tmp.path());
+        assert_eq!(cleanup(&clone, &wt, "feat"), Ok(()));
+        assert!(!wt.exists() && !branch_exists(&clone, "feat"), "cleaned up after the fetch");
+    }
+
+    #[test]
+    fn cleanup_skips_the_fetch_when_already_merged() {
+        let tmp = TempDir::new().unwrap();
+        let (origin, clone, wt) = clone_with_upstream_squash(tmp.path());
+        git(&clone, &["fetch", "origin"]);
+        commit_file(&origin, "later.txt", "later");
+        let fetched = rev_parse(&clone, "refs/remotes/origin/main");
+        assert_eq!(cleanup(&clone, &wt, "feat"), Ok(()));
+        assert_eq!(rev_parse(&clone, "refs/remotes/origin/main"), fetched, "origin/main never refetched");
+    }
+
+    #[test]
+    fn cleanup_refusal_names_a_failed_fetch() {
+        let tmp = TempDir::new().unwrap();
+        let (_origin, clone, wt) = clone_with_upstream_squash(tmp.path());
+        break_origin(&clone, tmp.path());
+        let err = cleanup(&clone, &wt, "feat").unwrap_err();
+        assert!(
+            err.contains("isn't merged into origin/main; not cleaning up\norigin/main not refreshed:"),
+            "{err}"
+        );
+        assert!(err.contains("does not appear to be a git repository"), "{err}");
+        assert!(wt.exists() && branch_exists(&clone, "feat"), "nothing destroyed");
     }
 
     // --- scan_merged_branches / delete_branches ---
@@ -2272,49 +2526,147 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    #[test]
-    fn scan_classifies_branches_and_skips_gates_without_gh() {
-        let tmp = TempDir::new().unwrap();
-        let repo = repo_with_branches(
-            tmp.path(),
-            &["development", "merged-ok", "feat/x", "open-pr", "no-pr", "other"],
-        );
-        let initial = tip_of(&repo, "main");
-        // One commit beyond what the (stubbed) PR merged.
-        git(&repo, &["switch", "-c", "merged-ahead"]);
-        std::fs::write(repo.join("more.txt"), "x").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-m", "beyond"]);
-        let wt = tmp.path().join("wt");
-        git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"]);
-        git(&repo, &["switch", "other"]); // checked out in the main repo itself
-        let gh = tmp.path().join("gh");
-        write_stub(
-            &gh,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$4\" >> \"$0.args\"\ncase \"$4\" in\n  merged-ok|feat/x|wt-branch|other) printf 'MERGED\\n%s\\n7\\n' \"$(git rev-parse \"refs/heads/$4\")\"; exit 0 ;;\n  merged-ahead) printf 'MERGED\\n{initial}\\n8\\n'; exit 0 ;;\n  open-pr) printf 'OPEN\\n%s\\n9\\n' \"$(git rev-parse \"refs/heads/$4\")\"; exit 0 ;;\n  no-pr) printf 'NONE\\n\\n\\n'; exit 0 ;;\nesac\nexit 1\n"
-            ),
-        );
+    /// Whether patch-ids alone would call `branch` merged: its net change as
+    /// one commit on `fork`, then any `=` mark among main's commits since.
+    fn lookalike(repo: &Path, branch: &str, fork: &str) -> bool {
+        let dir = repo.to_str().unwrap();
+        let tree = rev_parse(repo, &format!("{branch}^{{tree}}"));
+        let out = Command::new("git")
+            .args(["-C", dir, "commit-tree", &tree, "-p", fork, "-m", "probe"])
+            .output()
+            .unwrap();
+        let probe = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let range = format!("{probe}...main");
+        let out = Command::new("git")
+            .args(["-C", dir, "rev-list", "--cherry-mark", "--right-only", "--no-merges", &range])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().any(|l| l.starts_with('='))
+    }
 
-        let verdicts = scan_merged_branches_with(
-            repo.to_str().unwrap(),
-            &["development".to_string()],
-            gh.to_str().unwrap(),
-        )
-        .unwrap();
+    #[test]
+    fn scan_classifies_branches_from_local_git() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let r = repo.as_path();
+        git(r, &["branch", "stale"]);
+        let lines: String = (1..=8).map(|n| format!("{n}\n")).collect();
+        // Twenty identical lines, so a hunk looks the same wherever it lands.
+        let rep = |at: usize| -> String {
+            (1..=20).map(|n| if n == at { "b\n" } else { "a\n" }).collect()
+        };
+        std::fs::write(repo.join("rep.txt"), rep(0)).unwrap();
+        commit_file(r, "lines.txt", &lines);
+        let fork = rev_parse(r, "main");
+        // A branch off `fork` with one commit writing `file`.
+        let branch = |name: &str, file: &str, content: &str| {
+            git(r, &["switch", "-c", name, &fork]);
+            commit_file(r, file, content);
+            git(r, &["switch", "main"]);
+        };
+        // One more commit on an existing branch.
+        let extend = |name: &str, file: &str, content: &str| {
+            git(r, &["switch", name]);
+            commit_file(r, file, content);
+            git(r, &["switch", "main"]);
+        };
+
+        // Merged: a squash that main then edits next to, a slashed name, a
+        // --no-ff merge, a cherry-pick, and a squash whose reflog expired.
+        branch("squashed", "lines.txt", &lines.replace("2\n", "two\n"));
+        squash_merge(r, "squashed");
+        commit_file(r, "lines.txt", &lines.replace("2\n", "two\n").replace("3\n", "three\n"));
+        branch("feat/x", "x.txt", "x");
+        squash_merge(r, "feat/x");
+        branch("merge-commit", "m.txt", "m");
+        git(r, &["merge", "--no-ff", "-m", "merge", "merge-commit"]);
+        branch("rebased", "r.txt", "r");
+        git(r, &["cherry-pick", "rebased"]);
+        branch("expired", "e.txt", "e");
+        squash_merge(r, "expired");
+        git(r, &["reflog", "expire", "--expire=now", "refs/heads/expired"]);
+
+        // Not merged: more work after a squash or a merge, never merged, no
+        // shared history, and two branches patch-ids alone would call merged
+        // (whitespace inside the squashed lines; the same hunk elsewhere).
+        branch("beyond", "b.txt", "b");
+        squash_merge(r, "beyond");
+        extend("beyond", "b2.txt", "b2");
+        branch("merged-then-beyond", "mb.txt", "mb");
+        git(r, &["merge", "--no-ff", "-m", "merge", "merged-then-beyond"]);
+        extend("merged-then-beyond", "mb2.txt", "mb2");
+        branch("unmerged", "u.txt", "u");
+        git(r, &["switch", "--orphan", "unrelated"]);
+        commit_file(r, "o.txt", "o");
+        git(r, &["switch", "main"]);
+        branch("ws-only", "w.txt", "alpha beta\n");
+        squash_merge(r, "ws-only");
+        extend("ws-only", "w.txt", "alpha  beta\n");
+        branch("same-hunk-elsewhere", "rep.txt", &rep(15));
+        commit_file(r, "rep.txt", &rep(5));
+        assert!(lookalike(r, "ws-only", &fork), "ws-only fools patch-ids");
+        assert!(lookalike(r, "same-hunk-elsewhere", &fork), "same-hunk-elsewhere fools patch-ids");
+
+        // Nothing of its own: changes that cancel out (with an empty commit on
+        // main that an empty probe would match), main's tip, a fast-forward
+        // that main moved past, and main's first commit.
+        branch("net-zero", "z.txt", "z");
+        git(r, &["switch", "net-zero"]);
+        git(r, &["rm", "z.txt"]);
+        git(r, &["commit", "-m", "undo z"]);
+        git(r, &["switch", "main"]);
+        git(r, &["commit", "--allow-empty", "-m", "empty"]);
+        git(r, &["branch", "fresh"]);
+        git(r, &["switch", "-c", "ff-merged"]);
+        commit_file(r, "ff.txt", "ff");
+        git(r, &["switch", "main"]);
+        git(r, &["merge", "--ff-only", "ff-merged"]);
+        commit_file(r, "after-ff.txt", "after");
+
+        // Gated, and merged but checked out: in a linked worktree, and in the
+        // repo itself.
+        branch("development", "d.txt", "d");
+        squash_merge(r, "development");
+        let wt = tmp.path().join("wt");
+        git(r, &["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch", &fork]);
+        commit_file(&wt, "wt.txt", "wt");
+        squash_merge(r, "wt-branch");
+        branch("other", "other.txt", "other");
+        squash_merge(r, "other");
+        // Last: a replace graft that makes main look like it merged `grafted`.
+        branch("grafted", "g.txt", "g");
+        git(r, &["switch", "other"]);
+        git(r, &["replace", "--graft", "main", "main^", "grafted"]);
+        // The probe commit must bring its own identity.
+        git(r, &["config", "user.name", ""]);
+
+        let (verdicts, note) =
+            scan_merged_branches(repo.to_str().unwrap(), &["development".to_string()]).unwrap();
         let of = |name: &str| {
             verdicts.iter().find(|v| v.branch == name).unwrap_or_else(|| panic!("{name} scanned"))
         };
-        assert_eq!(verdicts.len(), 9);
-        assert_eq!(of("merged-ok").verdict, Verdict::Delete);
-        assert_eq!(of("merged-ok").pr, Some(7));
-        assert_eq!(of("merged-ok").tip, initial);
-        assert_eq!(of("feat/x").verdict, Verdict::Delete, "refs/heads/ stripped, slash kept");
-        assert_eq!(of("merged-ahead").verdict, Verdict::Skip("commits beyond the merged PR".into()));
-        assert_eq!(of("merged-ahead").pr, Some(8), "the PR number rides along with a skip");
-        assert_eq!(of("open-pr").verdict, Verdict::Skip("PR not merged (OPEN)".into()));
-        assert_eq!(of("no-pr").verdict, Verdict::Skip("no PR".into()));
-        assert_eq!(of("no-pr").pr, None);
+        assert_eq!(verdicts.len(), 20);
+        assert_eq!(note, None);
+        assert_eq!(of("feat/x").tip, rev_parse(r, "refs/heads/feat/x"), "the scan-time tip");
+        for name in ["squashed", "feat/x", "merge-commit", "rebased", "expired"] {
+            assert_eq!(of(name).verdict, Verdict::Delete, "{name}");
+        }
+        for name in [
+            "beyond",
+            "merged-then-beyond",
+            "unmerged",
+            "unrelated",
+            "ws-only",
+            "same-hunk-elsewhere",
+            "grafted",
+        ] {
+            assert_eq!(of(name).verdict, Verdict::Skip("not merged into main".into()), "{name}");
+        }
+        for name in ["net-zero", "fresh", "ff-merged", "stale"] {
+            assert_eq!(of(name).verdict, Verdict::Skip("no commits of its own".into()), "{name}");
+        }
         assert_eq!(of("development").verdict, Verdict::Skip("protected branch".into()));
         assert_eq!(of("main").verdict, Verdict::Skip("default branch".into()));
         match &of("wt-branch").verdict {
@@ -2327,30 +2679,159 @@ mod tests {
             Verdict::CheckedOut { worktree: repo_real.to_str().unwrap().to_string() },
             "the main checkout counts, at the realpath git reports"
         );
-        // Gated names never reach gh; everything else is asked exactly once.
-        let mut asked: Vec<String> = std::fs::read_to_string(format!("{}.args", gh.display()))
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        asked.sort();
-        assert_eq!(
-            asked,
-            ["feat/x", "merged-ahead", "merged-ok", "no-pr", "open-pr", "other", "wt-branch"]
-        );
     }
 
     #[test]
-    fn scan_aborts_when_gh_missing() {
+    fn scan_fetches_the_default_branch_first() {
+        // Found through a clone's origin/HEAD, and by name once that is gone.
+        for symbolic in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let (origin, clone, _wt) = clone_with_upstream_squash(tmp.path());
+            if !symbolic {
+                git(&clone, &["remote", "set-head", "origin", "-d"]);
+            }
+            git(&origin, &["tag", "v1"]); // on the commit the fetch brings in
+            let (verdicts, note) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
+            let feat = verdicts.iter().find(|v| v.branch == "feat").unwrap();
+            assert!(
+                matches!(feat.verdict, Verdict::CheckedOut { .. }),
+                "origin/HEAD {symbolic}: {:?}",
+                feat.verdict
+            );
+            assert_eq!(note, None, "origin/HEAD {symbolic}");
+            assert_eq!(
+                rev_parse(&clone, "refs/remotes/origin/main"),
+                rev_parse(&origin, "main"),
+                "origin/HEAD {symbolic}: origin/main refreshed"
+            );
+            let tags = Command::new("git")
+                .args(["-C", clone.to_str().unwrap(), "tag", "--list"])
+                .output()
+                .unwrap();
+            assert!(tags.stdout.is_empty(), "origin/HEAD {symbolic}: the fetch brought tags");
+        }
+    }
+
+    #[test]
+    fn scan_reports_a_failed_fetch_once() {
         let tmp = TempDir::new().unwrap();
-        let repo = repo_with_branches(tmp.path(), &["feat"]);
-        let err = scan_merged_branches_with(
-            repo.to_str().unwrap(),
-            &[],
-            "/nonexistent/definitely/not/gh",
-        )
-        .unwrap_err();
-        assert!(err.contains("gh CLI not found"), "the first gh failure aborts: {err}");
+        let (_origin, clone, _wt) = clone_with_upstream_squash(tmp.path());
+        git(&clone, &["switch", "-c", "unmerged"]);
+        commit_file(&clone, "u.txt", "u");
+        git(&clone, &["switch", "main"]);
+        break_origin(&clone, tmp.path());
+        let (verdicts, note) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
+        for name in ["feat", "unmerged"] {
+            let v = verdicts.iter().find(|v| v.branch == name).unwrap();
+            assert_eq!(v.verdict, Verdict::Skip("not merged into origin/main".into()), "{name}");
+        }
+        let note = note.expect("the failed refresh is noted");
+        assert!(
+            note.starts_with("origin/main not refreshed: couldn't fetch main from origin: fatal:"),
+            "{note}"
+        );
+        assert!(note.contains("does not appear to be a git repository"), "{note}");
+    }
+
+    #[test]
+    fn scan_and_cleanup_read_the_base_history_after_the_fetch() {
+        // A branch at origin's new tip: unmerged work against the stale
+        // origin/main, main's own history against the fetched one.
+        let tmp = TempDir::new().unwrap();
+        let (origin, clone) = issue_fixture(tmp.path());
+        commit_file(&origin, "new.txt", "new");
+        git(&origin, &["push", clone.to_str().unwrap(), "main:refs/heads/upstream-tip"]);
+        let stale = rev_parse(&clone, "refs/remotes/origin/main");
+        let wt = tmp.path().join("wt");
+        git(&clone, &["worktree", "add", wt.to_str().unwrap(), "upstream-tip"]);
+        let err = cleanup(&clone, &wt, "upstream-tip").unwrap_err();
+        assert!(err.contains("no commits of its own"), "{err}");
+
+        git(&clone, &["update-ref", "refs/remotes/origin/main", &stale]);
+        let (verdicts, _) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
+        let v = verdicts.iter().find(|v| v.branch == "upstream-tip").unwrap();
+        assert_eq!(v.verdict, Verdict::Skip("no commits of its own".into()));
+    }
+
+    #[test]
+    fn scan_resolves_the_base_lazily() {
+        // An unborn repo has no branch to check, and no default branch to find.
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-b", "main"]);
+        assert_eq!(scan_merged_branches(tmp.path().to_str().unwrap(), &[]), Ok((vec![], None)));
+        // Only a gated branch: no fetch, so the broken origin goes unnoticed.
+        let tmp = TempDir::new().unwrap();
+        let (_origin, clone) = issue_fixture(tmp.path());
+        break_origin(&clone, tmp.path());
+        let (verdicts, note) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
+        assert_eq!(verdicts.len(), 1, "{verdicts:?}");
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn scan_skips_squash_detection_in_a_partial_clone() {
+        let tmp = TempDir::new().unwrap();
+        let r = tmp.path();
+        init_repo(r);
+        for name in ["squashed", "merged"] {
+            git(r, &["switch", "-c", name]);
+            commit_file(r, &format!("{name}.txt"), name);
+            git(r, &["switch", "main"]);
+        }
+        squash_merge(r, "squashed");
+        git(r, &["merge", "--no-ff", "-m", "merge", "merged"]);
+        git(r, &["config", "extensions.partialclone", "origin"]);
+        let (verdicts, note) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+        let of = |name: &str| &verdicts.iter().find(|v| v.branch == name).unwrap().verdict;
+        assert_eq!(of("squashed"), &Verdict::Skip("not merged into main".into()));
+        assert_eq!(of("merged"), &Verdict::Delete, "merge commits still count");
+        assert_eq!(note.as_deref(), Some("squash merges not detected in a partial clone"));
+    }
+
+    #[test]
+    fn scan_never_runs_a_custom_merge_driver() {
+        // A driver picked by `$GIT_DIR/info/attributes`, which no attribute pin
+        // reaches. The replay needs a content merge (main edited the file
+        // before the squash), so it would run the driver; the scan runs `false`
+        // instead and keeps the branch (a known false negative).
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let r = repo.as_path();
+        let lines: String = (1..=8).map(|n| format!("{n}\n")).collect();
+        commit_file(r, "f.txt", &lines);
+        git(r, &["switch", "-c", "spied"]);
+        commit_file(r, "f.txt", &lines.replace("2\n", "two\n"));
+        git(r, &["switch", "main"]);
+        commit_file(r, "f.txt", &lines.replace("7\n", "seven\n"));
+        squash_merge(r, "spied");
+        let marker = tmp.path().join("driver-ran");
+        git(r, &["config", "merge.spy.driver", &format!("touch '{}'", marker.display())]);
+        std::fs::write(repo.join(".git/info/attributes"), "* merge=spy\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", r.to_str().unwrap(), "merge-tree", "--write-tree", "main^", "spied"])
+            .output()
+            .unwrap();
+        assert!(marker.exists(), "the fixture really reaches the driver");
+        std::fs::remove_file(&marker).unwrap();
+
+        let (verdicts, _) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+        assert!(!marker.exists(), "the scan ran the custom driver");
+        let v = verdicts.iter().find(|v| v.branch == "spied").unwrap();
+        assert_eq!(v.verdict, Verdict::Skip("not merged into main".into()));
+    }
+
+    #[test]
+    fn cleanups_error_without_a_default_branch() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&repo, &["branch", "-m", "main", "trunk"]);
+        let want = "couldn't find the default branch to compare against (no origin/HEAD, \
+                    origin/main, origin/master, main or master)";
+        assert_eq!(cleanup(&repo, &wt, &branch), Err(want.to_string()));
+        assert_eq!(scan_merged_branches(repo.to_str().unwrap(), &[]), Err(want.to_string()));
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
     }
 
     #[test]
@@ -2553,6 +3034,7 @@ mod tests {
         git(&clone, &["config", "user.email", "t@t"]);
         git(&clone, &["config", "user.name", "t"]);
         git(&clone, &["config", "commit.gpgsign", "false"]);
+        git(&clone, &["config", "core.logAllRefUpdates", "true"]);
         (origin, clone)
     }
 

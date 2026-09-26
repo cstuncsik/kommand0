@@ -73,11 +73,10 @@ impl AddWorkspaceField {
     }
 }
 
-/// One preview row: rendered as `<branch> <pr> <action>` with the branch column
+/// One preview row: rendered as `<branch> <action>` with the branch column
 /// sized to the width left over, so the action is never pushed off-screen.
 pub(crate) struct RepoCleanupRow {
     pub branch: String,
-    pub pr: String,
     pub action: String,
 }
 
@@ -127,6 +126,8 @@ pub(crate) enum ModalState {
         repo_id: String,
         repo_name: String,
         summary: String,
+        /// Core's note on the scan (a failed refresh, squash detection off).
+        note: Option<String>,
         rows: Vec<RepoCleanupRow>,
         plan: Vec<RepoCleanupItem>,
     },
@@ -1066,7 +1067,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             );
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    "Only proceeds if the branch's PR has been merged.",
+                    "Only proceeds if merged into the default branch.",
                     Style::default().fg(th.muted),
                 )),
                 inner[2],
@@ -1080,7 +1081,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             }
             if *unpushed {
                 warn.push(Line::styled(
-                    "⚠ Unpushed commits will block cleanup.",
+                    "⚠ Unpushed commits may block cleanup.",
                     Style::default().fg(th.error),
                 ));
             }
@@ -1096,7 +1097,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[5],
             );
         }
-        ModalState::ConfirmRepoCleanup { repo_name, summary, rows, .. } => {
+        ModalState::ConfirmRepoCleanup { repo_name, summary, note, rows, .. } => {
             // Content-sized: border 2 + summary 1 + blank 1 + footer 1 around the rows.
             let height = (rows.len() + 5).min(frame.area().height.saturating_sub(2) as usize);
             let area = frame
@@ -1126,6 +1127,13 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 Paragraph::new(Line::styled(summary.as_str(), Style::default().fg(th.text))),
                 inner[0],
             );
+            // The otherwise blank row, so the note costs no height.
+            if let Some(note) = note {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(note.as_str(), Style::default().fg(th.error))),
+                    inner[1],
+                );
+            }
 
             // ponytail: fixed cap with a "+N more" marker; a scrollable list if a
             // real repo overflows a 24-row terminal.
@@ -1137,9 +1145,9 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 .map(|r| UnicodeWidthStr::width(r.action.as_str()))
                 .max()
                 .unwrap_or(0);
-            // 8 = the pr column (6) plus its two separating spaces; the branch
-            // column takes what is left, truncating before the action ever clips.
-            let branch_w = (inner[2].width as usize).saturating_sub(8 + action_max).clamp(10, 30);
+            // 1 = the separating space; the branch column takes what is left,
+            // truncating before the action ever clips.
+            let branch_w = (inner[2].width as usize).saturating_sub(1 + action_max).clamp(10, 30);
             let mut lines: Vec<Line> = visible
                 .iter()
                 .map(|r| {
@@ -1150,7 +1158,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                         branch_w.saturating_sub(UnicodeWidthStr::width(branch.as_str())),
                     );
                     Line::styled(
-                        format!("{branch}{pad} {:<6} {}", r.pr, r.action),
+                        format!("{branch}{pad} {}", r.action),
                         Style::default().fg(th.text),
                     )
                 })
@@ -1434,6 +1442,7 @@ mod tests {
             repo_id: "r1".into(),
             repo_name: "demo".into(),
             summary: String::new(),
+            note: None,
             rows: vec![],
             plan: vec![],
         };

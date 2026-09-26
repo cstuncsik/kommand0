@@ -1039,7 +1039,9 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
             if let Some((msg, is_error)) = app.repo_cleanup_result.get(id) {
                 let color = if *is_error { th.error } else { th.text };
-                lines.push(Line::styled(msg.clone(), Style::default().fg(color)));
+                for line in msg.lines() {
+                    lines.push(Line::styled(line.to_string(), Style::default().fg(color)));
+                }
             }
             (title, lines)
         }
@@ -1201,13 +1203,20 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     );
                 }
                 if let Some(msg) = app.cleanup_result.get(&ws.id) {
+                    let mut msg_lines = msg.lines();
                     lines.push(Line::from(vec![
                         Span::styled(
                             "Cleanup blocked: ",
                             Style::default().fg(th.error).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(msg.clone(), Style::default().fg(th.error)),
+                        Span::styled(
+                            msg_lines.next().unwrap_or_default().to_string(),
+                            Style::default().fg(th.error),
+                        ),
                     ]));
+                    for line in msg_lines {
+                        lines.push(Line::styled(line.to_string(), Style::default().fg(th.error)));
+                    }
                 }
             }
 

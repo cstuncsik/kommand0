@@ -67,13 +67,14 @@ impl<T> Drop for SendOnDrop<T> {
 type ProfileDeleteMsg =
     (String, Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>);
 
-/// Repo-cleanup worker -> event loop: the scan's routed plan, or the delete
-/// phase's per-branch results. Both carry the repo id. `Scanned(_, Err)` also
-/// carries a delete-phase failure that produced no per-branch results (the
-/// config read).
+/// Repo-cleanup worker -> event loop: the scan's routed plan with core's note
+/// (a failed refresh of the default branch, squash detection off), or the
+/// delete phase's per-branch results. Both carry the repo id.
+/// `Scanned(_, Err)` also carries a delete-phase failure that produced no
+/// per-branch results (the config read).
 #[derive(Debug)]
 enum RepoCleanupMsg {
-    Scanned(String, Result<Vec<RepoCleanupItem>, String>),
+    Scanned(String, Result<(Vec<RepoCleanupItem>, Option<String>), String>),
     Deleted(String, Vec<(String, Result<(), String>)>),
 }
 
@@ -898,10 +899,10 @@ pub(crate) struct App {
     /// One-line repo-cleanup outcome `(message, is_error)` per repo id, shown
     /// in that repo's detail pane.
     pub(crate) repo_cleanup_result: HashMap<String, (String, bool)>,
-    /// A finished scan the user has not reviewed yet: parked when the result
-    /// landed while something else owned the keyboard; the next `c` on that
-    /// repo row opens it without rescanning.
-    repo_cleanup_pending: Option<(String, Vec<RepoCleanupItem>)>,
+    /// A finished scan (plan and note) the user has not reviewed yet: parked
+    /// when the result landed while something else owned the keyboard; the
+    /// next `c` on that repo row opens it without rescanning.
+    repo_cleanup_pending: Option<(String, Vec<RepoCleanupItem>, Option<String>)>,
     /// Repo-cleanup worker → event-loop channel.
     repo_cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<RepoCleanupMsg>>,
 
@@ -3609,10 +3610,12 @@ impl App {
             return;
         }
         match self.repo_cleanup_pending.take() {
-            Some((id, items)) if id == repo_id => self.open_repo_cleanup_modal(id, items),
+            Some((id, items, note)) if id == repo_id => {
+                self.open_repo_cleanup_modal(id, items, note)
+            }
             other => {
                 // A dropped plan takes its "press c to review" line with it.
-                if let Some((other_id, _)) = other {
+                if let Some((other_id, ..)) = other {
                     self.repo_cleanup_result.remove(&other_id);
                 }
                 self.start_repo_cleanup_scan(repo_id);
@@ -3620,8 +3623,9 @@ impl App {
         }
     }
 
-    /// Scan the repo's local branches for merged PRs off the render loop (one gh
-    /// call per branch) and route the verdicts against a snapshot of its workspaces.
+    /// Scan the repo's local branches for merged ones off the render loop (local
+    /// git after one fetch of the default branch) and route the verdicts against
+    /// a snapshot of its workspaces.
     fn start_repo_cleanup_scan(&mut self, repo_id: &str) {
         let Some(path) = self.repos.iter().find(|r| r.id == repo_id).map(|r| r.path.clone())
         else {
@@ -3646,48 +3650,55 @@ impl App {
             };
             let result = Config::protected_branches_at(&config_path)
                 .and_then(|protected| kommand0_core::scan_merged_branches(&path, &protected))
-                .map(|verdicts| kommand0_core::plan_repo_cleanup(verdicts, &id, &workspaces));
+                .map(|(verdicts, note)| {
+                    (kommand0_core::plan_repo_cleanup(verdicts, &id, &workspaces), note)
+                });
             guard.payload = Some(RepoCleanupMsg::Scanned(id, result));
         });
     }
 
     /// A scan landed. Nothing actionable: say so in the repo detail line. Else
     /// open the preview while the tree is idle, or park the plan and point at `c`.
+    /// Core's note rides along: a second detail line, or a row in the preview.
     fn on_repo_cleanup_scanned(
         &mut self,
         repo_id: String,
-        result: Result<Vec<RepoCleanupItem>, String>,
+        result: Result<(Vec<RepoCleanupItem>, Option<String>), String>,
     ) {
-        let items = match result {
-            Ok(items) => items,
+        let (items, note) = match result {
+            Ok(scan) => scan,
             Err(e) => {
                 self.repo_cleanup_result.insert(repo_id, (format!("Cleanup failed: {e}"), true));
                 return;
             }
         };
+        let with_note = |line: String| match &note {
+            Some(n) => (format!("{line}\n{n}"), true),
+            None => (line, false),
+        };
         let (deletes, routed, skipped) = repo_cleanup_counts(&items);
         if deletes + routed == 0 {
-            self.repo_cleanup_result
-                .insert(repo_id, (format!("Nothing to clean up ({skipped} skipped)"), false));
+            let line = with_note(format!("Nothing to clean up ({skipped} skipped)"));
+            self.repo_cleanup_result.insert(repo_id, line);
         } else if self.can_open_repo_cleanup_modal() {
-            self.open_repo_cleanup_modal(repo_id, items);
+            self.open_repo_cleanup_modal(repo_id, items, note);
         } else {
-            self.repo_cleanup_result.insert(
-                repo_id.clone(),
-                (
-                    format!(
-                        "Scan done: {deletes} to delete, {routed} workspace(s); press c to review"
-                    ),
-                    false,
-                ),
-            );
-            self.repo_cleanup_pending = Some((repo_id, items));
+            let line = with_note(format!(
+                "Scan done: {deletes} to delete, {routed} workspace(s); press c to review"
+            ));
+            self.repo_cleanup_result.insert(repo_id.clone(), line);
+            self.repo_cleanup_pending = Some((repo_id, items, note));
         }
     }
 
     /// Open the preview for a scanned plan. Rows are built now, not at scan
     /// time, so a parked plan shows the current dirty/unpushed/live markers.
-    fn open_repo_cleanup_modal(&mut self, repo_id: String, items: Vec<RepoCleanupItem>) {
+    fn open_repo_cleanup_modal(
+        &mut self,
+        repo_id: String,
+        items: Vec<RepoCleanupItem>,
+        note: Option<String>,
+    ) {
         self.repo_cleanup_result.remove(&repo_id);
         let repo_name = self
             .repos
@@ -3703,6 +3714,7 @@ impl App {
             repo_id,
             repo_name,
             summary,
+            note,
             rows,
             plan: items,
         };
@@ -3734,7 +3746,7 @@ impl App {
             }
             RepoCleanupItem::Skip { reason, .. } => format!("skip: {reason}"),
         };
-        modal::RepoCleanupRow { branch: item.branch().to_string(), pr: item.pr_label(), action }
+        modal::RepoCleanupRow { branch: item.branch().to_string(), action }
     }
 
     /// `y` in the preview: the workspace rows go through the workspace cleanup
@@ -10224,6 +10236,35 @@ mod key_tests {
         );
     }
 
+    /// A failed-refresh note in core's exact format.
+    fn stale_note(dir: &std::path::Path) -> String {
+        format!(
+            "origin/main not refreshed: couldn't fetch main from origin: fatal: '{}' does not \
+             appear to be a git repository",
+            dir.join("gone").display()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_workspace_refusal_shows_its_note_on_a_line_of_its_own() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+        app.workspaces[0].branch_name = Some("ws-one".into());
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let refusal = "the branch isn't merged into origin/main; not cleaning up";
+        app.cleanup_result.insert("w1".to_string(), format!("{refusal}\n{}", stale_note(tmp.path())));
+        let text = render_to_string(&mut app, 80, 24);
+        assert!(text.contains("Cleanup blocked: the branch"), "{text}");
+        let note = text
+            .lines()
+            .find(|l| l.contains("origin/main not refreshed"))
+            .unwrap_or_else(|| panic!("the note is visible at 80x24:\n{text}"));
+        assert!(!note.contains("Cleanup blocked"), "the note has its own line: {note}");
+    }
+
     /// One worker message, bounded: a hang must fail this test, not wedge the run.
     async fn recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
         tokio::time::timeout(Duration::from_secs(10), rx.recv())
@@ -10233,11 +10274,11 @@ mod key_tests {
     }
 
     fn delete_item(branch: &str) -> RepoCleanupItem {
-        RepoCleanupItem::Delete { branch: branch.into(), tip: "t".into(), pr: Some(12) }
+        RepoCleanupItem::Delete { branch: branch.into(), tip: "t".into() }
     }
 
     fn skip_item(branch: &str, reason: &str) -> RepoCleanupItem {
-        RepoCleanupItem::Skip { branch: branch.into(), pr: None, reason: reason.into() }
+        RepoCleanupItem::Skip { branch: branch.into(), reason: reason.into() }
     }
 
     /// Point w1 at the real repo as an own-branch workspace on `branch`.
@@ -10286,12 +10327,12 @@ mod key_tests {
             dirty: false,
             unpushed: false,
         };
-        app.on_repo_cleanup_scanned("r1".into(), Ok(vec![delete_item("stale")]));
+        app.on_repo_cleanup_scanned("r1".into(), Ok((vec![delete_item("stale")], None)));
         assert!(
             matches!(app.modal, modal::ModalState::ConfirmCleanup { .. }),
             "the open modal is not replaced"
         );
-        assert!(matches!(&app.repo_cleanup_pending, Some((id, _)) if id == "r1"));
+        assert!(matches!(&app.repo_cleanup_pending, Some((id, ..)) if id == "r1"));
         assert!(app.repo_cleanup_result["r1"].0.contains("press c to review"));
 
         press(&mut app, KeyCode::Char('n')).await;
@@ -10322,7 +10363,7 @@ mod key_tests {
         for (owner, own) in owners {
             let mut app = test_app();
             own(&mut app);
-            app.on_repo_cleanup_scanned("r1".into(), Ok(vec![delete_item("stale")]));
+            app.on_repo_cleanup_scanned("r1".into(), Ok((vec![delete_item("stale")], None)));
             assert!(!app.modal.is_active(), "{owner}: parked, not opened over it");
             assert!(app.repo_cleanup_pending.is_some(), "{owner}: the plan is kept");
         }
@@ -10332,7 +10373,7 @@ mod key_tests {
         let mut app = test_app();
         let tmp = tempfile::TempDir::new().unwrap();
         app.repos[1].path = tmp.path().join("missing").to_string_lossy().into_owned();
-        app.repo_cleanup_pending = Some(("r1".into(), vec![delete_item("stale")]));
+        app.repo_cleanup_pending = Some(("r1".into(), vec![delete_item("stale")], None));
         app.repo_cleanup_result.insert("r1".into(), ("Scan done: press c to review".into(), false));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.repo_cleanup_tx = Some(tx);
@@ -10346,33 +10387,93 @@ mod key_tests {
     #[tokio::test]
     async fn repo_cleanup_scan_result_opens_the_modal_or_reports_idle() {
         let mut app = test_app();
-        app.on_repo_cleanup_scanned("r1".into(), Ok(vec![skip_item("main", "default branch")]));
+        let idle = vec![skip_item("main", "default branch")];
+        app.on_repo_cleanup_scanned("r1".into(), Ok((idle, None)));
         assert!(!app.modal.is_active(), "nothing actionable opens no modal");
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Nothing to clean up (1 skipped)"), "{text}");
 
+        let tmp = tempfile::TempDir::new().unwrap();
         let mut app = test_app();
         app.on_repo_cleanup_scanned(
             "r1".into(),
-            Ok(vec![
-                delete_item("stale"),
-                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "ws-one".into(), pr: Some(13) },
-                skip_item("wip", "no PR"),
-            ]),
+            Ok((
+                vec![
+                    delete_item("stale"),
+                    RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "ws-one".into() },
+                    skip_item("wip", "not merged into main"),
+                ],
+                Some(stale_note(tmp.path())),
+            )),
         );
         assert!(app.modal.is_active());
-        let text = render_to_string(&mut app, 100, 30);
-        for needle in [
-            " Clean Up Repo alpha ",
-            "1 to delete, 1 via workspace cleanup, 1 skipped",
-            "stale",
-            "workspace ws-one",
-            "skip: no PR",
-        ] {
-            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        for (cols, rows) in [(100u16, 30u16), (80, 24)] {
+            let text = render_to_string(&mut app, cols, rows);
+            for needle in [
+                " Clean Up Repo alpha ",
+                "1 to delete, 1 via workspace cleanup, 1 skipped",
+                "origin/main not refreshed",
+                "stale",
+                "workspace ws-one",
+                "skip: not merged into main",
+            ] {
+                assert!(text.contains(needle), "missing {needle:?} at {cols}x{rows}:\n{text}");
+            }
         }
         press(&mut app, KeyCode::Char('n')).await;
         assert!(!app.modal.is_active(), "n closes the preview");
+    }
+
+    #[tokio::test]
+    async fn repo_cleanup_reports_a_stale_base_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let note = stale_note(tmp.path());
+        let unmerged = || skip_item("wip", "not merged into origin/main");
+        for (cols, rows) in [(80u16, 24u16), (100, 30)] {
+            // Nothing actionable: the idle line, and the note under it.
+            let mut app = test_app();
+            app.on_repo_cleanup_scanned("r1".into(), Ok((vec![unmerged()], Some(note.clone()))));
+            assert!(app.repo_cleanup_result["r1"].1, "a stale base reads as an error");
+            let text = render_to_string(&mut app, cols, rows);
+            assert!(text.contains("Nothing to clean up (1 skipped)"), "{cols}x{rows}:\n{text}");
+            assert!(text.contains("origin/main not refreshed"), "{cols}x{rows}:\n{text}");
+
+            // Parked while help owned the keyboard, shown once it closes.
+            let mut app = test_app();
+            app.show_help = true;
+            let plan = vec![delete_item("stale"), unmerged()];
+            app.on_repo_cleanup_scanned("r1".into(), Ok((plan, Some(note.clone()))));
+            app.show_help = false;
+            let (line, is_error) = &app.repo_cleanup_result["r1"];
+            assert!(line.contains("press c to review") && *is_error, "{line}");
+            let text = render_to_string(&mut app, cols, rows);
+            // At 80 columns the hint is clipped off the pane's right edge.
+            if cols == 100 {
+                assert!(text.contains("press c to review"), "{cols}x{rows}:\n{text}");
+            }
+            assert!(text.contains("origin/main not refreshed"), "{cols}x{rows}:\n{text}");
+
+            // `c` reviews it: the note on the row under the summary, rows plain.
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.repo_cleanup_tx = Some(tx);
+            app.select_repo_row("r1");
+            press(&mut app, KeyCode::Char('c')).await;
+            let text = render_to_string(&mut app, cols, rows);
+            let lines: Vec<&str> = text.lines().collect();
+            let summary = lines
+                .iter()
+                .position(|l| l.contains("1 to delete, 0 via workspace cleanup, 1 skipped"))
+                .unwrap_or_else(|| panic!("the preview opened at {cols}x{rows}:\n{text}"));
+            assert!(
+                lines[summary + 1].contains("origin/main not refreshed"),
+                "the note sits under the summary at {cols}x{rows}:\n{text}"
+            );
+            let row = lines
+                .iter()
+                .find(|l| l.contains("skip: not merged into origin/main"))
+                .unwrap_or_else(|| panic!("the skip row at {cols}x{rows}:\n{text}"));
+            assert!(!row.contains("refreshed"), "the row doesn't repeat the note: {row}");
+        }
     }
 
     #[tokio::test]
@@ -10399,18 +10500,11 @@ mod key_tests {
                 "r1".into(),
                 vec![
                     delete_item("stale"),
-                    RepoCleanupItem::Workspace {
-                        ws_id: "w1".into(),
-                        branch: long_branch.clone(),
-                        pr: Some(7),
-                    },
-                    skip_item("wip", "no PR"),
-                    RepoCleanupItem::Workspace {
-                        ws_id: "w1".into(),
-                        branch: cjk_branch.clone(),
-                        pr: Some(8),
-                    },
+                    RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: long_branch.clone() },
+                    skip_item("wip", "not merged into main"),
+                    RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: cjk_branch.clone() },
                 ],
+                None,
             );
             app
         };
@@ -10422,7 +10516,7 @@ mod key_tests {
             let width = cols as usize * 80 / 100;
             let inner_x = (cols as usize - width) / 2 + 2;
             let inner_w = width - 4;
-            let branch_w = inner_w.saturating_sub(8 + action.len()).clamp(10, 30);
+            let branch_w = inner_w.saturating_sub(1 + action.len()).clamp(10, 30);
             let line = text
                 .lines()
                 .find(|l| l.contains(action))
@@ -10434,22 +10528,19 @@ mod key_tests {
                 Some(' '),
                 "the branch cell is exactly {branch_w} cells at {cols} cols:\n{line}"
             );
-            assert!(line.contains(&format!("#7     {action}")), "pr column, then the action:\n{line}");
+            let after: String = line.chars().skip(inner_x + branch_w + 1).collect();
+            assert!(after.starts_with(action), "the action follows the branch cell:\n{line}");
             // A wide branch is padded by display width (one cell per char in
             // the buffer text), so the action is not pushed off the row.
             let cjk = text
                 .lines()
                 .find(|l| l.contains('\u{6f22}'))
                 .unwrap_or_else(|| panic!("CJK row visible at {cols} cols:\n{text}"));
-            let pr_at = cjk.find("#8").expect("pr column");
+            let action_at = cjk.find(action).expect("the action survives a wide branch");
             assert_eq!(
-                cjk[..pr_at].chars().count(),
+                cjk[..action_at].chars().count(),
                 inner_x + branch_w + 1,
                 "the CJK branch cell is exactly {branch_w} cells at {cols} cols:\n{cjk}"
-            );
-            assert!(
-                cjk.contains(&format!("#8     {action}")),
-                "the action survives a wide branch:\n{cjk}"
             );
         }
 
@@ -10462,8 +10553,8 @@ mod key_tests {
     async fn repo_cleanup_modal_caps_rows_with_an_exact_more_marker() {
         let mut app = test_app();
         let mut items = vec![delete_item("stale")];
-        items.extend((0..40).map(|i| skip_item(&format!("skip-{i:02}"), "no PR")));
-        app.open_repo_cleanup_modal("r1".into(), items);
+        items.extend((0..40).map(|i| skip_item(&format!("skip-{i:02}"), "not merged into main")));
+        app.open_repo_cleanup_modal("r1".into(), items, None);
 
         // 41 rows + 5 = 46 > 22 (24 - 2): height 22, interior 20, rows area 17,
         // so 16 rows show and the marker takes the last line.
@@ -10486,13 +10577,13 @@ mod key_tests {
         app.open_repo_cleanup_modal(
             "real".into(),
             vec![
-                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into(), pr: Some(1) },
+                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into() },
                 RepoCleanupItem::Delete {
                     branch: "stale".into(),
                     tip: "0000000000000000000000000000000000000000".into(),
-                    pr: Some(2),
                 },
             ],
+            None,
         );
 
         press(&mut app, KeyCode::Char('y')).await;
@@ -10502,7 +10593,7 @@ mod key_tests {
         assert_eq!(ws_id, "w1");
         assert!(
             result.unwrap_err().contains("default branch"),
-            "the workspace gate fires before any gh spawn"
+            "the workspace gate fires before the merged check"
         );
 
         assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("real"));
@@ -10552,9 +10643,10 @@ mod key_tests {
         app.open_repo_cleanup_modal(
             "real".into(),
             vec![
-                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into(), pr: Some(1) },
-                RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "main".into(), pr: Some(2) },
+                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into() },
+                RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "main".into() },
             ],
+            None,
         );
 
         let start = Instant::now();
@@ -10579,13 +10671,16 @@ mod key_tests {
         let msg = recv(&mut repo_rx).await;
         app.repo_cleanup_inflight = None;
         match msg {
-            RepoCleanupMsg::Scanned(_, Ok(items)) => assert_eq!(
-                items,
-                vec![
-                    skip_item("main", "default branch"),
-                    skip_item("release", "protected branch"),
-                ],
-                "nothing reached gh"
+            RepoCleanupMsg::Scanned(_, Ok(scan)) => assert_eq!(
+                scan,
+                (
+                    vec![
+                        skip_item("main", "default branch"),
+                        skip_item("release", "protected branch"),
+                    ],
+                    None
+                ),
+                "gated names never reach the merged check"
             ),
             other => panic!("expected a successful scan, got {other:?}"),
         }

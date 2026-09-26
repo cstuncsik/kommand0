@@ -151,11 +151,11 @@ enum RepoAction {
         /// The mode to switch to; omit to print the current one
         mode: Option<SortArg>,
     },
-    /// Delete local branches whose PR is merged (merged kommand0 worktrees are cleaned up too)
+    /// Delete local branches merged into the default branch (merged kommand0 worktrees too)
     Cleanup {
         /// Repo reference (name, path, or ID)
         name: String,
-        /// Print the plan and exit
+        /// Print the plan and exit (still fetches the default branch)
         #[arg(long, conflicts_with = "force")]
         dry_run: bool,
         /// Skip confirmation prompt
@@ -443,14 +443,17 @@ fn main() -> anyhow::Result<()> {
                 let protected = Config::protected_branches_now().map_err(anyhow::Error::msg)?;
                 let mut state = AppState::load()?;
                 let repo = state.resolve_repo(&name)?.clone();
-                let verdicts =
+                let (verdicts, note) =
                     scan_merged_branches(&repo.path, &protected).map_err(anyhow::Error::msg)?;
                 let plan = plan_repo_cleanup(verdicts, &repo.id, &state.workspaces);
 
                 fn ws_of<'a>(state: &'a AppState, id: &str) -> Option<&'a Workspace> {
                     state.workspaces.iter().find(|w| w.id == id)
                 }
-                println!("{:<30} {:<7} ACTION", "BRANCH", "PR");
+                if let Some(n) = &note {
+                    eprintln!("warning: {n}");
+                }
+                println!("{:<30} ACTION", "BRANCH");
                 for item in &plan {
                     let action = match item {
                         RepoCleanupItem::Delete { .. } => "delete".to_string(),
@@ -460,7 +463,7 @@ fn main() -> anyhow::Result<()> {
                         ),
                         RepoCleanupItem::Skip { reason, .. } => format!("skip: {reason}"),
                     };
-                    println!("{:<30} {:<7} {action}", item.branch(), item.pr_label());
+                    println!("{:<30} {action}", item.branch());
                 }
                 let actionable =
                     plan.iter().filter(|i| !matches!(i, RepoCleanupItem::Skip { .. })).count();
