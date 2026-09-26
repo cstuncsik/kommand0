@@ -720,7 +720,8 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
         && let Some(b) = &origin_branch
         && let Err(e) = fetch_origin_branch(repo_path, b, &gh_bin(), false)
     {
-        tracing::warn!("cleanup: {name} not refreshed: {e}");
+        // Reported by the caller (TUI log, CLI stderr), not logged here: the
+        // CLI's tracing also writes to stderr, so it would print twice.
         refresh_note = Some(format!("{name} not refreshed: {e}"));
     }
     let oid = git_stdout(

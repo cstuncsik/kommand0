@@ -3672,6 +3672,10 @@ impl App {
                 return;
             }
         };
+        // The pane clips the note; the log keeps it whole.
+        if let Some(n) = &note {
+            tracing::warn!("repo cleanup: {n}");
+        }
         let with_note = |line: String| match &note {
             Some(n) => (format!("{line}\n{n}"), true),
             None => (line, false),
@@ -5399,6 +5403,9 @@ async fn run(
                         }
                     }
                     Err(msg) => {
+                        // The pane clips a long refusal (its note line
+                        // included); the log keeps it whole.
+                        tracing::warn!("cleanup: {msg}");
                         app.cleanup_result.insert(ws_id, msg);
                     }
                 }

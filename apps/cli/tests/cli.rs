@@ -873,6 +873,7 @@ fn repo_cleanup_dry_run_warns_when_the_default_branch_cannot_be_refreshed() {
     assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("warning: origin/main not refreshed"), "{err}");
+    assert_eq!(err.matches("not refreshed").count(), 1, "said once, not also logged: {err}");
     assert!(err.contains("does not appear to be a git repository"), "{err}");
     let text = stdout(&out);
     assert!(text.starts_with("BRANCH"), "the table still prints: {text}");
