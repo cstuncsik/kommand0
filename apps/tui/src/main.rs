@@ -10427,19 +10427,21 @@ mod key_tests {
 
     #[tokio::test]
     async fn repo_cleanup_reports_a_stale_base_once() {
-        let note = || Some(STALE_NOTE.to_string());
+        // Two lines, the first short enough that the second, glued onto it,
+        // would still show on the same row.
+        let note = || Some("origin/main not refreshed: timed out\nsquash merges not detected".into());
         let unmerged = || skip_item("wip", "not merged into origin/main");
-        // The detail-pane row holding the note, which must be a row of its own.
-        let note_row = |text: &str, size: &str| {
-            let row = text
-                .lines()
-                .find(|l| l.contains("origin/main not refreshed"))
-                .unwrap_or_else(|| panic!("the note is visible at {size}:\n{text}"))
-                .to_string();
-            assert!(
-                !row.contains("Nothing to clean up") && !row.contains("press c to review"),
-                "the note has its own line at {size}: {row}"
-            );
+        // Each note line sits on a detail-pane row of its own.
+        let marks = ["Nothing to clean up", "press c to review", "not refreshed", "squash merges"];
+        let note_rows = |text: &str, size: &str| {
+            for line in ["not refreshed", "squash merges"] {
+                let row = text
+                    .lines()
+                    .find(|l| l.contains(line))
+                    .unwrap_or_else(|| panic!("{line:?} is visible at {size}:\n{text}"));
+                let shared = marks.iter().find(|m| **m != line && row.contains(**m));
+                assert_eq!(shared, None, "{line:?} has a row of its own at {size}: {row}");
+            }
         };
         for (cols, rows) in [(80u16, 24u16), (100, 30)] {
             let size = format!("{cols}x{rows}");
@@ -10449,7 +10451,7 @@ mod key_tests {
             assert!(app.repo_cleanup_result["r1"].1, "a stale base reads as an error");
             let text = render_to_string(&mut app, cols, rows);
             assert!(text.contains("Nothing to clean up (1 skipped)"), "{size}:\n{text}");
-            note_row(&text, &size);
+            note_rows(&text, &size);
 
             // Parked while help owned the keyboard, shown once it closes.
             let mut app = test_app();
@@ -10464,9 +10466,9 @@ mod key_tests {
             if cols == 100 {
                 assert!(text.contains("press c to review"), "{size}:\n{text}");
             }
-            note_row(&text, &size);
+            note_rows(&text, &size);
 
-            // `c` reviews it: the note on the row under the summary, rows plain.
+            // `c` reviews it: the note's first line under the summary, rows plain.
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             app.repo_cleanup_tx = Some(tx);
             app.select_repo_row("r1");
@@ -10477,9 +10479,10 @@ mod key_tests {
                 .iter()
                 .position(|l| l.contains("1 to delete, 0 via workspace cleanup, 1 skipped"))
                 .unwrap_or_else(|| panic!("the preview opened at {size}:\n{text}"));
+            let under = lines[summary + 1];
             assert!(
-                lines[summary + 1].contains("origin/main not refreshed"),
-                "the note sits under the summary at {size}:\n{text}"
+                under.contains("origin/main not refreshed") && !under.contains("squash merges"),
+                "only the note's first line sits under the summary at {size}:\n{text}"
             );
             let row = lines
                 .iter()

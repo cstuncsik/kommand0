@@ -2142,7 +2142,7 @@ mod tests {
 
     /// Squash-merge `branch` into main, which `repo` has checked out.
     fn squash_merge(repo: &Path, branch: &str) {
-        git(repo, &["merge", "--squash", branch]);
+        git(repo, &["merge", "--squash", "--ff", branch]);
         git(repo, &["commit", "-m", &format!("squash {branch}")]);
     }
 
@@ -2806,6 +2806,8 @@ mod tests {
         // before the squash), so it would run the driver; the scan runs `false`
         // instead and keeps the branch (a known false negative). `a=b` is a
         // legal driver name that a `-c` override splits in the wrong place.
+        // A squash that needs no driver must still count: the overrides may
+        // not break the replay itself.
         for driver in ["spy", "a=b"] {
             let tmp = TempDir::new().unwrap();
             let repo = tmp.path().join("repo");
@@ -2814,6 +2816,10 @@ mod tests {
             let r = repo.as_path();
             let lines: String = (1..=8).map(|n| format!("{n}\n")).collect();
             commit_file(r, "f.txt", &lines);
+            git(r, &["switch", "-c", "added"]);
+            commit_file(r, "new.txt", "new");
+            git(r, &["switch", "main"]);
+            squash_merge(r, "added");
             git(r, &["switch", "-c", "spied"]);
             commit_file(r, "f.txt", &lines.replace("2\n", "two\n"));
             git(r, &["switch", "main"]);
@@ -2830,10 +2836,12 @@ mod tests {
             assert!(marker.exists(), "{driver}: the fixture really reaches the driver");
             std::fs::remove_file(&marker).unwrap();
 
-            let (verdicts, _) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+            let (verdicts, note) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
             assert!(!marker.exists(), "{driver}: the scan ran the custom driver");
-            let v = verdicts.iter().find(|v| v.branch == "spied").unwrap();
-            assert_eq!(v.verdict, Verdict::Skip("not merged into main".into()), "{driver}");
+            let of = |name: &str| &verdicts.iter().find(|v| v.branch == name).unwrap().verdict;
+            assert_eq!(of("spied"), &Verdict::Skip("not merged into main".into()), "{driver}");
+            assert_eq!(of("added"), &Verdict::Delete, "{driver}: a squash that needs no driver");
+            assert_eq!(note, None, "{driver}");
         }
     }
 

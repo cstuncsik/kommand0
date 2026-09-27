@@ -1369,7 +1369,7 @@ fn squash_merge(repo: &std::path::Path, dir: &std::path::Path, branch: &str) {
     if dir == repo {
         run_git(repo, &["switch", "main"]);
     }
-    run_git(repo, &["merge", "--squash", branch]);
+    run_git(repo, &["merge", "--squash", "--ff", branch]);
     run_git(repo, &["commit", "-m", &format!("squash {branch}")]);
 }
 
