@@ -385,6 +385,9 @@ are kept on purpose, because local git can't prove them merged:
   are still detected);
 - files that need a custom merge driver (drivers never run during the check).
 
+The other way round, a merge later reverted on the default branch still
+counts as merged, because its commit stays in the default branch's history.
+
 If the default branch was renamed on the server, run `git remote set-head
 origin -a`. Delete a leftover by hand with `git branch -D <branch>`.
 

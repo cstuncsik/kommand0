@@ -1127,10 +1127,11 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 Paragraph::new(Line::styled(summary.as_str(), Style::default().fg(th.text))),
                 inner[0],
             );
-            // The otherwise blank row, so the note costs no height.
-            if let Some(note) = note {
+            // The otherwise blank row, so the note costs no height: its first
+            // line, the one to act on.
+            if let Some(first) = note.as_deref().and_then(|n| n.lines().next()) {
                 frame.render_widget(
-                    Paragraph::new(Line::styled(note.as_str(), Style::default().fg(th.error))),
+                    Paragraph::new(Line::styled(first, Style::default().fg(th.error))),
                     inner[1],
                 );
             }

@@ -353,8 +353,9 @@ fn workspace_create_from_an_issue() {
 fn the_linked_branch_fetch_never_asks_for_credentials() {
     // A PATH shim records how kommand0 actually invokes git: the fetch carries
     // gh's credential helper (a private HTTPS origin authenticated only by a
-    // GH_TOKEN fetches with nothing else), and neither git nor ssh may fall back
-    // to a prompt, which off the UI thread would hang past the timeout.
+    // GH_TOKEN fetches with nothing else), and neither git (a terminal or an
+    // askpass helper, which VS Code terminals set) nor ssh may fall back to a
+    // prompt, which off the UI thread would hang past the timeout.
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
     let repo = tmp.path().join("repo");
@@ -368,8 +369,8 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
     let path = git_shim(
         &tmp.path().join("shim"),
         &format!(
-            "printf '%s [%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
-             \"${{GIT_SSH_COMMAND-UNSET}}\" >> \"{}\"",
+            "printf '%s [%s][%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
+             \"${{GIT_SSH_COMMAND-UNSET}}\" \"${{GIT_ASKPASS-UNSET}}\" >> \"{}\"",
             log.display()
         ),
     );
@@ -381,6 +382,7 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
             ("PATH", &path),
             // A user's own GIT_SSH_COMMAND must survive, with batch mode added.
             ("GIT_SSH_COMMAND", "ssh -F /dev/null"),
+            ("GIT_ASKPASS", "/opt/editor/askpass.sh"),
         ],
         &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
     );
@@ -399,8 +401,8 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
         lines[fetch]
     );
     assert!(
-        lines[fetch].ends_with("[0][ssh -F /dev/null -oBatchMode=yes]"),
-        "no terminal prompt, and batch mode is appended to the user's ssh command: {}",
+        lines[fetch].ends_with("[0][ssh -F /dev/null -oBatchMode=yes][]"),
+        "no terminal or askpass prompt, and batch mode is appended to the user's ssh command: {}",
         lines[fetch]
     );
     let is_ancestor = lines
@@ -869,10 +871,13 @@ fn repo_cleanup_dry_run_warns_when_the_default_branch_cannot_be_refreshed() {
     run_git(&repo, &["push", "origin", "main"]);
     run_git(&repo, &["fetch", "origin"]);
     run_git(&repo, &["remote", "set-url", "origin", tmp.path().join("gone").to_str().unwrap()]);
+    // A second note: each gets a warning line of its own.
+    run_git(&repo, &["config", "extensions.partialclone", "origin"]);
     let out = repo_cleanup(&state, &repo, &["--dry-run"], &[]);
     assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("warning: origin/main not refreshed"), "{err}");
+    assert!(err.contains("warning: squash merges not detected in a partial clone"), "{err}");
     assert_eq!(err.matches("not refreshed").count(), 1, "said once, not also logged: {err}");
     let text = stdout(&out);
     assert!(text.starts_with("BRANCH"), "the table still prints: {text}");
@@ -881,17 +886,22 @@ fn repo_cleanup_dry_run_warns_when_the_default_branch_cannot_be_refreshed() {
 #[test]
 fn repo_cleanup_fails_closed_when_git_cannot_answer() {
     // Each git call the merged check makes for the squash-merged `stale`,
-    // failing the way a broken git does (exit 128): stale is kept.
-    let arms: &[(&str, &str, &str)] = &[
-        ("merge-base", "*\" merge-base \"*", "skip: not merged into main"),
-        ("commit-tree", "*\" commit-tree \"*", "skip: not merged into main"),
-        ("cherry-mark", "*\"rev-list --cherry-mark\"*", "skip: not merged into main"),
-        ("merge-tree", "*\" merge-tree \"*", "skip: not merged into main"),
+    // failing the way a broken git does (exit 128): stale is kept. Two of
+    // them turn squash detection off, with a warning and nothing else.
+    let unmerged = "skip: not merged into main";
+    let arms: &[(&str, &str, &str, &str)] = &[
+        ("merge-base", "*\" merge-base \"*", unmerged, ""),
+        ("commit-tree", "*\" commit-tree \"*", unmerged, ""),
+        ("cherry-mark", "*\"rev-list --cherry-mark\"*", unmerged, ""),
+        // The version probe included.
+        ("merge-tree", "*\" merge-tree \"*", unmerged, "(needs git 2.38 or newer)"),
         // Only the replay (it carries the merge config), past the capability check.
-        ("replay", "*merge.default=text*merge-tree*", "skip: not merged into main"),
-        ("reflog", "*\"reflog show\"*", "skip: no commits of its own"),
+        ("replay", "*merge.default=text*merge-tree*", unmerged, ""),
+        // A driver that can't be listed can't be overridden.
+        ("drivers", "*\" --get-regexp \"*", unmerged, "(couldn't read the merge driver config)"),
+        ("reflog", "*\"reflog show\"*", "skip: no commits of its own", ""),
     ];
-    for (what, pattern, want) in arms {
+    for (what, pattern, want, squash_off) in arms {
         let tmp = tempfile::tempdir().unwrap();
         let (state, repo) = setup_for_repo_cleanup(tmp.path());
         let path =
@@ -902,8 +912,13 @@ fn repo_cleanup_fails_closed_when_git_cannot_answer() {
         assert!(row(&text, "stale").ends_with(want), "{what}: {text}");
         assert!(branch_exists(&repo, "stale"), "{what}: stale survives --force");
         let err = String::from_utf8_lossy(&out.stderr);
-        let warned = err.contains("warning: squash merges not detected (needs git 2.38 or newer)");
-        assert_eq!(warned, *what == "merge-tree", "{what}: {err}");
+        if squash_off.is_empty() {
+            assert!(!err.contains("squash merges not detected"), "{what}: {err}");
+        } else {
+            let warning = format!("warning: squash merges not detected {squash_off}");
+            assert!(err.contains(&warning), "{what}: {err}");
+            assert!(!err.contains(" WARN "), "{what}: nothing logged beside it: {err}");
+        }
     }
 
     // The ancestor path, through a --no-ff merge.

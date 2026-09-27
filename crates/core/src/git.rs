@@ -681,13 +681,13 @@ struct Target {
     /// `GIT_ATTR_SOURCE` for every check, so no in-tree attributes apply (git
     /// before 2.40 ignores it).
     empty_tree: String,
-    /// Whether squash merges can be detected: `merge-tree --write-tree` works
-    /// and this isn't a partial clone.
+    /// Whether squash merges can be detected: `merge-tree --write-tree` works,
+    /// this isn't a partial clone, and the merge drivers could be listed.
     squash: bool,
-    /// The `-c key=value` pairs every replay runs with.
+    /// The config options (`-c`, `--config-env`) every replay runs with.
     merge_config: Vec<String>,
-    /// What the answers can't show on their own (squash detection off, a
-    /// failed refresh), `"; "`-joined.
+    /// What the answers can't show on their own, one per line: a failed
+    /// refresh first (the one to act on), then squash detection off.
     note: Option<String>,
 }
 
@@ -729,25 +729,54 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
     .ok_or_else(|| format!("couldn't resolve {name}"))?;
     let empty_tree = check_git_stdout(repo_path, &["hash-object", "-t", "tree", "/dev/null"], &[])
         .ok_or_else(|| "couldn't compute git's empty tree".to_string())?;
+    // Listed so the replay can override them. Exit 1 means none are set; any
+    // other failure leaves them unknown, so squash detection goes off rather
+    // than replay without the overrides.
+    let drivers = Command::new("git")
+        .args(["-C", repo_path, "config", "--name-only", "--get-regexp"])
+        .arg(r"^merge\..*\.driver$")
+        .output();
+    let driver_keys = match &drivers {
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(o) if o.status.code() == Some(1) => Some(String::new()),
+        _ => None,
+    };
+    // The version probe reads only the exit status: on git before 2.38 it fails
+    // every time, and a logged failure would land on kmd's stderr.
     let squash_note = if git_config_value(repo_path, "extensions.partialclone").is_some() {
         Some("squash merges not detected in a partial clone")
-    } else if check_git_stdout(repo_path, &["merge-tree", "--write-tree", &oid, &oid], &[]).is_none() {
+    } else if !Command::new("git")
+        .args(["-C", repo_path, "merge-tree", "--write-tree", &oid, &oid])
+        .envs(CHECK_ENV)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
         Some("squash merges not detected (needs git 2.38 or newer)")
+    } else if driver_keys.is_none() {
+        Some("squash merges not detected (couldn't read the merge driver config)")
     } else {
         None
     };
-    let mut merge_config =
-        ["core.attributesFile=/dev/null", "merge.renormalize=false", "merge.default=text"]
-            .map(String::from)
-            .to_vec();
-    // Every configured driver becomes `false`: attribute pins can't cover
-    // `$GIT_DIR/info/attributes`, and no custom driver may run in a background check.
-    let drivers = ["config", "--name-only", "--get-regexp", r"^merge\..*\.driver$"];
-    if let Some(keys) = check_git_stdout(repo_path, &drivers, &[]) {
-        merge_config.extend(keys.lines().map(|k| format!("{k}=false")));
+    let mut merge_config = [
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "merge.renormalize=false",
+        "-c",
+        "merge.default=text",
+    ]
+    .map(String::from)
+    .to_vec();
+    // Every configured driver becomes `false` (K0_DRIVER_OFF), whatever picks
+    // it: attribute pins miss `$GIT_DIR/info/attributes`. `--config-env`
+    // splits at the last `=`, `-c` at the first, and a driver name may have one.
+    for key in driver_keys.iter().flat_map(|k| k.lines()) {
+        merge_config.push(format!("--config-env={key}=K0_DRIVER_OFF"));
     }
     let notes: Vec<String> =
-        squash_note.map(str::to_string).into_iter().chain(refresh_note).collect();
+        refresh_note.into_iter().chain(squash_note.map(str::to_string)).collect();
     Ok(Target {
         name,
         origin_branch,
@@ -755,7 +784,7 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
         empty_tree,
         squash: squash_note.is_none(),
         merge_config,
-        note: (!notes.is_empty()).then(|| notes.join("; ")),
+        note: (!notes.is_empty()).then(|| notes.join("\n")),
     })
 }
 
@@ -781,7 +810,7 @@ enum Merged {
 ///
 /// Then [`fresh_by_reflog`] can still veto it.
 fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Merged {
-    let env = [("GIT_ATTR_SOURCE", target.empty_tree.as_str())];
+    let env = [("GIT_ATTR_SOURCE", target.empty_tree.as_str()), ("K0_DRIVER_OFF", "false")];
     let git = |args: &[&str]| check_git_stdout(repo_path, args, &env);
     let base = target.oid.as_str();
     let Some(fork) = git(&["merge-base", base, tip]) else { return Merged::No };
@@ -839,8 +868,7 @@ fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Mer
         // if replaying the branch onto its parent reproduces its tree exactly.
         let replayed = marks.lines().filter_map(|l| l.strip_prefix('=')).any(|c| {
             let parent = format!("{c}^");
-            let mut args: Vec<&str> =
-                target.merge_config.iter().flat_map(|kv| ["-c", kv.as_str()]).collect();
+            let mut args: Vec<&str> = target.merge_config.iter().map(String::as_str).collect();
             args.extend(["merge-tree", "--write-tree", parent.as_str(), tip]);
             let tree = git(&["rev-parse", &format!("{c}^{{tree}}")]);
             let (Some(tree), Some(out)) = (tree, git(&args)) else { return false };
@@ -976,6 +1004,12 @@ fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
 ///   status aborts rather than assuming clean); and
 /// - the branch is still at the checked tip right before the worktree is
 ///   removed, and again right before the branch is deleted.
+///
+/// The fetch runs only on a not-merged answer, so after an upstream
+/// force-push a stale default branch can still read merged: the dropped
+/// commits stay reachable from `refs/remotes/origin/<b>` until the next fetch,
+/// and in its reflog after that, much as the gh era trusted GitHub's merged
+/// flag.
 ///
 /// The worktree is removed WITHOUT `--force` (a last-moment dirty state still
 /// fails safe), and only then is the branch deleted, locally only: the remote
@@ -1536,6 +1570,9 @@ fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(),
         // never consulted for an ssh or local origin.
         // `--no-tags`: an explicit refspec would still auto-follow tags.
         .args(["-C", repo_dir, "-c", &helper, "fetch", "origin", &refspec, "--no-tags"])
+        // Empty, not unset: git asks an askpass helper (VS Code terminals set
+        // one) before it checks GIT_TERMINAL_PROMPT, and that pops a dialog.
+        .env("GIT_ASKPASS", "")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_SSH_COMMAND", batch_ssh_command(repo_dir))
         .stdin(Stdio::null())
@@ -2703,17 +2740,23 @@ mod tests {
         commit_file(&clone, "u.txt", "u");
         git(&clone, &["switch", "main"]);
         break_origin(&clone, tmp.path());
+        // A second note, to pin the order: the one to act on comes first.
+        git(&clone, &["config", "extensions.partialclone", "origin"]);
         let (verdicts, note) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
         for name in ["feat", "unmerged"] {
             let v = verdicts.iter().find(|v| v.branch == name).unwrap();
             assert_eq!(v.verdict, Verdict::Skip("not merged into origin/main".into()), "{name}");
         }
         let note = note.expect("the failed refresh is noted");
+        let mut lines = note.lines();
+        let refresh = lines.next().unwrap_or_default();
         assert!(
-            note.starts_with("origin/main not refreshed: couldn't fetch main from origin: fatal:"),
+            refresh.starts_with("origin/main not refreshed: couldn't fetch main from origin: fatal:"),
             "{note}"
         );
-        assert!(note.contains("does not appear to be a git repository"), "{note}");
+        assert!(refresh.contains("does not appear to be a git repository"), "{note}");
+        assert_eq!(lines.next(), Some("squash merges not detected in a partial clone"), "{note}");
+        assert_eq!(lines.next(), None, "{note}");
     }
 
     #[test]
@@ -2761,33 +2804,37 @@ mod tests {
         // A driver picked by `$GIT_DIR/info/attributes`, which no attribute pin
         // reaches. The replay needs a content merge (main edited the file
         // before the squash), so it would run the driver; the scan runs `false`
-        // instead and keeps the branch (a known false negative).
-        let tmp = TempDir::new().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        init_repo(&repo);
-        let r = repo.as_path();
-        let lines: String = (1..=8).map(|n| format!("{n}\n")).collect();
-        commit_file(r, "f.txt", &lines);
-        git(r, &["switch", "-c", "spied"]);
-        commit_file(r, "f.txt", &lines.replace("2\n", "two\n"));
-        git(r, &["switch", "main"]);
-        commit_file(r, "f.txt", &lines.replace("7\n", "seven\n"));
-        squash_merge(r, "spied");
-        let marker = tmp.path().join("driver-ran");
-        git(r, &["config", "merge.spy.driver", &format!("touch '{}'", marker.display())]);
-        std::fs::write(repo.join(".git/info/attributes"), "* merge=spy\n").unwrap();
-        let _ = Command::new("git")
-            .args(["-C", r.to_str().unwrap(), "merge-tree", "--write-tree", "main^", "spied"])
-            .output()
-            .unwrap();
-        assert!(marker.exists(), "the fixture really reaches the driver");
-        std::fs::remove_file(&marker).unwrap();
+        // instead and keeps the branch (a known false negative). `a=b` is a
+        // legal driver name that a `-c` override splits in the wrong place.
+        for driver in ["spy", "a=b"] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            init_repo(&repo);
+            let r = repo.as_path();
+            let lines: String = (1..=8).map(|n| format!("{n}\n")).collect();
+            commit_file(r, "f.txt", &lines);
+            git(r, &["switch", "-c", "spied"]);
+            commit_file(r, "f.txt", &lines.replace("2\n", "two\n"));
+            git(r, &["switch", "main"]);
+            commit_file(r, "f.txt", &lines.replace("7\n", "seven\n"));
+            squash_merge(r, "spied");
+            let marker = tmp.path().join("driver-ran");
+            let key = format!("merge.{driver}.driver");
+            git(r, &["config", &key, &format!("touch '{}'", marker.display())]);
+            std::fs::write(repo.join(".git/info/attributes"), format!("* merge={driver}\n")).unwrap();
+            let _ = Command::new("git")
+                .args(["-C", r.to_str().unwrap(), "merge-tree", "--write-tree", "main^", "spied"])
+                .output()
+                .unwrap();
+            assert!(marker.exists(), "{driver}: the fixture really reaches the driver");
+            std::fs::remove_file(&marker).unwrap();
 
-        let (verdicts, _) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
-        assert!(!marker.exists(), "the scan ran the custom driver");
-        let v = verdicts.iter().find(|v| v.branch == "spied").unwrap();
-        assert_eq!(v.verdict, Verdict::Skip("not merged into main".into()));
+            let (verdicts, _) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+            assert!(!marker.exists(), "{driver}: the scan ran the custom driver");
+            let v = verdicts.iter().find(|v| v.branch == "spied").unwrap();
+            assert_eq!(v.verdict, Verdict::Skip("not merged into main".into()), "{driver}");
+        }
     }
 
     #[test]

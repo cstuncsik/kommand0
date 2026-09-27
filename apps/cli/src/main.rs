@@ -450,8 +450,8 @@ fn main() -> anyhow::Result<()> {
                 fn ws_of<'a>(state: &'a AppState, id: &str) -> Option<&'a Workspace> {
                     state.workspaces.iter().find(|w| w.id == id)
                 }
-                if let Some(n) = &note {
-                    eprintln!("warning: {n}");
+                for line in note.iter().flat_map(|n| n.lines()) {
+                    eprintln!("warning: {line}");
                 }
                 println!("{:<30} ACTION", "BRANCH");
                 for item in &plan {

@@ -18,8 +18,9 @@ All notable changes to kommand0 are documented here. The format is based on
   repo scan fetches the default branch first and, when that fails, says so
   once (the detail pane, the preview, or a `kmd` warning); the workspace
   cleanup fetches only when the local copy says not merged. That fetch, shared
-  with issue branches, no longer pulls tags, and a failed fetch now shows
-  git's own error line.
+  with issue branches, no longer pulls tags or asks an askpass helper for
+  credentials (VS Code terminals set one), and a failed fetch now shows git's
+  own error line.
 
 ### Changed
 
