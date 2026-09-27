@@ -10618,14 +10618,15 @@ mod key_tests {
         match msg {
             RepoCleanupMsg::Deleted(id, results) => {
                 assert_eq!(id, "real");
-                assert_eq!(results, vec![("stale".to_string(), Err("moved since scan".to_string()))]);
+                let moved = Err("moved since it was checked".to_string());
+                assert_eq!(results, vec![("stale".to_string(), moved)]);
                 app.on_repo_cleanup_deleted(id, results);
             }
             other => panic!("expected the delete results, got {other:?}"),
         }
         assert_eq!(
             app.repo_cleanup_result["real"],
-            ("Deleted 0 of 1 branches; failed: stale (moved since scan)".to_string(), true)
+            ("Deleted 0 of 1 branches; failed: stale (moved since it was checked)".to_string(), true)
         );
         app.on_repo_cleanup_deleted("real".into(), vec![("a".into(), Ok(())), ("b".into(), Ok(()))]);
         assert_eq!(app.repo_cleanup_result["real"], ("Deleted 2 branches".to_string(), false));

@@ -627,15 +627,17 @@ fn is_live_worktree(worktree_path: &str) -> bool {
 }
 
 /// Env for every merged-check spawn: replace refs and grafts can't fake a
-/// merge, a partial clone never fetches (or prompts) mid-check, and no
-/// system-wide attributes apply.
-const CHECK_ENV: [(&str, &str); 4] = [
+/// merge, a partial clone never fetches (or prompts) mid-check, no system-wide
+/// attributes apply, and the replay's driver overrides read `false`.
+const CHECK_ENV: [(&str, &str); 5] = [
     ("GIT_NO_REPLACE_OBJECTS", "1"),
     // Not `/dev/null`, which makes git print its grafts deprecation hint on
     // every spawn; a path under it can't exist, so it is silently ignored.
     ("GIT_GRAFT_FILE", "/dev/null/none"),
     ("GIT_NO_LAZY_FETCH", "1"),
     ("GIT_ATTR_NOSYSTEM", "1"),
+    // The value of every `--config-env=merge.<driver>.driver=K0_DRIVER_OFF`.
+    ("K0_DRIVER_OFF", "false"),
 ];
 
 /// `git -C <repo_path> <args>` under [`CHECK_ENV`] plus `envs`: the trimmed
@@ -729,30 +731,57 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
     .ok_or_else(|| format!("couldn't resolve {name}"))?;
     let empty_tree = check_git_stdout(repo_path, &["hash-object", "-t", "tree", "/dev/null"], &[])
         .ok_or_else(|| "couldn't compute git's empty tree".to_string())?;
-    // Listed so the replay can override them. Exit 1 means none are set; any
-    // other failure leaves them unknown, so squash detection goes off rather
-    // than replay without the overrides.
-    let drivers = Command::new("git")
-        .args(["-C", repo_path, "config", "--name-only", "--get-regexp"])
-        .arg(r"^merge\..*\.driver$")
-        .output();
-    let driver_keys = match &drivers {
-        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
-        Ok(o) if o.status.code() == Some(1) => Some(String::new()),
-        _ => None,
+    // Listed so the replay can override them, from every config name filtered
+    // here on bytes: in a UTF-8 locale `--get-regexp` silently skips a name
+    // that isn't UTF-8. Any failure, or such a name (a lossy decode would
+    // override a different key), leaves them unknown, so squash detection goes
+    // off rather than replay without the overrides.
+    let names =
+        Command::new("git").args(["-C", repo_path, "config", "--list", "--name-only"]).output();
+    let driver_keys = match names {
+        Ok(o) if o.status.success() => {
+            let keys = o.stdout.split(|b| *b == b'\n').filter(|name| {
+                name.strip_prefix(b"merge.").is_some_and(|rest| rest.ends_with(b".driver"))
+            });
+            let decoded: Option<Vec<String>> =
+                keys.map(|k| String::from_utf8(k.to_vec()).ok()).collect();
+            if decoded.is_none() {
+                tracing::debug!("git config: a merge driver name isn't UTF-8");
+            }
+            decoded
+        }
+        Ok(o) => {
+            let why = last_line(&o.stderr);
+            tracing::debug!("git config --list failed ({}): {why}", o.status);
+            None
+        }
+        Err(e) => {
+            tracing::debug!("git config --list: {e}");
+            None
+        }
     };
-    // The version probe reads only the exit status: on git before 2.38 it fails
-    // every time, and a logged failure would land on kmd's stderr.
-    let squash_note = if git_config_value(repo_path, "extensions.partialclone").is_some() {
-        Some("squash merges not detected in a partial clone")
-    } else if !Command::new("git")
+    // The version probe logs at debug only: on git before 2.38 it fails every
+    // time, and a warning would land on kmd's stderr.
+    let merge_tree_works = || match Command::new("git")
         .args(["-C", repo_path, "merge-tree", "--write-tree", &oid, &oid])
         .envs(CHECK_ENV)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
     {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            let why = last_line(&o.stderr);
+            tracing::debug!("git merge-tree --write-tree failed ({}): {why}", o.status);
+            false
+        }
+        Err(e) => {
+            tracing::debug!("git merge-tree --write-tree: {e}");
+            false
+        }
+    };
+    let squash_note = if git_config_value(repo_path, "extensions.partialclone").is_some() {
+        Some("squash merges not detected in a partial clone")
+    } else if !merge_tree_works() {
         Some("squash merges not detected (needs git 2.38 or newer)")
     } else if driver_keys.is_none() {
         Some("squash merges not detected (couldn't read the merge driver config)")
@@ -769,10 +798,11 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
     ]
     .map(String::from)
     .to_vec();
-    // Every configured driver becomes `false` (K0_DRIVER_OFF), whatever picks
-    // it: attribute pins miss `$GIT_DIR/info/attributes`. `--config-env`
-    // splits at the last `=`, `-c` at the first, and a driver name may have one.
-    for key in driver_keys.iter().flat_map(|k| k.lines()) {
+    // Every configured driver becomes `false` (K0_DRIVER_OFF, in CHECK_ENV),
+    // whatever picks it: attribute pins miss `$GIT_DIR/info/attributes`.
+    // `--config-env` splits at the last `=`, `-c` at the first, and a driver
+    // name may have one.
+    for key in driver_keys.iter().flatten() {
         merge_config.push(format!("--config-env={key}=K0_DRIVER_OFF"));
     }
     let notes: Vec<String> =
@@ -810,7 +840,7 @@ enum Merged {
 ///
 /// Then [`fresh_by_reflog`] can still veto it.
 fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Merged {
-    let env = [("GIT_ATTR_SOURCE", target.empty_tree.as_str()), ("K0_DRIVER_OFF", "false")];
+    let env = [("GIT_ATTR_SOURCE", target.empty_tree.as_str())];
     let git = |args: &[&str]| check_git_stdout(repo_path, args, &env);
     let base = target.oid.as_str();
     let Some(fork) = git(&["merge-base", base, tip]) else { return Merged::No };
@@ -957,13 +987,13 @@ fn refuse_branch_delete(
 }
 
 /// `git branch -D -- <branch>`, only while it still points at `tip` (else
-/// "moved since scan"): force, because a squash-merge leaves the branch
-/// "unmerged" to git (the callers proved `tip` merged). `--` makes the gate's
-/// leading-dash refusal belt-and-braces, not load-bearing. Otherwise Err is
-/// git's last stderr line or the io error.
+/// "moved since it was checked"): force, because a squash-merge leaves the
+/// branch "unmerged" to git (the callers proved `tip` merged). `--` makes the
+/// gate's leading-dash refusal belt-and-braces, not load-bearing. Otherwise
+/// Err is git's last stderr line or the io error.
 fn delete_local_branch(repo_path: &str, branch: &str, tip: &str) -> Result<(), String> {
     if branch_tip(repo_path, branch).as_deref() != Some(tip) {
-        return Err("moved since scan".to_string());
+        return Err("moved since it was checked".to_string());
     }
     match Command::new("git")
         .args(["-C", repo_path, "branch", "-D", "--", branch])
@@ -1237,8 +1267,8 @@ pub fn scan_merged_branches(
 }
 
 /// Delete local branches, each only while it still points at its scan-time
-/// `tip` (else "moved since scan"). The name gates re-run; nothing here touches
-/// remotes, prunes, or calls gh. Results come back in input order.
+/// `tip` (else "moved since it was checked"). The name gates re-run; nothing
+/// here touches remotes, prunes, or calls gh. Results come back in input order.
 pub fn delete_branches(
     repo_path: &str,
     branches: &[(String, String)],
@@ -2846,6 +2876,29 @@ mod tests {
     }
 
     #[test]
+    fn scan_skips_squash_detection_for_a_driver_name_that_is_not_utf8() {
+        // A lossy decode would override a different key and leave this driver
+        // free to run, so a name that won't decode turns squash detection off.
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let r = tmp.path();
+        init_repo(r);
+        git(r, &["switch", "-c", "added"]);
+        commit_file(r, "new.txt", "new");
+        git(r, &["switch", "main"]);
+        squash_merge(r, "added");
+        // Raw bytes, not git argv: a git wrapper may reject non-UTF-8 arguments.
+        let mut config =
+            std::fs::OpenOptions::new().append(true).open(r.join(".git/config")).unwrap();
+        config.write_all(b"[merge \"\xff\"]\n\tdriver = false\n").unwrap();
+        let (verdicts, note) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+        let added = verdicts.iter().find(|v| v.branch == "added").unwrap();
+        assert_eq!(added.verdict, Verdict::Skip("not merged into main".into()));
+        let want = "squash merges not detected (couldn't read the merge driver config)";
+        assert_eq!(note.as_deref(), Some(want));
+    }
+
+    #[test]
     fn cleanups_error_without_a_default_branch() {
         let tmp = TempDir::new().unwrap();
         let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
@@ -2877,7 +2930,7 @@ mod tests {
         let names: Vec<&str> = results.iter().map(|(b, _)| b.as_str()).collect();
         assert_eq!(names, ["a", "b", "main", "x..y", "development", "wt-branch"], "input order");
         assert_eq!(results[0].1, Ok(()));
-        assert_eq!(results[1].1, Err("moved since scan".to_string()));
+        assert_eq!(results[1].1, Err("moved since it was checked".to_string()));
         assert!(results[2].1.as_ref().unwrap_err().contains("default branch"));
         assert!(results[3].1.as_ref().unwrap_err().contains("malformed"));
         assert!(results[4].1.as_ref().unwrap_err().contains("protected branch"));

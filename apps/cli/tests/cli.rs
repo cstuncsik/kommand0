@@ -898,7 +898,7 @@ fn repo_cleanup_fails_closed_when_git_cannot_answer() {
         // Only the replay (it carries the merge config), past the capability check.
         ("replay", "*merge.default=text*merge-tree*", unmerged, ""),
         // A driver that can't be listed can't be overridden.
-        ("drivers", "*\" --get-regexp \"*", unmerged, "(couldn't read the merge driver config)"),
+        ("drivers", "*\" config --list \"*", unmerged, "(couldn't read the merge driver config)"),
         ("reflog", "*\"reflog show\"*", "skip: no commits of its own", ""),
     ];
     for (what, pattern, want, squash_off) in arms {
@@ -997,7 +997,8 @@ fn workspace_cleanup_refuses_when_the_branch_moves_mid_cleanup() {
     );
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("worktree removed, but couldn't delete branch feat"), "{err}");
+    let reason = "worktree removed, but couldn't delete branch feat: moved since it was checked";
+    assert!(err.contains(reason), "{err}");
     assert_eq!(tip("refs/heads/feat^"), merged, "feat is kept, at the commit made mid-cleanup");
     let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
     assert!(list.contains("feat"), "workspace row survives: {list}");
