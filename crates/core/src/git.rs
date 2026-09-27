@@ -602,7 +602,8 @@ fn is_default_branch(repo_path: &str, branch: &str) -> bool {
 /// None when origin/HEAD is missing or isn't a plain origin branch.
 fn origin_head_branch(repo_path: &str) -> Option<String> {
     // `-q`: a missing origin/HEAD exits 1 quietly, not 128.
-    let target = git_stdout(repo_path, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], &[])?;
+    let target =
+        check_git_stdout(repo_path, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], &[])?;
     let branch = target.strip_prefix("refs/remotes/origin/")?;
     is_valid_branch_name(branch).then(|| branch.to_string())
 }
@@ -641,7 +642,7 @@ const CHECK_ENV: [(&str, &str); 4] = [
 /// stdout, or None when git can't run or exits non-zero. A failure is logged
 /// with the args and git's first stderr line: debug for a plain "no" (exit 1),
 /// warn from exit 128 up, where git broke rather than answered.
-fn git_stdout(repo_path: &str, args: &[&str], envs: &[(&str, &str)]) -> Option<String> {
+fn check_git_stdout(repo_path: &str, args: &[&str], envs: &[(&str, &str)]) -> Option<String> {
     let out = match Command::new("git")
         .args(["-C", repo_path])
         .args(args)
@@ -700,41 +701,37 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
          origin/master, main or master)"
             .to_string()
     })?;
-    let origin_branch = if git_ref == "refs/remotes/origin/HEAD" {
-        origin_head_branch(repo_path)
-    } else {
-        git_ref
-            .strip_prefix("refs/remotes/origin/")
-            .filter(|b| is_valid_branch_name(b))
-            .map(str::to_string)
+    let origin_branch = match git_ref.strip_prefix("refs/remotes/origin/") {
+        Some("HEAD") => origin_head_branch(repo_path),
+        b => b.map(str::to_string),
     };
     let name = match &origin_branch {
         Some(b) => format!("origin/{b}"),
-        None => {
-            let short = git_ref.strip_prefix("refs/heads/");
-            short.or(git_ref.strip_prefix("refs/remotes/")).unwrap_or(&git_ref).to_string()
-        }
+        None => git_ref
+            .trim_start_matches("refs/heads/")
+            .trim_start_matches("refs/remotes/")
+            .to_string(),
     };
     let mut refresh_note = None;
     if fetch
         && let Some(b) = &origin_branch
-        && let Err(e) = fetch_origin_branch(repo_path, b, &gh_bin(), false)
+        && let Err(e) = fetch_origin_branch(repo_path, b, &gh_bin())
     {
         // Reported by the caller (TUI log, CLI stderr), not logged here: the
         // CLI's tracing also writes to stderr, so it would print twice.
         refresh_note = Some(format!("{name} not refreshed: {e}"));
     }
-    let oid = git_stdout(
+    let oid = check_git_stdout(
         repo_path,
         &["rev-parse", "--verify", "--quiet", &format!("{git_ref}^{{commit}}")],
         &[],
     )
     .ok_or_else(|| format!("couldn't resolve {name}"))?;
-    let empty_tree = git_stdout(repo_path, &["hash-object", "-t", "tree", "/dev/null"], &[])
+    let empty_tree = check_git_stdout(repo_path, &["hash-object", "-t", "tree", "/dev/null"], &[])
         .ok_or_else(|| "couldn't compute git's empty tree".to_string())?;
     let squash_note = if git_config_value(repo_path, "extensions.partialclone").is_some() {
         Some("squash merges not detected in a partial clone")
-    } else if git_stdout(repo_path, &["merge-tree", "--write-tree", &oid, &oid], &[]).is_none() {
+    } else if check_git_stdout(repo_path, &["merge-tree", "--write-tree", &oid, &oid], &[]).is_none() {
         Some("squash merges not detected (needs git 2.38 or newer)")
     } else {
         None
@@ -746,7 +743,7 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
     // Every configured driver becomes `false`: attribute pins can't cover
     // `$GIT_DIR/info/attributes`, and no custom driver may run in a background check.
     let drivers = ["config", "--name-only", "--get-regexp", r"^merge\..*\.driver$"];
-    if let Some(keys) = git_stdout(repo_path, &drivers, &[]) {
+    if let Some(keys) = check_git_stdout(repo_path, &drivers, &[]) {
         merge_config.extend(keys.lines().map(|k| format!("{k}=false")));
     }
     let notes: Vec<String> =
@@ -785,7 +782,7 @@ enum Merged {
 /// Then [`fresh_by_reflog`] can still veto it.
 fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Merged {
     let env = [("GIT_ATTR_SOURCE", target.empty_tree.as_str())];
-    let git = |args: &[&str]| git_stdout(repo_path, args, &env);
+    let git = |args: &[&str]| check_git_stdout(repo_path, args, &env);
     let base = target.oid.as_str();
     let Some(fork) = git(&["merge-base", base, tip]) else { return Merged::No };
     if fork == tip {
@@ -814,7 +811,6 @@ fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Mer
         // The branch's net change as one commit on the fork point. A fixed
         // identity and date: deterministic, and no user config can block it.
         let probe_env = [
-            ("GIT_ATTR_SOURCE", target.empty_tree.as_str()),
             ("GIT_AUTHOR_NAME", "kommand0"),
             ("GIT_AUTHOR_EMAIL", "kommand0@localhost"),
             ("GIT_AUTHOR_DATE", "1700000000 +0000"),
@@ -831,7 +827,9 @@ fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Mer
             "-m",
             "kommand0 cleanup probe",
         ];
-        let Some(probe) = git_stdout(repo_path, &probe_args, &probe_env) else { return Merged::No };
+        let Some(probe) = check_git_stdout(repo_path, &probe_args, &probe_env) else {
+            return Merged::No;
+        };
         let range = format!("{probe}...{base}");
         let Some(marks) = git(&["rev-list", "--cherry-mark", "--right-only", "--no-merges", &range])
         else {
@@ -864,7 +862,7 @@ fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Mer
 fn fresh_by_reflog(repo_path: &str, branch: &str, tip: &str) -> bool {
     let refname = format!("refs/heads/{branch}");
     let args = ["reflog", "show", "--no-show-signature", "--format=%H%x00%gs", refname.as_str()];
-    let Some(log) = git_stdout(repo_path, &args, &[]) else { return true };
+    let Some(log) = check_git_stdout(repo_path, &args, &[]) else { return true };
     let mut entries = log.lines();
     let (Some(only), None) = (entries.next(), entries.next()) else { return false };
     let Some((oid, subject)) = only.split_once('\0') else { return true };
@@ -930,12 +928,15 @@ fn refuse_branch_delete(
     Ok(())
 }
 
-/// `git branch -D -- <branch>`: force, because a squash-merge leaves the branch
-/// "unmerged" to git (the callers proved this tip merged and re-checked that
-/// the branch is still on it). `--` makes the gate's leading-dash refusal
-/// belt-and-braces, not load-bearing. Err is git's last stderr line or the io
-/// error.
-fn delete_local_branch(repo_path: &str, branch: &str) -> Result<(), String> {
+/// `git branch -D -- <branch>`, only while it still points at `tip` (else
+/// "moved since scan"): force, because a squash-merge leaves the branch
+/// "unmerged" to git (the callers proved `tip` merged). `--` makes the gate's
+/// leading-dash refusal belt-and-braces, not load-bearing. Otherwise Err is
+/// git's last stderr line or the io error.
+fn delete_local_branch(repo_path: &str, branch: &str, tip: &str) -> Result<(), String> {
+    if branch_tip(repo_path, branch).as_deref() != Some(tip) {
+        return Err("moved since scan".to_string());
+    }
     match Command::new("git")
         .args(["-C", repo_path, "branch", "-D", "--", branch])
         .output()
@@ -1109,14 +1110,9 @@ pub fn cleanup_merged_workspace(
         .args(["-C", repo_path, "worktree", "prune"])
         .output();
 
-    // Checked again because kmd doesn't stop a live agent: a commit landed
-    // since the first check is kept, and so is the branch.
-    let delete = if branch_tip(repo_path, branch).as_deref() == Some(tip.as_str()) {
-        delete_local_branch(repo_path, branch)
-    } else {
-        Err("it moved during the cleanup, so it is kept".to_string())
-    };
-    delete.map_err(|e| {
+    // The delete re-checks the tip, because kmd doesn't stop a live agent: a
+    // commit landed since the first check keeps the branch.
+    delete_local_branch(repo_path, branch, &tip).map_err(|e| {
         if worktree_exists {
             format!("worktree removed, but couldn't delete branch {branch}: {e}")
         } else {
@@ -1149,10 +1145,9 @@ pub struct BranchVerdict {
 
 /// Classify every local branch of `repo_path` for deletion: the name gates of
 /// [`cleanup_merged_workspace`] first, then its merged check against the
-/// default branch, fetched first. The default branch is resolved at the first
-/// branch past the gates, so an unborn or all-gated repo needs none and pays no
-/// fetch. Deletes and prunes nothing. Returns the target's note (a failed
-/// refresh, squash detection off) once, beside the verdicts.
+/// default branch, fetched first. Deletes and prunes nothing. Returns the
+/// target's note (a failed refresh, squash detection off) once, beside the
+/// verdicts.
 ///
 /// A stale default branch (the fetch failed) only under-reports, except after
 /// an upstream force-push: the dropped commits stay reachable from
@@ -1180,7 +1175,7 @@ pub fn scan_merged_branches(
     let text = String::from_utf8_lossy(&out.stdout);
     let fields: Vec<&str> = text.split('\0').collect();
     let mut verdicts = Vec::new();
-    let mut target: Option<Target> = None;
+    let target = merge_target(repo_path, true)?;
     // for-each-ref ends each record with '\n', which lands in front of the next
     // refname; the newline-only remainder after the last NUL is dropped.
     let (records, _) = fields.as_chunks::<3>();
@@ -1188,29 +1183,23 @@ pub fn scan_merged_branches(
         let Some(branch) = refname.trim_start_matches('\n').strip_prefix("refs/heads/") else {
             continue;
         };
+        // ponytail: ~5 git spawns per branch plus one cherry-mark walk over every base
+        // commit since its fork; fold all probes into one octopus for a single
+        // rev-list --cherry-mark pass if hundreds of branches make the scan slow.
         let verdict = match refuse_branch_delete(repo_path, branch, protected) {
             Err(r) => Verdict::Skip(r.short().to_string()),
-            Ok(()) => {
-                let t = match &mut target {
-                    Some(t) => t,
-                    slot @ None => slot.insert(merge_target(repo_path, true)?),
-                };
-                // ponytail: ~5 git spawns per branch plus one cherry-mark walk over every base
-                // commit since its fork; fold all probes into one octopus for a single
-                // rev-list --cherry-mark pass if hundreds of branches make the scan slow.
-                match merged_into(repo_path, t, branch, tip) {
-                    Merged::NoCommits => Verdict::Skip("no commits of its own".to_string()),
-                    Merged::No => Verdict::Skip(format!("not merged into {}", t.name)),
-                    Merged::Yes if !worktree.is_empty() => {
-                        Verdict::CheckedOut { worktree: worktree.to_string() }
-                    }
-                    Merged::Yes => Verdict::Delete,
+            Ok(()) => match merged_into(repo_path, &target, branch, tip) {
+                Merged::NoCommits => Verdict::Skip("no commits of its own".to_string()),
+                Merged::No => Verdict::Skip(format!("not merged into {}", target.name)),
+                Merged::Yes if !worktree.is_empty() => {
+                    Verdict::CheckedOut { worktree: worktree.to_string() }
                 }
-            }
+                Merged::Yes => Verdict::Delete,
+            },
         };
         verdicts.push(BranchVerdict { branch: branch.to_string(), tip: tip.to_string(), verdict });
     }
-    Ok((verdicts, target.and_then(|t| t.note)))
+    Ok((verdicts, target.note))
 }
 
 /// Delete local branches, each only while it still points at its scan-time
@@ -1223,10 +1212,7 @@ pub fn delete_branches(
 ) -> Vec<(String, Result<(), String>)> {
     let delete = |branch: &str, tip: &str| -> Result<(), String> {
         refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
-        if branch_tip(repo_path, branch).as_deref() != Some(tip) {
-            return Err("moved since scan".to_string());
-        }
-        delete_local_branch(repo_path, branch)
+        delete_local_branch(repo_path, branch, tip)
     };
     branches.iter().map(|(b, t)| (b.clone(), delete(b, t))).collect()
 }
@@ -1470,7 +1456,24 @@ fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
 /// Fetch the linked branch, then refuse the two ways adopting it could pick the
 /// wrong commit. Runs after the name gate: the branch reaches a refspec here.
 fn prepare_linked_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(), String> {
-    fetch_origin_branch(repo_dir, branch, gh_bin, true)?;
+    // A `--single-branch` clone maps only its own branch, and `worktree add
+    // --track` then dies with "not a branch" on the tracking ref we just
+    // fetched. Widen the remote first, unless a refspec already covers it (a
+    // second `set-branches --add` would duplicate the entry). Best-effort: the
+    // fetch may still work, and its own error is the one worth showing.
+    if !origin_fetches(repo_dir, branch) {
+        match Command::new("git")
+            .args(["-C", repo_dir, "remote", "set-branches", "--add", "origin", branch])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(st) if st.success() => {}
+            Ok(st) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({st})"),
+            Err(e) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({e})"),
+        }
+    }
+    fetch_origin_branch(repo_dir, branch, gh_bin)?;
     // `create_worktree_from_branch` resolves `refs/remotes/<ref>` BEFORE
     // `refs/remotes/origin/<ref>`, so a linked branch named `alice/fix` would
     // adopt remote `alice`'s `fix` instead. Only an existing ref shadows, hence
@@ -1522,32 +1525,9 @@ fn shell_quote(s: &str) -> String {
 /// non-interactive, without tags. Explicit refspec: a bare `git fetch origin
 /// <branch>` leaves the tracking ref to the configured refspec, and a STALE
 /// tracking ref passes `verify_ref` and silently yields a worktree behind
-/// origin. `widen` adds the branch to `remote.origin.fetch` when no refspec
-/// covers it yet (a branch about to be checked out needs that).
-fn fetch_origin_branch(
-    repo_dir: &str,
-    branch: &str,
-    gh_bin: &str,
-    widen: bool,
-) -> Result<(), String> {
+/// origin.
+fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(), String> {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    // A `--single-branch` clone maps only its own branch, and `worktree add
-    // --track` then dies with "not a branch" on the tracking ref we just
-    // fetched. Widen the remote first, unless a refspec already covers it (a
-    // second `set-branches --add` would duplicate the entry). Best-effort: the
-    // fetch may still work, and its own error is the one worth showing.
-    if widen && !origin_fetches(repo_dir, branch) {
-        match Command::new("git")
-            .args(["-C", repo_dir, "remote", "set-branches", "--add", "origin", branch])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(st) if st.success() => {}
-            Ok(st) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({st})"),
-            Err(e) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({e})"),
-        }
-    }
     let helper = format!("credential.helper=!{} auth git-credential", shell_quote(gh_bin));
     let spawned = Command::new("git")
         // gh authenticates HTTPS through the credential helper it injects, so a
@@ -2752,21 +2732,6 @@ mod tests {
         let (verdicts, _) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
         let v = verdicts.iter().find(|v| v.branch == "upstream-tip").unwrap();
         assert_eq!(v.verdict, Verdict::Skip("no commits of its own".into()));
-    }
-
-    #[test]
-    fn scan_resolves_the_base_lazily() {
-        // An unborn repo has no branch to check, and no default branch to find.
-        let tmp = TempDir::new().unwrap();
-        git(tmp.path(), &["init", "-b", "main"]);
-        assert_eq!(scan_merged_branches(tmp.path().to_str().unwrap(), &[]), Ok((vec![], None)));
-        // Only a gated branch: no fetch, so the broken origin goes unnoticed.
-        let tmp = TempDir::new().unwrap();
-        let (_origin, clone) = issue_fixture(tmp.path());
-        break_origin(&clone, tmp.path());
-        let (verdicts, note) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
-        assert_eq!(verdicts.len(), 1, "{verdicts:?}");
-        assert_eq!(note, None);
     }
 
     #[test]

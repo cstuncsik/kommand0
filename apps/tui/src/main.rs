@@ -67,14 +67,17 @@ impl<T> Drop for SendOnDrop<T> {
 type ProfileDeleteMsg =
     (String, Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>);
 
-/// Repo-cleanup worker -> event loop: the scan's routed plan with core's note
-/// (a failed refresh of the default branch, squash detection off), or the
-/// delete phase's per-branch results. Both carry the repo id.
-/// `Scanned(_, Err)` also carries a delete-phase failure that produced no
-/// per-branch results (the config read).
+/// A scan's routed plan with core's note (a failed refresh of the default
+/// branch, squash detection off).
+type RepoScan = (Vec<RepoCleanupItem>, Option<String>);
+
+/// Repo-cleanup worker -> event loop: the scan, or the delete phase's
+/// per-branch results. Both carry the repo id. `Scanned(_, Err)` also carries
+/// a delete-phase failure that produced no per-branch results (the config
+/// read).
 #[derive(Debug)]
 enum RepoCleanupMsg {
-    Scanned(String, Result<(Vec<RepoCleanupItem>, Option<String>), String>),
+    Scanned(String, Result<RepoScan, String>),
     Deleted(String, Vec<(String, Result<(), String>)>),
 }
 
@@ -896,13 +899,13 @@ pub(crate) struct App {
 
     /// The repo whose merged-branch scan or delete is running (at most one).
     pub(crate) repo_cleanup_inflight: Option<String>,
-    /// One-line repo-cleanup outcome `(message, is_error)` per repo id, shown
-    /// in that repo's detail pane.
+    /// Repo-cleanup outcome `(message, is_error)` per repo id, shown in that
+    /// repo's detail pane: one line, plus core's note below it when there is one.
     pub(crate) repo_cleanup_result: HashMap<String, (String, bool)>,
-    /// A finished scan (plan and note) the user has not reviewed yet: parked
-    /// when the result landed while something else owned the keyboard; the
-    /// next `c` on that repo row opens it without rescanning.
-    repo_cleanup_pending: Option<(String, Vec<RepoCleanupItem>, Option<String>)>,
+    /// A finished scan the user has not reviewed yet: parked when the result
+    /// landed while something else owned the keyboard; the next `c` on that
+    /// repo row opens it without rescanning.
+    repo_cleanup_pending: Option<(String, RepoScan)>,
     /// Repo-cleanup worker → event-loop channel.
     repo_cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<RepoCleanupMsg>>,
 
@@ -3610,12 +3613,12 @@ impl App {
             return;
         }
         match self.repo_cleanup_pending.take() {
-            Some((id, items, note)) if id == repo_id => {
+            Some((id, (items, note))) if id == repo_id => {
                 self.open_repo_cleanup_modal(id, items, note)
             }
             other => {
                 // A dropped plan takes its "press c to review" line with it.
-                if let Some((other_id, ..)) = other {
+                if let Some((other_id, _)) = other {
                     self.repo_cleanup_result.remove(&other_id);
                 }
                 self.start_repo_cleanup_scan(repo_id);
@@ -3663,7 +3666,7 @@ impl App {
     fn on_repo_cleanup_scanned(
         &mut self,
         repo_id: String,
-        result: Result<(Vec<RepoCleanupItem>, Option<String>), String>,
+        result: Result<RepoScan, String>,
     ) {
         let (items, note) = match result {
             Ok(scan) => scan,
@@ -3691,7 +3694,7 @@ impl App {
                 "Scan done: {deletes} to delete, {routed} workspace(s); press c to review"
             ));
             self.repo_cleanup_result.insert(repo_id.clone(), line);
-            self.repo_cleanup_pending = Some((repo_id, items, note));
+            self.repo_cleanup_pending = Some((repo_id, (items, note)));
         }
     }
 
@@ -10339,7 +10342,7 @@ mod key_tests {
             matches!(app.modal, modal::ModalState::ConfirmCleanup { .. }),
             "the open modal is not replaced"
         );
-        assert!(matches!(&app.repo_cleanup_pending, Some((id, ..)) if id == "r1"));
+        assert!(matches!(&app.repo_cleanup_pending, Some((id, _)) if id == "r1"));
         assert!(app.repo_cleanup_result["r1"].0.contains("press c to review"));
 
         press(&mut app, KeyCode::Char('n')).await;
@@ -10380,7 +10383,7 @@ mod key_tests {
         let mut app = test_app();
         let tmp = tempfile::TempDir::new().unwrap();
         app.repos[1].path = tmp.path().join("missing").to_string_lossy().into_owned();
-        app.repo_cleanup_pending = Some(("r1".into(), vec![delete_item("stale")], None));
+        app.repo_cleanup_pending = Some(("r1".into(), (vec![delete_item("stale")], None)));
         app.repo_cleanup_result.insert("r1".into(), ("Scan done: press c to review".into(), false));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.repo_cleanup_tx = Some(tx);
