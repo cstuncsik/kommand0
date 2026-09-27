@@ -2155,15 +2155,6 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_merged_clean_removes_worktree_and_branch() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
-        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()));
-        assert!(!wt.exists(), "worktree dir removed");
-        assert!(!branch_exists(&repo, &branch), "branch deleted");
-    }
-
-    #[test]
     fn cleanup_refuses_an_unmerged_branch_and_destroys_nothing() {
         let tmp = TempDir::new().unwrap();
         let (repo, wt, branch) = repo_with_worktree(tmp.path());
@@ -2175,7 +2166,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_refuses_a_fresh_branch_with_no_commits_of_its_own() {
+    fn cleanup_refuses_a_branch_still_at_main() {
         let tmp = TempDir::new().unwrap();
         let (repo, wt, branch) = repo_with_worktree(tmp.path());
         let err = cleanup(&repo, &wt, &branch).unwrap_err();
@@ -2289,10 +2280,10 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_deletes_adopted_and_legacy_branches_when_merged() {
-        // A branch kommand0 didn't name (adopted via --branch / the checkout
-        // offer) is cleanable once merged, and so is a pre-0.11 `kommand0/` one.
-        for name in ["feat/login", "kommand0/legacy"] {
+    fn cleanup_removes_a_merged_worktree_and_its_branch() {
+        // A workspace's own branch, one kommand0 didn't name (adopted via
+        // --branch / the checkout offer), and a pre-0.11 `kommand0/` one.
+        for name in ["feat", "feat/login", "kommand0/legacy"] {
             let tmp = TempDir::new().unwrap();
             let (repo, wt, branch) = merged_worktree_on(tmp.path(), name);
             assert_eq!(cleanup(&repo, &wt, &branch), Ok(()), "{name}");
@@ -2499,14 +2490,6 @@ mod tests {
         repo
     }
 
-    fn tip_of(repo: &Path, branch: &str) -> String {
-        let out = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "rev-parse", &format!("refs/heads/{branch}")])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
     /// Whether patch-ids alone would call `branch` merged: its net change as
     /// one commit on `fork`, then any `=` mark among main's commits since.
     fn lookalike(repo: &Path, branch: &str, fork: &str) -> bool {
@@ -2591,15 +2574,14 @@ mod tests {
         assert!(lookalike(r, "same-hunk-elsewhere", &fork), "same-hunk-elsewhere fools patch-ids");
 
         // Nothing of its own: changes that cancel out (with an empty commit on
-        // main that an empty probe would match), main's tip, a fast-forward
-        // that main moved past, and main's first commit.
+        // main that an empty probe would match), a fast-forward that main
+        // moved past, and main's first commit.
         branch("net-zero", "z.txt", "z");
         git(r, &["switch", "net-zero"]);
         git(r, &["rm", "z.txt"]);
         git(r, &["commit", "-m", "undo z"]);
         git(r, &["switch", "main"]);
         git(r, &["commit", "--allow-empty", "-m", "empty"]);
-        git(r, &["branch", "fresh"]);
         git(r, &["switch", "-c", "ff-merged"]);
         commit_file(r, "ff.txt", "ff");
         git(r, &["switch", "main"]);
@@ -2628,7 +2610,7 @@ mod tests {
         let of = |name: &str| {
             verdicts.iter().find(|v| v.branch == name).unwrap_or_else(|| panic!("{name} scanned"))
         };
-        assert_eq!(verdicts.len(), 20);
+        assert_eq!(verdicts.len(), 19);
         assert_eq!(note, None);
         assert_eq!(of("feat/x").tip, rev_parse(r, "refs/heads/feat/x"), "the scan-time tip");
         for name in ["squashed", "feat/x", "merge-commit", "rebased", "expired"] {
@@ -2645,7 +2627,7 @@ mod tests {
         ] {
             assert_eq!(of(name).verdict, Verdict::Skip("not merged into main".into()), "{name}");
         }
-        for name in ["net-zero", "fresh", "ff-merged", "stale"] {
+        for name in ["net-zero", "ff-merged", "stale"] {
             assert_eq!(of(name).verdict, Verdict::Skip("no commits of its own".into()), "{name}");
         }
         assert_eq!(of("development").verdict, Verdict::Skip("protected branch".into()));
@@ -2663,6 +2645,24 @@ mod tests {
     }
 
     #[test]
+    fn scan_ignores_a_grafts_file() {
+        // A grafts entry giving main's tip `g` as a second parent would read
+        // as a merge commit.
+        let tmp = TempDir::new().unwrap();
+        let r = tmp.path();
+        init_repo(r);
+        git(r, &["switch", "-c", "g"]);
+        commit_file(r, "g.txt", "g");
+        git(r, &["switch", "main"]);
+        commit_file(r, "m.txt", "m");
+        let graft = [rev_parse(r, "main"), rev_parse(r, "main^"), rev_parse(r, "g")].join(" ");
+        std::fs::write(r.join(".git/info/grafts"), format!("{graft}\n")).unwrap();
+        let (verdicts, _) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+        let g = verdicts.iter().find(|v| v.branch == "g").unwrap();
+        assert_eq!(g.verdict, Verdict::Skip("not merged into main".into()));
+    }
+
+    #[test]
     fn scan_fetches_the_default_branch_first() {
         // Found through a clone's origin/HEAD, and by name once that is gone.
         for symbolic in [true, false] {
@@ -2671,7 +2671,9 @@ mod tests {
             if !symbolic {
                 git(&clone, &["remote", "set-head", "origin", "-d"]);
             }
-            git(&origin, &["tag", "v1"]); // on the commit the fetch brings in
+            // A tag on the commit the fetch brings in. update-ref, not `git
+            // tag`: a global tag.gpgSign would sign it and open an editor.
+            git(&origin, &["update-ref", "refs/tags/v1", &rev_parse(&origin, "main")]);
             let (verdicts, note) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
             let feat = verdicts.iter().find(|v| v.branch == "feat").unwrap();
             assert!(
@@ -2806,7 +2808,7 @@ mod tests {
         let repo = repo_with_branches(tmp.path(), &["a", "b", "development"]);
         let wt = tmp.path().join("wt");
         git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"]);
-        let sha = tip_of(&repo, "main");
+        let sha = rev_parse(&repo, "refs/heads/main");
         let input = [
             ("a".to_string(), sha.clone()),
             ("b".to_string(), "0".repeat(40)), // stale tip

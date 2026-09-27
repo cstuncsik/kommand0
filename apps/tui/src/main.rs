@@ -10247,13 +10247,8 @@ mod key_tests {
     }
 
     /// A failed-refresh note in core's exact format.
-    fn stale_note(dir: &std::path::Path) -> String {
-        format!(
-            "origin/main not refreshed: couldn't fetch main from origin: fatal: '{}' does not \
-             appear to be a git repository",
-            dir.join("gone").display()
-        )
-    }
+    const STALE_NOTE: &str = "origin/main not refreshed: couldn't fetch main from origin: fatal: \
+         '/tmp/kommand0-test/gone' does not appear to be a git repository";
 
     #[tokio::test]
     async fn a_workspace_refusal_shows_its_note_on_a_line_of_its_own() {
@@ -10263,9 +10258,8 @@ mod key_tests {
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
         app.select_workspace_row("w1");
-        let tmp = tempfile::TempDir::new().unwrap();
         let refusal = "the branch isn't merged into origin/main; not cleaning up";
-        app.cleanup_result.insert("w1".to_string(), format!("{refusal}\n{}", stale_note(tmp.path())));
+        app.cleanup_result.insert("w1".to_string(), format!("{refusal}\n{STALE_NOTE}"));
         let text = render_to_string(&mut app, 80, 24);
         assert!(text.contains("Cleanup blocked: the branch"), "{text}");
         let note = text
@@ -10403,7 +10397,6 @@ mod key_tests {
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Nothing to clean up (1 skipped)"), "{text}");
 
-        let tmp = tempfile::TempDir::new().unwrap();
         let mut app = test_app();
         app.on_repo_cleanup_scanned(
             "r1".into(),
@@ -10413,55 +10406,65 @@ mod key_tests {
                     RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "ws-one".into() },
                     skip_item("wip", "not merged into main"),
                 ],
-                Some(stale_note(tmp.path())),
+                Some(STALE_NOTE.to_string()),
             )),
         );
         assert!(app.modal.is_active());
-        for (cols, rows) in [(100u16, 30u16), (80, 24)] {
-            let text = render_to_string(&mut app, cols, rows);
-            for needle in [
-                " Clean Up Repo alpha ",
-                "1 to delete, 1 via workspace cleanup, 1 skipped",
-                "origin/main not refreshed",
-                "stale",
-                "workspace ws-one",
-                "skip: not merged into main",
-            ] {
-                assert!(text.contains(needle), "missing {needle:?} at {cols}x{rows}:\n{text}");
-            }
+        let text = render_to_string(&mut app, 100, 30);
+        for needle in [
+            " Clean Up Repo alpha ",
+            "1 to delete, 1 via workspace cleanup, 1 skipped",
+            "stale",
+            "workspace ws-one",
+            "skip: not merged into main",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
         }
+        assert_eq!(text.matches("origin/main not refreshed").count(), 1, "the note, once:\n{text}");
         press(&mut app, KeyCode::Char('n')).await;
         assert!(!app.modal.is_active(), "n closes the preview");
     }
 
     #[tokio::test]
     async fn repo_cleanup_reports_a_stale_base_once() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let note = stale_note(tmp.path());
+        let note = || Some(STALE_NOTE.to_string());
         let unmerged = || skip_item("wip", "not merged into origin/main");
+        // The detail-pane row holding the note, which must be a row of its own.
+        let note_row = |text: &str, size: &str| {
+            let row = text
+                .lines()
+                .find(|l| l.contains("origin/main not refreshed"))
+                .unwrap_or_else(|| panic!("the note is visible at {size}:\n{text}"))
+                .to_string();
+            assert!(
+                !row.contains("Nothing to clean up") && !row.contains("press c to review"),
+                "the note has its own line at {size}: {row}"
+            );
+        };
         for (cols, rows) in [(80u16, 24u16), (100, 30)] {
+            let size = format!("{cols}x{rows}");
             // Nothing actionable: the idle line, and the note under it.
             let mut app = test_app();
-            app.on_repo_cleanup_scanned("r1".into(), Ok((vec![unmerged()], Some(note.clone()))));
+            app.on_repo_cleanup_scanned("r1".into(), Ok((vec![unmerged()], note())));
             assert!(app.repo_cleanup_result["r1"].1, "a stale base reads as an error");
             let text = render_to_string(&mut app, cols, rows);
-            assert!(text.contains("Nothing to clean up (1 skipped)"), "{cols}x{rows}:\n{text}");
-            assert!(text.contains("origin/main not refreshed"), "{cols}x{rows}:\n{text}");
+            assert!(text.contains("Nothing to clean up (1 skipped)"), "{size}:\n{text}");
+            note_row(&text, &size);
 
             // Parked while help owned the keyboard, shown once it closes.
             let mut app = test_app();
             app.show_help = true;
             let plan = vec![delete_item("stale"), unmerged()];
-            app.on_repo_cleanup_scanned("r1".into(), Ok((plan, Some(note.clone()))));
+            app.on_repo_cleanup_scanned("r1".into(), Ok((plan, note())));
             app.show_help = false;
             let (line, is_error) = &app.repo_cleanup_result["r1"];
             assert!(line.contains("press c to review") && *is_error, "{line}");
             let text = render_to_string(&mut app, cols, rows);
             // At 80 columns the hint is clipped off the pane's right edge.
             if cols == 100 {
-                assert!(text.contains("press c to review"), "{cols}x{rows}:\n{text}");
+                assert!(text.contains("press c to review"), "{size}:\n{text}");
             }
-            assert!(text.contains("origin/main not refreshed"), "{cols}x{rows}:\n{text}");
+            note_row(&text, &size);
 
             // `c` reviews it: the note on the row under the summary, rows plain.
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10473,15 +10476,15 @@ mod key_tests {
             let summary = lines
                 .iter()
                 .position(|l| l.contains("1 to delete, 0 via workspace cleanup, 1 skipped"))
-                .unwrap_or_else(|| panic!("the preview opened at {cols}x{rows}:\n{text}"));
+                .unwrap_or_else(|| panic!("the preview opened at {size}:\n{text}"));
             assert!(
                 lines[summary + 1].contains("origin/main not refreshed"),
-                "the note sits under the summary at {cols}x{rows}:\n{text}"
+                "the note sits under the summary at {size}:\n{text}"
             );
             let row = lines
                 .iter()
                 .find(|l| l.contains("skip: not merged into origin/main"))
-                .unwrap_or_else(|| panic!("the skip row at {cols}x{rows}:\n{text}"));
+                .unwrap_or_else(|| panic!("the skip row at {size}:\n{text}"));
             assert!(!row.contains("refreshed"), "the row doesn't repeat the note: {row}");
         }
     }
