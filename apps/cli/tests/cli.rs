@@ -942,6 +942,28 @@ fn repo_cleanup_fails_closed_when_git_cannot_answer() {
 }
 
 #[test]
+fn workspace_cleanup_prints_a_failed_refresh_as_a_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    run_git(&repo, &["push", "origin", "main"]);
+    run_git(&repo, &["fetch", "origin"]);
+    run_git(&repo, &["remote", "set-url", "origin", tmp.path().join("gone").to_str().unwrap()]);
+    let dir = workspace_dir(&state, "feat");
+    std::fs::write(dir.join("f.txt"), "f").unwrap();
+    run_git(&dir, &["add", "."]);
+    run_git(&dir, &["commit", "-m", "never merged"]);
+    let out =
+        kmd(&state, &[("KOMMAND0_GH_BIN", "false")], &["workspace", "cleanup", "feat", "--force"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = err.lines().collect();
+    assert!(lines.iter().any(|l| l.starts_with("warning: origin/main not refreshed: ")), "{err}");
+    let refusal = "Error: the branch isn't merged into origin/main; not cleaning up";
+    assert!(lines.contains(&refusal), "the refusal is a line of its own: {err}");
+}
+
+#[test]
 fn repo_cleanup_never_runs_a_merge_driver_under_an_inherited_git_config() {
     // `GIT_CONFIG` points `git config` alone at one file: the driver listing
     // missed the repo's drivers, and the replay then ran them.

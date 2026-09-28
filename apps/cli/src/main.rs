@@ -321,6 +321,17 @@ fn wants_checkout(answer: &str) -> bool {
 /// check, exactly as the inline blocks did. The existing-branch checkout
 /// offer stays separate on purpose: it defaults to YES (non-destructive),
 /// the opposite polarity.
+/// A workspace-cleanup refusal is its reason, then core's notes on lines of
+/// their own: the notes go out as warnings, the reason comes back.
+fn warn_notes(refusal: &str) -> &str {
+    let mut lines = refusal.lines();
+    let reason = lines.next().unwrap_or_default();
+    for note in lines {
+        eprintln!("warning: {note}");
+    }
+    reason
+}
+
 fn confirm_or_exit(
     action: &str,
     prompt: impl FnOnce() -> anyhow::Result<String>,
@@ -521,7 +532,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         Err(e) => {
                             failed += 1;
-                            println!("Could not clean up workspace {ws_name}: {e}");
+                            println!("Could not clean up workspace {ws_name}: {}", warn_notes(&e));
                         }
                     }
                 }
@@ -823,7 +834,7 @@ fn main() -> anyhow::Result<()> {
                         state.delete_workspace_by_id(&ws.id)?;
                         println!("Cleaned up workspace: {name}");
                     }
-                    Err(e) => anyhow::bail!("{e}"),
+                    Err(e) => anyhow::bail!("{}", warn_notes(&e)),
                 }
             }
         },
