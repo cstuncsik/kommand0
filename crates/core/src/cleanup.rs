@@ -9,8 +9,8 @@
 //! branch, then a local delete that re-checks every gate.
 
 use crate::git::{
-    branch_status, default_branch_ref, fetch_origin_branch, gh_bin, git_config_value,
-    is_valid_branch_name, last_line,
+    default_branch_ref, fetch_origin_branch, gh_bin, git_config_value, is_valid_branch_name,
+    last_line,
 };
 use std::process::{Command, Stdio};
 
@@ -472,8 +472,9 @@ fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
 ///   (see [`fresh_by_reflog`]);
 /// - the worktree, if it still exists, is live and its HEAD is still on
 ///   `branch` (a `git switch` inside it made the dir another branch's checkout);
-/// - the worktree is clean (no uncommitted/untracked changes; an unreadable
-///   status aborts rather than assuming clean); and
+/// - the worktree is clean (no uncommitted/untracked changes, even with
+///   `status.showUntrackedFiles=no`; an unreadable status aborts rather than
+///   assuming clean); and
 /// - the branch is still at the checked tip right before the worktree is
 ///   removed, and again right before the branch is deleted.
 ///
@@ -562,12 +563,22 @@ pub fn cleanup_merged_workspace(
                 "the worktree is on {on}, not {branch}; switch back or delete it by hand"
             ));
         }
-        let st = branch_status(worktree_path)
-            .ok_or_else(|| "couldn't read the worktree's git status — not cleaning up".to_string())?;
-        if st.dirty {
-            return Err(
-                "the worktree has uncommitted changes — commit or discard them first".to_string(),
-            );
+        // Its own status, not the tree's `branch_status`: untracked files must
+        // count even when `status.showUntrackedFiles=no` hides them, which it
+        // does from `worktree remove`'s own check too (that then deletes them).
+        let status = Command::new("git")
+            .args(["-C", worktree_path, "status", "--porcelain"])
+            .args(["--untracked-files=normal", "--ignore-submodules=none"])
+            .output();
+        match status {
+            Ok(o) if o.status.success() && o.stdout.is_empty() => {}
+            Ok(o) if o.status.success() => {
+                return Err(
+                    "the worktree has uncommitted changes; commit or discard them first"
+                        .to_string(),
+                );
+            }
+            _ => return Err("couldn't read the worktree's git status; not cleaning up".to_string()),
         }
     }
 
@@ -578,11 +589,13 @@ pub fn cleanup_merged_workspace(
     }
 
     // Remove the worktree (no --force, so a last-moment dirty state still fails
-    // safe). If the dir survives, which of the two failure shapes it is comes
-    // from re-probing, never from matching git's stderr text.
+    // safe, untracked files included: the `-c` reaches git's own status check).
+    // If the dir survives, which of the two failure shapes it is comes from
+    // re-probing, never from matching git's stderr text.
     if worktree_exists {
         let out = Command::new("git")
-            .args(["-C", repo_path, "worktree", "remove", worktree_path])
+            .args(["-C", repo_path, "-c", "status.showUntrackedFiles=normal"])
+            .args(["worktree", "remove", worktree_path])
             .output();
         if std::path::Path::new(worktree_path).exists() {
             if is_live_worktree(worktree_path) {
@@ -879,6 +892,20 @@ mod tests {
         let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert!(err.contains("uncommitted"), "expected 'uncommitted', got: {err}");
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
+
+    #[test]
+    fn cleanup_sees_untracked_files_a_status_config_hides() {
+        // `status.showUntrackedFiles=no` hides them from a plain status AND from
+        // `worktree remove`'s own check, which would then delete them.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&repo, &["config", "status.showUntrackedFiles", "no"]);
+        std::fs::write(wt.join("notes.txt"), "wip").unwrap();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.contains("uncommitted"), "expected 'uncommitted', got: {err}");
+        assert!(wt.join("notes.txt").exists(), "the untracked file survives");
+        assert!(branch_exists(&repo, &branch), "the branch survives");
     }
 
     #[test]

@@ -954,7 +954,7 @@ fn workspace_cleanup_refuses_when_the_branch_moves_mid_cleanup() {
     let path = git_shim(
         &tmp.path().join("shim"),
         &format!(
-            "case \"$*\" in\n  *\"status --porcelain=v2\"*) if [ ! -e '{m}' ]; then : > '{m}'; \
+            "case \"$*\" in\n  *\"status --porcelain\"*) if [ ! -e '{m}' ]; then : > '{m}'; \
              \"$real_git\" -C \"$2\" commit -q --allow-empty -m moved; fi ;;\nesac",
             m = marker.display()
         ),
