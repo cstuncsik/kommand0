@@ -489,8 +489,10 @@ fn uncommitted_work(worktree_path: &str) -> Result<(), String> {
     let verdict = created.map_err(|_| unreadable()).and_then(|_| {
         // Re-added from their own index info: no flags and no stat data, so
         // status has to read each one's content (through filters), mode and
-        // type. Unsplit, unhooked and full, so writing the copy can't expire
-        // the real index's shared file or run the repo's hooks.
+        // type. Without `core.ignoreStat`, which would flag them again as they
+        // go in; unsplit, full and without hook scripts or fsmonitor, so
+        // writing the copy can't expire the real index's shared file or run
+        // them (a config-defined `hook.*` still could).
         let mut info = Vec::new();
         for (entry, path, _) in &flagged {
             info.extend_from_slice(entry);
@@ -499,8 +501,9 @@ fn uncommitted_work(worktree_path: &str) -> Result<(), String> {
             info.push(0);
         }
         let mut child = Command::new("git")
-            .args(["-C", worktree_path, "-c", "core.splitIndex=false"])
-            .args(["-c", "splitIndex.sharedIndexExpire=never", "-c", "core.hooksPath=/dev/null"])
+            .args(["-C", worktree_path, "-c", "core.ignoreStat=false"])
+            .args(["-c", "core.splitIndex=false", "-c", "splitIndex.sharedIndexExpire=never"])
+            .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
             .args(["-c", "index.sparse=false", "update-index", "-z", "--index-info"])
             .env("GIT_INDEX_FILE", &copy)
             .stdin(Stdio::piped())
@@ -512,6 +515,17 @@ fn uncommitted_work(worktree_path: &str) -> Result<(), String> {
         let done = child.wait().is_ok_and(|s| s.success());
         if !done || !matches!(written, Some(Ok(()))) {
             return Err(unreadable());
+        }
+        // update-index skips a path it now rejects with only a warning, which
+        // would leave it flagged: nothing re-added may still be.
+        let tags = git(&args(&["ls-files", "-v", "-z"]), Some(&copy))?;
+        for entry in tags.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+            let (&tag, path) = entry.split_first().ok_or_else(unreadable)?;
+            let path = path.strip_prefix(b" ").ok_or_else(unreadable)?;
+            let still = tag.is_ascii_lowercase() || tag.eq_ignore_ascii_case(&b's');
+            if let Some((.., flag)) = flagged.iter().find(|(_, p, _)| still && *p == path) {
+                return Err(hidden(path, *flag));
+            }
         }
         let flags =
             ["status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none"];
@@ -1258,6 +1272,65 @@ mod tests {
             assert_eq!(cleanup(&repo, &wt, "feat"), Ok(()), "{case}");
             assert!(!wt.exists() && !branch_exists(&repo, "feat"), "{case}");
         }
+    }
+
+    #[test]
+    fn cleanup_sees_an_edit_under_core_ignore_stat() {
+        // Every checked-out file is flagged, and re-adding one to the index
+        // copy would flag it again unless that setting is off for the write.
+        for edit in ["content", "mode", "symlink"] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            init_repo(&repo);
+            git(&repo, &["config", "core.ignoreStat", "true"]);
+            let wt = tmp.path().join("wt");
+            git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "feat"]);
+            std::os::unix::fs::symlink("a.txt", wt.join("link")).unwrap();
+            commit_file(&wt, "work.txt", "work");
+            squash_merge(&repo, "feat");
+            let name = match edit {
+                "content" => {
+                    std::fs::write(wt.join("work.txt"), "edited").unwrap();
+                    "work.txt"
+                }
+                "mode" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let exec = std::fs::Permissions::from_mode(0o755);
+                    std::fs::set_permissions(wt.join("work.txt"), exec).unwrap();
+                    "work.txt"
+                }
+                _ => {
+                    std::fs::remove_file(wt.join("link")).unwrap();
+                    std::os::unix::fs::symlink("work.txt", wt.join("link")).unwrap();
+                    "link"
+                }
+            };
+            let err = cleanup(&repo, &wt, "feat").unwrap_err();
+            let want = format!("{name} is flagged assume-unchanged");
+            assert!(err.starts_with(&want), "{edit}: {err}");
+            assert!(wt.exists() && branch_exists(&repo, "feat"), "{edit}: nothing destroyed");
+        }
+    }
+
+    #[test]
+    fn cleanup_refuses_a_flagged_file_git_wont_re_add() {
+        // A path committed under looser rules (`core.protectNTFS=false`) that
+        // update-index now skips with just a warning: it stays flagged on the
+        // index copy, so nothing can vouch for it.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = repo_with_worktree_on(tmp.path(), "feat");
+        git(&repo, &["config", "core.protectNTFS", "false"]);
+        std::fs::create_dir_all(wt.join("git~1")).unwrap();
+        std::fs::write(wt.join("git~1/x.txt"), "x").unwrap();
+        commit_file(&wt, "work.txt", "work");
+        squash_merge(&repo, "feat");
+        git(&wt, &["update-index", "--assume-unchanged", "git~1/x.txt"]);
+        std::fs::write(wt.join("git~1/x.txt"), "edited").unwrap();
+        git(&repo, &["config", "core.protectNTFS", "true"]);
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.starts_with("git~1/x.txt is flagged assume-unchanged"), "{err}");
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
     }
 
     #[test]
