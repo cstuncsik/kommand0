@@ -761,6 +761,10 @@ fn repo_cleanup_force_deletes_stale_branches_and_routes_the_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, repo) = setup_for_repo_cleanup(tmp.path());
     let feat_dir = workspace_dir(&state, "feat");
+    // A stale origin/main, so the run goes through the fetch (and its gh
+    // credential helper) before it decides.
+    run_git(&repo, &["push", "origin", "main"]);
+    run_git(&repo, &["update-ref", "refs/remotes/origin/main", "main~1"]);
     let out = repo_cleanup(&state, &repo, &["--force"], &[]);
     assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
     let text = stdout(&out);
@@ -771,6 +775,13 @@ fn repo_cleanup_force_deletes_stale_branches_and_routes_the_workspace() {
     assert!(!feat_dir.exists(), "feat's worktree removed");
     let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
     assert!(!list.contains("feat"), "workspace row dropped: {list}");
+    let tracked = Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "rev-parse", "refs/remotes/origin/main", "main"])
+        .output()
+        .unwrap();
+    let tracked = String::from_utf8_lossy(&tracked.stdout);
+    let (fetched, local) = tracked.trim().split_once('\n').unwrap();
+    assert_eq!(fetched, local, "the run fetched origin/main");
     // Idempotent: a second run finds nothing actionable and exits 0.
     let again = repo_cleanup(&state, &repo, &["--force"], &[]);
     assert!(again.status.success(), "rerun: {}", String::from_utf8_lossy(&again.stderr));
@@ -900,6 +911,8 @@ fn repo_cleanup_fails_closed_when_git_cannot_answer() {
         // A driver that can't be listed can't be overridden.
         ("drivers", "*\" config --list \"*", unmerged, "(couldn't read the merge driver config)"),
         ("reflog", "*\"reflog show\"*", "skip: no commits of its own", ""),
+        // The commit dates a confirmed squash is checked against.
+        ("dates", "*\" log -1 \"*", unmerged, ""),
     ];
     for (what, pattern, want, squash_off) in arms {
         let tmp = tempfile::tempdir().unwrap();

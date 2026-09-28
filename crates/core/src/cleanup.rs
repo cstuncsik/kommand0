@@ -1473,6 +1473,19 @@ mod tests {
     }
 
     #[test]
+    fn scan_falls_back_to_the_last_fetch_when_the_refresh_fails() {
+        let tmp = TempDir::new().unwrap();
+        let (_origin, clone, _wt) = clone_with_upstream_squash(tmp.path());
+        git(&clone, &["fetch", "origin"]); // the last fetch saw the squash
+        break_origin(&clone, tmp.path());
+        let Scan { verdicts, notes, .. } = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
+        let feat = verdicts.iter().find(|v| v.branch == "feat").unwrap();
+        assert!(matches!(feat.verdict, Verdict::CheckedOut { .. }), "merged: {:?}", feat.verdict);
+        let [refresh] = &notes[..] else { panic!("one note: {notes:?}") };
+        assert!(refresh.starts_with("origin/main not refreshed: couldn't fetch"), "{refresh}");
+    }
+
+    #[test]
     fn scan_reports_a_failed_fetch_once() {
         let tmp = TempDir::new().unwrap();
         let (_origin, clone, _wt) = clone_with_upstream_squash(tmp.path());
