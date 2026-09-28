@@ -3678,13 +3678,13 @@ impl App {
         let scan = match result {
             Ok(scan) => scan,
             Err(e) => {
-                // The pane clips it; the log keeps it whole.
+                // The pane may cut off its bottom; the log keeps it whole.
                 tracing::warn!("repo cleanup failed: {e}");
                 self.repo_cleanup_result.insert(repo_id, (format!("Cleanup failed: {e}"), true));
                 return;
             }
         };
-        // The pane clips a note; the log keeps it whole.
+        // The pane may cut off the bottom; the log keeps every note whole.
         for note in &scan.notes {
             tracing::warn!("repo cleanup: {note}");
         }
@@ -3696,7 +3696,7 @@ impl App {
         } else if self.can_open_repo_cleanup_modal() {
             self.open_repo_cleanup_modal(repo_id, scan);
         } else {
-            // The instruction first: the pane clips the tail.
+            // The instruction first, in case the pane cuts off the bottom.
             let line = with_notes(format!(
                 "Press c to review: {deletes} to delete, {routed} workspace(s)"
             ));
@@ -3808,8 +3808,8 @@ impl App {
         });
     }
 
-    /// The delete phase landed: one result line for the repo (the pane clips
-    /// it); every failure also goes to the log in full.
+    /// The delete phase landed: one result line for the repo (the pane may
+    /// cut off its bottom); every failure also goes to the log in full.
     fn on_repo_cleanup_deleted(
         &mut self,
         repo_id: String,
@@ -5415,8 +5415,8 @@ async fn run(
                         }
                     }
                     Err(msg) => {
-                        // The pane clips a long refusal (its notes
-                        // included); the log keeps it whole.
+                        // The pane may cut off a long refusal's bottom
+                        // (its notes included); the log keeps it whole.
                         tracing::warn!("cleanup: {msg}");
                         app.cleanup_result.insert(ws_id, msg);
                     }
@@ -10315,6 +10315,24 @@ mod key_tests {
         let text = render_to_string(&mut app, 80, 24);
         for word in ["assume-unchanged,", "--no-assume-unchanged", "discard"] {
             assert!(text.contains(word), "{word:?} visible at 80x24:\n{text}");
+        }
+        // A spawn error goes first below the buttons, so the refusal can't push
+        // it off the pane.
+        app.embed_error = Some(("w1".to_string(), "Couldn't start claude: boom".to_string()));
+        let text = render_to_string(&mut app, 80, 24);
+        let row = |needle: &str| text.lines().position(|l| l.contains(needle));
+        let (err, refusal) = (row("Couldn't start claude"), row("Cleanup blocked"));
+        assert!(err.is_some() && err < refusal, "the spawn error shows, above it:\n{text}");
+        app.embed_error = None;
+        // And a button the pane is too short to show isn't clickable below it.
+        for rows in 8..=24u16 {
+            render_to_string(&mut app, 100, rows);
+            let pane = app.right_pane_area;
+            let off = app
+                .hit_regions
+                .iter()
+                .find(|r| r.area.x >= pane.x && r.area.y >= pane.bottom().saturating_sub(1));
+            assert!(off.is_none(), "a hit region below the pane at 100x{rows}: {:?}", off.map(|r| r.area));
         }
 
         app.select_repo_row("r1");

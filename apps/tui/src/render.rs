@@ -882,7 +882,10 @@ fn push_button(
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     };
     lines.push(Line::styled(format!("[{label}]"), style));
-    hit_regions.push(buttons::HitRegion { area: rect, action });
+    // Not clickable where it isn't drawn (a pane too short to show it).
+    if rect.y < inner.bottom() {
+        hit_regions.push(buttons::HitRegion { area: rect, action });
+    }
 }
 
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -1254,11 +1257,10 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     if let (Some(sel), Some((err_ws, msg))) = (selected_ws_id, &app.embed_error)
         && sel == err_ws.as_str()
     {
-        right_content.push(Line::raw(""));
-        right_content.push(Line::styled(
-            msg.clone(),
-            Style::default().fg(th.error).add_modifier(Modifier::BOLD),
-        ));
+        // First below the buttons: a wrapped cleanup refusal after it could
+        // push it off the pane, and this is the only place it shows.
+        let style = Style::default().fg(th.error).add_modifier(Modifier::BOLD);
+        right_content.splice(tail_from..tail_from, [Line::raw(""), Line::styled(msg.clone(), style)]);
     }
 
     // No wrap down to the last button: the clickable hit-regions are positioned
