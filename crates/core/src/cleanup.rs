@@ -146,8 +146,8 @@ struct Target {
 fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
     let git_ref = default_branch_ref(repo_path).ok_or_else(|| {
         "couldn't find the default branch to compare against (no origin/HEAD, origin/main, \
-         origin/master, main or master); if origin has one, `git remote set-head origin -a` \
-         sets origin/HEAD"
+         origin/master, main or master); if origin has one, `git fetch origin` and then \
+         `git remote set-head origin -a` set origin/HEAD"
             .to_string()
     })?;
     let origin_branch = match git_ref.strip_prefix("refs/remotes/origin/") {
@@ -1753,8 +1753,8 @@ mod tests {
         let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         git(&repo, &["branch", "-m", "main", "trunk"]);
         let want = "couldn't find the default branch to compare against (no origin/HEAD, \
-                    origin/main, origin/master, main or master); if origin has one, `git remote \
-                    set-head origin -a` sets origin/HEAD";
+                    origin/main, origin/master, main or master); if origin has one, `git fetch \
+                    origin` and then `git remote set-head origin -a` set origin/HEAD";
         assert_eq!(cleanup(&repo, &wt, &branch), Err(want.to_string()));
         assert_eq!(scan_merged_branches(repo.to_str().unwrap(), &[]), Err(want.to_string()));
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");

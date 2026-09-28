@@ -13,35 +13,40 @@ All notable changes to kommand0 are documented here. The format is based on
   cleanups now decide "merged" from local git: a branch is merged when its
   changes are already on the default branch, by a merge commit, or by a squash
   (or a one-commit rebase) that replays to exactly the commit on the default
-  branch and landed after the branch's last commit. Squash detection needs
+  branch and landed after the branch's newest commit. Squash detection needs
   git 2.38 or newer. A branch with no commits of its own never qualifies, nor,
   per its reflog, one just created at a merged tip. The repo scan fetches the
   default branch first and, when that fails, says so once (the detail pane,
   the preview, or a `kmd` warning); the workspace cleanup fetches only when
-  the local copy says not merged, and names a failed fetch under its refusal.
-  Confirming a preview after the default branch was rewound deletes nothing.
-- **Workspace cleanup no longer deletes untracked files that
-  `status.showUntrackedFiles=no` hides.** Its dirty check and git's own check
-  in `worktree remove` both honored the setting, so the removal took them.
+  the local copy says not merged, and reports a failed fetch with its refusal.
+  Confirming a preview after the default branch was rewound deletes none of
+  the plain branches (workspace rows re-check on their own).
+- **Workspace cleanup no longer deletes work git was told to hide.** Untracked
+  files under `status.showUntrackedFiles=no`, edits to files flagged
+  `--assume-unchanged` or `--skip-worktree`, and changes a stale fsmonitor or
+  untracked cache missed: its clean check and git's own in `worktree remove`
+  both trusted those, so the removal took them. The refusal names what it
+  found.
 - **The default-branch fetch, shared with issue branches, stays on its one
   ref.** It no longer pulls tags, asks an askpass helper for credentials (VS
   Code terminals set one; gh's own fetch for an issue branch can't either),
   or updates a local branch that a configured `remote.origin.fetch` maps into
-  `refs/heads/`. A fetch hung past its 20 s limit is killed instead of left
-  running, and a failed one shows git's own error line.
+  `refs/heads/`. A stalled one gives up on its own (ssh connect and keepalive
+  timeouts, an https stall limit) instead of hanging on after kmd stops
+  waiting at 20 s, and a failed one shows git's own error line.
 
 ### Changed
 
 - **"Merged" follows the default branch's history, not the PR's state.** A
   branch merged by a local merge commit, with no PR, is now cleaned up. A
   squash whose diff differs from the branch (a conflict resolved while
-  merging), a multi-commit rebase merge and a branch with commits after its
-  merge are kept; see Troubleshooting in the README.
+  merging) and a multi-commit rebase merge are kept; see Troubleshooting in
+  the README.
 - **Both cleanups need a default branch** (`origin/HEAD`, `origin/main`,
   `origin/master`, `main` or `master`) and stop with an error without one,
-  pointing at `git remote set-head origin -a`. `kmd repo cleanup --dry-run`
-  fetches the default branch too, and the plan table drops its PR column
-  (BRANCH / ACTION), as does the TUI preview.
+  pointing at `git fetch origin` and `git remote set-head origin -a`.
+  `kmd repo cleanup --dry-run` fetches the default branch too, and the plan
+  table drops its PR column (BRANCH / ACTION), as does the TUI preview.
 
 ## [0.29.1] - 2026-09-25
 
