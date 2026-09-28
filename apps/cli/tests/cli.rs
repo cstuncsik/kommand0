@@ -985,6 +985,29 @@ fn workspace_cleanup_prints_a_failed_refresh_as_a_warning() {
 }
 
 #[test]
+fn repo_cleanup_deletes_no_plain_branch_once_the_default_branch_is_rewound() {
+    // Rewound between the scan and the deletes (here: right at the check).
+    // The plain deletes stand down as one; the workspace row re-checks on its
+    // own and, its squash gone, refuses too.
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        "case \"$*\" in\n  *\"merge-base --is-ancestor\"*) \
+         \"$real_git\" -C \"$2\" update-ref refs/heads/main main~1 ;;\nesac",
+    );
+    let out = repo_cleanup(&state, &repo, &["--force"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    let refusal = "Could not delete branches: scan again: main was rewound or rewritten";
+    assert!(text.contains(refusal), "{text}");
+    assert!(text.contains("Could not clean up workspace feat"), "{text}");
+    for b in ["stale", "feat"] {
+        assert!(branch_exists(&repo, b), "{b} kept");
+    }
+}
+
+#[test]
 fn repo_cleanup_never_runs_a_merge_driver_under_an_inherited_git_config() {
     // `GIT_CONFIG` points `git config` alone at one file: the driver listing
     // missed the repo's drivers, and the replay then ran them.
@@ -1085,6 +1108,32 @@ fn workspace_cleanup_refuses_when_the_branch_moves_mid_cleanup() {
     assert_eq!(tip("refs/heads/feat^"), merged, "feat is kept, at the commit made mid-cleanup");
     let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
     assert!(list.contains("feat"), "workspace row survives: {list}");
+}
+
+#[test]
+fn workspace_cleanup_keeps_an_untracked_file_that_appears_at_the_last_moment() {
+    // After the gate, inside `worktree remove`: only the `-c` kommand0 passes
+    // there makes git's own check see it despite the config.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let dir = workspace_dir(&state, "feat");
+    squash_merge(&repo, &dir, "feat");
+    run_git(&repo, &["config", "status.showUntrackedFiles", "no"]);
+    let late = dir.join("late.txt");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!("case \"$*\" in\n  *\"worktree remove\"*) : > '{}' ;;\nesac", late.display()),
+    );
+    let out = kmd(
+        &state,
+        &[("PATH", &path), ("KOMMAND0_GH_BIN", "false")],
+        &["workspace", "cleanup", "feat", "--force"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("couldn't remove the worktree"), "{err}");
+    assert!(late.exists() && branch_exists(&repo, "feat"), "the file and the branch survive");
 }
 
 #[test]

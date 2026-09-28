@@ -113,8 +113,8 @@ fn check_git_stdout(repo_path: &str, args: &[&str], envs: &[(&str, &str)]) -> Op
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// A default branch pinned at one commit, for a whole scan or cleanup. The
-/// default pins nothing, so [`delete_branches`] refuses to delete against it.
+/// A default branch pinned at one commit, for a whole scan or cleanup.
+/// `Base::default()` pins nothing, so [`delete_branches`] refuses it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Base {
     /// `origin/main`, or the local `main`: what messages call it.
@@ -398,6 +398,56 @@ fn fresh_by_reflog(repo_path: &str, branch: &str, tip: &str) -> bool {
         && subject != format!("branch: Created from origin/{branch}")
 }
 
+/// `-c`s for a status (or `worktree remove`, whose own check is one) that sees
+/// what's on disk however git was told to look: see [`uncommitted_work`].
+const LOOK_AT_THE_DISK: [&str; 6] = [
+    "-c",
+    "status.showUntrackedFiles=normal",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+];
+
+/// What removing `worktree_path` would lose, by its first path: a change
+/// `git status` lists, or a file whose edits an index flag hides. None when
+/// it's clean; Err when git can't tell.
+///
+/// Its own status, not the tree's `branch_status`, because git can be told not
+/// to look: `status.showUntrackedFiles=no` hides untracked files (from
+/// `worktree remove`'s own check too, which then deletes them), and a stale
+/// fsmonitor or untracked cache answers for the disk. Edits to a file flagged
+/// assume-unchanged or skip-worktree show in no status at all; a skip-worktree
+/// file that isn't on disk is just a sparse checkout.
+fn uncommitted_work(worktree_path: &str) -> Result<Option<String>, ()> {
+    use std::os::unix::ffi::OsStrExt;
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-C", worktree_path])
+            .args(LOOK_AT_THE_DISK)
+            .args(args)
+            .output();
+        out.ok().filter(|o| o.status.success()).ok_or(())
+    };
+    let status = git(&["status", "--porcelain", "--ignore-submodules=none"])?;
+    if let Some(line) = String::from_utf8_lossy(&status.stdout).lines().next() {
+        return Ok(Some(line.trim().to_string()));
+    }
+    let files = git(&["ls-files", "-v", "-z"])?;
+    for entry in files.stdout.split(|b| *b == 0) {
+        let Some((&tag, rest)) = entry.split_first() else { continue };
+        let path = rest.strip_prefix(b" ").unwrap_or(rest);
+        let on_disk = || std::path::Path::new(worktree_path).join(std::ffi::OsStr::from_bytes(path));
+        let flag = match tag {
+            t if t.is_ascii_lowercase() => "assume-unchanged",
+            b'S' if on_disk().exists() => "skip-worktree",
+            _ => continue,
+        };
+        return Ok(Some(format!("{}, {flag}", String::from_utf8_lossy(path))));
+    }
+    Ok(None)
+}
+
 /// Why a local branch must not be deleted, in gate order.
 enum BranchRefusal {
     Malformed,
@@ -499,9 +549,8 @@ fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
 ///   (see [`fresh_by_reflog`]);
 /// - the worktree, if it still exists, is live and its HEAD is still on
 ///   `branch` (a `git switch` inside it made the dir another branch's checkout);
-/// - the worktree is clean (no uncommitted/untracked changes, even with
-///   `status.showUntrackedFiles=no`; an unreadable status aborts rather than
-///   assuming clean); and
+/// - the worktree is clean (see [`uncommitted_work`]; an unreadable status
+///   aborts rather than assuming clean); and
 /// - the branch is still at the checked tip right before the worktree is
 ///   removed, and again right before the branch is deleted.
 ///
@@ -598,22 +647,16 @@ pub fn cleanup_merged_workspace(
                 "the worktree is on {on}, not {branch}; switch back or delete it by hand"
             ));
         }
-        // Its own status, not the tree's `branch_status`: untracked files must
-        // count even when `status.showUntrackedFiles=no` hides them, which it
-        // does from `worktree remove`'s own check too (that then deletes them).
-        let status = Command::new("git")
-            .args(["-C", worktree_path, "status", "--porcelain"])
-            .args(["--untracked-files=normal", "--ignore-submodules=none"])
-            .output();
-        match status {
-            Ok(o) if o.status.success() && o.stdout.is_empty() => {}
-            Ok(o) if o.status.success() => {
-                return Err(
-                    "the worktree has uncommitted changes; commit or discard them first"
-                        .to_string(),
-                );
+        match uncommitted_work(worktree_path) {
+            Ok(None) => {}
+            Ok(Some(what)) => {
+                return Err(format!(
+                    "the worktree has uncommitted changes ({what}); commit or discard them first"
+                ));
             }
-            _ => return Err("couldn't read the worktree's git status; not cleaning up".to_string()),
+            Err(()) => {
+                return Err("couldn't read the worktree's git status; not cleaning up".to_string());
+            }
         }
     }
 
@@ -624,12 +667,13 @@ pub fn cleanup_merged_workspace(
     }
 
     // Remove the worktree (no --force, so a last-moment dirty state still fails
-    // safe, untracked files included: the `-c` reaches git's own status check).
+    // safe, untracked files included: the `-c`s reach git's own status check).
     // If the dir survives, which of the two failure shapes it is comes from
     // re-probing, never from matching git's stderr text.
     if worktree_exists {
         let out = Command::new("git")
-            .args(["-C", repo_path, "-c", "status.showUntrackedFiles=normal"])
+            .args(["-C", repo_path])
+            .args(LOOK_AT_THE_DISK)
             .args(["worktree", "remove", worktree_path])
             .output();
         if std::path::Path::new(worktree_path).exists() {
@@ -786,12 +830,16 @@ pub fn delete_branches(
     if branches.is_empty() {
         return Ok(Vec::new());
     }
+    if base.oid.is_empty() {
+        return Err("scan again: no scan pinned the default branch".to_string());
+    }
     let contains = default_branch_ref(repo_path).is_some_and(|now| {
         let args = ["merge-base", "--is-ancestor", base.oid.as_str(), now.as_str()];
         check_git_stdout(repo_path, &args, &[]).is_some()
     });
     if !contains {
-        return Err(format!("{} was rewound or rewritten since the scan; scan again", base.name));
+        // The remedy first: the TUI pane clips the tail.
+        return Err(format!("scan again: {} was rewound or rewritten since the scan", base.name));
     }
     let delete = |branch: &str, tip: &str| -> Result<(), String> {
         refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
@@ -986,9 +1034,50 @@ mod tests {
         git(&repo, &["config", "status.showUntrackedFiles", "no"]);
         std::fs::write(wt.join("notes.txt"), "wip").unwrap();
         let err = cleanup(&repo, &wt, &branch).unwrap_err();
-        assert!(err.contains("uncommitted"), "expected 'uncommitted', got: {err}");
+        assert!(err.contains("uncommitted changes (?? notes.txt)"), "names it: {err}");
         assert!(wt.join("notes.txt").exists(), "the untracked file survives");
         assert!(branch_exists(&repo, &branch), "the branch survives");
+    }
+
+    #[test]
+    fn cleanup_sees_edits_an_index_flag_or_a_stale_fsmonitor_hides() {
+        // No status lists them, so neither did the gate nor git's own check.
+        for flag in ["--assume-unchanged", "--skip-worktree", "fsmonitor"] {
+            let tmp = TempDir::new().unwrap();
+            let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+            if flag == "fsmonitor" {
+                // A hook that always answers "nothing changed" since its token.
+                let hook = tmp.path().join("fsmonitor");
+                std::fs::write(&hook, "#!/bin/sh\nprintf 'token\\0'\n").unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+                git(&wt, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+                git(&wt, &["update-index", "--fsmonitor"]);
+                git(&wt, &["status"]);
+            } else {
+                git(&wt, &["update-index", flag, "work.txt"]);
+            }
+            std::fs::write(wt.join("work.txt"), "edited").unwrap();
+            let plain = Command::new("git")
+                .args(["-C", wt.to_str().unwrap(), "status", "--porcelain"])
+                .output()
+                .unwrap();
+            assert!(plain.stdout.is_empty(), "{flag}: the fixture hides the edit from a status");
+            let err = cleanup(&repo, &wt, &branch).unwrap_err();
+            assert!(err.contains("uncommitted") && err.contains("work.txt"), "{flag}: {err}");
+            assert_eq!(std::fs::read_to_string(wt.join("work.txt")).unwrap(), "edited", "{flag}");
+        }
+    }
+
+    #[test]
+    fn cleanup_removes_a_sparse_worktree() {
+        // A skip-worktree file that isn't on disk is a sparse checkout, not work.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&wt, &["update-index", "--skip-worktree", "work.txt"]);
+        std::fs::remove_file(wt.join("work.txt")).unwrap();
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()));
+        assert!(!wt.exists() && !branch_exists(&repo, &branch));
     }
 
     #[test]
@@ -1717,7 +1806,7 @@ mod tests {
         let input = [(branch.clone(), feat.tip.clone())];
         git(&repo, &["reset", "--hard", "HEAD~1"]);
         let err = delete_branches(dir, &input, &[], &scan.base).unwrap_err();
-        assert_eq!(err, "main was rewound or rewritten since the scan; scan again");
+        assert_eq!(err, "scan again: main was rewound or rewritten since the scan");
         assert!(branch_exists(&repo, &branch), "nothing deleted");
         assert_eq!(delete_branches(dir, &[], &[], &Base::default()), Ok(vec![]), "nothing to do");
         assert!(delete_branches(dir, &input, &[], &Base::default()).is_err(), "no base, no deletes");
