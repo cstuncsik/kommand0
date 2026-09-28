@@ -49,6 +49,10 @@ git worktree. A `kmd` CLI mirrors the core actions.
   refreshes ~2s; PR/CI status ~60s (network).
 - **All `gh` calls go through `git::run_gh`** — non-interactive (prompts/pager off,
   stdin null), ETXTBSY-retry, 20s timeout. Never invoke `gh` directly.
+- **Network git follows `git::fetch_origin_branch`'s recipe**: `GIT_TERMINAL_PROMPT=0`,
+  an empty `GIT_ASKPASS`, `batch_ssh_command()` (batch mode plus keepalives),
+  `http_stall()`, null stdin, and `wait_bounded`, which stops waiting at 20 s but
+  never kills (a slow fetch still lands; the transports end a real stall).
 - **Overlays** (help, palette, modal, diff) own the screen: they swallow keys AND
   must appear in the mouse/paste guards in `main.rs` so clicks/paste don't leak to
   the tree behind them. Global focus is `Focus { Tree, Embedded }` (Tab-switched).

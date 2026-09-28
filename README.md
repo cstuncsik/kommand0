@@ -160,7 +160,7 @@ cargo run -p kommand0-tui   # from a checkout
 - **Branch/diff status**: each workspace shows its git branch and how far it is ahead/behind its upstream plus whether it has uncommitted changes — a compact `↑2↓1*` segment in the tree row and full detail (`Branch:` / `Changes:`) in the detail pane. Computed off the render loop (never blocks keystrokes), refreshed every couple of seconds and on workspace create/close
 - **PR/CI status**: each own-branch workspace surfaces its GitHub PR at a glance — a compact `#12 ✓` in the tree row (`✓` checks passing · `✗` failing · `○` pending · `⬤` merged · `✕` closed) and a full `PR #12 · open · CI passing · approved` line + URL in the detail pane. One read-only `gh pr list` per repo, off the render loop, refreshed periodically. Requires `gh` installed and authenticated; nothing shows without it. Press `p` to open the PR in your browser
 - **Review a workspace's diff**: press `v` on a workspace to open a two-pane dialog (GitHub-style) — a file tree with collapsible folders on the left, the selected file's diff on the right (`git diff <default>...HEAD`, the committed changes a PR would show, coloured by add / remove / hunk). `Tab` switches focus between the panes; click or select a file. In the file pane `j`/`k` move, `Enter`/`l`/`h` expand/collapse folders; in the diff pane `j`/`k`, `PgUp`/`PgDn`, `g`/`G` scroll; `Esc`/`v`/`q` close. Rebindable as `review-diff`
-- **Clean up merged workspaces**: press `c` (or click `[Clean up]`) to remove a workspace's worktree and delete its branch once it is merged, meaning its changes are already on the default branch (by a merge commit, a squash, or a rebase of one commit). That is decided from local git with no GitHub API call; the default branch is fetched first only when the local copy says not merged. Behind a confirmation, and it only proceeds when the branch has commits of its own, none made after the merge (by commit date), and the worktree is clean, counting what git may be set to hide (untracked files under `status.showUntrackedFiles=no`, `--assume-unchanged` edits); otherwise it refuses and tells you why. On success the workspace is dropped from the tree
+- **Clean up merged workspaces**: press `c` (or click `[Clean up]`) to remove a workspace's worktree and delete its branch once it is merged, meaning its changes are already on the default branch (by a merge commit, a squash, or a rebase of one commit). That is decided from local git with no GitHub API call; the default branch is fetched first only when the local copy says not merged. Behind a confirmation, and it only proceeds when the branch has commits of its own, none made after the merge (by commit date), and the worktree is clean, counting what git may be set not to show (e.g. untracked files under `status.showUntrackedFiles=no`, edits to a file flagged `--assume-unchanged`); ignored files go with the worktree. Otherwise it refuses and tells you why. On success the workspace is dropped from the tree
 - **Status bar**: bottom row shows the current mode (TREE / CLAUDE), the selected repo/workspace, the live-session count (and how many are active / waiting), and context key hints
 - **Activity indicator**: a workspace's tree row animates its prompt into a spinner while its embedded Claude is actively producing output (debounced, so a stray keystroke doesn't flicker it)
 - **Attention indicator**: when a session produces output you haven't viewed and then goes quiet, its workspace gets a magenta dot (and a "N waiting" count in the status bar) so you can tell at a glance which of your parallel sessions has come back to you. The flag is per-session and latches until you actually open that session (a mid-turn pause won't flicker it) — so a workspace stays flagged while any of its tabs has unseen output, and selecting a workspace in the tree doesn't count as viewing it (you have to open the session to clear it). Optionally ring a terminal bell or raise a desktop notification on that edge — see the `notify` config option below (off by default).
@@ -380,8 +380,10 @@ purpose, because local git can't prove them merged:
   branch that was then squashed into the default branch;
 - a squash or one-commit rebase with branch commits made after it, even ones
   that undo each other (the net change would hide them) or only an amend or a
-  rebase; commit dates decide, so a clock running ahead also keeps a branch
-  merged within that lead (and one running behind can let such commits by);
+  rebase, or when the same change had landed on the default branch before (and
+  was reverted); commit dates decide, so a clock running ahead also keeps a
+  branch merged within that lead (and one running behind can let such commits
+  by);
 - a branch fast-forwarded into the default branch, or one whose changes cancel
   out: neither has commits of its own;
 - a branch whose only reflog entry is its creation at the current tip (e.g.
@@ -398,6 +400,11 @@ counts as merged, because its commit stays in the default branch's history.
 If `origin/HEAD` is missing, or the default branch was renamed on the server,
 run `git fetch origin` and then `git remote set-head origin -a`. Delete a
 leftover by hand with `git branch -D <branch>`.
+
+kommand0 adds batch mode and keepalives to the ssh command its fetch runs
+(`-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes`). These
+win over `~/.ssh/config`; to change one, put your own `-o` in `core.sshCommand`,
+which wins over them.
 
 **The embedded pane won't open (or exits immediately).** The `claude` binary
 isn't on PATH, or the one found isn't the Claude Code CLI. Install it, or point

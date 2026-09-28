@@ -21,19 +21,22 @@ All notable changes to kommand0 are documented here. The format is based on
   the local copy says not merged, and reports a failed fetch with its refusal.
   Confirming a preview after the default branch was rewound deletes none of
   the plain branches (workspace rows re-check on their own).
-- **Workspace cleanup no longer deletes work git was told to hide.** Untracked
-  files under `status.showUntrackedFiles=no`, edits to files flagged
+- **Workspace cleanup no longer deletes changes git was told not to show.**
+  Untracked files under `status.showUntrackedFiles=no`, edits to files flagged
   `--assume-unchanged` or `--skip-worktree`, and changes a stale fsmonitor or
   untracked cache missed: its clean check and git's own in `worktree remove`
   both trusted those, so the removal took them. The refusal names what it
-  found.
-- **The default-branch fetch, shared with issue branches, stays on its one
-  ref.** It no longer pulls tags, asks an askpass helper for credentials (VS
-  Code terminals set one; gh's own fetch for an issue branch can't either),
-  or updates a local branch that a configured `remote.origin.fetch` maps into
-  `refs/heads/`. A stalled one gives up on its own (ssh connect and keepalive
-  timeouts, an https stall limit) instead of hanging on after kmd stops
-  waiting at 20 s, and a failed one shows git's own error line.
+  found. Ignored files still go with the worktree, as before.
+- **The issue-branch fetch (now also the cleanups' default-branch fetch) stays
+  on its one ref.** It no longer pulls tags, asks an askpass helper for
+  credentials (VS Code terminals set one; gh's own fetch for an issue branch
+  can't either), or updates a local branch that a configured
+  `remote.origin.fetch` maps into `refs/heads/`. After kommand0 stops waiting
+  at 20 s, a stalled ssh or https transfer now gives up on its own (ssh
+  keepalives; an https limit of 5 minutes without progress, unless you set
+  your own), and a failed fetch shows git's own error line. `GIT_SSH` is
+  honored instead of being replaced by plain ssh, and a plink or `simple` ssh
+  variant no longer gets OpenSSH options.
 
 ### Changed
 
