@@ -274,10 +274,11 @@ const NET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Collect a spawned child's output, giving up after [`NET_TIMEOUT`].
 ///
-/// Reading happens on a helper thread so the pipes can't deadlock; if it outruns
-/// the deadline we abandon the child (it has its own network timeouts, and the OS
-/// reaps it on exit) rather than block indefinitely. A non-zero exit is still
-/// `Ok`: that's the caller's to inspect.
+/// Each pipe is read on its own thread, so neither can fill up and stall the
+/// child. One that outruns the deadline is killed, not abandoned: nothing else
+/// would stop it (git has no stall timeout over https, ssh no keepalive, and a
+/// child outlives its parent), so hung fetches would pile up behind every later
+/// cleanup. A non-zero exit is still `Ok`: that's the caller's to inspect.
 fn wait_bounded(child: std::process::Child) -> std::io::Result<std::process::Output> {
     wait_bounded_in(child, NET_TIMEOUT)
 }
@@ -285,17 +286,44 @@ fn wait_bounded(child: std::process::Child) -> std::io::Result<std::process::Out
 /// [`wait_bounded`] with an explicit deadline, so the give-up path is testable
 /// without a 20-second test.
 fn wait_bounded_in(
-    child: std::process::Child,
+    mut child: std::process::Child,
     deadline: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(deadline) {
-        Ok(out) => out,
-        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")),
+    fn drain<R>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
     }
+    let end = std::time::Instant::now() + deadline;
+    let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
+    let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+    let status = loop {
+        let waited = child.try_wait();
+        if let Ok(Some(status)) = waited {
+            break status;
+        }
+        if waited.is_err() || std::time::Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(waited.err().unwrap_or_else(timed_out));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // The pipes close with the child unless something it started still holds
+    // them, which counts as outliving the deadline too.
+    let left = || end.saturating_duration_since(std::time::Instant::now());
+    let stdout = stdout.recv_timeout(left()).map_err(|_| timed_out())?;
+    let stderr = stderr.recv_timeout(left()).map_err(|_| timed_out())?;
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 /// The ssh command git would have used for `repo_dir`, with batch mode appended:
@@ -385,6 +413,9 @@ fn run_gh(gh_bin: &str, cwd: &str, args: &[&str]) -> std::io::Result<std::proces
             // agent blocks on a /dev/tty prompt, pinning a TUI worker thread
             // past the timeout.
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Empty, not unset, as in `fetch_origin_branch`: git asks an askpass
+            // helper (VS Code terminals set one) before it reads the above.
+            .env("GIT_ASKPASS", "")
             .env("GIT_SSH_COMMAND", batch_ssh_command(cwd))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -885,7 +916,12 @@ pub(crate) fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) ->
         // to the helper list, so a user's own helper still runs first, and it's
         // never consulted for an ssh or local origin.
         // `--no-tags`: an explicit refspec would still auto-follow tags.
+        // `--refmap=`: only this refspec updates a ref, not also the configured
+        // `remote.origin.fetch` mappings, which may point into `refs/heads/`.
+        // No submodules and no auto-gc (`--no-auto-maintenance` before git
+        // 2.29): the bounded call fetches the one ref and nothing more.
         .args(["-C", repo_dir, "-c", &helper, "fetch", "origin", &refspec, "--no-tags"])
+        .args(["--refmap=", "--no-recurse-submodules", "--no-auto-gc"])
         // Empty, not unset: git asks an askpass helper (VS Code terminals set
         // one) before it checks GIT_TERMINAL_PROMPT, and that pops a dialog.
         .env("GIT_ASKPASS", "")
@@ -2117,13 +2153,15 @@ pub(crate) mod tests {
         let gh = tmp.path().join("gh");
         write_stub(
             &gh,
-            "#!/bin/sh\nprintf '%s|%s\\n' \"${GIT_TERMINAL_PROMPT-UNSET}\" \
-             \"${GIT_SSH_COMMAND-UNSET}\" > \"$0.env\"\nexit 1\n",
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"${GIT_TERMINAL_PROMPT-UNSET}\" \
+             \"${GIT_ASKPASS-UNSET}\" \"${GIT_SSH_COMMAND-UNSET}\" > \"$0.env\"\nexit 1\n",
         );
         let _ = issue_branch_with(tmp.path().to_str().unwrap(), "123", gh.to_str().unwrap());
         let env = std::fs::read_to_string(format!("{}.env", gh.display())).unwrap();
-        let (prompt, ssh) = env.trim().split_once('|').unwrap();
+        let fields: Vec<&str> = env.trim_end().split('|').collect();
+        let [prompt, askpass, ssh] = fields[..] else { panic!("{env}") };
         assert_eq!(prompt, "0", "git can't fall back to a terminal prompt");
+        assert_eq!(askpass, "", "nor to an askpass helper");
         assert!(ssh.ends_with("-oBatchMode=yes"), "ssh can't ask for a passphrase: {ssh}");
     }
 
@@ -2275,17 +2313,50 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn wait_bounded_in_gives_up_on_a_child_that_outlives_the_deadline() {
+    fn wait_bounded_in_kills_a_child_that_outlives_the_deadline() {
+        // The shell would `touch` after its sleep if it were still alive.
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("survived");
         let child = Command::new("sh")
-            // 100x the deadline: long enough to be deterministic, short enough
-            // that the orphan is gone soon after the suite.
-            .args(["-c", "sleep 5"])
+            .args(["-c", &format!("sleep 1; touch '{}'", marker.display())])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let err = wait_bounded_in(child, std::time::Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(!marker.exists(), "killed at the deadline, not left running");
+    }
+
+    #[test]
+    fn wait_bounded_in_collects_both_pipes() {
+        let child = Command::new("sh")
+            .args(["-c", "echo out; echo err >&2; exit 3"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = wait_bounded_in(child, std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!((&out.stdout[..], &out.stderr[..]), (&b"out\n"[..], &b"err\n"[..]));
+    }
+
+    #[test]
+    fn the_origin_fetch_updates_only_its_own_ref() {
+        // A configured `remote.origin.fetch` into `refs/heads/` would otherwise
+        // force-update that local branch too (git's opportunistic refmap).
+        let tmp = TempDir::new().unwrap();
+        let (origin, clone) = issue_fixture(tmp.path());
+        git(&clone, &["branch", "wip"]);
+        let wip = rev_parse(&clone, "refs/heads/wip");
+        git(&clone, &["config", "--add", "remote.origin.fetch", "+refs/heads/main:refs/heads/wip"]);
+        std::fs::write(origin.join("b.txt"), "b").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-m", "b"]);
+        fetch_origin_branch(clone.to_str().unwrap(), "main", "gh").unwrap();
+        assert_eq!(rev_parse(&clone, "refs/remotes/origin/main"), rev_parse(&origin, "main"));
+        assert_eq!(rev_parse(&clone, "refs/heads/wip"), wip, "the local branch stays put");
     }
 
     #[test]
