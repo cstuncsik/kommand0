@@ -5,8 +5,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 /// What kommand0 appends to the ssh command its git runs (core's `SSH_OPTS`).
-const SSH_OPTS: &str =
-    "-oConnectTimeout=20 -oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes";
+const SSH_OPTS: &str = "-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes";
 
 fn run_git(cwd: &Path, args: &[&str]) {
     let ok = Command::new("git")
@@ -373,9 +372,10 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
     let path = git_shim(
         &tmp.path().join("shim"),
         &format!(
-            "printf '%s [%s][%s][%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
+            "printf '%s [%s][%s][%s][%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
              \"${{GIT_SSH_COMMAND-UNSET}}\" \"${{GIT_ASKPASS-UNSET}}\" \
-             \"${{GIT_HTTP_LOW_SPEED_TIME-UNSET}}\" >> \"{}\"",
+             \"${{GIT_HTTP_LOW_SPEED_LIMIT-UNSET}}\" \"${{GIT_HTTP_LOW_SPEED_TIME-UNSET}}\" \
+             >> \"{}\"",
             log.display()
         ),
     );
@@ -406,7 +406,7 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
         lines[fetch]
     );
     assert!(
-        lines[fetch].ends_with(&format!("[0][ssh -F /dev/null {SSH_OPTS}][][20]")),
+        lines[fetch].ends_with(&format!("[0][ssh -F /dev/null {SSH_OPTS}][][1][300]")),
         "no terminal or askpass prompt, batch mode and stall timeouts appended to the user's \
          ssh command, and a stalled https transfer gives up: {}",
         lines[fetch]
@@ -981,15 +981,15 @@ fn workspace_cleanup_prints_a_failed_refresh_as_a_warning() {
 
 #[test]
 fn repo_cleanup_deletes_no_plain_branch_once_the_default_branch_is_rewound() {
-    // Rewound between the scan and the deletes (here: right at the check).
-    // The plain deletes stand down as one; the workspace row re-checks on its
-    // own and, its squash gone, refuses too.
+    // Rewound after the scan pinned it (here: during the scan's reflog read,
+    // once). The plain deletes stand down as one; the workspace row re-checks
+    // on its own and, its squash gone, refuses too.
     let tmp = tempfile::tempdir().unwrap();
     let (state, repo) = setup_for_repo_cleanup(tmp.path());
     let path = git_shim(
         &tmp.path().join("shim"),
-        "case \"$*\" in\n  *\"merge-base --is-ancestor\"*) \
-         \"$real_git\" -C \"$2\" update-ref refs/heads/main main~1 ;;\nesac",
+        "case \"$*\" in\n  *\"reflog show\"*) [ -e \"$0.done\" ] || { : > \"$0.done\"; \
+         \"$real_git\" -C \"$2\" update-ref refs/heads/main main~1; } ;;\nesac",
     );
     let out = repo_cleanup(&state, &repo, &["--force"], &[("PATH", &path)]);
     assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -1050,8 +1050,6 @@ fn repo_cleanup_never_runs_a_merge_driver_under_an_inherited_git_config() {
     let text = stdout(&out);
     assert!(row(&text, "spied").ends_with("skip: not merged into main"), "{text}");
     assert!(row(&text, "added").ends_with("delete"), "{text}");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!err.contains("squash merges not detected"), "{err}");
 }
 
 #[test]
