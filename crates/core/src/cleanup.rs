@@ -78,8 +78,8 @@ const CHECK_ENV: [(&str, &str); 5] = [
     ("GIT_GRAFT_FILE", "/dev/null/none"),
     ("GIT_NO_LAZY_FETCH", "1"),
     ("GIT_ATTR_NOSYSTEM", "1"),
-    // The value of every `--config-env=merge.<driver>.driver=K0_DRIVER_OFF`.
-    ("K0_DRIVER_OFF", "false"),
+    // The value of every `--config-env=merge.<driver>.driver=KOMMAND0_MERGE_DRIVER_OFF`.
+    ("KOMMAND0_MERGE_DRIVER_OFF", "false"),
 ];
 
 /// `git -C <repo_path> <args>` under [`CHECK_ENV`] plus `envs`: the trimmed
@@ -118,18 +118,16 @@ fn check_git_stdout(repo_path: &str, args: &[&str], envs: &[(&str, &str)]) -> Op
 struct Target {
     /// `origin/main`, or the local `main`: what messages call it.
     name: String,
-    /// The origin branch that refreshes it; None for a local base.
-    origin_branch: Option<String>,
     /// `<ref>^{commit}`, resolved once, after any fetch.
     oid: String,
     /// `GIT_ATTR_SOURCE` for every check, so no in-tree attributes apply (git
     /// before 2.40 ignores it).
     empty_tree: String,
-    /// Whether squash merges can be detected: `merge-tree --write-tree` works,
-    /// this isn't a partial clone, and the merge drivers could be listed.
-    squash: bool,
-    /// The config options (`-c`, `--config-env`) every replay runs with.
-    merge_config: Vec<String>,
+    /// The config options (`-c`, `--config-env`) every replay runs with. None
+    /// when squash merges can't be detected: `merge-tree --write-tree` doesn't
+    /// work, this is a partial clone, or the merge drivers couldn't be listed
+    /// (so no replay can run without their overrides).
+    merge_config: Option<Vec<String>>,
     /// What the answers can't show on their own, one per line: a failed
     /// refresh first (the one to act on), then squash detection off.
     note: Option<String>,
@@ -230,31 +228,28 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
     } else {
         None
     };
-    let mut merge_config = [
-        "-c",
-        "core.attributesFile=/dev/null",
-        "-c",
-        "merge.renormalize=false",
-        "-c",
-        "merge.default=text",
-    ]
-    .map(String::from)
-    .to_vec();
-    // Every configured driver becomes `false` (K0_DRIVER_OFF, in CHECK_ENV),
-    // whatever picks it: attribute pins miss `$GIT_DIR/info/attributes`.
-    // `--config-env` splits at the last `=`, `-c` at the first, and a driver
-    // name may have one.
-    for key in driver_keys.iter().flatten() {
-        merge_config.push(format!("--config-env={key}=K0_DRIVER_OFF"));
-    }
+    let merge_config = driver_keys.filter(|_| squash_note.is_none()).map(|keys| {
+        let fixed = [
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "merge.renormalize=false",
+            "-c",
+            "merge.default=text",
+        ];
+        // Every configured driver becomes `false` (the value in CHECK_ENV),
+        // whatever picks it: attribute pins miss `$GIT_DIR/info/attributes`.
+        // `--config-env` splits at the last `=`, `-c` at the first, and a driver
+        // name may have one.
+        let drivers = keys.iter().map(|k| format!("--config-env={k}=KOMMAND0_MERGE_DRIVER_OFF"));
+        fixed.map(String::from).into_iter().chain(drivers).collect()
+    });
     let notes: Vec<String> =
         refresh_note.into_iter().chain(squash_note.map(str::to_string)).collect();
     Ok(Target {
         name,
-        origin_branch,
         oid,
         empty_tree,
-        squash: squash_note.is_none(),
         merge_config,
         note: (!notes.is_empty()).then(|| notes.join("\n")),
     })
@@ -300,15 +295,11 @@ fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Mer
         let Some(trees) = git(&["rev-parse", &tip_tree, &format!("{fork}^{{tree}}")]) else {
             return Merged::No;
         };
-        let mut t = trees.lines();
-        match (t.next(), t.next()) {
-            (Some(a), Some(b)) if a == b => return Merged::NoCommits, // changes that cancel out
-            (Some(_), Some(_)) => {}
-            _ => return Merged::No,
+        let Some((a, b)) = trees.split_once('\n') else { return Merged::No };
+        if a == b {
+            return Merged::NoCommits; // changes that cancel out
         }
-        if !target.squash {
-            return Merged::No;
-        }
+        let Some(merge_config) = &target.merge_config else { return Merged::No };
         // The branch's net change as one commit on the fork point. A fixed
         // identity and date: deterministic, and no user config can block it.
         let probe_env = [
@@ -340,7 +331,7 @@ fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Mer
         // if replaying the branch onto its parent reproduces its tree exactly.
         let replayed = marks.lines().filter_map(|l| l.strip_prefix('=')).any(|c| {
             let parent = format!("{c}^");
-            let mut args: Vec<&str> = target.merge_config.iter().map(String::as_str).collect();
+            let mut args: Vec<&str> = merge_config.iter().map(String::as_str).collect();
             args.extend(["merge-tree", "--write-tree", parent.as_str(), tip]);
             let tree = git(&["rev-parse", &format!("{c}^{{tree}}")]);
             let (Some(tree), Some(out)) = (tree, git(&args)) else { return false };
@@ -508,9 +499,11 @@ pub fn cleanup_merged_workspace(
     let mut target = merge_target(repo_path, false)?;
     let mut merged = merged_into(repo_path, &target, branch, &tip);
     // Fetch only when it could change the answer: a routed row was scanned
-    // after a fetch and read merged, so a batch of them never fires N fetches
-    // racing on one ref lock. The target is re-resolved and re-pinned.
-    if merged == Merged::No && target.origin_branch.is_some() {
+    // after a fetch and read merged, so a batch of them normally fires no fetch
+    // (rows that moved since the scan can still race on the ref lock; the loser
+    // reads its local copy and says so). The target is re-resolved and
+    // re-pinned; a local base just isn't fetched.
+    if merged == Merged::No {
         target = merge_target(repo_path, true)?;
         merged = merged_into(repo_path, &target, branch, &tip);
     }
