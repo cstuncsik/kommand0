@@ -1,0 +1,22 @@
+apps/cli/tests/cli.rs
+  s_76970c2a14e89e::t_bbaa33fdd7f959 945-965
+  s_76970c2a14e89e::t_5867ad61115f8d 944
+apps/cli/src/main.rs
+  s_76970c2a14e89e::t_bbaa33fdd7f959 324-334,535,837
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "23a68e2d1cc19c16ca10e82ba3a7251a3dec3c8f",
+  "prompts": {},
+  "sessions": {
+    "s_76970c2a14e89e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "27b81858-da3f-441b-b2c3-be5289a95fdf",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
