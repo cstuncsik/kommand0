@@ -425,6 +425,7 @@ const LOOK_AT_THE_DISK: [&str; 6] = [
 /// worktree keeps its caches.
 fn uncommitted_work(worktree_path: &str) -> Result<(), String> {
     use std::ffi::OsStr;
+    use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     fn args(a: &[&'static str]) -> Vec<&'static OsStr> {
@@ -448,13 +449,15 @@ fn uncommitted_work(worktree_path: &str) -> Result<(), String> {
         ));
     }
 
-    // `<tag> <path>`: the tag lowercase when assume-unchanged, `S`/`s` when
-    // skip-worktree.
-    let files = git(&args(&["ls-files", "-v", "-z"]), None)?;
-    let mut flagged: Vec<(&[u8], Flags)> = Vec::new();
+    // `<tag> <mode> <oid> <stage>\t<path>`: the tag lowercase when
+    // assume-unchanged, `S`/`s` when skip-worktree.
+    let files = git(&args(&["ls-files", "-s", "-v", "-z"]), None)?;
+    let mut flagged: Vec<(&[u8], &[u8], Flags)> = Vec::new();
     for entry in files.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-        let (&tag, path) = entry.split_first().ok_or_else(unreadable)?;
-        let path = path.strip_prefix(b" ").ok_or_else(unreadable)?;
+        let (&tag, rest) = entry.split_first().ok_or_else(unreadable)?;
+        let rest = rest.strip_prefix(b" ").ok_or_else(unreadable)?;
+        let tab = rest.iter().position(|b| *b == b'\t').ok_or_else(unreadable)?;
+        let (info, path) = (&rest[..tab], &rest[tab + 1..]);
         let flag =
             Flags { assume: tag.is_ascii_lowercase(), skip: tag.eq_ignore_ascii_case(&b's') };
         if !flag.assume && !flag.skip {
@@ -465,38 +468,62 @@ fn uncommitted_work(worktree_path: &str) -> Result<(), String> {
         match std::fs::symlink_metadata(on_disk) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(unreadable()),
-            Ok(_) => flagged.push((path, flag)),
+            Ok(_) => flagged.push((info, path, flag)),
         }
     }
     if flagged.is_empty() {
         return Ok(());
     }
 
-    // The copy sits beside the index, where a split index's shared file resolves.
+    // The copy sits beside the index, where a split index's shared file
+    // resolves, and is created fresh under a name nothing else can hold.
     let index = git(&args(&["rev-parse", "--git-path", "index"]), None)?;
     let index = PathBuf::from(OsStr::from_bytes(index.stdout.trim_ascii()));
     let index = if index.is_absolute() { index } else { Path::new(worktree_path).join(index) };
-    let copy = index.with_file_name(format!("index.kommand0-{}", std::process::id()));
-    std::fs::copy(&index, &copy).map_err(|_| unreadable())?;
-    let verdict = (|| {
-        // One flag per call: update-index applies only the first of the two.
-        for flag in ["--no-assume-unchanged", "--no-skip-worktree"] {
-            for chunk in flagged.chunks(256) {
-                let mut clear = args(&["update-index", flag, "--"]);
-                clear.extend(chunk.iter().map(|(path, _)| OsStr::from_bytes(path)));
-                git(&clear, Some(&copy))?;
-            }
+    let copy = index.with_file_name(format!("index.kommand0-{}", uuid::Uuid::new_v4()));
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&copy)
+        .and_then(|mut to| std::io::copy(&mut std::fs::File::open(&index)?, &mut to));
+    let verdict = created.map_err(|_| unreadable()).and_then(|_| {
+        // Re-added from their own index info: no flags and no stat data, so
+        // status has to read each one's content (through filters), mode and
+        // type. Unsplit, unhooked and full, so writing the copy can't expire
+        // the real index's shared file or run the repo's hooks.
+        let mut info = Vec::new();
+        for (entry, path, _) in &flagged {
+            info.extend_from_slice(entry);
+            info.push(b'\t');
+            info.extend_from_slice(path);
+            info.push(0);
         }
-        let flags = ["status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none"];
+        let mut child = Command::new("git")
+            .args(["-C", worktree_path, "-c", "core.splitIndex=false"])
+            .args(["-c", "splitIndex.sharedIndexExpire=never", "-c", "core.hooksPath=/dev/null"])
+            .args(["-c", "index.sparse=false", "update-index", "-z", "--index-info"])
+            .env("GIT_INDEX_FILE", &copy)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| unreadable())?;
+        let written = child.stdin.take().map(|mut stdin| stdin.write_all(&info));
+        let done = child.wait().is_ok_and(|s| s.success());
+        if !done || !matches!(written, Some(Ok(()))) {
+            return Err(unreadable());
+        }
+        let flags =
+            ["status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none"];
         let status = git(&args(&flags), Some(&copy))?;
         // `XY <path>`, the path raw.
         let Some(entry) = status.stdout.split(|b| *b == 0).find(|e| !e.is_empty()) else {
             return Ok(());
         };
         let path = entry.get(3..).unwrap_or_default();
-        let flag = flagged.iter().find(|(p, _)| *p == path).map(|(_, f)| *f);
+        let flag = flagged.iter().find(|(_, p, _)| *p == path).map(|(.., f)| *f);
         Err(hidden(path, flag.unwrap_or(Flags { assume: true, skip: true })))
-    })();
+    });
     let _ = std::fs::remove_file(&copy);
     verdict
 }
@@ -509,15 +536,19 @@ struct Flags {
 }
 
 /// The refusal for an edit an index flag hides: the command that clears each
-/// flag, with the name quoted for a shell. A name with control characters is
-/// shown escaped and without the name in the command, so it can't split the
-/// refusal into a fake note or be pasted into a shell as is.
+/// flag, with the name quoted for a shell. Any other name is shown escaped and
+/// left out of the command, so it can't split the refusal into a fake note or
+/// be pasted into a shell as is.
 fn hidden(path: &[u8], flags: Flags) -> String {
     let name = String::from_utf8_lossy(path);
-    let (shown, arg) = if name.chars().any(char::is_control) {
-        (name.escape_debug().to_string(), "<file>".to_string())
-    } else {
+    // A backslash too (fish reads `\'` inside single quotes as a quote), and a
+    // name that isn't UTF-8 (the lossy one would name another file).
+    let plain = std::str::from_utf8(path)
+        .is_ok_and(|n| !n.chars().any(|c| c.is_control() || c == '\\'));
+    let (shown, arg) = if plain {
         (name.to_string(), shell_quote(&name))
+    } else {
+        (name.escape_debug().to_string(), "<file>".to_string())
     };
     let set: Vec<&str> = [(flags.assume, "assume-unchanged"), (flags.skip, "skip-worktree")]
         .into_iter()
@@ -1141,7 +1172,10 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(plain.stdout.is_empty(), "{flag}: the fixture hides the edit from a status");
+            let index = repo.join(".git/worktrees/wt/index");
+            let before = std::fs::read(&index).unwrap();
             let err = cleanup(&repo, &wt, &branch).unwrap_err();
+            assert_eq!(std::fs::read(&index).unwrap(), before, "{flag}: the real index is untouched");
             let want = match flag {
                 "fsmonitor" => "uncommitted changes (M work.txt)".to_string(),
                 "both" => "work.txt is flagged assume-unchanged and skip-worktree, which hides its \
@@ -1242,6 +1276,14 @@ mod tests {
             let mut flag = vec!["update-index", "--assume-unchanged", "--"];
             flag.extend(names.iter().map(String::as_str));
             git(&wt, &flag);
+            let admin = |repo: &Path| -> Vec<String> {
+                let dir = std::fs::read_dir(repo.join(".git/worktrees/wt")).unwrap();
+                let mut names: Vec<String> =
+                    dir.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect();
+                names.sort();
+                names
+            };
+            let admin_before = admin(&repo);
             let last = wt.join("f299.txt");
             if edit == "content" {
                 std::fs::write(&last, "edited\n").unwrap();
@@ -1252,12 +1294,7 @@ mod tests {
             let err = cleanup(&repo, &wt, &branch).unwrap_err();
             assert!(err.starts_with("f299.txt is flagged assume-unchanged"), "{edit}: {err}");
             assert!(wt.exists() && branch_exists(&repo, &branch), "{edit}: nothing destroyed");
-            let admin = std::fs::read_dir(repo.join(".git/worktrees/wt")).unwrap();
-            let left: Vec<_> = admin
-                .filter_map(|e| e.ok()?.file_name().into_string().ok())
-                .filter(|n| n.starts_with("index.kommand0"))
-                .collect();
-            assert!(left.is_empty(), "{edit}: the index copy is gone: {left:?}");
+            assert_eq!(admin(&repo), admin_before, "{edit}: nothing left beside the index");
         }
     }
 
@@ -1270,8 +1307,6 @@ mod tests {
         let (repo, wt, branch) = repo_with_worktree_on(tmp.path(), "feat");
         std::os::unix::fs::symlink("work.txt", wt.join("link")).unwrap();
         std::fs::write(wt.join("a\nb.txt"), "odd").unwrap();
-        let hostile = "$(touch pwned) it's.txt";
-        std::fs::write(wt.join(hostile), "x").unwrap();
         commit_file(&wt, "work.txt", "work");
         squash_merge(&repo, "feat");
         git(&wt, &["update-index", "--skip-worktree", "link"]);
@@ -1288,15 +1323,50 @@ mod tests {
         let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert!(err.starts_with("a\\nb.txt is flagged assume-unchanged"), "{err}");
         assert!(!err.contains('\n') && err.contains("-- <file>`"), "one line, no name to paste: {err}");
-        std::fs::write(wt.join("a\nb.txt"), "odd").unwrap();
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
 
-        // A name that's shell syntax is quoted in the command it suggests.
-        git(&wt, &["update-index", "--no-assume-unchanged", "a\nb.txt"]);
+    #[test]
+    fn the_suggested_fix_quotes_a_hostile_file_name() {
+        // A name that's shell syntax is quoted in the command the refusal
+        // suggests; one with a backslash (fish reads `\'` in quotes) isn't
+        // offered as a command at all.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = repo_with_worktree_on(tmp.path(), "feat");
+        let (hostile, slashed) = ("$(touch pwned) it's.txt", "a\\b.txt");
+        std::fs::write(wt.join(hostile), "x").unwrap();
+        std::fs::write(wt.join(slashed), "x").unwrap();
+        commit_file(&wt, "work.txt", "work");
+        squash_merge(&repo, "feat");
         git(&wt, &["update-index", "--assume-unchanged", hostile]);
         std::fs::write(wt.join(hostile), "edited").unwrap();
         let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert!(err.contains(r#"-- '$(touch pwned) it'\''s.txt'`"#), "quoted: {err}");
+        std::fs::write(wt.join(hostile), "x").unwrap();
+        git(&wt, &["update-index", "--assume-unchanged", slashed]);
+        std::fs::write(wt.join(slashed), "edited").unwrap();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.starts_with("a\\\\b.txt is flagged") && err.contains("-- <file>`"), "{err}");
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
+
+    #[test]
+    fn cleanup_reads_a_flagged_files_content_not_its_cached_stat() {
+        // Same length, mtime put back, and git told to compare little else:
+        // the stat git cached for the flagged file still matches (clearing
+        // the flag keeps it), and only its content tells.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&repo, &["config", "core.trustctime", "false"]);
+        git(&repo, &["config", "core.checkStat", "minimal"]);
+        git(&wt, &["update-index", "--assume-unchanged", "work.txt"]);
+        let file = wt.join("work.txt");
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, "WORK").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(mtime).unwrap();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.starts_with("work.txt is flagged assume-unchanged"), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "WORK");
     }
 
     #[test]

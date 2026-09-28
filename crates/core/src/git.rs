@@ -372,8 +372,9 @@ fn batch_ssh_command(repo_dir: &str) -> String {
         .then(|| git_config_value(repo_dir, "core.sshCommand"))
         .flatten();
     let program = std::env::var("GIT_SSH").ok().filter(|p| !p.is_empty());
-    // git reads the variant from the environment first, as for the command.
-    let variant = std::env::var("GIT_SSH_VARIANT").ok().filter(|v| !v.is_empty());
+    // git reads the variant from the environment first (even empty: that's
+    // ssh), as for the command.
+    let variant = std::env::var("GIT_SSH_VARIANT").ok();
     let variant = variant.or_else(|| git_config_value(repo_dir, "ssh.variant"));
     let (env, cfg) = (env.as_deref(), cfg.as_deref());
     ssh_command_with_batch_mode(env, cfg, program.as_deref(), variant.as_deref())
@@ -395,7 +396,7 @@ fn ssh_command_with_batch_mode(
 ) -> String {
     let line = env.filter(|v| !v.trim().is_empty()).or(cfg);
     let (base, program) = match (line, program) {
-        (Some(line), _) => (line.to_string(), first_word(line).to_string()),
+        (Some(line), _) => (line.to_string(), first_word(line)),
         (None, Some(program)) => (shell_quote(program), program.to_string()),
         (None, None) => ("ssh".to_string(), "ssh".to_string()),
     };
@@ -407,11 +408,29 @@ fn ssh_command_with_batch_mode(
     if openssh { format!("{base} {SSH_OPTS}") } else { base }
 }
 
-/// The program a shell command line runs: its first word, unquoted.
-fn first_word(line: &str) -> &str {
-    let line = line.trim_start();
-    let quoted = ['\'', '"'].into_iter().find_map(|q| line.strip_prefix(q)?.split(q).next());
-    quoted.unwrap_or_else(|| line.split_whitespace().next().unwrap_or_default())
+/// The program a shell command line runs: its first word as sh splits it,
+/// quoted and escaped parts joined (`"/opt/My Tools"/plink`, `My\ Tools/plink`).
+fn first_word(line: &str) -> String {
+    let mut word = String::new();
+    let mut chars = line.trim_start().chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => word.extend(chars.by_ref().take_while(|&c| c != '\'')),
+            '"' => {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => word.extend(chars.next()),
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => word.extend(chars.next()),
+            c if c.is_whitespace() => break,
+            c => word.push(c),
+        }
+    }
+    word
 }
 
 /// A single git config value for `repo_dir`, or `None` when unset (or git
@@ -2381,9 +2400,15 @@ pub(crate) mod tests {
             (None, None, Some("/opt/My Tools/PLINK.exe"), None, "'/opt/My Tools/PLINK.exe'".into()),
             (None, Some("\"/opt/PuTTY/plink\" -batch"), None, None, "\"/opt/PuTTY/plink\" -batch".into()),
             (None, Some("'/opt/plink tools/ssh' -v"), None, None, opts("'/opt/plink tools/ssh' -v")),
+            (None, Some("\"/opt/My Tools\"/plink -v"), None, None, "\"/opt/My Tools\"/plink -v".into()),
+            (None, Some("/opt/My\\ Tools/plink -v"), None, None, "/opt/My\\ Tools/plink -v".into()),
+            (None, Some("\"/opt/plink\"/ssh"), None, None, opts("\"/opt/plink\"/ssh")),
             // Or by variant; a value git doesn't know means ssh, as for git.
             (None, Some("ssh"), None, Some("simple"), "ssh".into()),
             (None, Some("wrap"), None, Some("putty"), "wrap".into()),
+            (None, Some("wrap"), None, Some("plink"), "wrap".into()),
+            (None, Some("wrap"), None, Some("tortoiseplink"), "wrap".into()),
+            (None, Some("plink"), None, Some(""), opts("plink")),
             (None, Some("wrap"), None, Some("ssh"), opts("wrap")),
             (None, Some("wrap"), None, Some("OpenSSH"), opts("wrap")),
             (None, Some("wrap"), None, Some("auto"), opts("wrap")),
@@ -2434,9 +2459,12 @@ pub(crate) mod tests {
         // process-global, so it isn't set here).
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
+        let dir = tmp.path().to_str().unwrap();
+        let limit_is_ours = http_stall(dir).contains(&limit);
         git(tmp.path(), &["config", "http.https://example.com/.lowSpeedTime", "600"]);
-        let stall = http_stall(tmp.path().to_str().unwrap());
+        let stall = http_stall(dir);
         assert!(!stall.iter().any(|(var, _)| var.ends_with("TIME")), "{stall:?}");
+        assert_eq!(stall.contains(&limit), limit_is_ours, "the other half is unaffected");
     }
 
     #[test]
