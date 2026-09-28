@@ -365,10 +365,13 @@ fn ssh_command_with_batch_mode(env: Option<&str>, cfg: Option<&str>) -> String {
 }
 
 /// A single git config value for `repo_dir`, or `None` when unset (or git
-/// couldn't be run). Panic-free: this is called off the UI thread.
+/// couldn't be run). Panic-free: this is called off the UI thread. Read as the
+/// rest of git reads it: an inherited `GIT_CONFIG` redirects `git config`
+/// alone, to one file.
 pub(crate) fn git_config_value(repo_dir: &str, key: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", repo_dir, "config", "--get", key])
+        .env_remove("GIT_CONFIG")
         .stderr(Stdio::null())
         .output()
         .ok()?;
@@ -875,6 +878,7 @@ fn prepare_linked_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(
 fn origin_fetches(repo_dir: &str, branch: &str) -> bool {
     let Ok(out) = Command::new("git")
         .args(["-C", repo_dir, "config", "--get-all", "remote.origin.fetch"])
+        .env_remove("GIT_CONFIG")
         .output()
     else {
         return false;

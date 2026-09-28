@@ -175,9 +175,12 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
     // here on bytes: in a UTF-8 locale `--get-regexp` silently skips a name
     // that isn't UTF-8. Any failure, or such a name (a lossy decode would
     // override a different key), leaves them unknown, so squash detection goes
-    // off rather than replay without the overrides.
-    let names =
-        Command::new("git").args(["-C", repo_path, "config", "--list", "--name-only"]).output();
+    // off rather than replay without the overrides. Without `GIT_CONFIG`, which
+    // points `git config` alone at one file: the replay reads the real config.
+    let names = Command::new("git")
+        .args(["-C", repo_path, "config", "--list", "--name-only"])
+        .env_remove("GIT_CONFIG")
+        .output();
     let driver_keys = match names {
         Ok(o) if o.status.success() => {
             let keys = o.stdout.split(|b| *b == b'\n').filter(|name| {

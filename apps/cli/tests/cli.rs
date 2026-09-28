@@ -942,6 +942,46 @@ fn repo_cleanup_fails_closed_when_git_cannot_answer() {
 }
 
 #[test]
+fn repo_cleanup_never_runs_a_merge_driver_under_an_inherited_git_config() {
+    // `GIT_CONFIG` points `git config` alone at one file: the driver listing
+    // missed the repo's drivers, and the replay then ran them.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let lines: String = (1..=8).map(|n| format!("{n}\n")).collect();
+    let commit = |content: String, msg: &str| {
+        std::fs::write(repo.join("f.txt"), content).unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", msg]);
+    };
+    commit(lines.clone(), "f");
+    run_git(&repo, &["switch", "-c", "spied"]);
+    commit(lines.replace("2\n", "two\n"), "two");
+    run_git(&repo, &["switch", "main"]);
+    // The replay needs a content merge, so it reaches the driver.
+    commit(lines.replace("7\n", "seven\n"), "seven");
+    run_git(&repo, &["merge", "--squash", "--ff", "spied"]);
+    run_git(&repo, &["commit", "-m", "squash spied"]);
+    let marker = tmp.path().join("driver-ran");
+    run_git(&repo, &["config", "merge.spy.driver", &format!("touch '{}'", marker.display())]);
+    std::fs::write(repo.join(".git/info/attributes"), "* merge=spy\n").unwrap();
+    let _ = Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "merge-tree", "--write-tree", "main^", "spied"])
+        .output()
+        .unwrap();
+    assert!(marker.exists(), "the fixture really reaches the driver");
+    std::fs::remove_file(&marker).unwrap();
+
+    let empty = tmp.path().join("empty.gitconfig");
+    std::fs::write(&empty, "").unwrap();
+    let out = repo_cleanup(&state, &repo, &["--dry-run"], &[("GIT_CONFIG", empty.to_str().unwrap())]);
+    assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!marker.exists(), "the scan ran the repo's merge driver");
+    let text = stdout(&out);
+    assert!(row(&text, "spied").ends_with("skip: not merged into main"), "{text}");
+}
+
+#[test]
 fn workspace_cleanup_refuses_when_the_branch_moves_mid_cleanup() {
     // kmd doesn't stop a live agent, so a commit can land while the cleanup
     // runs. Before the worktree goes: the status check commits, once.
