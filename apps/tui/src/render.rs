@@ -1220,8 +1220,9 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             Style::default().fg(th.error),
                         ),
                     ]));
-                    for line in msg_lines {
-                        lines.push(Line::styled(line.to_string(), Style::default().fg(th.error)));
+                    // Core's notes: warnings, as in the repo pane.
+                    for note in msg_lines {
+                        lines.push(Line::styled(note.to_string(), Style::default().fg(th.dirty)));
                     }
                 }
             }

@@ -172,7 +172,8 @@ pub(crate) enum ModalResult {
     SubmitRename(String, String, String),
     /// Cleanup confirmed for a workspace id.
     ConfirmCleanup(String),
-    /// Repo cleanup confirmed: (repo_id, the plan to execute).
+    /// Repo cleanup confirmed: (repo_id, the plan to execute, the scan's base
+    /// the plain deletes are checked against).
     ConfirmRepoCleanup(String, Vec<RepoCleanupItem>, kommand0_core::Base),
     /// Choice from the branch-exists prompt: check out the existing branch when
     /// `checkout`, else fork a fresh (suffixed) branch.

@@ -767,8 +767,8 @@ fn repo_cleanup_force_deletes_stale_branches_and_routes_the_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, repo) = setup_for_repo_cleanup(tmp.path());
     let feat_dir = workspace_dir(&state, "feat");
-    // A stale origin/main, so the run goes through the fetch (and its gh
-    // credential helper) before it decides.
+    // A stale origin/main, so the run goes through the fetch before it decides
+    // (gh's credential helper only answers over https, not for this origin).
     run_git(&repo, &["push", "origin", "main"]);
     run_git(&repo, &["update-ref", "refs/remotes/origin/main", "main~1"]);
     let out = repo_cleanup(&state, &repo, &["--force"], &[]);
@@ -781,13 +781,8 @@ fn repo_cleanup_force_deletes_stale_branches_and_routes_the_workspace() {
     assert!(!feat_dir.exists(), "feat's worktree removed");
     let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
     assert!(!list.contains("feat"), "workspace row dropped: {list}");
-    let tracked = Command::new("git")
-        .args(["-C", repo.to_str().unwrap(), "rev-parse", "refs/remotes/origin/main", "main"])
-        .output()
-        .unwrap();
-    let tracked = String::from_utf8_lossy(&tracked.stdout);
-    let (fetched, local) = tracked.trim().split_once('\n').unwrap();
-    assert_eq!(fetched, local, "the run fetched origin/main");
+    // The run fetched: origin/main caught up with main.
+    run_git(&repo, &["merge-base", "--is-ancestor", "main", "refs/remotes/origin/main"]);
     // Idempotent: a second run finds nothing actionable and exits 0.
     let again = repo_cleanup(&state, &repo, &["--force"], &[]);
     assert!(again.status.success(), "rerun: {}", String::from_utf8_lossy(&again.stderr));
@@ -1021,6 +1016,15 @@ fn repo_cleanup_never_runs_a_merge_driver_under_an_inherited_git_config() {
         run_git(&repo, &["commit", "-m", msg]);
     };
     commit(lines.clone(), "f");
+    // A squash that needs no driver, which must still read merged: squash
+    // detection didn't just switch itself off.
+    run_git(&repo, &["switch", "-c", "added"]);
+    std::fs::write(repo.join("new.txt"), "new").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "new"]);
+    run_git(&repo, &["switch", "main"]);
+    run_git(&repo, &["merge", "--squash", "--ff", "added"]);
+    run_git(&repo, &["commit", "-m", "squash added"]);
     run_git(&repo, &["switch", "-c", "spied"]);
     commit(lines.replace("2\n", "two\n"), "two");
     run_git(&repo, &["switch", "main"]);
@@ -1045,6 +1049,9 @@ fn repo_cleanup_never_runs_a_merge_driver_under_an_inherited_git_config() {
     assert!(!marker.exists(), "the scan ran the repo's merge driver");
     let text = stdout(&out);
     assert!(row(&text, "spied").ends_with("skip: not merged into main"), "{text}");
+    assert!(row(&text, "added").ends_with("delete"), "{text}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("squash merges not detected"), "{err}");
 }
 
 #[test]

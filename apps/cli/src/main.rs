@@ -314,13 +314,6 @@ fn wants_checkout(answer: &str) -> bool {
     !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no")
 }
 
-/// Shared gate for the destructive `[y/N]` prompts: refuses (exit 1) when
-/// stdin is not a tty, else prints `prompt()` and returns whether the user
-/// confirmed with y/Y (anything else cancels). The prompt is lazy so a
-/// caller can defer work (the profile-delete preview) until after the tty
-/// check, exactly as the inline blocks did. The existing-branch checkout
-/// offer stays separate on purpose: it defaults to YES (non-destructive),
-/// the opposite polarity.
 /// A workspace-cleanup refusal is its reason, then core's notes on lines of
 /// their own: the notes go out as warnings, the reason comes back.
 fn warn_notes(refusal: &str) -> &str {
@@ -332,6 +325,13 @@ fn warn_notes(refusal: &str) -> &str {
     reason
 }
 
+/// Shared gate for the destructive `[y/N]` prompts: refuses (exit 1) when
+/// stdin is not a tty, else prints `prompt()` and returns whether the user
+/// confirmed with y/Y (anything else cancels). The prompt is lazy so a
+/// caller can defer work (the profile-delete preview) until after the tty
+/// check, exactly as the inline blocks did. The existing-branch checkout
+/// offer stays separate on purpose: it defaults to YES (non-destructive),
+/// the opposite polarity.
 fn confirm_or_exit(
     action: &str,
     prompt: impl FnOnce() -> anyhow::Result<String>,

@@ -80,11 +80,11 @@ struct RepoScan {
 /// Repo-cleanup worker -> event loop: the scan, or the delete phase's
 /// per-branch results. Both carry the repo id. `Scanned(_, Err)` also carries
 /// a delete-phase failure that produced no per-branch results (the config
-/// read).
+/// read, or the default branch rewound since the scan).
 #[derive(Debug)]
 enum RepoCleanupMsg {
     Scanned(String, Result<RepoScan, String>),
-    Deleted(String, Vec<(String, Result<(), String>)>),
+    Deleted(String, kommand0_core::BranchResults),
 }
 
 /// `(to delete, via workspace cleanup, skipped)` for a repo cleanup plan.
@@ -3622,7 +3622,7 @@ impl App {
         match self.repo_cleanup_pending.take() {
             Some((id, scan)) if id == repo_id => self.open_repo_cleanup_modal(id, scan),
             other => {
-                // A dropped plan takes its "press c to review" line with it.
+                // A dropped plan takes its "Press c to review" line with it.
                 if let Some((other_id, _)) = other {
                     self.repo_cleanup_result.remove(&other_id);
                 }
@@ -3669,7 +3669,7 @@ impl App {
 
     /// A scan landed. Nothing actionable: say so in the repo detail line. Else
     /// open the preview while the tree is idle, or park the plan and point at `c`.
-    /// Core's note rides along: a second detail line, or a row in the preview.
+    /// Core's notes ride along: a detail line each, or rows in the preview.
     fn on_repo_cleanup_scanned(
         &mut self,
         repo_id: String,
@@ -3688,16 +3688,16 @@ impl App {
         for note in &scan.notes {
             tracing::warn!("repo cleanup: {note}");
         }
-        let with_note = |line: String| ([vec![line], scan.notes.clone()].concat().join("\n"), false);
+        let with_notes = |line: String| ([vec![line], scan.notes.clone()].concat().join("\n"), false);
         let (deletes, routed, skipped) = repo_cleanup_counts(&scan.items);
         if deletes + routed == 0 {
-            let line = with_note(format!("Nothing to clean up ({skipped} skipped)"));
+            let line = with_notes(format!("Nothing to clean up ({skipped} skipped)"));
             self.repo_cleanup_result.insert(repo_id, line);
         } else if self.can_open_repo_cleanup_modal() {
             self.open_repo_cleanup_modal(repo_id, scan);
         } else {
             // The instruction first: the pane clips the tail.
-            let line = with_note(format!(
+            let line = with_notes(format!(
                 "Press c to review: {deletes} to delete, {routed} workspace(s)"
             ));
             self.repo_cleanup_result.insert(repo_id.clone(), line);
@@ -3813,7 +3813,7 @@ impl App {
     fn on_repo_cleanup_deleted(
         &mut self,
         repo_id: String,
-        results: Vec<(String, Result<(), String>)>,
+        results: kommand0_core::BranchResults,
     ) {
         let mut failed = Vec::new();
         for (branch, result) in &results {
@@ -5415,7 +5415,7 @@ async fn run(
                         }
                     }
                     Err(msg) => {
-                        // The pane clips a long refusal (its note line
+                        // The pane clips a long refusal (its notes
                         // included); the log keeps it whole.
                         tracing::warn!("cleanup: {msg}");
                         app.cleanup_result.insert(ws_id, msg);
@@ -9157,15 +9157,10 @@ mod key_tests {
         terminal.draw(|frame| render::ui(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
         for y in 0..h {
-            let cells: Vec<&str> = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
-            let Some(at) = cells.concat().find(needle) else { continue };
-            // `at` counts bytes: the cells before it are the ones that end by then.
-            let mut end = 0;
-            let x = cells.iter().take_while(|s| {
-                end += s.len();
-                end <= at
-            });
-            return buffer[(x.count() as u16, y)].fg;
+            let from = |x| (x..w).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+            if let Some(x) = (0..w).find(|&x| from(x).starts_with(needle)) {
+                return buffer[(x, y)].fg;
+            }
         }
         panic!("{needle:?} isn't rendered");
     }
@@ -10298,6 +10293,9 @@ mod key_tests {
             .find(|l| l.contains("origin/main not refreshed"))
             .unwrap_or_else(|| panic!("the note is visible at 80x24:\n{text}"));
         assert!(!note.contains("Cleanup blocked"), "the note has its own line: {note}");
+        let th = app.theme;
+        assert_eq!(fg_of(&mut app, 80, 24, "the branch isn't"), th.error, "the refusal");
+        assert_eq!(fg_of(&mut app, 80, 24, "origin/main not refreshed"), th.dirty, "a warning");
     }
 
     /// One worker message, bounded: a hang must fail this test, not wedge the run.
@@ -10618,6 +10616,49 @@ mod key_tests {
         assert!(text.contains("skip-14"), "{text}");
         assert!(!text.contains("skip-15"), "{text}");
         assert!(text.contains("+25 more: kmd repo cleanup alpha --dry-run lists all"), "{text}");
+
+        // A second note takes a row from the list, and the marker stays exact.
+        let mut items = vec![delete_item("stale")];
+        items.extend((0..40).map(|i| skip_item(&format!("skip-{i:02}"), "not merged into main")));
+        app.open_repo_cleanup_modal("r1".into(), scan_of(items, &["one", "two"]));
+        let text = render_to_string(&mut app, 100, 24);
+        assert!(text.contains("skip-13") && !text.contains("skip-14"), "{text}");
+        assert!(text.contains("+26 more: kmd repo cleanup alpha --dry-run lists all"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn y_after_the_default_branch_was_rewound_deletes_no_plain_branch() {
+        let mut app = test_app();
+        let repo = add_real_repo(&mut app, "stale");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // The scan pins a commit main then loses.
+        git(&["commit", "--allow-empty", "-m", "pinned"]);
+        let path = repo.path().to_string_lossy().into_owned();
+        let base = kommand0_core::scan_merged_branches(&path, &[]).unwrap().base;
+        git(&["reset", "--hard", "HEAD~1"]);
+        let tip = git(&["rev-parse", "refs/heads/stale"]);
+        let (repo_tx, mut repo_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(repo_tx);
+        let items = vec![RepoCleanupItem::Delete { branch: "stale".into(), tip }];
+        app.open_repo_cleanup_modal("real".into(), RepoScan { items, notes: vec![], base });
+
+        press(&mut app, KeyCode::Char('y')).await;
+        let msg = recv(&mut repo_rx).await;
+        app.repo_cleanup_inflight = None;
+        let RepoCleanupMsg::Scanned(id, Err(e)) = msg else { panic!("the refusal, not {msg:?}") };
+        assert!(e.starts_with("scan again: main was rewound"), "{e}");
+        app.on_repo_cleanup_scanned(id, Err(e));
+        let (line, is_error) = &app.repo_cleanup_result["real"];
+        assert!(line.starts_with("Cleanup failed: scan again:") && *is_error, "{line}");
+        git(&["rev-parse", "--verify", "refs/heads/stale"]);
     }
 
     #[tokio::test]
