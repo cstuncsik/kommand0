@@ -270,22 +270,23 @@ enum Merged {
     /// Nothing of its own: the default branch's own history, changes that
     /// cancel out, or a branch created at a merged tip.
     NoCommits,
-    /// Squash-merged (or rebased), but before the branch's last commit: the
+    /// Squash-merged (or rebased), but before the branch's newest commit: the
     /// commits since may hold work its net change hides (something added and
     /// removed again).
-    Later,
+    CommitsAfter,
     /// Not merged, or git couldn't tell.
     No,
 }
 
 /// Whether `branch` (at `tip`) is merged into `target`. Every failure lands on
-/// No, Later or NoCommits, never Yes. Yes needs one of:
+/// No, CommitsAfter or NoCommits, never Yes. Yes needs one of:
 /// - the tip is an ancestor of the base but off its first-parent line (merged
 ///   by a merge commit; on that line it is the base's own history);
 /// - a commit on the base since the fork point carries the branch's net change
 ///   (same patch-id), replaying the branch onto that commit's parent
-///   reproduces its tree exactly, and it was committed no earlier than the tip
-///   (a squash, or a one-commit rebase, of the branch as it is now; else Later).
+///   reproduces its tree exactly, and every such commit was committed no
+///   earlier than the branch's newest (a squash, or a one-commit rebase, of the
+///   branch as it is now; else CommitsAfter).
 ///
 /// Then [`fresh_by_reflog`] can still veto it.
 fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Merged {
@@ -354,16 +355,26 @@ fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Mer
         if confirmed.is_empty() {
             return Merged::No;
         }
-        // And only a merge committed no earlier than the tip: the net change
-        // can't show commits made after it. Committer dates, so clock skew can
-        // hide such a commit (the net change is still on the base then) or keep
-        // a branch merged within the skew of its last commit.
-        let time = |rev: &str| {
-            git(&["log", "-1", "--no-show-signature", "--format=%ct", rev])?.parse::<i64>().ok()
+        // And only when every such commit is no older than the branch's newest
+        // commit: the net change can't show commits made after a merge
+        // (something added and removed again), and a later landing of the same
+        // change on the base, after a revert, doesn't vouch for them either.
+        // Committer dates, so a clock running behind can still hide such a
+        // commit, and one running ahead keeps a branch merged within its lead.
+        let dates = |revs: &[&str]| -> Option<Vec<i64>> {
+            let mut args = vec!["log", "--no-show-signature", "--format=%ct"];
+            args.extend_from_slice(revs);
+            git(&args)?.lines().map(|t| t.parse().ok()).collect()
         };
-        let Some(tip_time) = time(tip) else { return Merged::No };
-        if !confirmed.iter().any(|c| time(c).is_some_and(|t| t >= tip_time)) {
-            return Merged::Later;
+        let range = format!("{fork}..{tip}");
+        let newest = dates(&[range.as_str()]).and_then(|d| d.into_iter().max());
+        let landings = [&["--no-walk"][..], &confirmed].concat();
+        let first_landing = dates(&landings).and_then(|d| d.into_iter().min());
+        let (Some(newest), Some(first_landing)) = (newest, first_landing) else {
+            return Merged::No;
+        };
+        if first_landing < newest {
+            return Merged::CommitsAfter;
         }
     }
     if fresh_by_reflog(repo_path, branch, tip) { Merged::NoCommits } else { Merged::Yes }
@@ -539,7 +550,7 @@ pub fn cleanup_merged_workspace(
         Merged::NoCommits => {
             return Err("the branch has no commits of its own; not cleaning up".to_string());
         }
-        Merged::Later => {
+        Merged::CommitsAfter => {
             return Err(format!(
                 "the branch has commits after its merge into {}; not cleaning up",
                 target.base.name
@@ -744,7 +755,7 @@ pub fn scan_merged_branches(
             Err(r) => Verdict::Skip(r.short().to_string()),
             Ok(()) => match merged_into(repo_path, &target, branch, tip) {
                 Merged::NoCommits => Verdict::Skip("no commits of its own".to_string()),
-                Merged::Later => Verdict::Skip("commits after its merge".to_string()),
+                Merged::CommitsAfter => Verdict::Skip("commits after its merge".to_string()),
                 Merged::No => Verdict::Skip(format!("not merged into {}", target.base.name)),
                 Merged::Yes if !worktree.is_empty() => {
                     Verdict::CheckedOut { worktree: worktree.to_string() }
@@ -823,17 +834,23 @@ mod tests {
         git(dir, &["commit", "-m", name]);
     }
 
-    /// Commit everything in `dir` dated far after the rest of a fixture, so it
-    /// surely postdates any merge in it.
-    fn commit_later(dir: &Path, msg: &str) {
-        git(dir, &["add", "-A"]);
+    /// `git <args>` in `dir`, committing `secs` from now: commit dates decide
+    /// "commits after its merge", and a fixture runs within a second.
+    fn git_at(dir: &Path, secs: i64, args: &[&str]) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
         let out = Command::new("git")
-            .args(["commit", "-m", msg])
-            .env("GIT_COMMITTER_DATE", "2100000000 +0000")
+            .args(args)
+            .env("GIT_COMMITTER_DATE", format!("{} +0000", now.as_secs() as i64 + secs))
             .current_dir(dir)
             .output()
             .unwrap();
-        assert!(out.status.success(), "commit {msg}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Commit everything in `dir`, `secs` from now (see [`git_at`]).
+    fn commit_at(dir: &Path, secs: i64, msg: &str) {
+        git(dir, &["add", "-A"]);
+        git_at(dir, secs, &["commit", "-m", msg]);
     }
 
     /// Squash-merge `branch` into main, which `repo` has checked out.
@@ -1409,15 +1426,39 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         std::fs::write(wt.join("spike.txt"), "spike").unwrap();
-        commit_later(&wt, "spike");
+        commit_at(&wt, 60, "spike");
         std::fs::remove_file(wt.join("spike.txt")).unwrap();
-        commit_later(&wt, "drop the spike");
+        commit_at(&wt, 61, "drop the spike");
         let verdicts = scan_merged_branches(repo.to_str().unwrap(), &[]).unwrap().verdicts;
         let feat = verdicts.iter().find(|v| v.branch == "feat").unwrap();
         assert_eq!(feat.verdict, Verdict::Skip("commits after its merge".into()));
         let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert_eq!(err, "the branch has commits after its merge into main; not cleaning up");
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+    }
+
+    #[test]
+    fn commits_after_a_merge_count_by_the_newest_and_against_every_landing() {
+        // The spike again, but (a) its undo comes from a machine whose clock
+        // runs behind, dated before the squash, or (b) main reverts the squash
+        // and lands the same change again after the spike. Neither the tip's
+        // date nor the newer landing may vouch for the spike.
+        for relanded in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let (repo, wt, _) = merged_worktree_on(tmp.path(), "feat");
+            std::fs::write(wt.join("spike.txt"), "spike").unwrap();
+            commit_at(&wt, 60, "spike");
+            std::fs::remove_file(wt.join("spike.txt")).unwrap();
+            commit_at(&wt, if relanded { 61 } else { -60 }, "drop the spike");
+            if relanded {
+                git_at(&repo, 120, &["revert", "--no-edit", "HEAD"]);
+                git_at(&repo, 121, &["revert", "--no-edit", "HEAD"]);
+            }
+            let verdicts = scan_merged_branches(repo.to_str().unwrap(), &[]).unwrap().verdicts;
+            let feat = verdicts.iter().find(|v| v.branch == "feat").unwrap();
+            let want = Verdict::Skip("commits after its merge".into());
+            assert_eq!(feat.verdict, want, "relanded: {relanded}");
+        }
     }
 
     #[test]

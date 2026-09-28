@@ -917,8 +917,10 @@ fn repo_cleanup_fails_closed_when_git_cannot_answer() {
         // A driver that can't be listed can't be overridden.
         ("drivers", "*\" config --list \"*", unmerged, "(couldn't read the merge driver config)"),
         ("reflog", "*\"reflog show\"*", "skip: no commits of its own", ""),
-        // The commit dates a confirmed squash is checked against.
-        ("dates", "*\" log -1 \"*", unmerged, ""),
+        // The dates a confirmed squash is checked against: the branch's own,
+        // and those of every landing (one failing alone must not fail open).
+        ("branch dates", "*\"--format=%ct\"*\"..\"*", unmerged, ""),
+        ("landing dates", "*\"--no-walk\"*", unmerged, ""),
     ];
     for (what, pattern, want, squash_off) in arms {
         let tmp = tempfile::tempdir().unwrap();
