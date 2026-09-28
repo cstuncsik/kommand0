@@ -1,3 +1,4 @@
+pub mod cleanup;
 pub mod codex;
 pub mod config;
 pub mod git;
@@ -9,12 +10,14 @@ pub mod sort;
 pub mod workspace;
 pub mod worktree;
 
+pub use cleanup::{
+    BranchVerdict, Verdict, cleanup_merged_workspace, delete_branches, scan_merged_branches,
+};
 pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
 pub use git::{
-    BranchStatus, BranchVerdict, FileDiff, IssueBranch, PrChecks, PrReview, PrState, PrStatus,
-    Verdict, branch_status, cleanup_merged_workspace, delete_branches,
-    diff_files_vs_default_branch, is_issue_ref, issue_branch, pr_statuses, scan_merged_branches,
+    BranchStatus, FileDiff, IssueBranch, PrChecks, PrReview, PrState, PrStatus, branch_status,
+    diff_files_vs_default_branch, is_issue_ref, issue_branch, pr_statuses,
 };
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
