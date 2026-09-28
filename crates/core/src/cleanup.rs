@@ -10,7 +10,7 @@
 
 use crate::git::{
     default_branch_ref, fetch_origin_branch, gh_bin, git_config_value, is_valid_branch_name,
-    last_line,
+    last_line, shell_quote,
 };
 use std::process::{Command, Stdio};
 
@@ -410,87 +410,126 @@ const LOOK_AT_THE_DISK: [&str; 6] = [
 ];
 
 /// Refuses, with the refusal, when removing `worktree_path` would lose work: a
-/// change `git status` lists, or an edit to a file whose index flag hides it
-/// from status. Refuses too when git can't tell.
+/// change `git status` lists, even in a file whose index flag hides it from a
+/// plain status. Refuses too when git can't tell.
 ///
 /// Its own status, not the tree's `branch_status`, because git can be told not
 /// to look: `status.showUntrackedFiles=no` hides untracked files (from
 /// `worktree remove`'s own check too, which then deletes them), and a stale
 /// fsmonitor or untracked cache answers for the disk. A file flagged
-/// assume-unchanged or skip-worktree shows in no status at all, so each one on
-/// disk is compared with its index blob; one that isn't on disk (a sparse
-/// checkout, or a deletion git doesn't see) loses nothing. Nothing here writes
-/// the index, so a refused worktree keeps its caches.
+/// assume-unchanged or skip-worktree shows in no status at all, so the flagged
+/// files on disk get a second status, on a copy of the index with their flags
+/// cleared: git's own verdict (filters and line endings, the executable bit,
+/// symlinks). One that isn't on disk (a sparse checkout, or a deletion git
+/// doesn't see) loses nothing. Nothing here writes the real index, so a refused
+/// worktree keeps its caches.
 fn uncommitted_work(worktree_path: &str) -> Result<(), String> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
-    let unreadable = || "couldn't read the worktree's git status; not cleaning up".to_string();
-    let git = |args: &[&OsStr]| {
-        let out = Command::new("git")
-            .args(["-C", worktree_path])
-            .args(LOOK_AT_THE_DISK)
-            .args(args)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .output();
-        out.ok().filter(|o| o.status.success()).ok_or_else(unreadable)
-    };
+    use std::path::{Path, PathBuf};
     fn args(a: &[&'static str]) -> Vec<&'static OsStr> {
         a.iter().map(|s| OsStr::new(*s)).collect()
     }
-    let status = git(&args(&["status", "--porcelain", "--ignore-submodules=none"]))?;
+    let unreadable = || "couldn't read the worktree's git status; not cleaning up".to_string();
+    let git = |args: &[&OsStr], index: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        cmd.args(["-C", worktree_path]).args(LOOK_AT_THE_DISK).args(args);
+        cmd.env("GIT_OPTIONAL_LOCKS", "0");
+        if let Some(index) = index {
+            cmd.env("GIT_INDEX_FILE", index);
+        }
+        cmd.output().ok().filter(|o| o.status.success()).ok_or_else(unreadable)
+    };
+    let status = git(&args(&["status", "--porcelain", "--ignore-submodules=none"]), None)?;
     if let Some(line) = String::from_utf8_lossy(&status.stdout).lines().next() {
         return Err(format!(
             "the worktree has uncommitted changes ({}); commit or discard them first",
             line.trim()
         ));
     }
-    // Escaped: `-z` doesn't quote, and a newline would split the refusal.
-    let hidden = |path: &[u8], flag: &str| {
-        let path = String::from_utf8_lossy(path).escape_debug().to_string();
-        format!(
-            "{path} is flagged {flag}, which hides its edits from git; clear it with \
-             `git update-index --no-{flag} -- {path}`, then commit or discard them"
-        )
-    };
-    // `<tag> <mode> <oid> <stage>\t<path>`, tag lowercase when assume-unchanged.
-    let files = git(&args(&["ls-files", "-s", "-v", "-z"]))?;
-    let mut flagged = Vec::new();
+
+    // `<tag> <path>`: the tag lowercase when assume-unchanged, `S`/`s` when
+    // skip-worktree.
+    let files = git(&args(&["ls-files", "-v", "-z"]), None)?;
+    let mut flagged: Vec<(&[u8], Flags)> = Vec::new();
     for entry in files.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-        let Some(tab) = entry.iter().position(|b| *b == b'\t') else { return Err(unreadable()) };
-        let (fields, path) = (&entry[..tab], &entry[tab + 1..]);
-        let mut fields = fields.split(|b| *b == b' ');
-        let (Some(tag), Some(mode), Some(oid)) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(unreadable());
-        };
-        let flag = match tag {
-            [t] if t.is_ascii_lowercase() => "assume-unchanged",
-            b"S" => "skip-worktree",
-            _ => continue,
-        };
+        let (&tag, path) = entry.split_first().ok_or_else(unreadable)?;
+        let path = path.strip_prefix(b" ").ok_or_else(unreadable)?;
+        let flag = Flags { assume: tag.is_ascii_lowercase(), skip: tag.eq_ignore_ascii_case(&b's') };
+        if !flag.assume && !flag.skip {
+            continue;
+        }
         // lstat: a dangling symlink is on disk too.
-        match std::fs::symlink_metadata(std::path::Path::new(worktree_path).join(OsStr::from_bytes(path))) {
+        let on_disk = Path::new(worktree_path).join(OsStr::from_bytes(path));
+        match std::fs::symlink_metadata(on_disk) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(unreadable()),
-            // Only a regular file compares simply; a symlink or a type change is kept.
-            Ok(meta) if !meta.is_file() || !mode.starts_with(b"100") => return Err(hidden(path, flag)),
-            Ok(_) => flagged.push((path, oid, flag)),
+            Ok(_) => flagged.push((path, flag)),
         }
     }
-    // hash-object applies the filters `git add` would, so an unedited file
-    // hashes to its blob.
-    for chunk in flagged.chunks(256) {
-        let mut hash = args(&["hash-object", "--"]);
-        hash.extend(chunk.iter().map(|(path, ..)| OsStr::from_bytes(path)));
-        let out = git(&hash)?;
-        let mut hashes = out.stdout.split(|b| *b == b'\n');
-        for (path, oid, flag) in chunk {
-            if hashes.next() != Some(*oid) {
-                return Err(hidden(path, flag));
+    if flagged.is_empty() {
+        return Ok(());
+    }
+
+    // The copy sits beside the index, where a split index's shared file resolves.
+    let index = git(&args(&["rev-parse", "--git-path", "index"]), None)?;
+    let index = PathBuf::from(OsStr::from_bytes(index.stdout.trim_ascii()));
+    let index = if index.is_absolute() { index } else { Path::new(worktree_path).join(index) };
+    let copy = index.with_file_name(format!("index.kommand0-{}", std::process::id()));
+    std::fs::copy(&index, &copy).map_err(|_| unreadable())?;
+    let verdict = (|| {
+        // One flag per call: update-index applies only the first of the two.
+        for flag in ["--no-assume-unchanged", "--no-skip-worktree"] {
+            for chunk in flagged.chunks(256) {
+                let mut clear = args(&["update-index", flag, "--"]);
+                clear.extend(chunk.iter().map(|(path, _)| OsStr::from_bytes(path)));
+                git(&clear, Some(&copy))?;
             }
         }
-    }
-    Ok(())
+        let flags = ["status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none"];
+        let status = git(&args(&flags), Some(&copy))?;
+        // `XY <path>`, the path raw.
+        let Some(entry) = status.stdout.split(|b| *b == 0).find(|e| !e.is_empty()) else {
+            return Ok(());
+        };
+        let path = entry.get(3..).unwrap_or_default();
+        let flag = flagged.iter().find(|(p, _)| *p == path).map(|(_, f)| *f);
+        Err(hidden(path, flag.unwrap_or(Flags { assume: true, skip: true })))
+    })();
+    let _ = std::fs::remove_file(&copy);
+    verdict
+}
+
+/// The index flags that hide a file's edits from `git status`.
+#[derive(Debug, Clone, Copy)]
+struct Flags {
+    assume: bool,
+    skip: bool,
+}
+
+/// The refusal for an edit an index flag hides: the command that clears each
+/// flag, with the name quoted for a shell. A name with control characters is
+/// shown escaped and without the name in the command, so it can't split the
+/// refusal into a fake note or be pasted into a shell as is.
+fn hidden(path: &[u8], flags: Flags) -> String {
+    let name = String::from_utf8_lossy(path);
+    let (shown, arg) = if name.chars().any(char::is_control) {
+        (name.escape_debug().to_string(), "<file>".to_string())
+    } else {
+        (name.to_string(), shell_quote(&name))
+    };
+    let set: Vec<&str> = [(flags.assume, "assume-unchanged"), (flags.skip, "skip-worktree")]
+        .into_iter()
+        .filter_map(|(on, flag)| on.then_some(flag))
+        .collect();
+    let fix: Vec<String> =
+        set.iter().map(|flag| format!("git update-index --no-{flag} -- {arg}")).collect();
+    format!(
+        "{shown} is flagged {}, which hides its edits from git; clear it with `{}`, then \
+         commit or discard them",
+        set.join(" and "),
+        fix.join(" && ")
+    )
 }
 
 /// Why a local branch must not be deleted, in gate order.
@@ -1077,7 +1116,7 @@ mod tests {
     #[test]
     fn cleanup_sees_edits_an_index_flag_or_a_stale_fsmonitor_hides() {
         // No status lists them, so neither did the gate nor git's own check.
-        for flag in ["--assume-unchanged", "--skip-worktree", "fsmonitor"] {
+        for flag in ["--assume-unchanged", "--skip-worktree", "both", "fsmonitor"] {
             let tmp = TempDir::new().unwrap();
             let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
             if flag == "fsmonitor" {
@@ -1089,6 +1128,9 @@ mod tests {
                 git(&wt, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
                 git(&wt, &["update-index", "--fsmonitor"]);
                 git(&wt, &["status"]);
+            } else if flag == "both" {
+                git(&wt, &["update-index", "--assume-unchanged", "work.txt"]);
+                git(&wt, &["update-index", "--skip-worktree", "work.txt"]);
             } else {
                 git(&wt, &["update-index", flag, "work.txt"]);
             }
@@ -1101,6 +1143,10 @@ mod tests {
             let err = cleanup(&repo, &wt, &branch).unwrap_err();
             let want = match flag {
                 "fsmonitor" => "uncommitted changes (M work.txt)".to_string(),
+                "both" => "work.txt is flagged assume-unchanged and skip-worktree, which hides its \
+                           edits from git; clear it with `git update-index --no-assume-unchanged \
+                           -- 'work.txt' && git update-index --no-skip-worktree -- 'work.txt'`"
+                    .to_string(),
                 _ => format!("work.txt is flagged {}", flag.trim_start_matches("--")),
             };
             assert!(err.contains(&want), "{flag}: {err}");
@@ -1131,34 +1177,86 @@ mod tests {
 
     #[test]
     fn cleanup_removes_a_worktree_whose_flagged_files_are_unedited() {
-        // The flag alone isn't work: `core.ignoreStat` sets assume-unchanged on
-        // every file a worktree checks out, and an unedited flagged file hashes
-        // to its blob.
-        for flag in ["--assume-unchanged", "--skip-worktree", "core.ignoreStat"] {
+        // The flag alone isn't work. `core.ignoreStat` flags every entry a
+        // worktree checks out, symlinks included; a blob committed with CRLF
+        // under `text=auto`, or a file checked out with `eol=crlf`, differs
+        // from its blob on disk yet has no edit, as `git status` itself says.
+        for case in ["--assume-unchanged", "--skip-worktree", "core.ignoreStat", "crlf", "eol"] {
             let tmp = TempDir::new().unwrap();
-            let (repo, wt, branch) = if flag == "core.ignoreStat" {
-                let repo = tmp.path().join("repo");
-                std::fs::create_dir_all(&repo).unwrap();
-                init_repo(&repo);
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            init_repo(&repo);
+            git(&repo, &["config", "core.autocrlf", "false"]);
+            if case == "core.ignoreStat" {
                 git(&repo, &["config", "core.ignoreStat", "true"]);
-                let wt = tmp.path().join("wt");
-                git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "feat"]);
-                commit_file(&wt, "work.txt", "work");
-                squash_merge(&repo, "feat");
-                (repo, wt, "feat".to_string())
-            } else {
-                let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+            }
+            let wt = tmp.path().join("wt");
+            git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "feat"]);
+            match case {
+                "crlf" => {
+                    commit_file(&wt, "work.txt", "one\r\ntwo\r\n");
+                    commit_file(&wt, ".gitattributes", "* text=auto\n");
+                }
+                "eol" => {
+                    commit_file(&wt, ".gitattributes", "*.txt text eol=crlf\n");
+                    commit_file(&wt, "work.txt", "one\ntwo\n");
+                    // Checked out again, now with the CRLF endings eol asks for.
+                    std::fs::remove_file(wt.join("work.txt")).unwrap();
+                    git(&wt, &["checkout", "--", "work.txt"]);
+                }
+                _ => {
+                    std::os::unix::fs::symlink("a.txt", wt.join("link")).unwrap();
+                    commit_file(&wt, "work.txt", "work");
+                }
+            }
+            squash_merge(&repo, "feat");
+            if case != "core.ignoreStat" {
+                let flag = if case.starts_with("--") { case } else { "--assume-unchanged" };
                 git(&wt, &["update-index", flag, "work.txt"]);
-                (repo, wt, branch)
-            };
+            }
             let tags = Command::new("git")
-                .args(["-C", wt.to_str().unwrap(), "ls-files", "-v", "work.txt"])
+                .args(["-C", wt.to_str().unwrap(), "ls-files", "-v"])
                 .output()
                 .unwrap();
-            let tag = String::from_utf8_lossy(&tags.stdout);
-            assert!(tag.starts_with('h') || tag.starts_with('S'), "{flag}: flagged: {tag}");
-            assert_eq!(cleanup(&repo, &wt, &branch), Ok(()), "{flag}");
-            assert!(!wt.exists() && !branch_exists(&repo, &branch), "{flag}");
+            let tags = String::from_utf8_lossy(&tags.stdout);
+            assert!(tags.contains("h work.txt") || tags.contains("S work.txt"), "{case}: {tags}");
+            assert_eq!(cleanup(&repo, &wt, "feat"), Ok(()), "{case}");
+            assert!(!wt.exists() && !branch_exists(&repo, "feat"), "{case}");
+        }
+    }
+
+    #[test]
+    fn cleanup_sees_any_edit_among_many_flagged_files() {
+        // Every flagged file on disk counts, not just the first; an executable
+        // bit is an edit too (git status says so).
+        for edit in ["content", "mode"] {
+            let tmp = TempDir::new().unwrap();
+            let (repo, wt, branch) = repo_with_worktree_on(tmp.path(), "feat");
+            for i in 0..300 {
+                std::fs::write(wt.join(format!("f{i:03}.txt")), format!("{i}\n")).unwrap();
+            }
+            commit_file(&wt, "work.txt", "work");
+            squash_merge(&repo, "feat");
+            let names: Vec<String> = (0..300).map(|i| format!("f{i:03}.txt")).collect();
+            let mut flag = vec!["update-index", "--assume-unchanged", "--"];
+            flag.extend(names.iter().map(String::as_str));
+            git(&wt, &flag);
+            let last = wt.join("f299.txt");
+            if edit == "content" {
+                std::fs::write(&last, "edited\n").unwrap();
+            } else {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&last, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let err = cleanup(&repo, &wt, &branch).unwrap_err();
+            assert!(err.starts_with("f299.txt is flagged assume-unchanged"), "{edit}: {err}");
+            assert!(wt.exists() && branch_exists(&repo, &branch), "{edit}: nothing destroyed");
+            let admin = std::fs::read_dir(repo.join(".git/worktrees/wt")).unwrap();
+            let left: Vec<_> = admin
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("index.kommand0"))
+                .collect();
+            assert!(left.is_empty(), "{edit}: the index copy is gone: {left:?}");
         }
     }
 
@@ -1171,6 +1269,8 @@ mod tests {
         let (repo, wt, branch) = repo_with_worktree_on(tmp.path(), "feat");
         std::os::unix::fs::symlink("work.txt", wt.join("link")).unwrap();
         std::fs::write(wt.join("a\nb.txt"), "odd").unwrap();
+        let hostile = "$(touch pwned) it's.txt";
+        std::fs::write(wt.join(hostile), "x").unwrap();
         commit_file(&wt, "work.txt", "work");
         squash_merge(&repo, "feat");
         git(&wt, &["update-index", "--skip-worktree", "link"]);
@@ -1186,7 +1286,15 @@ mod tests {
         std::fs::write(wt.join("a\nb.txt"), "edited").unwrap();
         let err = cleanup(&repo, &wt, &branch).unwrap_err();
         assert!(err.starts_with("a\\nb.txt is flagged assume-unchanged"), "{err}");
-        assert!(!err.contains('\n'), "one line: {err}");
+        assert!(!err.contains('\n') && err.contains("-- <file>`"), "one line, no name to paste: {err}");
+        std::fs::write(wt.join("a\nb.txt"), "odd").unwrap();
+
+        // A name that's shell syntax is quoted in the command it suggests.
+        git(&wt, &["update-index", "--no-assume-unchanged", "a\nb.txt"]);
+        git(&wt, &["update-index", "--assume-unchanged", hostile]);
+        std::fs::write(wt.join(hostile), "edited").unwrap();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.contains(r#"-- '$(touch pwned) it'\''s.txt'`"#), "quoted: {err}");
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
     }
 

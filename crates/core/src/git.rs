@@ -926,7 +926,7 @@ fn origin_fetches(repo_dir: &str, branch: &str) -> bool {
 
 /// Single-quote `s` as one shell word. Git runs a `!`-prefixed credential helper
 /// through `sh`, and kommand0's own state directory can contain a space.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
