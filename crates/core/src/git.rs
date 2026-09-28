@@ -1625,7 +1625,8 @@ pub(crate) mod tests {
     /// A real `origin` plus a clone of it, following
     /// `cleanup_refuses_default_branch_via_origin_head`. Origin is a local path,
     /// so `origin_slug` is `None` and no `--repo` lands in the argv (pinning has
-    /// its own test). Nothing ever pushes into it, so its being non-bare is fine.
+    /// its own test). Pushes only land on branches origin hasn't checked out, so
+    /// its being non-bare is fine.
     pub(crate) fn issue_fixture(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let origin = tmp.join("origin");
         std::fs::create_dir_all(&origin).unwrap();
