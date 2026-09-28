@@ -1038,9 +1038,15 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 );
             }
             if let Some((msg, is_error)) = app.repo_cleanup_result.get(id) {
+                // The outcome, then core's notes: warnings, even under a
+                // result that went fine.
+                let mut msg_lines = msg.lines();
                 let color = if *is_error { th.error } else { th.text };
-                for line in msg.lines() {
-                    lines.push(Line::styled(line.to_string(), Style::default().fg(color)));
+                if let Some(outcome) = msg_lines.next() {
+                    lines.push(Line::styled(outcome.to_string(), Style::default().fg(color)));
+                }
+                for note in msg_lines {
+                    lines.push(Line::styled(note.to_string(), Style::default().fg(th.dirty)));
                 }
             }
             (title, lines)

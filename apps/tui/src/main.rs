@@ -906,7 +906,8 @@ pub(crate) struct App {
     /// The repo whose merged-branch scan or delete is running (at most one).
     pub(crate) repo_cleanup_inflight: Option<String>,
     /// Repo-cleanup outcome `(message, is_error)` per repo id, shown in that
-    /// repo's detail pane: one line, plus core's note below it when there is one.
+    /// repo's detail pane: the outcome's line (an error when `is_error`), then
+    /// a line per core note (always warnings).
     pub(crate) repo_cleanup_result: HashMap<String, (String, bool)>,
     /// A finished scan the user has not reviewed yet: parked when the result
     /// landed while something else owned the keyboard; the next `c` on that
@@ -3677,6 +3678,8 @@ impl App {
         let scan = match result {
             Ok(scan) => scan,
             Err(e) => {
+                // The pane clips it; the log keeps it whole.
+                tracing::warn!("repo cleanup failed: {e}");
                 self.repo_cleanup_result.insert(repo_id, (format!("Cleanup failed: {e}"), true));
                 return;
             }
@@ -3685,10 +3688,7 @@ impl App {
         for note in &scan.notes {
             tracing::warn!("repo cleanup: {note}");
         }
-        let with_note = |line: String| {
-            let error = !scan.notes.is_empty();
-            ([vec![line], scan.notes.clone()].concat().join("\n"), error)
-        };
+        let with_note = |line: String| ([vec![line], scan.notes.clone()].concat().join("\n"), false);
         let (deletes, routed, skipped) = repo_cleanup_counts(&scan.items);
         if deletes + routed == 0 {
             let line = with_note(format!("Nothing to clean up ({skipped} skipped)"));
@@ -3696,8 +3696,9 @@ impl App {
         } else if self.can_open_repo_cleanup_modal() {
             self.open_repo_cleanup_modal(repo_id, scan);
         } else {
+            // The instruction first: the pane clips the tail.
             let line = with_note(format!(
-                "Scan done: {deletes} to delete, {routed} workspace(s); press c to review"
+                "Press c to review: {deletes} to delete, {routed} workspace(s)"
             ));
             self.repo_cleanup_result.insert(repo_id.clone(), line);
             self.repo_cleanup_pending = Some((repo_id, scan));
@@ -9150,6 +9151,25 @@ mod key_tests {
         out
     }
 
+    /// The foreground colour of the first cell of `needle` in a fresh render.
+    fn fg_of(app: &mut App, w: u16, h: u16, needle: &str) -> ratatui::style::Color {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| render::ui(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..h {
+            let cells: Vec<&str> = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
+            let Some(at) = cells.concat().find(needle) else { continue };
+            // `at` counts bytes: the cells before it are the ones that end by then.
+            let mut end = 0;
+            let x = cells.iter().take_while(|s| {
+                end += s.len();
+                end <= at
+            });
+            return buffer[(x.count() as u16, y)].fg;
+        }
+        panic!("{needle:?} isn't rendered");
+    }
+
     /// Render the app at a fixed size to the full-buffer string (for snapshots).
     fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -10212,6 +10232,9 @@ mod key_tests {
             matches!(app.modal, modal::ModalState::ConfirmCleanup { .. }),
             "c opens the cleanup modal"
         );
+        let text = render_to_string(&mut app, 80, 24);
+        let rule = "Only if merged into the default branch.";
+        assert!(text.contains(rule), "the whole rule fits at 80 cols:\n{text}");
 
         // Fallback workspace (no own branch): `c` is a no-op.
         let mut app = test_app(); // w1 has worktree_path: None
@@ -10351,7 +10374,7 @@ mod key_tests {
             "the open modal is not replaced"
         );
         assert!(matches!(&app.repo_cleanup_pending, Some((id, _)) if id == "r1"));
-        assert!(app.repo_cleanup_result["r1"].0.contains("press c to review"));
+        assert!(app.repo_cleanup_result["r1"].0.starts_with("Press c to review"));
 
         press(&mut app, KeyCode::Char('n')).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10392,7 +10415,7 @@ mod key_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         app.repos[1].path = tmp.path().join("missing").to_string_lossy().into_owned();
         app.repo_cleanup_pending = Some(("r1".into(), scan_of(vec![delete_item("stale")], &[])));
-        app.repo_cleanup_result.insert("r1".into(), ("Scan done: press c to review".into(), false));
+        app.repo_cleanup_result.insert("r1".into(), ("Press c to review: 1 to delete".into(), false));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.repo_cleanup_tx = Some(tx);
         app.select_repo_row("r2");
@@ -10446,7 +10469,7 @@ mod key_tests {
         let notes = ["origin/main not refreshed: timed out", "squash merges not detected"];
         let unmerged = || skip_item("wip", "not merged into origin/main");
         // Each note line sits on a detail-pane row of its own.
-        let marks = ["Nothing to clean up", "press c to review", "not refreshed", "squash merges"];
+        let marks = ["Nothing to clean up", "Press c to review", "not refreshed", "squash merges"];
         let note_rows = |text: &str, size: &str| {
             for line in ["not refreshed", "squash merges"] {
                 let row = text
@@ -10462,10 +10485,13 @@ mod key_tests {
             // Nothing actionable: the idle line, and the note under it.
             let mut app = test_app();
             app.on_repo_cleanup_scanned("r1".into(), Ok(scan_of(vec![unmerged()], &notes)));
-            assert!(app.repo_cleanup_result["r1"].1, "a stale base reads as an error");
+            assert!(!app.repo_cleanup_result["r1"].1, "notes don't make the outcome an error");
             let text = render_to_string(&mut app, cols, rows);
             assert!(text.contains("Nothing to clean up (1 skipped)"), "{size}:\n{text}");
             note_rows(&text, &size);
+            let th = app.theme;
+            assert_eq!(fg_of(&mut app, cols, rows, "Nothing to clean up"), th.text, "{size}");
+            assert_eq!(fg_of(&mut app, cols, rows, "not refreshed"), th.dirty, "{size}");
 
             // Parked while help owned the keyboard, shown once it closes.
             let mut app = test_app();
@@ -10474,15 +10500,12 @@ mod key_tests {
             app.on_repo_cleanup_scanned("r1".into(), Ok(scan_of(plan, &notes)));
             app.show_help = false;
             let (line, is_error) = &app.repo_cleanup_result["r1"];
-            assert!(line.contains("press c to review") && *is_error, "{line}");
+            assert!(line.starts_with("Press c to review") && !*is_error, "{line}");
             let text = render_to_string(&mut app, cols, rows);
-            // At 80 columns the hint is clipped off the pane's right edge.
-            if cols == 100 {
-                assert!(text.contains("press c to review"), "{size}:\n{text}");
-            }
+            assert!(text.contains("Press c to review"), "{size}:\n{text}");
             note_rows(&text, &size);
 
-            // `c` reviews it: the note's first line under the summary, rows plain.
+            // `c` reviews it: every note under the summary, rows plain.
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             app.repo_cleanup_tx = Some(tx);
             app.select_repo_row("r1");
@@ -10493,11 +10516,12 @@ mod key_tests {
                 .iter()
                 .position(|l| l.contains("1 to delete, 0 via workspace cleanup, 1 skipped"))
                 .unwrap_or_else(|| panic!("the preview opened at {size}:\n{text}"));
-            let under = lines[summary + 1];
             assert!(
-                under.contains("origin/main not refreshed") && !under.contains("squash merges"),
-                "only the note's first line sits under the summary at {size}:\n{text}"
+                lines[summary + 1].contains("origin/main not refreshed")
+                    && lines[summary + 2].contains("squash merges not detected"),
+                "both notes, in order, under the summary at {size}:\n{text}"
             );
+            assert_eq!(fg_of(&mut app, cols, rows, "squash merges"), th.dirty, "{size}");
             let row = lines
                 .iter()
                 .find(|l| l.contains("skip: not merged into origin/main"))

@@ -1073,7 +1073,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             );
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    "Only proceeds if merged into the default branch.",
+                    "Only if merged into the default branch.",
                     Style::default().fg(th.muted),
                 )),
                 inner[2],
@@ -1104,8 +1104,11 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             );
         }
         ModalState::ConfirmRepoCleanup { repo_name, summary, notes, rows, .. } => {
-            // Content-sized: border 2 + summary 1 + blank 1 + footer 1 around the rows.
-            let height = (rows.len() + 5).min(frame.area().height.saturating_sub(2) as usize);
+            // Content-sized: border 2 + summary 1 + blank 1 + footer 1 around the
+            // rows, plus a row per note beyond the first (the blank row holds it).
+            let extra = notes.len().saturating_sub(1);
+            let height =
+                (rows.len() + 5 + extra).min(frame.area().height.saturating_sub(2) as usize);
             let area = frame
                 .area()
                 .centered(Constraint::Percentage(80), Constraint::Length(height as u16));
@@ -1113,7 +1116,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
 
             let inner = Layout::vertical([
                 Constraint::Length(1), // summary
-                Constraint::Length(1), // blank
+                Constraint::Length(1 + extra as u16), // blank, or the notes
                 Constraint::Min(0),   // rows
                 Constraint::Length(1), // footer
             ])
@@ -1133,14 +1136,12 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 Paragraph::new(Line::styled(summary.as_str(), Style::default().fg(th.text))),
                 inner[0],
             );
-            // The otherwise blank row, so the note costs no height: its first
-            // line, the one to act on.
-            if let Some(first) = notes.first() {
-                frame.render_widget(
-                    Paragraph::new(Line::styled(first, Style::default().fg(th.error))),
-                    inner[1],
-                );
-            }
+            // The notes, the one to act on first, from the otherwise blank row.
+            let note_lines: Vec<Line> = notes
+                .iter()
+                .map(|n| Line::styled(n.as_str(), Style::default().fg(th.dirty)))
+                .collect();
+            frame.render_widget(Paragraph::new(note_lines), inner[1]);
 
             // ponytail: fixed cap with a "+N more" marker; a scrollable list if a
             // real repo overflows a 24-row terminal.
