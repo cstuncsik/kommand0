@@ -126,10 +126,12 @@ pub(crate) enum ModalState {
         repo_id: String,
         repo_name: String,
         summary: String,
-        /// Core's note on the scan (a failed refresh, squash detection off).
-        note: Option<String>,
+        /// Core's notes on the scan (a failed refresh, squash detection off).
+        notes: Vec<String>,
         rows: Vec<RepoCleanupRow>,
         plan: Vec<RepoCleanupItem>,
+        /// What the plain deletes are checked against (the scan's base).
+        base: kommand0_core::Base,
     },
     /// A branch named `name` already exists (local or origin); offer to check it
     /// out instead of forking a fresh branch (which would be suffixed `-2`, …).
@@ -171,7 +173,7 @@ pub(crate) enum ModalResult {
     /// Cleanup confirmed for a workspace id.
     ConfirmCleanup(String),
     /// Repo cleanup confirmed: (repo_id, the plan to execute).
-    ConfirmRepoCleanup(String, Vec<RepoCleanupItem>),
+    ConfirmRepoCleanup(String, Vec<RepoCleanupItem>, kommand0_core::Base),
     /// Choice from the branch-exists prompt: check out the existing branch when
     /// `checkout`, else fork a fresh (suffixed) branch.
     BranchCheckoutChoice { repo_id: String, name: String, checkout: bool },
@@ -458,9 +460,13 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
             }
             _ => ModalResult::Consumed,
         },
-        ModalState::ConfirmRepoCleanup { repo_id, plan, .. } => match key.code {
+        ModalState::ConfirmRepoCleanup { repo_id, plan, base, .. } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let result = ModalResult::ConfirmRepoCleanup(repo_id.clone(), std::mem::take(plan));
+                let result = ModalResult::ConfirmRepoCleanup(
+                    repo_id.clone(),
+                    std::mem::take(plan),
+                    std::mem::take(base),
+                );
                 *modal = ModalState::None;
                 result
             }
@@ -1097,7 +1103,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[5],
             );
         }
-        ModalState::ConfirmRepoCleanup { repo_name, summary, note, rows, .. } => {
+        ModalState::ConfirmRepoCleanup { repo_name, summary, notes, rows, .. } => {
             // Content-sized: border 2 + summary 1 + blank 1 + footer 1 around the rows.
             let height = (rows.len() + 5).min(frame.area().height.saturating_sub(2) as usize);
             let area = frame
@@ -1129,7 +1135,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             );
             // The otherwise blank row, so the note costs no height: its first
             // line, the one to act on.
-            if let Some(first) = note.as_deref().and_then(|n| n.lines().next()) {
+            if let Some(first) = notes.first() {
                 frame.render_widget(
                     Paragraph::new(Line::styled(first, Style::default().fg(th.error))),
                     inner[1],
@@ -1443,9 +1449,10 @@ mod tests {
             repo_id: "r1".into(),
             repo_name: "demo".into(),
             summary: String::new(),
-            note: None,
+            notes: vec![],
             rows: vec![],
             plan: vec![],
+            base: kommand0_core::Base::default(),
         };
         handle_modal_paste(&mut modal, "ignored");
         assert!(matches!(modal, ModalState::ConfirmRepoCleanup { .. }));

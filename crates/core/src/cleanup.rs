@@ -113,13 +113,19 @@ fn check_git_stdout(repo_path: &str, args: &[&str], envs: &[(&str, &str)]) -> Op
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The default branch the cleanups compare against, pinned to one commit for a
-/// whole scan or cleanup.
-struct Target {
+/// A default branch pinned at one commit, for a whole scan or cleanup. The
+/// default pins nothing, so [`delete_branches`] refuses to delete against it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Base {
     /// `origin/main`, or the local `main`: what messages call it.
     name: String,
     /// `<ref>^{commit}`, resolved once, after any fetch.
     oid: String,
+}
+
+/// The default branch the cleanups compare against, and how.
+struct Target {
+    base: Base,
     /// `GIT_ATTR_SOURCE` for every check, so no in-tree attributes apply (git
     /// before 2.40 ignores it).
     empty_tree: String,
@@ -128,15 +134,15 @@ struct Target {
     /// work, this is a partial clone, or the merge drivers couldn't be listed
     /// (so no replay can run without their overrides).
     merge_config: Option<Vec<String>>,
-    /// What the answers can't show on their own, one per line: a failed
-    /// refresh first (the one to act on), then squash detection off.
-    note: Option<String>,
+    /// What the answers can't show on their own, the one to act on first: a
+    /// failed refresh, then squash detection off.
+    notes: Vec<String>,
 }
 
 /// Resolve and pin the default branch (see [`default_branch_ref`]), fetching it
 /// from origin first when `fetch` is set and it is an origin branch. A failed
 /// fetch isn't an error: the checks run against the local copy, and the
-/// failure goes into the note.
+/// failure goes into the notes.
 fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
     let git_ref = default_branch_ref(repo_path).ok_or_else(|| {
         "couldn't find the default branch to compare against (no origin/HEAD, origin/main, \
@@ -247,14 +253,11 @@ fn merge_target(repo_path: &str, fetch: bool) -> Result<Target, String> {
         let drivers = keys.iter().map(|k| format!("--config-env={k}=KOMMAND0_MERGE_DRIVER_OFF"));
         fixed.map(String::from).into_iter().chain(drivers).collect()
     });
-    let notes: Vec<String> =
-        refresh_note.into_iter().chain(squash_note.map(str::to_string)).collect();
     Ok(Target {
-        name,
-        oid,
+        base: Base { name, oid },
         empty_tree,
         merge_config,
-        note: (!notes.is_empty()).then(|| notes.join("\n")),
+        notes: refresh_note.into_iter().chain(squash_note.map(str::to_string)).collect(),
     })
 }
 
@@ -287,7 +290,7 @@ enum Merged {
 fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Merged {
     let env = [("GIT_ATTR_SOURCE", target.empty_tree.as_str())];
     let git = |args: &[&str]| check_git_stdout(repo_path, args, &env);
-    let base = target.oid.as_str();
+    let base = target.base.oid.as_str();
     let Some(fork) = git(&["merge-base", base, tip]) else { return Merged::No };
     if fork == tip {
         // On the first-parent line, the walk ends on the commit whose first parent is the tip.
@@ -506,6 +509,9 @@ fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
 /// unusable half-deleted tree that this finishes deleting. Either way the branch
 /// survives an `Err`, so a retry re-runs every gate: `Ok`/`Err` is the caller's
 /// deregister signal, so a path that deletes the branch must return `Ok`.
+///
+/// An `Err` is the refusal on its first line, then, for "not merged", any notes
+/// (see [`Scan::notes`]) on lines of their own.
 pub fn cleanup_merged_workspace(
     repo_path: &str,
     worktree_path: &str,
@@ -536,15 +542,13 @@ pub fn cleanup_merged_workspace(
         Merged::Later => {
             return Err(format!(
                 "the branch has commits after its merge into {}; not cleaning up",
-                target.name
+                target.base.name
             ));
         }
         Merged::No => {
-            let refusal = format!("the branch isn't merged into {}; not cleaning up", target.name);
-            return Err(match &target.note {
-                Some(note) => format!("{refusal}\n{note}"),
-                None => refusal,
-            });
+            let refusal =
+                format!("the branch isn't merged into {}; not cleaning up", target.base.name);
+            return Err([vec![refusal], target.notes].concat().join("\n"));
         }
     }
 
@@ -671,6 +675,19 @@ pub enum Verdict {
     Skip(String),
 }
 
+/// What [`scan_merged_branches`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scan {
+    /// One verdict per local branch.
+    pub verdicts: Vec<BranchVerdict>,
+    /// What the verdicts can't show on their own, the one to act on first: a
+    /// failed refresh of the default branch, then squash detection off.
+    pub notes: Vec<String>,
+    /// The default branch the verdicts were judged against, for
+    /// [`delete_branches`].
+    pub base: Base,
+}
+
 /// One local branch as [`scan_merged_branches`] saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchVerdict {
@@ -684,9 +701,7 @@ pub struct BranchVerdict {
 
 /// Classify every local branch of `repo_path` for deletion: the name gates of
 /// [`cleanup_merged_workspace`] first, then its merged check against the
-/// default branch, fetched first. Deletes and prunes nothing. Returns the
-/// target's note (a failed refresh, squash detection off) once, beside the
-/// verdicts.
+/// default branch, fetched first. Deletes and prunes nothing.
 ///
 /// A stale default branch (the fetch failed) only under-reports, except after
 /// an upstream force-push: the dropped commits stay reachable from
@@ -694,7 +709,7 @@ pub struct BranchVerdict {
 pub fn scan_merged_branches(
     repo_path: &str,
     protected: &[String],
-) -> Result<(Vec<BranchVerdict>, Option<String>), String> {
+) -> Result<Scan, String> {
     // NUL-separated, NUL-terminated records: a newline in a foreign worktree
     // path can't truncate one. `%(refname)` + strip, not `refname:short`, so a
     // same-named tag can't shadow the branch.
@@ -730,7 +745,7 @@ pub fn scan_merged_branches(
             Ok(()) => match merged_into(repo_path, &target, branch, tip) {
                 Merged::NoCommits => Verdict::Skip("no commits of its own".to_string()),
                 Merged::Later => Verdict::Skip("commits after its merge".to_string()),
-                Merged::No => Verdict::Skip(format!("not merged into {}", target.name)),
+                Merged::No => Verdict::Skip(format!("not merged into {}", target.base.name)),
                 Merged::Yes if !worktree.is_empty() => {
                     Verdict::CheckedOut { worktree: worktree.to_string() }
                 }
@@ -739,22 +754,39 @@ pub fn scan_merged_branches(
         };
         verdicts.push(BranchVerdict { branch: branch.to_string(), tip: tip.to_string(), verdict });
     }
-    Ok((verdicts, target.note))
+    Ok(Scan { verdicts, notes: target.notes, base: target.base })
 }
 
+/// Each branch [`delete_branches`] was given, with how its delete went.
+pub type BranchResults = Vec<(String, Result<(), String>)>;
+
 /// Delete local branches, each only while it still points at its scan-time
-/// `tip` (else "moved since it was checked"). The name gates re-run; nothing
-/// here touches remotes, prunes, or calls gh. Results come back in input order.
+/// `tip` (else "moved since it was checked"), and none once the default branch
+/// no longer contains the scan's `base` commit: rewound or rewritten since (an
+/// upstream force-push, fetched), the verdicts don't hold anymore. The name
+/// gates re-run; nothing here touches remotes, prunes, or calls gh. Results
+/// come back in input order.
 pub fn delete_branches(
     repo_path: &str,
     branches: &[(String, String)],
     protected: &[String],
-) -> Vec<(String, Result<(), String>)> {
+    base: &Base,
+) -> Result<BranchResults, String> {
+    if branches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let contains = default_branch_ref(repo_path).is_some_and(|now| {
+        let args = ["merge-base", "--is-ancestor", base.oid.as_str(), now.as_str()];
+        check_git_stdout(repo_path, &args, &[]).is_some()
+    });
+    if !contains {
+        return Err(format!("{} was rewound or rewritten since the scan; scan again", base.name));
+    }
     let delete = |branch: &str, tip: &str| -> Result<(), String> {
         refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
         delete_local_branch(repo_path, branch, tip)
     };
-    branches.iter().map(|(b, t)| (b.clone(), delete(b, t))).collect()
+    Ok(branches.iter().map(|(b, t)| (b.clone(), delete(b, t))).collect())
 }
 
 #[cfg(test)]
@@ -1330,13 +1362,13 @@ mod tests {
         // The probe commit must bring its own identity.
         git(r, &["config", "user.name", ""]);
 
-        let (verdicts, note) =
+        let Scan { verdicts, notes, .. } =
             scan_merged_branches(repo.to_str().unwrap(), &["development".to_string()]).unwrap();
         let of = |name: &str| {
             verdicts.iter().find(|v| v.branch == name).unwrap_or_else(|| panic!("{name} scanned"))
         };
         assert_eq!(verdicts.len(), 21);
-        assert_eq!(note, None);
+        assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(of("feat/x").tip, rev_parse(r, "refs/heads/feat/x"), "the scan-time tip");
         for name in ["squashed", "content-merge", "feat/x", "merge-commit", "rebased", "expired"] {
             assert_eq!(of(name).verdict, Verdict::Delete, "{name}");
@@ -1380,7 +1412,7 @@ mod tests {
         commit_later(&wt, "spike");
         std::fs::remove_file(wt.join("spike.txt")).unwrap();
         commit_later(&wt, "drop the spike");
-        let (verdicts, _) = scan_merged_branches(repo.to_str().unwrap(), &[]).unwrap();
+        let verdicts = scan_merged_branches(repo.to_str().unwrap(), &[]).unwrap().verdicts;
         let feat = verdicts.iter().find(|v| v.branch == "feat").unwrap();
         assert_eq!(feat.verdict, Verdict::Skip("commits after its merge".into()));
         let err = cleanup(&repo, &wt, &branch).unwrap_err();
@@ -1401,7 +1433,7 @@ mod tests {
         commit_file(r, "m.txt", "m");
         let graft = [rev_parse(r, "main"), rev_parse(r, "main^"), rev_parse(r, "g")].join(" ");
         std::fs::write(r.join(".git/info/grafts"), format!("{graft}\n")).unwrap();
-        let (verdicts, _) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+        let verdicts = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap().verdicts;
         let g = verdicts.iter().find(|v| v.branch == "g").unwrap();
         assert_eq!(g.verdict, Verdict::Skip("not merged into main".into()));
     }
@@ -1418,14 +1450,15 @@ mod tests {
             // A tag on the commit the fetch brings in. update-ref, not `git
             // tag`: a global tag.gpgSign would sign it and open an editor.
             git(&origin, &["update-ref", "refs/tags/v1", &rev_parse(&origin, "main")]);
-            let (verdicts, note) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
+            let Scan { verdicts, notes, .. } =
+                scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
             let feat = verdicts.iter().find(|v| v.branch == "feat").unwrap();
             assert!(
                 matches!(feat.verdict, Verdict::CheckedOut { .. }),
                 "origin/HEAD {symbolic}: {:?}",
                 feat.verdict
             );
-            assert_eq!(note, None, "origin/HEAD {symbolic}");
+            assert!(notes.is_empty(), "origin/HEAD {symbolic}: {notes:?}");
             assert_eq!(
                 rev_parse(&clone, "refs/remotes/origin/main"),
                 rev_parse(&origin, "main"),
@@ -1449,21 +1482,18 @@ mod tests {
         break_origin(&clone, tmp.path());
         // A second note, to pin the order: the one to act on comes first.
         git(&clone, &["config", "extensions.partialclone", "origin"]);
-        let (verdicts, note) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
+        let Scan { verdicts, notes, .. } = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
         for name in ["feat", "unmerged"] {
             let v = verdicts.iter().find(|v| v.branch == name).unwrap();
             assert_eq!(v.verdict, Verdict::Skip("not merged into origin/main".into()), "{name}");
         }
-        let note = note.expect("the failed refresh is noted");
-        let mut lines = note.lines();
-        let refresh = lines.next().unwrap_or_default();
+        let [refresh, squash] = &notes[..] else { panic!("two notes: {notes:?}") };
         assert!(
             refresh.starts_with("origin/main not refreshed: couldn't fetch main from origin: fatal:"),
-            "{note}"
+            "{refresh}"
         );
-        assert!(refresh.contains("does not appear to be a git repository"), "{note}");
-        assert_eq!(lines.next(), Some("squash merges not detected in a partial clone"), "{note}");
-        assert_eq!(lines.next(), None, "{note}");
+        assert!(refresh.contains("does not appear to be a git repository"), "{refresh}");
+        assert_eq!(squash, "squash merges not detected in a partial clone");
     }
 
     #[test]
@@ -1481,7 +1511,7 @@ mod tests {
         assert!(err.contains("no commits of its own"), "{err}");
 
         git(&clone, &["update-ref", "refs/remotes/origin/main", &stale]);
-        let (verdicts, _) = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap();
+        let verdicts = scan_merged_branches(clone.to_str().unwrap(), &[]).unwrap().verdicts;
         let v = verdicts.iter().find(|v| v.branch == "upstream-tip").unwrap();
         assert_eq!(v.verdict, Verdict::Skip("no commits of its own".into()));
     }
@@ -1499,11 +1529,11 @@ mod tests {
         squash_merge(r, "squashed");
         git(r, &["merge", "--no-ff", "-m", "merge", "merged"]);
         git(r, &["config", "extensions.partialclone", "origin"]);
-        let (verdicts, note) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+        let Scan { verdicts, notes, .. } = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
         let of = |name: &str| &verdicts.iter().find(|v| v.branch == name).unwrap().verdict;
         assert_eq!(of("squashed"), &Verdict::Skip("not merged into main".into()));
         assert_eq!(of("merged"), &Verdict::Delete, "merge commits still count");
-        assert_eq!(note.as_deref(), Some("squash merges not detected in a partial clone"));
+        assert_eq!(notes, ["squash merges not detected in a partial clone"]);
     }
 
     #[test]
@@ -1543,12 +1573,12 @@ mod tests {
             assert!(marker.exists(), "{driver}: the fixture really reaches the driver");
             std::fs::remove_file(&marker).unwrap();
 
-            let (verdicts, note) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+            let Scan { verdicts, notes, .. } = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
             assert!(!marker.exists(), "{driver}: the scan ran the custom driver");
             let of = |name: &str| &verdicts.iter().find(|v| v.branch == name).unwrap().verdict;
             assert_eq!(of("spied"), &Verdict::Skip("not merged into main".into()), "{driver}");
             assert_eq!(of("added"), &Verdict::Delete, "{driver}: a squash that needs no driver");
-            assert_eq!(note, None, "{driver}");
+            assert!(notes.is_empty(), "{driver}: {notes:?}");
         }
     }
 
@@ -1568,11 +1598,10 @@ mod tests {
         let mut config =
             std::fs::OpenOptions::new().append(true).open(r.join(".git/config")).unwrap();
         config.write_all(b"[merge \"\xff\"]\n\tdriver = false\n").unwrap();
-        let (verdicts, note) = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
+        let Scan { verdicts, notes, .. } = scan_merged_branches(r.to_str().unwrap(), &[]).unwrap();
         let added = verdicts.iter().find(|v| v.branch == "added").unwrap();
         assert_eq!(added.verdict, Verdict::Skip("not merged into main".into()));
-        let want = "squash merges not detected (couldn't read the merge driver config)";
-        assert_eq!(note.as_deref(), Some(want));
+        assert_eq!(notes, ["squash merges not detected (couldn't read the merge driver config)"]);
     }
 
     #[test]
@@ -1602,8 +1631,9 @@ mod tests {
             ("development".to_string(), sha.clone()),
             ("wt-branch".to_string(), sha.clone()),
         ];
-        let results =
-            delete_branches(repo.to_str().unwrap(), &input, &["development".to_string()]);
+        let dir = repo.to_str().unwrap();
+        let base = scan_merged_branches(dir, &[]).unwrap().base;
+        let results = delete_branches(dir, &input, &["development".to_string()], &base).unwrap();
         let names: Vec<&str> = results.iter().map(|(b, _)| b.as_str()).collect();
         assert_eq!(names, ["a", "b", "main", "x..y", "development", "wt-branch"], "input order");
         assert_eq!(results[0].1, Ok(()));
@@ -1616,5 +1646,39 @@ mod tests {
         for survivor in ["b", "main", "development", "wt-branch"] {
             assert!(branch_exists(&repo, survivor), "{survivor} survives");
         }
+    }
+
+    #[test]
+    fn delete_branches_refuses_once_the_default_branch_was_rewound() {
+        // The squash that made `feat` read merged is gone from main (a reset,
+        // or an upstream force-push fetched while the preview was open).
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&repo, &["worktree", "remove", wt.to_str().unwrap()]);
+        let dir = repo.to_str().unwrap();
+        let scan = scan_merged_branches(dir, &[]).unwrap();
+        let feat = scan.verdicts.iter().find(|v| v.branch == branch).unwrap();
+        assert_eq!(feat.verdict, Verdict::Delete);
+        let input = [(branch.clone(), feat.tip.clone())];
+        git(&repo, &["reset", "--hard", "HEAD~1"]);
+        let err = delete_branches(dir, &input, &[], &scan.base).unwrap_err();
+        assert_eq!(err, "main was rewound or rewritten since the scan; scan again");
+        assert!(branch_exists(&repo, &branch), "nothing deleted");
+        assert_eq!(delete_branches(dir, &[], &[], &Base::default()), Ok(vec![]), "nothing to do");
+        assert!(delete_branches(dir, &input, &[], &Base::default()).is_err(), "no base, no deletes");
+    }
+
+    #[test]
+    fn delete_branches_still_deletes_after_the_default_branch_moved_on() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&repo, &["worktree", "remove", wt.to_str().unwrap()]);
+        let dir = repo.to_str().unwrap();
+        let scan = scan_merged_branches(dir, &[]).unwrap();
+        let tip = rev_parse(&repo, &format!("refs/heads/{branch}"));
+        commit_file(&repo, "later.txt", "later");
+        let results = delete_branches(dir, &[(branch.clone(), tip)], &[], &scan.base).unwrap();
+        assert_eq!(results, [(branch.clone(), Ok(()))]);
+        assert!(!branch_exists(&repo, &branch));
     }
 }

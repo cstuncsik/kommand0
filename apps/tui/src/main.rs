@@ -67,9 +67,15 @@ impl<T> Drop for SendOnDrop<T> {
 type ProfileDeleteMsg =
     (String, Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>);
 
-/// A scan's routed plan with core's note (a failed refresh of the default
-/// branch, squash detection off).
-type RepoScan = (Vec<RepoCleanupItem>, Option<String>);
+/// A scan, routed against the repo's workspaces: the plan, core's notes (a
+/// failed refresh of the default branch, squash detection off) and the base
+/// the plain deletes are checked against.
+#[derive(Debug)]
+struct RepoScan {
+    items: Vec<RepoCleanupItem>,
+    notes: Vec<String>,
+    base: kommand0_core::Base,
+}
 
 /// Repo-cleanup worker -> event loop: the scan, or the delete phase's
 /// per-branch results. Both carry the repo id. `Scanned(_, Err)` also carries
@@ -3613,9 +3619,7 @@ impl App {
             return;
         }
         match self.repo_cleanup_pending.take() {
-            Some((id, (items, note))) if id == repo_id => {
-                self.open_repo_cleanup_modal(id, items, note)
-            }
+            Some((id, scan)) if id == repo_id => self.open_repo_cleanup_modal(id, scan),
             other => {
                 // A dropped plan takes its "press c to review" line with it.
                 if let Some((other_id, _)) = other {
@@ -3653,8 +3657,10 @@ impl App {
             };
             let result = Config::protected_branches_at(&config_path)
                 .and_then(|protected| kommand0_core::scan_merged_branches(&path, &protected))
-                .map(|(verdicts, note)| {
-                    (kommand0_core::plan_repo_cleanup(verdicts, &id, &workspaces), note)
+                .map(|scan| RepoScan {
+                    items: kommand0_core::plan_repo_cleanup(scan.verdicts, &id, &workspaces),
+                    notes: scan.notes,
+                    base: scan.base,
                 });
             guard.payload = Some(RepoCleanupMsg::Scanned(id, result));
         });
@@ -3668,44 +3674,40 @@ impl App {
         repo_id: String,
         result: Result<RepoScan, String>,
     ) {
-        let (items, note) = match result {
+        let scan = match result {
             Ok(scan) => scan,
             Err(e) => {
                 self.repo_cleanup_result.insert(repo_id, (format!("Cleanup failed: {e}"), true));
                 return;
             }
         };
-        // The pane clips the note; the log keeps it whole.
-        if let Some(n) = &note {
-            tracing::warn!("repo cleanup: {n}");
+        // The pane clips a note; the log keeps it whole.
+        for note in &scan.notes {
+            tracing::warn!("repo cleanup: {note}");
         }
-        let with_note = |line: String| match &note {
-            Some(n) => (format!("{line}\n{n}"), true),
-            None => (line, false),
+        let with_note = |line: String| {
+            let error = !scan.notes.is_empty();
+            ([vec![line], scan.notes.clone()].concat().join("\n"), error)
         };
-        let (deletes, routed, skipped) = repo_cleanup_counts(&items);
+        let (deletes, routed, skipped) = repo_cleanup_counts(&scan.items);
         if deletes + routed == 0 {
             let line = with_note(format!("Nothing to clean up ({skipped} skipped)"));
             self.repo_cleanup_result.insert(repo_id, line);
         } else if self.can_open_repo_cleanup_modal() {
-            self.open_repo_cleanup_modal(repo_id, items, note);
+            self.open_repo_cleanup_modal(repo_id, scan);
         } else {
             let line = with_note(format!(
                 "Scan done: {deletes} to delete, {routed} workspace(s); press c to review"
             ));
             self.repo_cleanup_result.insert(repo_id.clone(), line);
-            self.repo_cleanup_pending = Some((repo_id, (items, note)));
+            self.repo_cleanup_pending = Some((repo_id, scan));
         }
     }
 
     /// Open the preview for a scanned plan. Rows are built now, not at scan
     /// time, so a parked plan shows the current dirty/unpushed/live markers.
-    fn open_repo_cleanup_modal(
-        &mut self,
-        repo_id: String,
-        items: Vec<RepoCleanupItem>,
-        note: Option<String>,
-    ) {
+    fn open_repo_cleanup_modal(&mut self, repo_id: String, scan: RepoScan) {
+        let RepoScan { items, notes, base } = scan;
         self.repo_cleanup_result.remove(&repo_id);
         let repo_name = self
             .repos
@@ -3721,9 +3723,10 @@ impl App {
             repo_id,
             repo_name,
             summary,
-            note,
+            notes,
             rows,
             plan: items,
+            base,
         };
     }
 
@@ -3759,7 +3762,12 @@ impl App {
     /// `y` in the preview: the workspace rows go through the workspace cleanup
     /// (one shared pane-capture grace for the set), the plain branches are
     /// deleted off the render loop (fast, but the loop never waits on git).
-    fn confirm_repo_cleanup(&mut self, repo_id: String, plan: Vec<RepoCleanupItem>) {
+    fn confirm_repo_cleanup(
+        &mut self,
+        repo_id: String,
+        plan: Vec<RepoCleanupItem>,
+        base: kommand0_core::Base,
+    ) {
         let routed: Vec<&str> = plan
             .iter()
             .filter_map(|item| match item {
@@ -3789,11 +3797,11 @@ impl App {
                     Err("the delete was interrupted".to_string()),
                 )),
             };
-            guard.payload = Some(match Config::protected_branches_at(&config_path) {
-                Ok(protected) => RepoCleanupMsg::Deleted(
-                    repo_id,
-                    kommand0_core::delete_branches(&path, &deletes, &protected),
-                ),
+            let deleted = Config::protected_branches_at(&config_path).and_then(|protected| {
+                kommand0_core::delete_branches(&path, &deletes, &protected, &base)
+            });
+            guard.payload = Some(match deleted {
+                Ok(results) => RepoCleanupMsg::Deleted(repo_id, results),
                 Err(e) => RepoCleanupMsg::Scanned(repo_id, Err(e)),
             });
         });
@@ -4624,8 +4632,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             modal::ModalResult::ConfirmCleanup(ws_id) => {
                 app.start_cleanup(&ws_id);
             }
-            modal::ModalResult::ConfirmRepoCleanup(repo_id, plan) => {
-                app.confirm_repo_cleanup(repo_id, plan);
+            modal::ModalResult::ConfirmRepoCleanup(repo_id, plan, base) => {
+                app.confirm_repo_cleanup(repo_id, plan, base);
             }
         }
         return Ok(KeyOutcome::Continue);
@@ -10285,6 +10293,12 @@ mod key_tests {
         RepoCleanupItem::Skip { branch: branch.into(), reason: reason.into() }
     }
 
+    /// A routed scan with `notes` and no base (so its plain deletes refuse).
+    fn scan_of(items: Vec<RepoCleanupItem>, notes: &[&str]) -> RepoScan {
+        let notes = notes.iter().map(|n| n.to_string()).collect();
+        RepoScan { items, notes, base: kommand0_core::Base::default() }
+    }
+
     /// Point w1 at the real repo as an own-branch workspace on `branch`.
     fn route_w1_to_real(app: &mut App, wt: &std::path::Path, branch: &str) {
         app.workspaces[0].repo_id = "real".into();
@@ -10331,7 +10345,7 @@ mod key_tests {
             dirty: false,
             unpushed: false,
         };
-        app.on_repo_cleanup_scanned("r1".into(), Ok((vec![delete_item("stale")], None)));
+        app.on_repo_cleanup_scanned("r1".into(), Ok(scan_of(vec![delete_item("stale")], &[])));
         assert!(
             matches!(app.modal, modal::ModalState::ConfirmCleanup { .. }),
             "the open modal is not replaced"
@@ -10367,7 +10381,7 @@ mod key_tests {
         for (owner, own) in owners {
             let mut app = test_app();
             own(&mut app);
-            app.on_repo_cleanup_scanned("r1".into(), Ok((vec![delete_item("stale")], None)));
+            app.on_repo_cleanup_scanned("r1".into(), Ok(scan_of(vec![delete_item("stale")], &[])));
             assert!(!app.modal.is_active(), "{owner}: parked, not opened over it");
             assert!(app.repo_cleanup_pending.is_some(), "{owner}: the plan is kept");
         }
@@ -10377,7 +10391,7 @@ mod key_tests {
         let mut app = test_app();
         let tmp = tempfile::TempDir::new().unwrap();
         app.repos[1].path = tmp.path().join("missing").to_string_lossy().into_owned();
-        app.repo_cleanup_pending = Some(("r1".into(), (vec![delete_item("stale")], None)));
+        app.repo_cleanup_pending = Some(("r1".into(), scan_of(vec![delete_item("stale")], &[])));
         app.repo_cleanup_result.insert("r1".into(), ("Scan done: press c to review".into(), false));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.repo_cleanup_tx = Some(tx);
@@ -10392,7 +10406,7 @@ mod key_tests {
     async fn repo_cleanup_scan_result_opens_the_modal_or_reports_idle() {
         let mut app = test_app();
         let idle = vec![skip_item("main", "default branch")];
-        app.on_repo_cleanup_scanned("r1".into(), Ok((idle, None)));
+        app.on_repo_cleanup_scanned("r1".into(), Ok(scan_of(idle, &[])));
         assert!(!app.modal.is_active(), "nothing actionable opens no modal");
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Nothing to clean up (1 skipped)"), "{text}");
@@ -10400,13 +10414,13 @@ mod key_tests {
         let mut app = test_app();
         app.on_repo_cleanup_scanned(
             "r1".into(),
-            Ok((
+            Ok(scan_of(
                 vec![
                     delete_item("stale"),
                     RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "ws-one".into() },
                     skip_item("wip", "not merged into main"),
                 ],
-                Some(STALE_NOTE.to_string()),
+                &[STALE_NOTE],
             )),
         );
         assert!(app.modal.is_active());
@@ -10429,7 +10443,7 @@ mod key_tests {
     async fn repo_cleanup_reports_a_stale_base_once() {
         // Two lines, the first short enough that the second, glued onto it,
         // would still show on the same row.
-        let note = || Some("origin/main not refreshed: timed out\nsquash merges not detected".into());
+        let notes = ["origin/main not refreshed: timed out", "squash merges not detected"];
         let unmerged = || skip_item("wip", "not merged into origin/main");
         // Each note line sits on a detail-pane row of its own.
         let marks = ["Nothing to clean up", "press c to review", "not refreshed", "squash merges"];
@@ -10447,7 +10461,7 @@ mod key_tests {
             let size = format!("{cols}x{rows}");
             // Nothing actionable: the idle line, and the note under it.
             let mut app = test_app();
-            app.on_repo_cleanup_scanned("r1".into(), Ok((vec![unmerged()], note())));
+            app.on_repo_cleanup_scanned("r1".into(), Ok(scan_of(vec![unmerged()], &notes)));
             assert!(app.repo_cleanup_result["r1"].1, "a stale base reads as an error");
             let text = render_to_string(&mut app, cols, rows);
             assert!(text.contains("Nothing to clean up (1 skipped)"), "{size}:\n{text}");
@@ -10457,7 +10471,7 @@ mod key_tests {
             let mut app = test_app();
             app.show_help = true;
             let plan = vec![delete_item("stale"), unmerged()];
-            app.on_repo_cleanup_scanned("r1".into(), Ok((plan, note())));
+            app.on_repo_cleanup_scanned("r1".into(), Ok(scan_of(plan, &notes)));
             app.show_help = false;
             let (line, is_error) = &app.repo_cleanup_result["r1"];
             assert!(line.contains("press c to review") && *is_error, "{line}");
@@ -10514,13 +10528,15 @@ mod key_tests {
             );
             app.open_repo_cleanup_modal(
                 "r1".into(),
-                vec![
-                    delete_item("stale"),
-                    RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: long_branch.clone() },
-                    skip_item("wip", "not merged into main"),
-                    RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: cjk_branch.clone() },
-                ],
-                None,
+                scan_of(
+                    vec![
+                        delete_item("stale"),
+                        RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: long_branch.clone() },
+                        skip_item("wip", "not merged into main"),
+                        RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: cjk_branch.clone() },
+                    ],
+                    &[],
+                ),
             );
             app
         };
@@ -10570,7 +10586,7 @@ mod key_tests {
         let mut app = test_app();
         let mut items = vec![delete_item("stale")];
         items.extend((0..40).map(|i| skip_item(&format!("skip-{i:02}"), "not merged into main")));
-        app.open_repo_cleanup_modal("r1".into(), items, None);
+        app.open_repo_cleanup_modal("r1".into(), scan_of(items, &[]));
 
         // 41 rows + 5 = 46 > 22 (24 - 2): height 22, interior 20, rows area 17,
         // so 16 rows show and the marker takes the last line.
@@ -10590,17 +10606,17 @@ mod key_tests {
         app.cleanup_tx = Some(cleanup_tx);
         let (repo_tx, mut repo_rx) = tokio::sync::mpsc::unbounded_channel();
         app.repo_cleanup_tx = Some(repo_tx);
-        app.open_repo_cleanup_modal(
-            "real".into(),
-            vec![
-                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into() },
-                RepoCleanupItem::Delete {
-                    branch: "stale".into(),
-                    tip: "0000000000000000000000000000000000000000".into(),
-                },
-            ],
-            None,
-        );
+        // A real base, so the delete gets as far as the stale tip.
+        let path = app.repos.iter().find(|r| r.id == "real").unwrap().path.clone();
+        let base = kommand0_core::scan_merged_branches(&path, &[]).unwrap().base;
+        let items = vec![
+            RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into() },
+            RepoCleanupItem::Delete {
+                branch: "stale".into(),
+                tip: "0000000000000000000000000000000000000000".into(),
+            },
+        ];
+        app.open_repo_cleanup_modal("real".into(), RepoScan { items, notes: vec![], base });
 
         press(&mut app, KeyCode::Char('y')).await;
 
@@ -10659,11 +10675,13 @@ mod key_tests {
         app.cleanup_tx = Some(cleanup_tx);
         app.open_repo_cleanup_modal(
             "real".into(),
-            vec![
-                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into() },
-                RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "main".into() },
-            ],
-            None,
+            scan_of(
+                vec![
+                    RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "main".into() },
+                    RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "main".into() },
+                ],
+                &[],
+            ),
         );
 
         let start = Instant::now();
@@ -10689,13 +10707,13 @@ mod key_tests {
         app.repo_cleanup_inflight = None;
         match msg {
             RepoCleanupMsg::Scanned(_, Ok(scan)) => assert_eq!(
-                scan,
+                (scan.items, scan.notes),
                 (
                     vec![
                         skip_item("main", "default branch"),
                         skip_item("release", "protected branch"),
                     ],
-                    None
+                    vec![]
                 ),
                 "gated names never reach the merged check"
             ),

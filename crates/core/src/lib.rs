@@ -11,7 +11,8 @@ pub mod workspace;
 pub mod worktree;
 
 pub use cleanup::{
-    BranchVerdict, Verdict, cleanup_merged_workspace, delete_branches, scan_merged_branches,
+    Base, BranchVerdict, Scan, Verdict, cleanup_merged_workspace, delete_branches,
+    scan_merged_branches,
 };
 pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
