@@ -263,17 +263,22 @@ enum Merged {
     /// Nothing of its own: the default branch's own history, changes that
     /// cancel out, or a branch created at a merged tip.
     NoCommits,
+    /// Squash-merged (or rebased), but before the branch's last commit: the
+    /// commits since may hold work its net change hides (something added and
+    /// removed again).
+    Later,
     /// Not merged, or git couldn't tell.
     No,
 }
 
 /// Whether `branch` (at `tip`) is merged into `target`. Every failure lands on
-/// No or NoCommits, never Yes. Yes needs one of:
+/// No, Later or NoCommits, never Yes. Yes needs one of:
 /// - the tip is an ancestor of the base but off its first-parent line (merged
 ///   by a merge commit; on that line it is the base's own history);
 /// - a commit on the base since the fork point carries the branch's net change
-///   (same patch-id), and replaying the branch onto that commit's parent
-///   reproduces its tree exactly (a squash, or a one-commit rebase).
+///   (same patch-id), replaying the branch onto that commit's parent
+///   reproduces its tree exactly, and it was committed no earlier than the tip
+///   (a squash, or a one-commit rebase, of the branch as it is now; else Later).
 ///
 /// Then [`fresh_by_reflog`] can still veto it.
 fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Merged {
@@ -329,16 +334,29 @@ fn merged_into(repo_path: &str, target: &Target, branch: &str, tip: &str) -> Mer
         };
         // Patch-ids ignore whitespace and position, so a candidate counts only
         // if replaying the branch onto its parent reproduces its tree exactly.
-        let replayed = marks.lines().filter_map(|l| l.strip_prefix('=')).any(|c| {
+        let replays = |c: &str| {
             let parent = format!("{c}^");
             let mut args: Vec<&str> = merge_config.iter().map(String::as_str).collect();
             args.extend(["merge-tree", "--write-tree", parent.as_str(), tip]);
             let tree = git(&["rev-parse", &format!("{c}^{{tree}}")]);
             let (Some(tree), Some(out)) = (tree, git(&args)) else { return false };
             out.lines().next() == Some(tree.as_str())
-        });
-        if !replayed {
+        };
+        let confirmed: Vec<&str> =
+            marks.lines().filter_map(|l| l.strip_prefix('=')).filter(|c| replays(c)).collect();
+        if confirmed.is_empty() {
             return Merged::No;
+        }
+        // And only a merge committed no earlier than the tip: the net change
+        // can't show commits made after it. Committer dates, so clock skew can
+        // hide such a commit (the net change is still on the base then) or keep
+        // a branch merged within the skew of its last commit.
+        let time = |rev: &str| {
+            git(&["log", "-1", "--no-show-signature", "--format=%ct", rev])?.parse::<i64>().ok()
+        };
+        let Some(tip_time) = time(tip) else { return Merged::No };
+        if !confirmed.iter().any(|c| time(c).is_some_and(|t| t >= tip_time)) {
+            return Merged::Later;
         }
     }
     if fresh_by_reflog(repo_path, branch, tip) { Merged::NoCommits } else { Merged::Yes }
@@ -511,6 +529,12 @@ pub fn cleanup_merged_workspace(
         Merged::Yes => {}
         Merged::NoCommits => {
             return Err("the branch has no commits of its own; not cleaning up".to_string());
+        }
+        Merged::Later => {
+            return Err(format!(
+                "the branch has commits after its merge into {}; not cleaning up",
+                target.name
+            ));
         }
         Merged::No => {
             let refusal = format!("the branch isn't merged into {}; not cleaning up", target.name);
@@ -702,6 +726,7 @@ pub fn scan_merged_branches(
             Err(r) => Verdict::Skip(r.short().to_string()),
             Ok(()) => match merged_into(repo_path, &target, branch, tip) {
                 Merged::NoCommits => Verdict::Skip("no commits of its own".to_string()),
+                Merged::Later => Verdict::Skip("commits after its merge".to_string()),
                 Merged::No => Verdict::Skip(format!("not merged into {}", target.name)),
                 Merged::Yes if !worktree.is_empty() => {
                     Verdict::CheckedOut { worktree: worktree.to_string() }
@@ -761,6 +786,19 @@ mod tests {
         std::fs::write(dir.join(name), content).unwrap();
         git(dir, &["add", "."]);
         git(dir, &["commit", "-m", name]);
+    }
+
+    /// Commit everything in `dir` dated far after the rest of a fixture, so it
+    /// surely postdates any merge in it.
+    fn commit_later(dir: &Path, msg: &str) {
+        git(dir, &["add", "-A"]);
+        let out = Command::new("git")
+            .args(["commit", "-m", msg])
+            .env("GIT_COMMITTER_DATE", "2100000000 +0000")
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "commit {msg}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
     /// Squash-merge `branch` into main, which `repo` has checked out.
@@ -1211,11 +1249,19 @@ mod tests {
             git(r, &["switch", "main"]);
         };
 
-        // Merged: a squash that main then edits next to, a slashed name, a
-        // --no-ff merge, a cherry-pick, and a squash whose reflog expired.
+        // Merged: a squash that main then edits next to, a two-commit squash
+        // whose replay merges with an edit main made to the same file first, a
+        // slashed name, a --no-ff merge, a cherry-pick, and a squash whose
+        // reflog expired.
         branch("squashed", "lines.txt", &lines.replace("2\n", "two\n"));
         squash_merge(r, "squashed");
-        commit_file(r, "lines.txt", &lines.replace("2\n", "two\n").replace("3\n", "three\n"));
+        let main_lines = lines.replace("2\n", "two\n").replace("3\n", "three\n");
+        commit_file(r, "lines.txt", &main_lines);
+        branch("content-merge", "lines.txt", &lines.replace("7\n", "seven\n"));
+        extend("content-merge", "lines.txt", &lines.replace("7\n", "seven\n").replace("8\n", "eight\n"));
+        // Outside the diff context of the branch's hunk: patch-ids see context.
+        commit_file(r, "lines.txt", &main_lines.replace("1\n", "one\n"));
+        squash_merge(r, "content-merge");
         branch("feat/x", "x.txt", "x");
         squash_merge(r, "feat/x");
         branch("merge-commit", "m.txt", "m");
@@ -1249,7 +1295,8 @@ mod tests {
 
         // Nothing of its own: changes that cancel out (with an empty commit on
         // main that an empty probe would match), a fast-forward that main
-        // moved past, and main's first commit.
+        // moved past, a branch just created at a merged tip, and main's first
+        // commit.
         branch("net-zero", "z.txt", "z");
         git(r, &["switch", "net-zero"]);
         git(r, &["rm", "z.txt"]);
@@ -1261,6 +1308,7 @@ mod tests {
         git(r, &["switch", "main"]);
         git(r, &["merge", "--ff-only", "ff-merged"]);
         commit_file(r, "after-ff.txt", "after");
+        git(r, &["branch", "fresh", "feat/x"]);
 
         // Gated, and merged but checked out: in a linked worktree, and in the
         // repo itself.
@@ -1284,10 +1332,10 @@ mod tests {
         let of = |name: &str| {
             verdicts.iter().find(|v| v.branch == name).unwrap_or_else(|| panic!("{name} scanned"))
         };
-        assert_eq!(verdicts.len(), 19);
+        assert_eq!(verdicts.len(), 21);
         assert_eq!(note, None);
         assert_eq!(of("feat/x").tip, rev_parse(r, "refs/heads/feat/x"), "the scan-time tip");
-        for name in ["squashed", "feat/x", "merge-commit", "rebased", "expired"] {
+        for name in ["squashed", "content-merge", "feat/x", "merge-commit", "rebased", "expired"] {
             assert_eq!(of(name).verdict, Verdict::Delete, "{name}");
         }
         for name in [
@@ -1301,7 +1349,7 @@ mod tests {
         ] {
             assert_eq!(of(name).verdict, Verdict::Skip("not merged into main".into()), "{name}");
         }
-        for name in ["net-zero", "ff-merged", "stale"] {
+        for name in ["net-zero", "ff-merged", "fresh", "stale"] {
             assert_eq!(of(name).verdict, Verdict::Skip("no commits of its own".into()), "{name}");
         }
         assert_eq!(of("development").verdict, Verdict::Skip("protected branch".into()));
@@ -1316,6 +1364,25 @@ mod tests {
             Verdict::CheckedOut { worktree: repo_real.to_str().unwrap().to_string() },
             "the main checkout counts, at the realpath git reports"
         );
+    }
+
+    #[test]
+    fn a_branch_with_commits_after_its_merge_is_kept() {
+        // Something added and removed again after the squash landed: the net
+        // change still replays to the squash, but those commits are on no
+        // other ref, and deleting the branch would strand them.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        std::fs::write(wt.join("spike.txt"), "spike").unwrap();
+        commit_later(&wt, "spike");
+        std::fs::remove_file(wt.join("spike.txt")).unwrap();
+        commit_later(&wt, "drop the spike");
+        let (verdicts, _) = scan_merged_branches(repo.to_str().unwrap(), &[]).unwrap();
+        let feat = verdicts.iter().find(|v| v.branch == "feat").unwrap();
+        assert_eq!(feat.verdict, Verdict::Skip("commits after its merge".into()));
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert_eq!(err, "the branch has commits after its merge into main; not cleaning up");
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
     }
 
     #[test]
