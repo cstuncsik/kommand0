@@ -51,8 +51,10 @@ git worktree. A `kmd` CLI mirrors the core actions.
   stdin null), ETXTBSY-retry, 20s timeout. Never invoke `gh` directly.
 - **Network git follows `git::fetch_origin_branch`'s recipe**: `GIT_TERMINAL_PROMPT=0`,
   an empty `GIT_ASKPASS`, `batch_ssh_command()` (batch mode plus keepalives),
-  `http_stall()`, null stdin, and `wait_bounded`, which stops waiting at 20 s but
-  never kills (a slow fetch still lands; the transports end a real stall).
+  `http_stall()`, `-c gc.auto=0 -c maintenance.auto=false`, null stdin, and
+  `wait_bounded`, which stops waiting at 20 s but never kills: a slow fetch still
+  lands, keepalives and the https limit end a dead connection or a stalled
+  transfer, and anything else (a stuck server on a live connection) is abandoned.
 - **Overlays** (help, palette, modal, diff) own the screen: they swallow keys AND
   must appear in the mouse/paste guards in `main.rs` so clicks/paste don't leak to
   the tree behind them. Global focus is `Focus { Tree, Embedded }` (Tab-switched).

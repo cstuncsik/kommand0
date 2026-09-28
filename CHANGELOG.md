@@ -31,12 +31,16 @@ All notable changes to kommand0 are documented here. The format is based on
   on its one ref.** It no longer pulls tags, asks an askpass helper for
   credentials (VS Code terminals set one; gh's own fetch for an issue branch
   can't either), or updates a local branch that a configured
-  `remote.origin.fetch` maps into `refs/heads/`. After kommand0 stops waiting
-  at 20 s, a stalled ssh or https transfer now gives up on its own (ssh
-  keepalives; an https limit of 5 minutes without progress, unless you set
-  your own), and a failed fetch shows git's own error line. `GIT_SSH` is
-  honored instead of being replaced by plain ssh, and a plink or `simple` ssh
-  variant no longer gets OpenSSH options.
+  `remote.origin.fetch` maps into `refs/heads/`, and a failed fetch shows
+  git's own error line.
+- **A stalled fetch gives up on its own, and `GIT_SSH` is honored.** kommand0
+  stops waiting after 20 s and leaves a slow fetch to finish; a dead ssh
+  connection now ends through keepalives, and an https transfer after 5
+  minutes without progress (each half of that limit only if you didn't set
+  your own). `GIT_SSH` is no longer replaced by plain ssh, and a plink, putty,
+  tortoiseplink or `simple` ssh variant no longer gets OpenSSH options.
+- **Long messages in the detail pane wrap** instead of being cut off at its
+  edge: a cleanup outcome or refusal, its notes, a spawn error.
 
 ### Changed
 

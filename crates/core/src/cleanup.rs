@@ -455,7 +455,8 @@ fn uncommitted_work(worktree_path: &str) -> Result<(), String> {
     for entry in files.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
         let (&tag, path) = entry.split_first().ok_or_else(unreadable)?;
         let path = path.strip_prefix(b" ").ok_or_else(unreadable)?;
-        let flag = Flags { assume: tag.is_ascii_lowercase(), skip: tag.eq_ignore_ascii_case(&b's') };
+        let flag =
+            Flags { assume: tag.is_ascii_lowercase(), skip: tag.eq_ignore_ascii_case(&b's') };
         if !flag.assume && !flag.skip {
             continue;
         }

@@ -401,10 +401,17 @@ If `origin/HEAD` is missing, or the default branch was renamed on the server,
 run `git fetch origin` and then `git remote set-head origin -a`. Delete a
 leftover by hand with `git branch -D <branch>`.
 
-kommand0 adds batch mode and keepalives to the ssh command its fetch runs
-(`-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes`). These
-win over `~/.ssh/config`; to change one, put your own `-o` in `core.sshCommand`,
-which wins over them.
+**A fetch fails where plain `git fetch` would prompt.** kommand0's fetches (the
+cleanups' default branch, an issue's linked branch) never prompt: they would
+hang behind the TUI. It adds batch mode and keepalives to the ssh command
+(`-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes`; `GIT_SSH`
+is honored, and a plink or `simple` variant gets none), so load a
+passphrase-protected key with `ssh-add`. These options win over
+`~/.ssh/config`; to change a keepalive, put your own `-o` in `GIT_SSH_COMMAND`
+or `core.sshCommand`, which win over them. An https transfer gives up after 5
+minutes without progress, unless you set `http.lowSpeedLimit` /
+`http.lowSpeedTime` (or `GIT_HTTP_LOW_SPEED_LIMIT` / `_TIME`) yourself. kommand0
+stops waiting after 20 s and leaves a slow fetch to finish.
 
 **The embedded pane won't open (or exits immediately).** The `claude` binary
 isn't on PATH, or the one found isn't the Claude Code CLI. Install it, or point

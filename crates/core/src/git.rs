@@ -964,7 +964,11 @@ pub(crate) fn shell_quote(s: &str) -> String {
 /// <branch>` leaves the tracking ref to the configured refspec, and a STALE
 /// tracking ref passes `verify_ref` and silently yields a worktree behind
 /// origin.
-pub(crate) fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(), String> {
+pub(crate) fn fetch_origin_branch(
+    repo_dir: &str,
+    branch: &str,
+    gh_bin: &str,
+) -> Result<(), String> {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
     let helper = format!("credential.helper=!{} auth git-credential", shell_quote(gh_bin));
     let spawned = Command::new("git")
