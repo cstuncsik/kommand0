@@ -402,8 +402,8 @@ run `git fetch origin` and then `git remote set-head origin -a`. Delete a
 leftover by hand with `git branch -D <branch>`.
 
 **A fetch fails where plain `git fetch` would prompt.** kommand0's fetches (the
-cleanups' default branch, an issue's linked branch) never prompt: they would
-hang behind the TUI. It adds batch mode and keepalives to the ssh command
+cleanups' default branch, an issue's linked branch) don't prompt, unless your
+own ssh command asks to (`-oBatchMode=no`): a prompt would hang behind the TUI. It adds batch mode and keepalives to the ssh command
 (`-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes`; `GIT_SSH`
 is honored, and a plink or `simple` variant gets none), so load a
 passphrase-protected key with `ssh-add`. These options win over
