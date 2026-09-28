@@ -10298,10 +10298,8 @@ mod key_tests {
         assert_eq!(fg_of(&mut app, 80, 24, "origin/main not refreshed"), th.dirty, "a warning");
     }
 
-    #[tokio::test]
-    async fn a_long_cleanup_refusal_wraps_below_the_buttons() {
-        // What to do sits at the end of the refusal; below the last button the
-        // pane wraps instead of clipping it, in the workspace and the repo pane.
+    /// The workspace pane with a long refusal under its `[Clean up]` button.
+    fn app_with_a_long_refusal() -> App {
         let mut app = test_app();
         app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
         app.workspaces[0].branch_name = Some("ws-one".into());
@@ -10312,19 +10310,23 @@ mod key_tests {
                        clear it with `git update-index --no-assume-unchanged -- work.txt`, then \
                        commit or discard them";
         app.cleanup_result.insert("w1".to_string(), refusal.to_string());
-        let text = render_to_string(&mut app, 80, 24);
-        for word in ["assume-unchanged,", "--no-assume-unchanged", "discard"] {
-            assert!(text.contains(word), "{word:?} visible at 80x24:\n{text}");
-        }
-        // A spawn error goes first below the buttons, so the refusal can't push
-        // it off the pane.
+        app
+    }
+
+    #[tokio::test]
+    async fn a_spawn_error_shows_above_a_wrapped_refusal() {
+        // First below the buttons, so the refusal can't push it off the pane.
+        let mut app = app_with_a_long_refusal();
         app.embed_error = Some(("w1".to_string(), "Couldn't start claude: boom".to_string()));
         let text = render_to_string(&mut app, 80, 24);
         let row = |needle: &str| text.lines().position(|l| l.contains(needle));
         let (err, refusal) = (row("Couldn't start claude"), row("Cleanup blocked"));
         assert!(err.is_some() && err < refusal, "the spawn error shows, above it:\n{text}");
-        app.embed_error = None;
-        // And a button the pane is too short to show isn't clickable below it.
+    }
+
+    #[tokio::test]
+    async fn a_button_the_pane_cannot_show_is_not_clickable() {
+        let mut app = app_with_a_long_refusal();
         for rows in 8..=24u16 {
             render_to_string(&mut app, 100, rows);
             let pane = app.right_pane_area;
@@ -10332,9 +10334,20 @@ mod key_tests {
                 .hit_regions
                 .iter()
                 .find(|r| r.area.x >= pane.x && r.area.y >= pane.bottom().saturating_sub(1));
-            assert!(off.is_none(), "a hit region below the pane at 100x{rows}: {:?}", off.map(|r| r.area));
+            let off = off.map(|r| r.area);
+            assert!(off.is_none(), "a hit region below the pane at 100x{rows}: {off:?}");
         }
+    }
 
+    #[tokio::test]
+    async fn a_long_cleanup_refusal_wraps_below_the_buttons() {
+        // What to do sits at the end of the refusal; below the last button the
+        // pane wraps instead of clipping it, in the workspace and the repo pane.
+        let mut app = app_with_a_long_refusal();
+        let text = render_to_string(&mut app, 80, 24);
+        for word in ["assume-unchanged,", "--no-assume-unchanged", "discard"] {
+            assert!(text.contains(word), "{word:?} visible at 80x24:\n{text}");
+        }
         app.select_repo_row("r1");
         let failed = "Cleanup failed: couldn't find the default branch to compare against (no \
                       origin/HEAD, origin/main, origin/master, main or master); if origin has \

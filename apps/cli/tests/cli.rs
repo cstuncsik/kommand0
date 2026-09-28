@@ -427,11 +427,11 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
     assert!(fetch < is_ancestor, "the local branch is judged against a fresh origin ref");
 }
 
-#[test]
-fn the_fetch_keeps_a_users_git_ssh_and_stall_time() {
-    // GIT_SSH is a program, not a command line, and the GIT_SSH_COMMAND kommand0
-    // sets would shadow it; a stall time the user exported stands, and git
-    // needs both halves, so kommand0 still sets the other.
+/// `kmd workspace create --issue 123` with `env`, on a fresh fixture and
+/// without the developer's git config, returning the linked branch's fetch as
+/// a git shim logged it: its argv, then
+/// `[GIT_SSH_COMMAND][GIT_HTTP_LOW_SPEED_LIMIT][GIT_HTTP_LOW_SPEED_TIME]`.
+fn issue_fetch(env: &[(&str, &str)]) -> String {
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
     let repo = tmp.path().join("repo");
@@ -447,29 +447,45 @@ fn the_fetch_keeps_a_users_git_ssh_and_stall_time() {
             log.display()
         ),
     );
-    let out = kmd(
-        &state,
-        &[
-            ("KOMMAND0_GH_BIN", gh.to_str().unwrap()),
-            ("PATH", &path),
-            ("GIT_SSH_COMMAND", ""),
-            ("GIT_SSH", "/opt/my tools/ssh"),
-            ("GIT_HTTP_LOW_SPEED_TIME", "600"),
-            ("GIT_CONFIG_GLOBAL", "/dev/null"),
-            ("GIT_CONFIG_NOSYSTEM", "1"),
-        ],
-        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
-    );
+    let mut env = env.to_vec();
+    env.extend([
+        ("KOMMAND0_GH_BIN", gh.to_str().unwrap()),
+        ("PATH", path.as_str()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]);
+    let args = ["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()];
+    let out = kmd(&state, &env, &args);
     assert!(out.status.success(), "create --issue: {}", String::from_utf8_lossy(&out.stderr));
     let recorded = std::fs::read_to_string(&log).unwrap();
-    let fetch = recorded
-        .lines()
-        .find(|l| l.contains("fetch origin +refs/heads/123-add-thing:"))
-        .unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}"));
+    let fetch = recorded.lines().find(|l| l.contains("fetch origin +refs/heads/123-add-thing:"));
+    fetch.unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}")).to_string()
+}
+
+#[test]
+fn the_fetch_keeps_a_users_git_ssh_and_stall_time() {
+    // GIT_SSH is a program, not a command line, and the GIT_SSH_COMMAND kommand0
+    // sets would shadow it; a stall time the user exported stands, and git
+    // needs both halves, so kommand0 still sets the other.
+    let env = [
+        ("GIT_SSH_COMMAND", ""),
+        ("GIT_SSH", "/opt/my tools/ssh"),
+        ("GIT_HTTP_LOW_SPEED_TIME", "600"),
+    ];
+    let fetch = issue_fetch(&env);
     assert!(fetch.contains(&format!("['/opt/my tools/ssh' {SSH_OPTS}]")), "{fetch}");
     if std::env::var_os("GIT_HTTP_LOW_SPEED_LIMIT").is_none() {
         assert!(fetch.ends_with("[1][600]"), "{fetch}");
     }
+}
+
+#[test]
+fn a_plink_variant_gets_no_openssh_options() {
+    // Read from the environment, as git reads it.
+    let env =
+        [("GIT_SSH_COMMAND", ""), ("GIT_SSH", "/opt/my tools/ssh"), ("GIT_SSH_VARIANT", "plink")];
+    let fetch = issue_fetch(&env);
+    assert!(fetch.contains("['/opt/my tools/ssh']"), "{fetch}");
 }
 
 #[test]
