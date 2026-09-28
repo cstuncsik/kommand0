@@ -388,6 +388,9 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
             // A user's own GIT_SSH_COMMAND must survive, with batch mode added.
             ("GIT_SSH_COMMAND", "ssh -F /dev/null"),
             ("GIT_ASKPASS", "/opt/editor/askpass.sh"),
+            // No `http.lowSpeed*` of the developer's own.
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
         ],
         &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
     );
@@ -406,16 +409,67 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
         lines[fetch]
     );
     assert!(
-        lines[fetch].ends_with(&format!("[0][ssh -F /dev/null {SSH_OPTS}][][1][300]")),
-        "no terminal or askpass prompt, batch mode and stall timeouts appended to the user's \
-         ssh command, and a stalled https transfer gives up: {}",
+        lines[fetch].contains(&format!("[0][ssh -F /dev/null {SSH_OPTS}][]")),
+        "no terminal or askpass prompt, and batch mode and keepalives are appended to the \
+         user's ssh command: {}",
         lines[fetch]
     );
+    // Only checkable when the developer's shell doesn't export its own.
+    if std::env::var_os("GIT_HTTP_LOW_SPEED_LIMIT").is_none()
+        && std::env::var_os("GIT_HTTP_LOW_SPEED_TIME").is_none()
+    {
+        assert!(lines[fetch].ends_with("[1][300]"), "a stalled https transfer gives up: {}", lines[fetch]);
+    }
     let is_ancestor = lines
         .iter()
         .position(|l| l.contains("merge-base --is-ancestor"))
         .unwrap_or_else(|| panic!("no local-branch check in:\n{recorded}"));
     assert!(fetch < is_ancestor, "the local branch is judged against a fresh origin ref");
+}
+
+#[test]
+fn the_fetch_keeps_a_users_git_ssh_and_stall_time() {
+    // GIT_SSH is a program, not a command line, and the GIT_SSH_COMMAND kommand0
+    // sets would shadow it; a stall time the user exported stands, and git
+    // needs both halves, so kommand0 still sets the other.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let gh = tmp.path().join("gh");
+    gh_develop_stub(&gh);
+    let log = tmp.path().join("git.log");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!(
+            "printf '%s [%s][%s][%s]\\n' \"$*\" \"${{GIT_SSH_COMMAND-UNSET}}\" \
+             \"${{GIT_HTTP_LOW_SPEED_LIMIT-UNSET}}\" \"${{GIT_HTTP_LOW_SPEED_TIME-UNSET}}\" \
+             >> \"{}\"",
+            log.display()
+        ),
+    );
+    let out = kmd(
+        &state,
+        &[
+            ("KOMMAND0_GH_BIN", gh.to_str().unwrap()),
+            ("PATH", &path),
+            ("GIT_SSH_COMMAND", ""),
+            ("GIT_SSH", "/opt/my tools/ssh"),
+            ("GIT_HTTP_LOW_SPEED_TIME", "600"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ],
+        &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "create --issue: {}", String::from_utf8_lossy(&out.stderr));
+    let recorded = std::fs::read_to_string(&log).unwrap();
+    let fetch = recorded
+        .lines()
+        .find(|l| l.contains("fetch origin +refs/heads/123-add-thing:"))
+        .unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}"));
+    assert!(fetch.contains(&format!("['/opt/my tools/ssh' {SSH_OPTS}]")), "{fetch}");
+    if std::env::var_os("GIT_HTTP_LOW_SPEED_LIMIT").is_none() {
+        assert!(fetch.ends_with("[1][600]"), "{fetch}");
+    }
 }
 
 #[test]

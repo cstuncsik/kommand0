@@ -315,17 +315,33 @@ const SSH_OPTS: &str = "-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatch
 
 /// The https counterpart of [`SSH_OPTS`]' keepalives, for git's environment: a
 /// transfer that makes no progress for 5 minutes gives up. Generous, because a
-/// server preparing a big pack only sends a keepalive now and then. Empty when
-/// the user set a limit of their own (in the environment, or `http.lowSpeed*`),
-/// which these would override.
-fn http_stall(repo_dir: &str) -> &'static [(&'static str, &'static str)] {
-    const STALL: [(&str, &str); 2] =
-        [("GIT_HTTP_LOW_SPEED_LIMIT", "1"), ("GIT_HTTP_LOW_SPEED_TIME", "300")];
-    let own = STALL.iter().any(|(var, _)| std::env::var_os(var).is_some())
-        || ["http.lowSpeedLimit", "http.lowSpeedTime"]
-            .iter()
-            .any(|key| git_config_value(repo_dir, key).is_some());
-    if own { &[] } else { &STALL }
+/// server preparing a big pack only sends a keepalive now and then. Each
+/// variable only when the user set neither it nor its `http.lowSpeed*` key
+/// (for any URL), which the variable would override; git needs both for a
+/// limit, so one they set still gets the other.
+fn http_stall(repo_dir: &str) -> Vec<(&'static str, &'static str)> {
+    let configured = Command::new("git")
+        .args(["-C", repo_dir, "config", "--get-regexp", r"^http\..*lowspeed(limit|time)$"])
+        .env_remove("GIT_CONFIG")
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase())
+        .unwrap_or_default();
+    let set = |var: &str, key: &str| {
+        std::env::var_os(var).is_some()
+            || configured.lines().any(|l| l.split(' ').next().is_some_and(|k| k.ends_with(key)))
+    };
+    let limit = set("GIT_HTTP_LOW_SPEED_LIMIT", "lowspeedlimit");
+    stall_env(limit, set("GIT_HTTP_LOW_SPEED_TIME", "lowspeedtime"))
+}
+
+/// [`http_stall`]'s rule, pure: kommand0's value for each variable the user
+/// didn't set.
+fn stall_env(limit_set: bool, time_set: bool) -> Vec<(&'static str, &'static str)> {
+    [(limit_set, ("GIT_HTTP_LOW_SPEED_LIMIT", "1")), (time_set, ("GIT_HTTP_LOW_SPEED_TIME", "300"))]
+        .into_iter()
+        .filter_map(|(set, var)| (!set).then_some(var))
+        .collect()
 }
 
 /// The ssh command git would have used for `repo_dir`, with [`SSH_OPTS`]
@@ -355,34 +371,47 @@ fn batch_ssh_command(repo_dir: &str) -> String {
         .is_none()
         .then(|| git_config_value(repo_dir, "core.sshCommand"))
         .flatten();
-    // A program, not a command line, so quoted as one word.
     let program = std::env::var("GIT_SSH").ok().filter(|p| !p.is_empty());
-    let program = program.map(|p| shell_quote(&p));
-    let variant = git_config_value(repo_dir, "ssh.variant");
+    // git reads the variant from the environment first, as for the command.
+    let variant = std::env::var("GIT_SSH_VARIANT").ok().filter(|v| !v.is_empty());
+    let variant = variant.or_else(|| git_config_value(repo_dir, "ssh.variant"));
     let (env, cfg) = (env.as_deref(), cfg.as_deref());
     ssh_command_with_batch_mode(env, cfg, program.as_deref(), variant.as_deref())
 }
 
 /// The precedence rule itself, pure so it can be tabled: a non-blank
-/// `GIT_SSH_COMMAND` wins, else `core.sshCommand`, else `GIT_SSH`, else plain
-/// ssh. An empty environment variable is treated as absent — git would die on
-/// it (`error: cannot run :`), and repairing it beats propagating it.
-/// [`SSH_OPTS`] are OpenSSH's, so a plink or `simple` variant (by `ssh.variant`,
-/// else by the program's name, as git itself tells) gets the command as is.
+/// `GIT_SSH_COMMAND` wins, else `core.sshCommand`, else `GIT_SSH` (a program,
+/// so quoted as one word), else plain ssh. An empty environment variable is
+/// treated as absent: git would die on it (`error: cannot run :`), and
+/// repairing it beats propagating it. [`SSH_OPTS`] are OpenSSH's, so a plink,
+/// putty, tortoiseplink or `simple` variant gets the command as is. The variant
+/// is decided as git decides it: `variant` (any other value means ssh), else
+/// the program's name.
 fn ssh_command_with_batch_mode(
     env: Option<&str>,
     cfg: Option<&str>,
     program: Option<&str>,
     variant: Option<&str>,
 ) -> String {
-    let base = env.filter(|v| !v.trim().is_empty()).or(cfg).or(program).unwrap_or("ssh");
-    let first = base.split_whitespace().next().unwrap_or_default().trim_matches('\'');
-    let name = first.rsplit('/').next().unwrap_or_default().to_ascii_lowercase();
+    let line = env.filter(|v| !v.trim().is_empty()).or(cfg);
+    let (base, program) = match (line, program) {
+        (Some(line), _) => (line.to_string(), first_word(line).to_string()),
+        (None, Some(program)) => (shell_quote(program), program.to_string()),
+        (None, None) => ("ssh".to_string(), "ssh".to_string()),
+    };
+    let name = program.rsplit('/').next().unwrap_or_default().to_ascii_lowercase();
     let openssh = match variant {
-        Some(v) if v != "auto" => v == "ssh",
+        Some(v) if v != "auto" => !matches!(v, "plink" | "putty" | "tortoiseplink" | "simple"),
         _ => !matches!(name.trim_end_matches(".exe"), "plink" | "tortoiseplink"),
     };
-    if openssh { format!("{base} {SSH_OPTS}") } else { base.to_string() }
+    if openssh { format!("{base} {SSH_OPTS}") } else { base }
+}
+
+/// The program a shell command line runs: its first word, unquoted.
+fn first_word(line: &str) -> &str {
+    let line = line.trim_start();
+    let quoted = ['\'', '"'].into_iter().find_map(|q| line.strip_prefix(q)?.split(q).next());
+    quoted.unwrap_or_else(|| line.split_whitespace().next().unwrap_or_default())
 }
 
 /// A single git config value for `repo_dir`, or `None` when unset (or git
@@ -441,7 +470,7 @@ fn run_gh(gh_bin: &str, cwd: &str, args: &[&str]) -> std::io::Result<std::proces
             // helper (VS Code terminals set one) before it reads the above.
             .env("GIT_ASKPASS", "")
             .env("GIT_SSH_COMMAND", batch_ssh_command(cwd))
-            .envs(http_stall(cwd).iter().copied())
+            .envs(http_stall(cwd))
             // gh reads git's config through `git config` too.
             .env_remove("GIT_CONFIG")
             .stdin(Stdio::null())
@@ -955,7 +984,7 @@ pub(crate) fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) ->
         .env("GIT_ASKPASS", "")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_SSH_COMMAND", batch_ssh_command(repo_dir))
-        .envs(http_stall(repo_dir).iter().copied())
+        .envs(http_stall(repo_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2196,8 +2225,10 @@ pub(crate) mod tests {
         assert_eq!(prompt, "0", "git can't fall back to a terminal prompt");
         assert_eq!(askpass, "", "nor to an askpass helper");
         assert!(ssh.ends_with(SSH_OPTS), "ssh can't prompt, and gives up on a stall: {ssh}");
-        if !http_stall(dir).is_empty() {
-            assert_eq!((limit, time), ("1", "300"), "nor can a stalled https transfer hang on");
+        // Whatever kommand0 sets (only what the user didn't) reaches gh's git.
+        for (var, value) in http_stall(dir) {
+            let seen = if var.ends_with("LIMIT") { limit } else { time };
+            assert_eq!(seen, value, "{var}: nor can a stalled https transfer hang on");
         }
     }
 
@@ -2338,14 +2369,19 @@ pub(crate) mod tests {
             // ssh takes the FIRST value of a repeated option, so someone who
             // asked to be prompted keeps that.
             (Some("ssh -oBatchMode=no"), None, None, None, opts("ssh -oBatchMode=no")),
-            // GIT_SSH ranks below both, and isn't shadowed by ours.
-            (None, None, Some("'/opt/wrap'"), None, opts("'/opt/wrap'")),
-            (None, Some("ssh -i /k/cfg"), Some("'/opt/wrap'"), None, opts("ssh -i /k/cfg")),
-            // No OpenSSH options for what isn't OpenSSH.
+            // GIT_SSH ranks below both, isn't shadowed by ours, and is one word.
+            (None, None, Some("/opt/my tools/ssh"), None, opts("'/opt/my tools/ssh'")),
+            (None, Some("ssh -i /k/cfg"), Some("/opt/wrap"), None, opts("ssh -i /k/cfg")),
+            // No OpenSSH options for what isn't OpenSSH, by name, quoted or not.
             (None, Some("plink -batch"), None, None, "plink -batch".into()),
-            (None, None, Some("'/opt/PLINK.exe'"), None, "'/opt/PLINK.exe'".into()),
+            (None, None, Some("/opt/My Tools/PLINK.exe"), None, "'/opt/My Tools/PLINK.exe'".into()),
+            (None, Some("\"/opt/PuTTY/plink\" -batch"), None, None, "\"/opt/PuTTY/plink\" -batch".into()),
+            (None, Some("'/opt/plink tools/ssh' -v"), None, None, opts("'/opt/plink tools/ssh' -v")),
+            // Or by variant; a value git doesn't know means ssh, as for git.
             (None, Some("ssh"), None, Some("simple"), "ssh".into()),
+            (None, Some("wrap"), None, Some("putty"), "wrap".into()),
             (None, Some("wrap"), None, Some("ssh"), opts("wrap")),
+            (None, Some("wrap"), None, Some("OpenSSH"), opts("wrap")),
             (None, Some("wrap"), None, Some("auto"), opts("wrap")),
         ];
         for (env, cfg, program, variant, want) in rows {
@@ -2384,18 +2420,19 @@ pub(crate) mod tests {
 
     #[test]
     fn the_https_stall_limit_yields_to_the_users_own() {
+        // The rule: kommand0's value for each variable the user didn't set.
+        let (limit, time) = (("GIT_HTTP_LOW_SPEED_LIMIT", "1"), ("GIT_HTTP_LOW_SPEED_TIME", "300"));
+        assert_eq!(stall_env(false, false), [limit, time]);
+        assert_eq!(stall_env(true, false), [time]);
+        assert_eq!(stall_env(false, true), [limit]);
+        assert_eq!(stall_env(true, true), []);
+        // And a URL-scoped key counts as set (the environment half is
+        // process-global, so it isn't set here).
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
-        let dir = tmp.path().to_str().unwrap();
-        // The environment half is the same test on a process-global, so only
-        // the config half runs here, and only on a machine that sets neither.
-        if http_stall(dir).is_empty() {
-            return;
-        }
-        let limit = http_stall(dir).iter().find(|(var, _)| var.ends_with("TIME"));
-        assert_eq!(limit, Some(&("GIT_HTTP_LOW_SPEED_TIME", "300")));
-        git(tmp.path(), &["config", "http.lowSpeedTime", "600"]);
-        assert!(http_stall(dir).is_empty(), "a configured limit stands");
+        git(tmp.path(), &["config", "http.https://example.com/.lowSpeedTime", "600"]);
+        let stall = http_stall(tmp.path().to_str().unwrap());
+        assert!(!stall.iter().any(|(var, _)| var.ends_with("TIME")), "{stall:?}");
     }
 
     #[test]
