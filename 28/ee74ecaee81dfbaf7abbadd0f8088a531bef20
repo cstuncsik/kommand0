@@ -1,0 +1,20 @@
+crates/core/src/git.rs
+  s_76970c2a14e89e::t_e24eccc9c5c508 292-295,2341-2342
+  s_76970c2a14e89e::t_a5d26e706b27ba 277-281,289,296-326,416-418,919-922,924,2156-2157,2161-2162,2164,2316-2319,2321,2328-2340,2343-2359
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "28ee74ecaee81dfbaf7abbadd0f8088a531bef20",
+  "prompts": {},
+  "sessions": {
+    "s_76970c2a14e89e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "27b81858-da3f-441b-b2c3-be5289a95fdf",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}

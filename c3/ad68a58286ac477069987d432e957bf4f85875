@@ -1,0 +1,22 @@
+crates/core/src/cleanup.rs
+  s_76970c2a14e89e::t_dedcb78acedbc5 266-269,275,279-281,337,344-347,350-360,533-538,729
+  s_76970c2a14e89e::t_4b1588aec8d0b0 791-803,1252-1255,1258-1261,1264,1298-1299,1311,1335,1338,1352,1369-1386
+  s_76970c2a14e89e::t_27dce6dbf68578 1262-1263
+  s_76970c2a14e89e::t_51dcc655083d6c 1387
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c3ad68a58286ac477069987d432e957bf4f85875",
+  "prompts": {},
+  "sessions": {
+    "s_76970c2a14e89e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "27b81858-da3f-441b-b2c3-be5289a95fdf",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
