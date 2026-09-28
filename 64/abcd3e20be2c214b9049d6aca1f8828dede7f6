@@ -1,0 +1,26 @@
+crates/core/src/cleanup.rs
+  s_76970c2a14e89e::t_778577c2d1708d 499-500
+  s_76970c2a14e89e::t_0c1b3a4e8875ef 149-150,1626-1627
+crates/core/src/git.rs
+  s_76970c2a14e89e::t_778577c2d1708d 1628-1629
+README.md
+  s_76970c2a14e89e::t_0c1b3a4e8875ef 163,372-377,380-384,389-390
+CHANGELOG.md
+  s_76970c2a14e89e::t_0c1b3a4e8875ef 16-31,35-39,41-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "64abcd3e20be2c214b9049d6aca1f8828dede7f6",
+  "prompts": {},
+  "sessions": {
+    "s_76970c2a14e89e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "27b81858-da3f-441b-b2c3-be5289a95fdf",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
