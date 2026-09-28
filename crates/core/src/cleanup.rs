@@ -409,43 +409,88 @@ const LOOK_AT_THE_DISK: [&str; 6] = [
     "core.untrackedCache=false",
 ];
 
-/// What removing `worktree_path` would lose, by its first path: a change
-/// `git status` lists, or a file whose edits an index flag hides. None when
-/// it's clean; Err when git can't tell.
+/// Refuses, with the refusal, when removing `worktree_path` would lose work: a
+/// change `git status` lists, or an edit to a file whose index flag hides it
+/// from status. Refuses too when git can't tell.
 ///
 /// Its own status, not the tree's `branch_status`, because git can be told not
 /// to look: `status.showUntrackedFiles=no` hides untracked files (from
 /// `worktree remove`'s own check too, which then deletes them), and a stale
-/// fsmonitor or untracked cache answers for the disk. Edits to a file flagged
-/// assume-unchanged or skip-worktree show in no status at all; a skip-worktree
-/// file that isn't on disk is just a sparse checkout.
-fn uncommitted_work(worktree_path: &str) -> Result<Option<String>, ()> {
+/// fsmonitor or untracked cache answers for the disk. A file flagged
+/// assume-unchanged or skip-worktree shows in no status at all, so each one on
+/// disk is compared with its index blob; one that isn't on disk (a sparse
+/// checkout, or a deletion git doesn't see) loses nothing. Nothing here writes
+/// the index, so a refused worktree keeps its caches.
+fn uncommitted_work(worktree_path: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
-    let git = |args: &[&str]| {
+    let unreadable = || "couldn't read the worktree's git status; not cleaning up".to_string();
+    let git = |args: &[&OsStr]| {
         let out = Command::new("git")
             .args(["-C", worktree_path])
             .args(LOOK_AT_THE_DISK)
             .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .output();
-        out.ok().filter(|o| o.status.success()).ok_or(())
+        out.ok().filter(|o| o.status.success()).ok_or_else(unreadable)
     };
-    let status = git(&["status", "--porcelain", "--ignore-submodules=none"])?;
-    if let Some(line) = String::from_utf8_lossy(&status.stdout).lines().next() {
-        return Ok(Some(line.trim().to_string()));
+    fn args(a: &[&'static str]) -> Vec<&'static OsStr> {
+        a.iter().map(|s| OsStr::new(*s)).collect()
     }
-    let files = git(&["ls-files", "-v", "-z"])?;
-    for entry in files.stdout.split(|b| *b == 0) {
-        let Some((&tag, rest)) = entry.split_first() else { continue };
-        let path = rest.strip_prefix(b" ").unwrap_or(rest);
-        let on_disk = || std::path::Path::new(worktree_path).join(std::ffi::OsStr::from_bytes(path));
+    let status = git(&args(&["status", "--porcelain", "--ignore-submodules=none"]))?;
+    if let Some(line) = String::from_utf8_lossy(&status.stdout).lines().next() {
+        return Err(format!(
+            "the worktree has uncommitted changes ({}); commit or discard them first",
+            line.trim()
+        ));
+    }
+    // Escaped: `-z` doesn't quote, and a newline would split the refusal.
+    let hidden = |path: &[u8], flag: &str| {
+        let path = String::from_utf8_lossy(path).escape_debug().to_string();
+        format!(
+            "{path} is flagged {flag}, which hides its edits from git; clear it with \
+             `git update-index --no-{flag} -- {path}`, then commit or discard them"
+        )
+    };
+    // `<tag> <mode> <oid> <stage>\t<path>`, tag lowercase when assume-unchanged.
+    let files = git(&args(&["ls-files", "-s", "-v", "-z"]))?;
+    let mut flagged = Vec::new();
+    for entry in files.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let Some(tab) = entry.iter().position(|b| *b == b'\t') else { return Err(unreadable()) };
+        let (fields, path) = (&entry[..tab], &entry[tab + 1..]);
+        let mut fields = fields.split(|b| *b == b' ');
+        let (Some(tag), Some(mode), Some(oid)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(unreadable());
+        };
         let flag = match tag {
-            t if t.is_ascii_lowercase() => "assume-unchanged",
-            b'S' if on_disk().exists() => "skip-worktree",
+            [t] if t.is_ascii_lowercase() => "assume-unchanged",
+            b"S" => "skip-worktree",
             _ => continue,
         };
-        return Ok(Some(format!("{}, {flag}", String::from_utf8_lossy(path))));
+        // lstat: a dangling symlink is on disk too.
+        match std::fs::symlink_metadata(std::path::Path::new(worktree_path).join(OsStr::from_bytes(path))) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(unreadable()),
+            // Only a regular file compares simply; a symlink or a type change is kept.
+            Ok(meta) if !meta.is_file() || !mode.starts_with(b"100") => return Err(hidden(path, flag)),
+            Ok(_) => flagged.push((path, oid, flag)),
+        }
     }
-    Ok(None)
+    // hash-object applies the filters `git add` would, so an unedited file
+    // hashes to its blob.
+    for chunk in flagged.chunks(256) {
+        let mut hash = args(&["hash-object", "--"]);
+        hash.extend(chunk.iter().map(|(path, ..)| OsStr::from_bytes(path)));
+        let out = git(&hash)?;
+        let mut hashes = out.stdout.split(|b| *b == b'\n');
+        for (path, oid, flag) in chunk {
+            if hashes.next() != Some(*oid) {
+                return Err(hidden(path, flag));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Why a local branch must not be deleted, in gate order.
@@ -647,17 +692,7 @@ pub fn cleanup_merged_workspace(
                 "the worktree is on {on}, not {branch}; switch back or delete it by hand"
             ));
         }
-        match uncommitted_work(worktree_path) {
-            Ok(None) => {}
-            Ok(Some(what)) => {
-                return Err(format!(
-                    "the worktree has uncommitted changes ({what}); commit or discard them first"
-                ));
-            }
-            Err(()) => {
-                return Err("couldn't read the worktree's git status; not cleaning up".to_string());
-            }
-        }
+        uncommitted_work(worktree_path)?;
     }
 
     // Still the tip that was checked: a commit made meanwhile (an agent in the
@@ -1064,9 +1099,95 @@ mod tests {
                 .unwrap();
             assert!(plain.stdout.is_empty(), "{flag}: the fixture hides the edit from a status");
             let err = cleanup(&repo, &wt, &branch).unwrap_err();
-            assert!(err.contains("uncommitted") && err.contains("work.txt"), "{flag}: {err}");
+            let want = match flag {
+                "fsmonitor" => "uncommitted changes (M work.txt)".to_string(),
+                _ => format!("work.txt is flagged {}", flag.trim_start_matches("--")),
+            };
+            assert!(err.contains(&want), "{flag}: {err}");
             assert_eq!(std::fs::read_to_string(wt.join("work.txt")).unwrap(), "edited", "{flag}");
         }
+    }
+
+    #[test]
+    fn a_refused_cleanup_leaves_the_worktrees_index_alone() {
+        // The gate reads status with the caches off; writing that index back
+        // would strip them from a worktree it then refuses to remove.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&wt, &["config", "core.untrackedCache", "true"]);
+        std::fs::write(wt.join("notes.txt"), "wip").unwrap();
+        git(&wt, &["status"]);
+        let out = Command::new("git")
+            .args(["-C", wt.to_str().unwrap(), "rev-parse", "--git-path", "index"])
+            .output()
+            .unwrap();
+        let index = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let index = if index.is_absolute() { index } else { wt.join(index) };
+        let cached = || std::fs::read(&index).unwrap().windows(4).any(|w| w == b"UNTR");
+        assert!(cached(), "the fixture's index has an untracked cache");
+        assert!(cleanup(&repo, &wt, &branch).is_err());
+        assert!(cached(), "the refused cleanup kept it");
+    }
+
+    #[test]
+    fn cleanup_removes_a_worktree_whose_flagged_files_are_unedited() {
+        // The flag alone isn't work: `core.ignoreStat` sets assume-unchanged on
+        // every file a worktree checks out, and an unedited flagged file hashes
+        // to its blob.
+        for flag in ["--assume-unchanged", "--skip-worktree", "core.ignoreStat"] {
+            let tmp = TempDir::new().unwrap();
+            let (repo, wt, branch) = if flag == "core.ignoreStat" {
+                let repo = tmp.path().join("repo");
+                std::fs::create_dir_all(&repo).unwrap();
+                init_repo(&repo);
+                git(&repo, &["config", "core.ignoreStat", "true"]);
+                let wt = tmp.path().join("wt");
+                git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "feat"]);
+                commit_file(&wt, "work.txt", "work");
+                squash_merge(&repo, "feat");
+                (repo, wt, "feat".to_string())
+            } else {
+                let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+                git(&wt, &["update-index", flag, "work.txt"]);
+                (repo, wt, branch)
+            };
+            let tags = Command::new("git")
+                .args(["-C", wt.to_str().unwrap(), "ls-files", "-v", "work.txt"])
+                .output()
+                .unwrap();
+            let tag = String::from_utf8_lossy(&tags.stdout);
+            assert!(tag.starts_with('h') || tag.starts_with('S'), "{flag}: flagged: {tag}");
+            assert_eq!(cleanup(&repo, &wt, &branch), Ok(()), "{flag}");
+            assert!(!wt.exists() && !branch_exists(&repo, &branch), "{flag}");
+        }
+    }
+
+    #[test]
+    fn cleanup_keeps_a_flagged_file_whatever_git_would_see_on_disk() {
+        // A skip-worktree symlink repointed at nothing is on disk (a dangling
+        // link doesn't "exist" to a stat that follows it), and a newline in a
+        // flagged name must not split the refusal into a fake note.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = repo_with_worktree_on(tmp.path(), "feat");
+        std::os::unix::fs::symlink("work.txt", wt.join("link")).unwrap();
+        std::fs::write(wt.join("a\nb.txt"), "odd").unwrap();
+        commit_file(&wt, "work.txt", "work");
+        squash_merge(&repo, "feat");
+        git(&wt, &["update-index", "--skip-worktree", "link"]);
+        std::fs::remove_file(wt.join("link")).unwrap();
+        std::os::unix::fs::symlink("missing", wt.join("link")).unwrap();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.starts_with("link is flagged skip-worktree"), "{err}");
+        git(&wt, &["update-index", "--no-skip-worktree", "link"]);
+        std::fs::remove_file(wt.join("link")).unwrap();
+        std::os::unix::fs::symlink("work.txt", wt.join("link")).unwrap();
+
+        git(&wt, &["update-index", "--assume-unchanged", "a\nb.txt"]);
+        std::fs::write(wt.join("a\nb.txt"), "edited").unwrap();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.starts_with("a\\nb.txt is flagged assume-unchanged"), "{err}");
+        assert!(!err.contains('\n'), "one line: {err}");
+        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
     }
 
     #[test]

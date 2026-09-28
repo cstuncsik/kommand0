@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -967,8 +967,9 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
 
     // The embedded claude pane is the only session view (handled above); here we
-    // show workspace/repo details for the current selection.
-    let (right_title, mut right_content) = match app.tree_items.get(app.selected_index) {
+    // show workspace/repo details for the current selection. `tail_from` is
+    // where the lines below the pane's last button start (see the render).
+    let (right_title, mut right_content, tail_from) = match app.tree_items.get(app.selected_index) {
         Some(TreeNode::Repo { id, name, .. }) => {
             let repo_path = app
                 .repos
@@ -1037,6 +1038,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     HitAction::CleanupRepoFor { repo_id: id.clone() },
                 );
             }
+            let tail_from = lines.len();
             if let Some((msg, is_error)) = app.repo_cleanup_result.get(id) {
                 // The outcome, then core's notes: warnings, even under a
                 // result that went fine.
@@ -1049,10 +1051,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     lines.push(Line::styled(note.to_string(), Style::default().fg(th.dirty)));
                 }
             }
-            (title, lines)
+            (title, lines, tail_from)
         }
         Some(TreeNode::Workspace { ws, repo_name }) => {
             let title = format!(" Workspace: {} ", ws.name);
+            let mut tail_from = usize::MAX;
             let status_span = if ws.active {
                 Span::styled("active", Style::default().fg(th.active))
             } else {
@@ -1209,6 +1212,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     );
                 }
                 if let Some(msg) = app.cleanup_result.get(&ws.id) {
+                    tail_from = lines.len();
                     let mut msg_lines = msg.lines();
                     lines.push(Line::from(vec![
                         Span::styled(
@@ -1227,7 +1231,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 }
             }
 
-            (title, lines)
+            (title, lines, tail_from)
         }
         Some(TreeNode::Hint { .. }) | None => {
             let title = " Details ".to_string();
@@ -1235,9 +1239,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 "Select a workspace to see details",
                 Style::default().fg(th.muted),
             )];
-            (title, lines)
+            let tail_from = lines.len();
+            (title, lines, tail_from)
         }
     };
+    let tail_from = tail_from.min(right_content.len());
 
     // Surface a spawn failure only in the detail pane of the workspace it
     // happened in (keyed by id, so navigating away doesn't show it elsewhere).
@@ -1255,12 +1261,19 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         ));
     }
 
-    // No wrap: the clickable button hit-regions below are positioned by logical
-    // line count, so each line must occupy exactly one row (a wrapped line would
-    // push the rendered buttons below their hit region). Value lines (Path, etc.)
-    // are already truncated to fit; a rare over-long line clips instead.
-    let paragraph = Paragraph::new(right_content).block(block.title(right_title));
-    frame.render_widget(paragraph, area);
+    // No wrap down to the last button: the clickable hit-regions are positioned
+    // by logical line count, so each of those lines must occupy exactly one row
+    // (a wrapped line would push the rendered buttons below their hit region).
+    // Value lines (Path, etc.) are already truncated to fit. What comes after
+    // the last button (a cleanup outcome or refusal, its notes, a spawn error)
+    // wraps instead of clipping the part that says what to do.
+    let tail = right_content.split_off(tail_from);
+    frame.render_widget(block.title(right_title), area);
+    let head_rows = (right_content.len() as u16).min(inner.height);
+    let [head, rest] =
+        Layout::vertical([Constraint::Length(head_rows), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(Paragraph::new(right_content), head);
+    frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), rest);
 }
 /// Icon cluster for a workspace or repo line in the tree view.
 /// Contains the spans to render and hit regions for click handling.

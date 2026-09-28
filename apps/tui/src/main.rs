@@ -10298,6 +10298,36 @@ mod key_tests {
         assert_eq!(fg_of(&mut app, 80, 24, "origin/main not refreshed"), th.dirty, "a warning");
     }
 
+    #[tokio::test]
+    async fn a_long_cleanup_refusal_wraps_below_the_buttons() {
+        // What to do sits at the end of the refusal; below the last button the
+        // pane wraps instead of clipping it, in the workspace and the repo pane.
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+        app.workspaces[0].branch_name = Some("ws-one".into());
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        let refusal = "work.txt is flagged assume-unchanged, which hides its edits from git; \
+                       clear it with `git update-index --no-assume-unchanged -- work.txt`, then \
+                       commit or discard them";
+        app.cleanup_result.insert("w1".to_string(), refusal.to_string());
+        let text = render_to_string(&mut app, 80, 24);
+        for word in ["assume-unchanged,", "--no-assume-unchanged", "discard"] {
+            assert!(text.contains(word), "{word:?} visible at 80x24:\n{text}");
+        }
+
+        app.select_repo_row("r1");
+        let failed = "Cleanup failed: couldn't find the default branch to compare against (no \
+                      origin/HEAD, origin/main, origin/master, main or master); if origin has \
+                      one, `git fetch origin` and then `git remote set-head origin -a` set \
+                      origin/HEAD";
+        app.repo_cleanup_result.insert("r1".to_string(), (failed.to_string(), true));
+        let text = render_to_string(&mut app, 80, 24);
+        assert!(text.contains("set-head"), "the remedy is visible at 80x24:\n{text}");
+        assert!(text.contains("[Clean up branches]"), "the button still renders:\n{text}");
+    }
+
     /// One worker message, bounded: a hang must fail this test, not wedge the run.
     async fn recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
         tokio::time::timeout(Duration::from_secs(10), rx.recv())
