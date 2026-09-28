@@ -4,6 +4,10 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// What kommand0 appends to the ssh command its git runs (core's `SSH_OPTS`).
+const SSH_OPTS: &str =
+    "-oConnectTimeout=20 -oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes";
+
 fn run_git(cwd: &Path, args: &[&str]) {
     let ok = Command::new("git")
         .args(args)
@@ -369,8 +373,9 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
     let path = git_shim(
         &tmp.path().join("shim"),
         &format!(
-            "printf '%s [%s][%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
-             \"${{GIT_SSH_COMMAND-UNSET}}\" \"${{GIT_ASKPASS-UNSET}}\" >> \"{}\"",
+            "printf '%s [%s][%s][%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
+             \"${{GIT_SSH_COMMAND-UNSET}}\" \"${{GIT_ASKPASS-UNSET}}\" \
+             \"${{GIT_HTTP_LOW_SPEED_TIME-UNSET}}\" >> \"{}\"",
             log.display()
         ),
     );
@@ -401,8 +406,9 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
         lines[fetch]
     );
     assert!(
-        lines[fetch].ends_with("[0][ssh -F /dev/null -oBatchMode=yes][]"),
-        "no terminal or askpass prompt, and batch mode is appended to the user's ssh command: {}",
+        lines[fetch].ends_with(&format!("[0][ssh -F /dev/null {SSH_OPTS}][][20]")),
+        "no terminal or askpass prompt, batch mode and stall timeouts appended to the user's \
+         ssh command, and a stalled https transfer gives up: {}",
         lines[fetch]
     );
     let is_ancestor = lines
@@ -450,8 +456,8 @@ fn the_fetch_keeps_the_repos_own_ssh_command() {
         .find(|l| l.contains("fetch origin +refs/heads/123-add-thing:"))
         .unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}"));
     assert!(
-        fetch.ends_with("[ssh -i /k/deploy -oBatchMode=yes]"),
-        "the repo's own ssh command survives, with batch mode appended: {fetch}"
+        fetch.ends_with(&format!("[ssh -i /k/deploy {SSH_OPTS}]")),
+        "the repo's own ssh command survives, with kommand0's options appended: {fetch}"
     );
 }
 

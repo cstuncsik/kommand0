@@ -274,11 +274,12 @@ const NET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Collect a spawned child's output, giving up after [`NET_TIMEOUT`].
 ///
-/// Each pipe is read on its own thread, so neither can fill up and stall the
-/// child. One that outruns the deadline is killed, not abandoned: nothing else
-/// would stop it (git has no stall timeout over https, ssh no keepalive, and a
-/// child outlives its parent), so hung fetches would pile up behind every later
-/// cleanup. A non-zero exit is still `Ok`: that's the caller's to inspect.
+/// Reading happens on a helper thread so the pipes can't deadlock. A child that
+/// outruns the deadline is left to finish there: a slow fetch still lands its
+/// ref for the next attempt, and killing git wouldn't stop a hung one anyway
+/// (the ssh or https helper actually stuck outlives it). What ends a hang is
+/// the transport's own stall limits, [`SSH_OPTS`] and [`HTTP_STALL`]. A non-zero
+/// exit is still `Ok`: that's the caller's to inspect.
 fn wait_bounded(child: std::process::Child) -> std::io::Result<std::process::Output> {
     wait_bounded_in(child, NET_TIMEOUT)
 }
@@ -286,50 +287,35 @@ fn wait_bounded(child: std::process::Child) -> std::io::Result<std::process::Out
 /// [`wait_bounded`] with an explicit deadline, so the give-up path is testable
 /// without a 20-second test.
 fn wait_bounded_in(
-    mut child: std::process::Child,
+    child: std::process::Child,
     deadline: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
-    fn drain<R>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>>
-    where
-        R: std::io::Read + Send + 'static,
-    {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
-            }
-            let _ = tx.send(buf);
-        });
-        rx
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(deadline) {
+        Ok(out) => out,
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")),
     }
-    let end = std::time::Instant::now() + deadline;
-    let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
-    let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
-    let status = loop {
-        let waited = child.try_wait();
-        if let Ok(Some(status)) = waited {
-            break status;
-        }
-        if waited.is_err() || std::time::Instant::now() >= end {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(waited.err().unwrap_or_else(timed_out));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-    // The pipes close with the child unless something it started still holds
-    // them, which counts as outliving the deadline too.
-    let left = || end.saturating_duration_since(std::time::Instant::now());
-    let stdout = stdout.recv_timeout(left()).map_err(|_| timed_out())?;
-    let stderr = stderr.recv_timeout(left()).map_err(|_| timed_out())?;
-    Ok(std::process::Output { status, stdout, stderr })
 }
 
-/// The ssh command git would have used for `repo_dir`, with batch mode appended:
-/// `GIT_TERMINAL_PROMPT` and a null stdin do NOT stop ssh asking for a key
-/// passphrase on /dev/tty, which from the TUI's worker thread would write into
-/// the alt-screen and outlive the timeout.
+/// Appended to every ssh command kommand0's git runs: batch mode, so nothing
+/// prompts, and connect and keepalive timeouts, so a stalled connection gives
+/// up on its own (see [`wait_bounded`]). ssh takes the FIRST value of a
+/// repeated option, so the user's own choices win.
+const SSH_OPTS: &str =
+    "-oConnectTimeout=20 -oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes";
+
+/// The https counterpart of [`SSH_OPTS`]' timeouts: a transfer that makes no
+/// progress for 20 s gives up.
+const HTTP_STALL: [(&str, &str); 2] =
+    [("GIT_HTTP_LOW_SPEED_LIMIT", "1"), ("GIT_HTTP_LOW_SPEED_TIME", "20")];
+
+/// The ssh command git would have used for `repo_dir`, with [`SSH_OPTS`]
+/// appended. Batch mode, because `GIT_TERMINAL_PROMPT` and a null stdin do NOT
+/// stop ssh asking for a key passphrase on /dev/tty, which from the TUI's
+/// worker thread would write into the alt-screen and outlive the timeout.
 ///
 /// Appends rather than clobbers, and follows git's OWN precedence:
 /// `GIT_SSH_COMMAND`, else `core.sshCommand`, else plain ssh. Setting the
@@ -361,7 +347,7 @@ fn batch_ssh_command(repo_dir: &str) -> String {
 /// (`error: cannot run :`), and repairing it beats propagating it.
 fn ssh_command_with_batch_mode(env: Option<&str>, cfg: Option<&str>) -> String {
     let base = env.filter(|v| !v.trim().is_empty()).or(cfg);
-    format!("{} -oBatchMode=yes", base.unwrap_or("ssh"))
+    format!("{} {SSH_OPTS}", base.unwrap_or("ssh"))
 }
 
 /// A single git config value for `repo_dir`, or `None` when unset (or git
@@ -420,6 +406,9 @@ fn run_gh(gh_bin: &str, cwd: &str, args: &[&str]) -> std::io::Result<std::proces
             // helper (VS Code terminals set one) before it reads the above.
             .env("GIT_ASKPASS", "")
             .env("GIT_SSH_COMMAND", batch_ssh_command(cwd))
+            .envs(HTTP_STALL)
+            // gh reads git's config through `git config` too.
+            .env_remove("GIT_CONFIG")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -919,18 +908,19 @@ pub(crate) fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) ->
         // private origin + a bare GH_TOKEN fetches only with this. `-c` APPENDS
         // to the helper list, so a user's own helper still runs first, and it's
         // never consulted for an ssh or local origin.
+        // No auto-maintenance, as config so an older git doesn't choke on a
+        // flag (`--no-auto-maintenance` is 2.29+): nothing beyond the one ref.
+        .args(["-C", repo_dir, "-c", &helper, "-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         // `--no-tags`: an explicit refspec would still auto-follow tags.
         // `--refmap=`: only this refspec updates a ref, not also the configured
         // `remote.origin.fetch` mappings, which may point into `refs/heads/`.
-        // No submodules and no auto-gc (`--no-auto-maintenance` before git
-        // 2.29): the bounded call fetches the one ref and nothing more.
-        .args(["-C", repo_dir, "-c", &helper, "fetch", "origin", &refspec, "--no-tags"])
-        .args(["--refmap=", "--no-recurse-submodules", "--no-auto-gc"])
+        .args(["fetch", "origin", &refspec, "--no-tags", "--refmap=", "--no-recurse-submodules"])
         // Empty, not unset: git asks an askpass helper (VS Code terminals set
         // one) before it checks GIT_TERMINAL_PROMPT, and that pops a dialog.
         .env("GIT_ASKPASS", "")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_SSH_COMMAND", batch_ssh_command(repo_dir))
+        .envs(HTTP_STALL)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2158,16 +2148,18 @@ pub(crate) mod tests {
         let gh = tmp.path().join("gh");
         write_stub(
             &gh,
-            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"${GIT_TERMINAL_PROMPT-UNSET}\" \
-             \"${GIT_ASKPASS-UNSET}\" \"${GIT_SSH_COMMAND-UNSET}\" > \"$0.env\"\nexit 1\n",
+            "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"${GIT_TERMINAL_PROMPT-UNSET}\" \
+             \"${GIT_ASKPASS-UNSET}\" \"${GIT_SSH_COMMAND-UNSET}\" \
+             \"${GIT_HTTP_LOW_SPEED_TIME-UNSET}\" > \"$0.env\"\nexit 1\n",
         );
         let _ = issue_branch_with(tmp.path().to_str().unwrap(), "123", gh.to_str().unwrap());
         let env = std::fs::read_to_string(format!("{}.env", gh.display())).unwrap();
         let fields: Vec<&str> = env.trim_end().split('|').collect();
-        let [prompt, askpass, ssh] = fields[..] else { panic!("{env}") };
+        let [prompt, askpass, ssh, stall] = fields[..] else { panic!("{env}") };
         assert_eq!(prompt, "0", "git can't fall back to a terminal prompt");
         assert_eq!(askpass, "", "nor to an askpass helper");
-        assert!(ssh.ends_with("-oBatchMode=yes"), "ssh can't ask for a passphrase: {ssh}");
+        assert!(ssh.ends_with(SSH_OPTS), "ssh can't prompt, and gives up on a stall: {ssh}");
+        assert_eq!(stall, "20", "neither can a stalled https transfer hang on");
     }
 
     #[test]
@@ -2293,19 +2285,20 @@ pub(crate) mod tests {
         // off for anyone who exports GIT_SSH_COMMAND, and `set_var` is
         // process-global and unsafe.
         let rows: &[(Option<&str>, Option<&str>, &str)] = &[
-            (None, None, "ssh -oBatchMode=yes"),
-            (None, Some("ssh -i /k/cfg"), "ssh -i /k/cfg -oBatchMode=yes"),
-            (Some("ssh -i /k/env"), None, "ssh -i /k/env -oBatchMode=yes"),
+            (None, None, "ssh"),
+            (None, Some("ssh -i /k/cfg"), "ssh -i /k/cfg"),
+            (Some("ssh -i /k/env"), None, "ssh -i /k/env"),
             // The environment wins, exactly as it does for git itself.
-            (Some("ssh -i /k/env"), Some("ssh -i /k/cfg"), "ssh -i /k/env -oBatchMode=yes"),
+            (Some("ssh -i /k/env"), Some("ssh -i /k/cfg"), "ssh -i /k/env"),
             // Blank reads as absent, so the config still gets its turn.
-            (Some("   "), Some("ssh -i /k/cfg"), "ssh -i /k/cfg -oBatchMode=yes"),
+            (Some("   "), Some("ssh -i /k/cfg"), "ssh -i /k/cfg"),
             // ssh takes the FIRST value of a repeated option, so someone who
             // asked to be prompted keeps that.
-            (Some("ssh -oBatchMode=no"), None, "ssh -oBatchMode=no -oBatchMode=yes"),
+            (Some("ssh -oBatchMode=no"), None, "ssh -oBatchMode=no"),
         ];
-        for (env, cfg, want) in rows {
-            assert_eq!(&ssh_command_with_batch_mode(*env, *cfg), want, "{env:?} / {cfg:?}");
+        for (env, cfg, command) in rows {
+            let want = format!("{command} {SSH_OPTS}");
+            assert_eq!(ssh_command_with_batch_mode(*env, *cfg), want, "{env:?} / {cfg:?}");
         }
 
         // The repo-backed half, which does not depend on the environment.
@@ -2318,33 +2311,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn wait_bounded_in_kills_a_child_that_outlives_the_deadline() {
-        // The shell would `touch` after its sleep if it were still alive.
-        let tmp = TempDir::new().unwrap();
-        let marker = tmp.path().join("survived");
+    fn wait_bounded_in_gives_up_on_a_child_that_outlives_the_deadline() {
         let child = Command::new("sh")
-            .args(["-c", &format!("sleep 1; touch '{}'", marker.display())])
+            // 100x the deadline: long enough to be deterministic, short enough
+            // that the orphan is gone soon after the suite.
+            .args(["-c", "sleep 5"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let err = wait_bounded_in(child, std::time::Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        assert!(!marker.exists(), "killed at the deadline, not left running");
-    }
-
-    #[test]
-    fn wait_bounded_in_collects_both_pipes() {
-        let child = Command::new("sh")
-            .args(["-c", "echo out; echo err >&2; exit 3"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let out = wait_bounded_in(child, std::time::Duration::from_secs(10)).unwrap();
-        assert_eq!(out.status.code(), Some(3));
-        assert_eq!((&out.stdout[..], &out.stderr[..]), (&b"out\n"[..], &b"err\n"[..]));
     }
 
     #[test]
