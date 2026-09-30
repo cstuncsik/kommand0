@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -882,7 +882,10 @@ fn push_button(
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     };
     lines.push(Line::styled(format!("[{label}]"), style));
-    hit_regions.push(buttons::HitRegion { area: rect, action });
+    // Not clickable where it isn't drawn (a pane too short to show it).
+    if rect.y < inner.bottom() {
+        hit_regions.push(buttons::HitRegion { area: rect, action });
+    }
 }
 
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -967,8 +970,9 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
 
     // The embedded claude pane is the only session view (handled above); here we
-    // show workspace/repo details for the current selection.
-    let (right_title, mut right_content) = match app.tree_items.get(app.selected_index) {
+    // show workspace/repo details for the current selection. `tail_from` is
+    // where the lines below the pane's last button start (see the render).
+    let (right_title, mut right_content, tail_from) = match app.tree_items.get(app.selected_index) {
         Some(TreeNode::Repo { id, name, .. }) => {
             let repo_path = app
                 .repos
@@ -1037,14 +1041,24 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     HitAction::CleanupRepoFor { repo_id: id.clone() },
                 );
             }
+            let tail_from = lines.len();
             if let Some((msg, is_error)) = app.repo_cleanup_result.get(id) {
+                // The outcome, then core's notes: warnings, even under a
+                // result that went fine.
+                let mut msg_lines = msg.lines();
                 let color = if *is_error { th.error } else { th.text };
-                lines.push(Line::styled(msg.clone(), Style::default().fg(color)));
+                if let Some(outcome) = msg_lines.next() {
+                    lines.push(Line::styled(outcome.to_string(), Style::default().fg(color)));
+                }
+                for note in msg_lines {
+                    lines.push(Line::styled(note.to_string(), Style::default().fg(th.dirty)));
+                }
             }
-            (title, lines)
+            (title, lines, tail_from)
         }
         Some(TreeNode::Workspace { ws, repo_name }) => {
             let title = format!(" Workspace: {} ", ws.name);
+            let mut tail_from = usize::MAX;
             let status_span = if ws.active {
                 Span::styled("active", Style::default().fg(th.active))
             } else {
@@ -1201,17 +1215,26 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     );
                 }
                 if let Some(msg) = app.cleanup_result.get(&ws.id) {
+                    tail_from = lines.len();
+                    let mut msg_lines = msg.lines();
                     lines.push(Line::from(vec![
                         Span::styled(
                             "Cleanup blocked: ",
                             Style::default().fg(th.error).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(msg.clone(), Style::default().fg(th.error)),
+                        Span::styled(
+                            msg_lines.next().unwrap_or_default().to_string(),
+                            Style::default().fg(th.error),
+                        ),
                     ]));
+                    // Core's notes: warnings, as in the repo pane.
+                    for note in msg_lines {
+                        lines.push(Line::styled(note.to_string(), Style::default().fg(th.dirty)));
+                    }
                 }
             }
 
-            (title, lines)
+            (title, lines, tail_from)
         }
         Some(TreeNode::Hint { .. }) | None => {
             let title = " Details ".to_string();
@@ -1219,9 +1242,11 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 "Select a workspace to see details",
                 Style::default().fg(th.muted),
             )];
-            (title, lines)
+            let tail_from = lines.len();
+            (title, lines, tail_from)
         }
     };
+    let tail_from = tail_from.min(right_content.len());
 
     // Surface a spawn failure only in the detail pane of the workspace it
     // happened in (keyed by id, so navigating away doesn't show it elsewhere).
@@ -1232,19 +1257,25 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     if let (Some(sel), Some((err_ws, msg))) = (selected_ws_id, &app.embed_error)
         && sel == err_ws.as_str()
     {
-        right_content.push(Line::raw(""));
-        right_content.push(Line::styled(
-            msg.clone(),
-            Style::default().fg(th.error).add_modifier(Modifier::BOLD),
-        ));
+        // First below the buttons: a wrapped cleanup refusal after it could
+        // push it off the pane, and this is the only place it shows.
+        let style = Style::default().fg(th.error).add_modifier(Modifier::BOLD);
+        right_content.splice(tail_from..tail_from, [Line::raw(""), Line::styled(msg.clone(), style)]);
     }
 
-    // No wrap: the clickable button hit-regions below are positioned by logical
-    // line count, so each line must occupy exactly one row (a wrapped line would
-    // push the rendered buttons below their hit region). Value lines (Path, etc.)
-    // are already truncated to fit; a rare over-long line clips instead.
-    let paragraph = Paragraph::new(right_content).block(block.title(right_title));
-    frame.render_widget(paragraph, area);
+    // No wrap down to the last button: the clickable hit-regions are positioned
+    // by logical line count, so each of those lines must occupy exactly one row
+    // (a wrapped line would push the rendered buttons below their hit region).
+    // Value lines (Path, etc.) are already truncated to fit. What comes after
+    // the last button (a cleanup outcome or refusal, its notes, a spawn error)
+    // wraps instead of clipping the part that says what to do.
+    let tail = right_content.split_off(tail_from);
+    frame.render_widget(block.title(right_title), area);
+    let head_rows = (right_content.len() as u16).min(inner.height);
+    let [head, rest] =
+        Layout::vertical([Constraint::Length(head_rows), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(Paragraph::new(right_content), head);
+    frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), rest);
 }
 /// Icon cluster for a workspace or repo line in the tree view.
 /// Contains the spans to render and hit regions for click handling.

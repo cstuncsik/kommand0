@@ -6,11 +6,8 @@
 //! returns `None` (rather than erroring) when the directory isn't a git repo,
 //! so the caller can run it across every workspace without special-casing.
 //!
-//! [`cleanup_merged_workspace`] removes a merged workspace's worktree and branch
-//! via the `gh` CLI. It runs synchronously and is meant to be called off the UI
-//! thread (it makes a network call). [`scan_merged_branches`] and
-//! [`delete_branches`] are its repo-wide counterpart: a verdict per local branch
-//! (one gh call each), then a local delete that re-checks every gate.
+//! The cleanup of merged branches lives in [`crate::cleanup`], on top of the
+//! default-branch resolution and the bounded fetch here.
 //!
 //! [`pr_statuses`] batches each workspace's PR/CI state out of `gh pr list`, and
 //! [`issue_branch`] resolves a GitHub issue reference to the branch GitHub links
@@ -19,6 +16,8 @@
 //!
 //! Every `gh` invocation goes through [`run_gh`], which pins the environment
 //! non-interactive and bounds the call; nothing here shells out to `gh` directly.
+//! The one network git call, [`fetch_origin_branch`], sets the same rules up
+//! for git: follow it for any other.
 
 use std::process::{Command, Stdio};
 
@@ -80,15 +79,16 @@ pub fn branch_status(working_dir: &str) -> Option<BranchStatus> {
     Some(s)
 }
 
-/// Resolve the ref to diff a branch against: the repository's default branch.
+/// Resolve the ref to diff a branch against, and the cleanups' merge target:
+/// the repository's default branch.
 /// Prefer the remote's advertised default (`origin/HEAD`), then the common
 /// remote/local names, returning the first ref that actually exists. `None`
 /// when none resolve (e.g. not a git repo).
 ///
-/// Counterpart of [`is_default_branch`], which is the cleanup gate's check:
-/// this wants precision (the one true diff base), that wants recall (over-block
-/// anything plausibly the default). Don't unify them.
-fn default_branch_ref(working_dir: &str) -> Option<String> {
+/// Counterpart of the cleanup gate's `is_default_branch` (in [`crate::cleanup`]):
+/// this wants precision (the one true diff and merge base), that wants recall
+/// (over-block anything plausibly the default). Don't unify them.
+pub(crate) fn default_branch_ref(working_dir: &str) -> Option<String> {
     // Fully-qualified refs (`refs/remotes/…`, `refs/heads/…`) so a tag or local
     // branch named e.g. `origin/main` can't shadow the intended ref — gitrevisions
     // ranks `refs/tags/*` above `refs/remotes/*` for a bare name. `^{commit}`
@@ -253,13 +253,13 @@ fn file_diff_path(section: &str) -> String {
 
 /// The `gh` binary to invoke (overridable via `KOMMAND0_GH_BIN`, mirroring the
 /// `KOMMAND0_CLAUDE_BIN` override used for the embedded pane).
-fn gh_bin() -> String {
+pub(crate) fn gh_bin() -> String {
     std::env::var("KOMMAND0_GH_BIN").unwrap_or_else(|_| "gh".to_string())
 }
 
 /// Last non-empty, trimmed line of some command output (gh prints the PR URL as
 /// the last stdout line; this also yields a one-line error from stderr).
-fn last_line(bytes: &[u8]) -> String {
+pub(crate) fn last_line(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .lines()
         .rev()
@@ -276,10 +276,14 @@ const NET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Collect a spawned child's output, giving up after [`NET_TIMEOUT`].
 ///
-/// Reading happens on a helper thread so the pipes can't deadlock; if it outruns
-/// the deadline we abandon the child (it has its own network timeouts, and the OS
-/// reaps it on exit) rather than block indefinitely. A non-zero exit is still
-/// `Ok`: that's the caller's to inspect.
+/// Reading happens on a helper thread so the pipes can't deadlock. A child that
+/// outruns the deadline is left to finish there, never killed: a slow fetch
+/// still lands its ref for the next attempt, and killing git wouldn't stop a
+/// hung one anyway (the ssh or https helper actually stuck outlives it). A
+/// network stall on ssh or https ends in the transport ([`SSH_OPTS`],
+/// [`http_stall`]); a stuck server on a live connection, a hung gh API call or
+/// a credential helper waiting on a prompt is only abandoned. A non-zero exit
+/// is still `Ok`: that's the caller's to inspect.
 fn wait_bounded(child: std::process::Child) -> std::io::Result<std::process::Output> {
     wait_bounded_in(child, NET_TIMEOUT)
 }
@@ -300,14 +304,55 @@ fn wait_bounded_in(
     }
 }
 
-/// The ssh command git would have used for `repo_dir`, with batch mode appended:
-/// `GIT_TERMINAL_PROMPT` and a null stdin do NOT stop ssh asking for a key
-/// passphrase on /dev/tty, which from the TUI's worker thread would write into
-/// the alt-screen and outlive the timeout.
+/// Appended to the ssh command kommand0's git runs: batch mode, so nothing
+/// prompts, and keepalives, so a connection that stops answering gives up on
+/// its own (see [`wait_bounded`]). No connect timeout: a slow ProxyCommand or
+/// bastion must still get through. ssh takes an option's FIRST value, so the
+/// same option earlier in the user's own ssh command wins, while one in
+/// `~/.ssh/config` loses to these (the command line comes first): a different
+/// keepalive belongs in `core.sshCommand`.
+const SSH_OPTS: &str = "-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes";
+
+/// The https counterpart of [`SSH_OPTS`]' keepalives, for git's environment: a
+/// transfer that makes no progress for 5 minutes gives up. Generous, because a
+/// server preparing a big pack only sends a keepalive now and then. Each
+/// variable only when the user set neither it nor its `http.lowSpeed*` key
+/// (for any URL), which the variable would override; git needs both for a
+/// limit, so one they set still gets the other.
+fn http_stall(repo_dir: &str) -> Vec<(&'static str, &'static str)> {
+    let configured = Command::new("git")
+        .args(["-C", repo_dir, "config", "--get-regexp", r"^http\..*lowspeed(limit|time)$"])
+        .env_remove("GIT_CONFIG")
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase())
+        .unwrap_or_default();
+    let set = |var: &str, key: &str| {
+        std::env::var_os(var).is_some()
+            || configured.lines().any(|l| l.split(' ').next().is_some_and(|k| k.ends_with(key)))
+    };
+    let limit = set("GIT_HTTP_LOW_SPEED_LIMIT", "lowspeedlimit");
+    stall_env(limit, set("GIT_HTTP_LOW_SPEED_TIME", "lowspeedtime"))
+}
+
+/// [`http_stall`]'s rule, pure: kommand0's value for each variable the user
+/// didn't set.
+fn stall_env(limit_set: bool, time_set: bool) -> Vec<(&'static str, &'static str)> {
+    [(limit_set, ("GIT_HTTP_LOW_SPEED_LIMIT", "1")), (time_set, ("GIT_HTTP_LOW_SPEED_TIME", "300"))]
+        .into_iter()
+        .filter_map(|(set, var)| (!set).then_some(var))
+        .collect()
+}
+
+/// The ssh command git would have used for `repo_dir`, with [`SSH_OPTS`]
+/// appended. Batch mode, because `GIT_TERMINAL_PROMPT` and a null stdin do NOT
+/// stop ssh asking for a key passphrase on /dev/tty, which from the TUI's
+/// worker thread would write into the alt-screen and outlive the timeout.
 ///
 /// Appends rather than clobbers, and follows git's OWN precedence:
-/// `GIT_SSH_COMMAND`, else `core.sshCommand`, else plain ssh. Setting the
-/// environment variable overrides `core.sshCommand` (see git-config(1)), so
+/// `GIT_SSH_COMMAND`, else `core.sshCommand`, else `GIT_SSH`, else plain ssh.
+/// Setting the environment variable overrides `core.sshCommand` (see
+/// git-config(1)), and shadows `GIT_SSH`, so
 /// reading only the environment would silently swap out a repo-scoped identity
 /// (`core.sshCommand = ssh -i ~/.ssh/id_work`, the usual multi-account setup)
 /// for the default key — and on the issue path that failure lands AFTER
@@ -326,23 +371,76 @@ fn batch_ssh_command(repo_dir: &str) -> String {
         .is_none()
         .then(|| git_config_value(repo_dir, "core.sshCommand"))
         .flatten();
-    ssh_command_with_batch_mode(env.as_deref(), cfg.as_deref())
+    let program = std::env::var("GIT_SSH").ok().filter(|p| !p.is_empty());
+    // git reads the variant from the environment first (even empty: that's
+    // ssh), as for the command.
+    let variant = std::env::var("GIT_SSH_VARIANT").ok();
+    let variant = variant.or_else(|| git_config_value(repo_dir, "ssh.variant"));
+    let (env, cfg) = (env.as_deref(), cfg.as_deref());
+    ssh_command_with_batch_mode(env, cfg, program.as_deref(), variant.as_deref())
 }
 
 /// The precedence rule itself, pure so it can be tabled: a non-blank
-/// `GIT_SSH_COMMAND` wins, else `core.sshCommand`, else plain ssh. An empty
-/// environment variable is treated as absent — git would die on it
-/// (`error: cannot run :`), and repairing it beats propagating it.
-fn ssh_command_with_batch_mode(env: Option<&str>, cfg: Option<&str>) -> String {
-    let base = env.filter(|v| !v.trim().is_empty()).or(cfg);
-    format!("{} -oBatchMode=yes", base.unwrap_or("ssh"))
+/// `GIT_SSH_COMMAND` wins, else `core.sshCommand`, else `GIT_SSH` (a program,
+/// so quoted as one word), else plain ssh. An empty environment variable is
+/// treated as absent: git would die on it (`error: cannot run :`), and
+/// repairing it beats propagating it. [`SSH_OPTS`] are OpenSSH's, so a plink,
+/// putty, tortoiseplink or `simple` variant gets the command as is. The variant
+/// is decided as git decides it: `variant` (any other value means ssh), else
+/// the program's name.
+fn ssh_command_with_batch_mode(
+    env: Option<&str>,
+    cfg: Option<&str>,
+    program: Option<&str>,
+    variant: Option<&str>,
+) -> String {
+    let line = env.filter(|v| !v.trim().is_empty()).or(cfg);
+    let (base, program) = match (line, program) {
+        (Some(line), _) => (line.to_string(), first_word(line)),
+        (None, Some(program)) => (shell_quote(program), program.to_string()),
+        (None, None) => ("ssh".to_string(), "ssh".to_string()),
+    };
+    let name = program.rsplit('/').next().unwrap_or_default().to_ascii_lowercase();
+    let openssh = match variant {
+        Some(v) if v != "auto" => !matches!(v, "plink" | "putty" | "tortoiseplink" | "simple"),
+        _ => !matches!(name.trim_end_matches(".exe"), "plink" | "tortoiseplink"),
+    };
+    if openssh { format!("{base} {SSH_OPTS}") } else { base }
+}
+
+/// The program a shell command line runs: its first word as sh splits it,
+/// quoted and escaped parts joined (`"/opt/My Tools"/plink`, `My\ Tools/plink`).
+fn first_word(line: &str) -> String {
+    let mut word = String::new();
+    let mut chars = line.trim_start().chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => word.extend(chars.by_ref().take_while(|&c| c != '\'')),
+            '"' => {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => word.extend(chars.next()),
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => word.extend(chars.next()),
+            c if c.is_whitespace() => break,
+            c => word.push(c),
+        }
+    }
+    word
 }
 
 /// A single git config value for `repo_dir`, or `None` when unset (or git
-/// couldn't be run). Panic-free: this is called off the UI thread.
-fn git_config_value(repo_dir: &str, key: &str) -> Option<String> {
+/// couldn't be run). Panic-free: this is called off the UI thread. Read as the
+/// rest of git reads it: an inherited `GIT_CONFIG` redirects `git config`
+/// alone, to one file.
+pub(crate) fn git_config_value(repo_dir: &str, key: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", repo_dir, "config", "--get", key])
+        .env_remove("GIT_CONFIG")
         .stderr(Stdio::null())
         .output()
         .ok()?;
@@ -387,7 +485,13 @@ fn run_gh(gh_bin: &str, cwd: &str, args: &[&str]) -> std::io::Result<std::proces
             // agent blocks on a /dev/tty prompt, pinning a TUI worker thread
             // past the timeout.
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Empty, not unset, as in `fetch_origin_branch`: git asks an askpass
+            // helper (VS Code terminals set one) before it reads the above.
+            .env("GIT_ASKPASS", "")
             .env("GIT_SSH_COMMAND", batch_ssh_command(cwd))
+            .envs(http_stall(cwd))
+            // gh reads git's config through `git config` too.
+            .env_remove("GIT_CONFIG")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -569,455 +673,6 @@ fn pr_supersedes(a: &PrStatus, b: &PrStatus) -> bool {
     (open_rank(a.state), a.number) > (open_rank(b.state), b.number)
 }
 
-/// Remove a merged workspace's worktree and delete its branch — but only when it
-/// is provably safe. Returns a message (deleting nothing) unless ALL hold:
-/// - the branch is not the repo's default branch (see [`is_default_branch`]),
-///   not a malformed name (empty, `..`, leading `-`), and not one of the
-///   `protected` names (the config's `protected_branches`). Any *other* branch,
-///   including one kommand0 didn't create, is fair game once the checks below
-///   hold: adopting and cleaning up your own branches is deliberate behavior;
-/// - its PR is `MERGED` (per `gh`);
-/// - the worktree, if it still exists, is live and its HEAD is still on
-///   `branch` (a `git switch` inside it made the dir another branch's checkout);
-/// - the worktree is clean (no uncommitted/untracked changes; an unreadable
-///   status aborts rather than assuming clean); and
-/// - the branch tip equals the last commit the PR merged (so there are no
-///   commits beyond the PR — squash-safe, and catches pushed or unpushed extras).
-///
-/// The worktree is removed WITHOUT `--force` (a last-moment dirty state still
-/// fails safe), and only then is the branch deleted — locally only; the remote
-/// branch is never touched.
-///
-/// A removal that *fails* has two shapes, told apart by [`is_live_worktree`]:
-/// git refused and touched nothing (its own reason is reported, nothing is
-/// deleted), or it died mid-delete after dropping the admin entry, leaving an
-/// unusable half-deleted tree that this finishes deleting. Either way the branch
-/// survives an `Err`, so a retry re-runs every gate: `Ok`/`Err` is the caller's
-/// deregister signal, so a path that deletes the branch must return `Ok`.
-pub fn cleanup_merged_workspace(
-    repo_path: &str,
-    worktree_path: &str,
-    branch: &str,
-    protected: &[String],
-) -> Result<(), String> {
-    cleanup_merged_workspace_with(repo_path, worktree_path, branch, protected, &gh_bin())
-}
-
-/// Whether `branch` is (or plausibly is) the repo's default branch — the
-/// cleanup gate's trunk protection. Best-effort: a failed probe just doesn't
-/// match, so an offline/remote-less repo never blocks on this. Two checks:
-/// - the literals `main`/`master`, unconditionally — even when the actual
-///   default is something else, since e.g. a gitflow back-merge PR with
-///   `headRefName == main` would pass the merged-PR check. Accepted flip side:
-///   a branch literally named `master` in a `main`-default repo is refused
-///   (delete it by hand).
-/// - whatever `origin/HEAD` points at, when resolvable — covers `trunk`/
-///   `develop`-style defaults. Residual: a default named neither main/master
-///   in a repo without `origin/HEAD` is unprotected here; the merged-PR +
-///   tip-equality checks still apply, the delete is local-only, and the branch
-///   is restorable from the remote.
-///
-/// Counterpart of [`default_branch_ref`] (the diff base): that wants precision,
-/// this wants recall. Don't unify them.
-fn is_default_branch(repo_path: &str, branch: &str) -> bool {
-    if branch == "main" || branch == "master" {
-        return true;
-    }
-    // ponytail: one `symbolic-ref` spawn per gated branch; resolve origin/HEAD
-    // once per scan if a huge repo makes the local gates measurable.
-    match Command::new("git")
-        .args(["-C", repo_path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let name = last_line(&o.stdout);
-            name.strip_prefix("origin/").unwrap_or(&name) == branch
-        }
-        _ => false,
-    }
-}
-
-/// Whether `worktree_path` is still a worktree git knows about.
-///
-/// The discriminator for a failed `git worktree remove`: git deletes the
-/// `.git/worktrees/<id>` admin entry BEFORE unlinking the files, so a directory
-/// whose `rev-parse` no longer resolves is the wreckage of a half-done removal.
-/// Fails safe in every adjacent shape: a nested independent repo and a plain
-/// subdirectory of a repo both resolve (so both count as live, never wreckage),
-/// and git failing to run at all counts as live too.
-fn is_live_worktree(worktree_path: &str) -> bool {
-    match Command::new("git")
-        .args(["-C", worktree_path, "rev-parse", "--git-dir"])
-        .output()
-    {
-        Ok(o) => o.status.success(),
-        Err(_) => true,
-    }
-}
-
-/// The newest PR whose head is a branch, as `gh` reports it.
-struct PrLookup {
-    state: String,
-    /// The oid of the PR's last commit (empty when it has none).
-    tip: String,
-    /// Absent when gh printed the older two-line shape.
-    number: Option<u64>,
-}
-
-/// `Ok(None)` = no PR has that head. `Err` = gh itself failed: not installed or
-/// timed out, or a non-zero exit (not authenticated, not a GitHub repo). Looks
-/// up by `--head <branch>` (a bare positional would be parsed as a PR NUMBER for
-/// an all-digit branch name); several PRs can share a head over time, so the
-/// newest by number wins, mirroring the pr-status view.
-fn lookup_pr(gh_bin: &str, repo_path: &str, branch: &str) -> Result<Option<PrLookup>, String> {
-    let out = match run_gh(
-        gh_bin,
-        repo_path,
-        &[
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--json",
-            "number,state,commits",
-            "-q",
-            "(sort_by(.number) | last) // {} | (.state // \"NONE\"), (.commits[-1].oid // \"\"), (.number // \"\")",
-        ],
-    ) {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => return Err(format!("gh pr list failed ({})", last_line(&o.stderr))),
-        Err(_) => return Err("gh CLI not found — install GitHub CLI to clean up".to_string()),
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = text.lines();
-    let state = lines.next().unwrap_or("").trim().to_string();
-    if state == "NONE" {
-        return Ok(None);
-    }
-    let tip = lines.next().unwrap_or("").trim().to_string();
-    let number = lines.next().and_then(|l| l.trim().parse().ok());
-    Ok(Some(PrLookup { state, tip, number }))
-}
-
-/// Why a local branch must not be deleted, in gate order.
-enum BranchRefusal {
-    Malformed,
-    Default,
-    Protected,
-}
-
-impl BranchRefusal {
-    /// The scan's skip reason.
-    fn short(&self) -> &'static str {
-        match self {
-            Self::Malformed => "malformed branch name",
-            Self::Default => "default branch",
-            Self::Protected => "protected branch",
-        }
-    }
-
-    /// The cleanup's refusal message.
-    fn message(&self, branch: &str) -> String {
-        match self {
-            Self::Malformed => "refusing to delete a malformed branch name".to_string(),
-            Self::Default => format!("refusing to delete the default branch ({branch})"),
-            Self::Protected => format!(
-                "refusing to delete a protected branch ({branch}); remove it from protected_branches to clean up"
-            ),
-        }
-    }
-}
-
-/// The gate every local branch delete runs first, so protection lives in one
-/// place. Order: malformed, default, protected (a protected name that is also
-/// the default reports the stronger reason).
-fn refuse_branch_delete(
-    repo_path: &str,
-    branch: &str,
-    protected: &[String],
-) -> Result<(), BranchRefusal> {
-    // Malformed names: `..` is refused because `rev-parse refs/heads/a..b`
-    // REINTERPRETS it as a range (the tip check would fail-closed only by output
-    // shape, not by rejection); a leading `-` can't come from a validated
-    // workspace name but an adopted ref could carry one. `is_valid_branch_name`
-    // rejects the rest of the shapes git can reinterpret too; every one of them
-    // is already illegal as a branch, so nothing git would accept is lost here.
-    if !is_valid_branch_name(branch) {
-        return Err(BranchRefusal::Malformed);
-    }
-    // Trunk protection: the one branch cleanup must never delete, however the
-    // workspace came to sit on it.
-    if is_default_branch(repo_path, branch) {
-        return Err(BranchRefusal::Default);
-    }
-    if protected.iter().any(|p| p == branch) {
-        return Err(BranchRefusal::Protected);
-    }
-    Ok(())
-}
-
-/// `git branch -D -- <branch>`: force, because a squash-merge leaves the branch
-/// "unmerged" locally (the callers' tip checks proved nothing lies beyond the
-/// merge). `--` makes the gate's leading-dash refusal belt-and-braces, not
-/// load-bearing. Err is git's last stderr line or the io error.
-fn delete_local_branch(repo_path: &str, branch: &str) -> Result<(), String> {
-    match Command::new("git")
-        .args(["-C", repo_path, "branch", "-D", "--", branch])
-        .output()
-    {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(last_line(&o.stderr)),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// The oid `refs/heads/<branch>` points at, or None when it doesn't resolve.
-fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
-    match Command::new("git")
-        .args(["-C", repo_path, "rev-parse", &format!("refs/heads/{branch}")])
-        .output()
-    {
-        Ok(o) if o.status.success() => Some(last_line(&o.stdout)),
-        _ => None,
-    }
-}
-
-fn cleanup_merged_workspace_with(
-    repo_path: &str,
-    worktree_path: &str,
-    branch: &str,
-    protected: &[String],
-    gh_bin: &str,
-) -> Result<(), String> {
-    refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
-
-    // The PR must be merged; capture the oid of the last commit it merged. Run
-    // gh from the repo (not the worktree) so a partial-cleanup retry (worktree
-    // already gone) still works instead of failing with a bogus "gh not found".
-    let Some(PrLookup { state, tip: pr_tip, .. }) = lookup_pr(gh_bin, repo_path, branch)? else {
-        return Err("no PR found for this branch — not cleaning up".to_string());
-    };
-    if state != "MERGED" {
-        return Err(format!(
-            "the PR for this branch isn't merged (state: {state}) — not cleaning up"
-        ));
-    }
-
-    // The worktree must be clean — but only check if it still exists (a retry
-    // after a partial cleanup has no worktree left to be dirty). An unreadable
-    // status on an existing worktree aborts (never assume safe).
-    let worktree_exists = std::path::Path::new(worktree_path).exists();
-    if worktree_exists {
-        // A dir git no longer recognizes is wreckage from an earlier removal
-        // that died mid-delete: there is no status to read, and nothing here can
-        // prove what survived, so say so rather than dead-end on an unreadable
-        // status (the old message) or delete a path we can't vouch for.
-        if !is_live_worktree(worktree_path) {
-            return Err(format!(
-                "a failed removal left files behind: delete {worktree_path}, then clean up again"
-            ));
-        }
-        // HEAD must still be on `branch`: after a `git switch` inside the
-        // worktree the dir is another branch's checkout, and removing it would
-        // take that checkout (ignored files included) with it. Full ref, not
-        // `--short`: with a same-named tag `--short` prints `heads/<b>`.
-        let head = match Command::new("git")
-            .args(["-C", worktree_path, "symbolic-ref", "HEAD"])
-            .output()
-        {
-            Ok(o) if o.status.success() => last_line(&o.stdout),
-            _ => String::new(), // detached (exit 128), or git itself failed
-        };
-        if head != format!("refs/heads/{branch}") {
-            let on = match head.strip_prefix("refs/heads/") {
-                Some(b) => b,
-                None if head.is_empty() => "a detached HEAD",
-                None => head.as_str(),
-            };
-            return Err(format!(
-                "the worktree is on {on}, not {branch}; switch back or delete it by hand"
-            ));
-        }
-        let st = branch_status(worktree_path)
-            .ok_or_else(|| "couldn't read the worktree's git status — not cleaning up".to_string())?;
-        if st.dirty {
-            return Err(
-                "the worktree has uncommitted changes — commit or discard them first".to_string(),
-            );
-        }
-    }
-
-    // The branch tip must be exactly what the PR merged: no commits beyond it
-    // (pushed OR unpushed). This is the guard that makes the force-delete safe.
-    let Some(local_tip) = branch_tip(repo_path, branch) else {
-        return Err("couldn't resolve the branch tip — not cleaning up".to_string());
-    };
-    if pr_tip.is_empty() || local_tip != pr_tip {
-        return Err("the branch has commits beyond its merged PR — not cleaning up".to_string());
-    }
-
-    // Remove the worktree (no --force, so a last-moment dirty state still fails
-    // safe). If the dir survives, which of the two failure shapes it is comes
-    // from re-probing, never from matching git's stderr text.
-    if worktree_exists {
-        let out = Command::new("git")
-            .args(["-C", repo_path, "worktree", "remove", worktree_path])
-            .output();
-        if std::path::Path::new(worktree_path).exists() {
-            if is_live_worktree(worktree_path) {
-                // Git refused before touching a byte. Report ITS reason: it
-                // checks things this gate doesn't (a dirty submodule, since its
-                // status runs with --ignore-submodules=none).
-                let mut reason = match &out {
-                    Ok(o) => last_line(&o.stderr),
-                    Err(e) => e.to_string(),
-                };
-                if reason.is_empty() {
-                    reason = "it may have changes".to_string();
-                }
-                return Err(format!("couldn't remove the worktree ({reason})"));
-            }
-            // Live at the gate, not live now: git dropped the admin entry and
-            // unlinked an arbitrary subset of the files, so the tree is unusable
-            // and its tracked content was just proven identical to the merged PR
-            // tip. Finish the delete git started; leaving it is what made this
-            // state unrecoverable.
-            if let Err(e) = std::fs::remove_dir_all(worktree_path) {
-                return Err(format!(
-                    "a failed removal left files behind: delete {worktree_path}, then clean up again ({e})"
-                ));
-            }
-        }
-    }
-    // Clean up any stale worktree admin entry (whether we removed it or it was
-    // already gone) so the branch is deletable.
-    let _ = Command::new("git")
-        .args(["-C", repo_path, "worktree", "prune"])
-        .output();
-
-    // The PR-tip check above proved there's nothing beyond the merge.
-    delete_local_branch(repo_path, branch).map_err(|e| {
-        if worktree_exists {
-            format!("worktree removed, but couldn't delete branch {branch}: {e}")
-        } else {
-            format!("couldn't delete branch {branch}: {e}")
-        }
-    })
-}
-
-/// What the repo-wide scan decided for one local branch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
-    /// Merged PR, tip equals the PR's last commit, checked out nowhere.
-    Delete,
-    /// Same, but checked out at `worktree` (git refuses `branch -D` there).
-    CheckedOut { worktree: String },
-    /// Not deletable, and why (short, user-facing).
-    Skip(String),
-}
-
-/// One local branch as [`scan_merged_branches`] saw it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchVerdict {
-    /// The short name (`refs/heads/` stripped).
-    pub branch: String,
-    /// The tip at scan time; [`delete_branches`] refuses a branch that moved.
-    pub tip: String,
-    /// The PR number, whenever a PR was found.
-    pub pr: Option<u64>,
-    /// What the scan decided for it.
-    pub verdict: Verdict,
-}
-
-/// Classify every local branch of `repo_path` for deletion: the name gates of
-/// [`cleanup_merged_workspace`] first (default/malformed/protected names never
-/// reach gh), then one PR lookup per remaining branch. Deletes and prunes
-/// nothing. The first gh failure aborts the whole scan, so a missing or wedged
-/// gh can't read as "no PR" for every branch.
-pub fn scan_merged_branches(
-    repo_path: &str,
-    protected: &[String],
-) -> Result<Vec<BranchVerdict>, String> {
-    scan_merged_branches_with(repo_path, protected, &gh_bin())
-}
-
-fn scan_merged_branches_with(
-    repo_path: &str,
-    protected: &[String],
-    gh_bin: &str,
-) -> Result<Vec<BranchVerdict>, String> {
-    // NUL-separated, NUL-terminated records: a newline in a foreign worktree
-    // path can't truncate one. `%(refname)` + strip, not `refname:short`, so a
-    // same-named tag can't shadow the branch.
-    let out = Command::new("git")
-        .args([
-            "-C",
-            repo_path,
-            "for-each-ref",
-            "--format=%(refname)%00%(objectname)%00%(worktreepath)%00",
-            "refs/heads",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(last_line(&out.stderr));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let fields: Vec<&str> = text.split('\0').collect();
-    let mut verdicts = Vec::new();
-    // for-each-ref ends each record with '\n', which lands in front of the next
-    // refname; the newline-only remainder after the last NUL is dropped.
-    let (records, _) = fields.as_chunks::<3>();
-    for &[refname, tip, worktree] in records {
-        let Some(branch) = refname.trim_start_matches('\n').strip_prefix("refs/heads/") else {
-            continue;
-        };
-        let tip = tip.to_string();
-        let (pr, verdict) = match refuse_branch_delete(repo_path, branch, protected) {
-            Err(r) => (None, Verdict::Skip(r.short().to_string())),
-            // ponytail: one gh round-trip per branch; batch them through `gh api graphql`
-            // if a repo with hundreds of branches makes the scan too slow.
-            Ok(()) => match lookup_pr(gh_bin, repo_path, branch).map_err(|e| format!("{branch}: {e}"))? {
-                None => (None, Verdict::Skip("no PR".to_string())),
-                Some(pr) => {
-                    let verdict = if pr.state != "MERGED" {
-                        Verdict::Skip(format!("PR not merged ({})", pr.state))
-                    } else if pr.tip.is_empty() || pr.tip != tip {
-                        Verdict::Skip("commits beyond the merged PR".to_string())
-                    } else if !worktree.is_empty() {
-                        Verdict::CheckedOut { worktree: worktree.to_string() }
-                    } else {
-                        Verdict::Delete
-                    };
-                    (pr.number, verdict)
-                }
-            },
-        };
-        verdicts.push(BranchVerdict { branch: branch.to_string(), tip, pr, verdict });
-    }
-    Ok(verdicts)
-}
-
-/// Delete local branches, each only while it still points at its scan-time
-/// `tip` (else "moved since scan"). The name gates re-run; nothing here touches
-/// remotes, prunes, or calls gh. Results come back in input order.
-pub fn delete_branches(
-    repo_path: &str,
-    branches: &[(String, String)],
-    protected: &[String],
-) -> Vec<(String, Result<(), String>)> {
-    let delete = |branch: &str, tip: &str| -> Result<(), String> {
-        refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
-        if branch_tip(repo_path, branch).as_deref() != Some(tip) {
-            return Err("moved since scan".to_string());
-        }
-        delete_local_branch(repo_path, branch)
-    };
-    branches.iter().map(|(b, t)| (b.clone(), delete(b, t))).collect()
-}
-
 /// A parsed GitHub issue reference.
 struct ParsedRef<'a> {
     /// The issue number, digits only.
@@ -1184,12 +839,12 @@ fn other_remote(repo_dir: &str) -> Option<String> {
 
 /// Whether a branch name is safe to interpolate into a refspec or hand to
 /// `git worktree add`. Shared by the issue resolver (names come from the remote)
-/// and by [`cleanup_merged_workspace_with`] (names come from state, possibly
+/// and by [`crate::cleanup_merged_workspace`] (names come from state, possibly
 /// adopted). Not a full `git check-ref-format`: the point is that everything
 /// reaching a refspec, a `-`-leading argv slot or `create_worktree_from_branch`
 /// is boring. A `-evil` branch name really does create a junk tracking ref, and
 /// `refs/heads/a..b` REINTERPRETS as a range.
-fn is_valid_branch_name(branch: &str) -> bool {
+pub(crate) fn is_valid_branch_name(branch: &str) -> bool {
     // `HEAD` is the dangerous one: fetching `+refs/heads/HEAD:refs/remotes/origin/HEAD`
     // writes THROUGH the `refs/remotes/origin/HEAD` symref, so local
     // `origin/<default>` silently moves to that branch's commit and every
@@ -1257,6 +912,23 @@ fn refuse_diverged_local(repo_dir: &str, branch: &str) -> Result<(), String> {
 /// Fetch the linked branch, then refuse the two ways adopting it could pick the
 /// wrong commit. Runs after the name gate: the branch reaches a refspec here.
 fn prepare_linked_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(), String> {
+    // A `--single-branch` clone maps only its own branch, and `worktree add
+    // --track` then dies with "not a branch" on the tracking ref we just
+    // fetched. Widen the remote first, unless a refspec already covers it (a
+    // second `set-branches --add` would duplicate the entry). Best-effort: the
+    // fetch may still work, and its own error is the one worth showing.
+    if !origin_fetches(repo_dir, branch) {
+        match Command::new("git")
+            .args(["-C", repo_dir, "remote", "set-branches", "--add", "origin", branch])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(st) if st.success() => {}
+            Ok(st) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({st})"),
+            Err(e) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({e})"),
+        }
+    }
     fetch_origin_branch(repo_dir, branch, gh_bin)?;
     // `create_worktree_from_branch` resolves `refs/remotes/<ref>` BEFORE
     // `refs/remotes/origin/<ref>`, so a linked branch named `alice/fix` would
@@ -1278,6 +950,7 @@ fn prepare_linked_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(
 fn origin_fetches(repo_dir: &str, branch: &str) -> bool {
     let Ok(out) = Command::new("git")
         .args(["-C", repo_dir, "config", "--get-all", "remote.origin.fetch"])
+        .env_remove("GIT_CONFIG")
         .output()
     else {
         return false;
@@ -1301,49 +974,57 @@ fn origin_fetches(repo_dir: &str, branch: &str) -> bool {
 
 /// Single-quote `s` as one shell word. Git runs a `!`-prefixed credential helper
 /// through `sh`, and kommand0's own state directory can contain a space.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Refresh `refs/remotes/origin/<branch>` from origin, bounded and
-/// non-interactive. Explicit refspec: a bare `git fetch origin <branch>` leaves
-/// the tracking ref to the configured refspec, and a STALE tracking ref passes
-/// `verify_ref` and silently yields a worktree behind origin.
-fn fetch_origin_branch(repo_dir: &str, branch: &str, gh_bin: &str) -> Result<(), String> {
+/// non-interactive, without tags. Explicit refspec: a bare `git fetch origin
+/// <branch>` leaves the tracking ref to the configured refspec, and a STALE
+/// tracking ref passes `verify_ref` and silently yields a worktree behind
+/// origin.
+pub(crate) fn fetch_origin_branch(
+    repo_dir: &str,
+    branch: &str,
+    gh_bin: &str,
+) -> Result<(), String> {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    // A `--single-branch` clone maps only its own branch, and `worktree add
-    // --track` then dies with "not a branch" on the tracking ref we just
-    // fetched. Widen the remote first, unless a refspec already covers it (a
-    // second `set-branches --add` would duplicate the entry). Best-effort: the
-    // fetch may still work, and its own error is the one worth showing.
-    if !origin_fetches(repo_dir, branch) {
-        match Command::new("git")
-            .args(["-C", repo_dir, "remote", "set-branches", "--add", "origin", branch])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(st) if st.success() => {}
-            Ok(st) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({st})"),
-            Err(e) => tracing::warn!(branch, "couldn't widen remote.origin.fetch ({e})"),
-        }
-    }
     let helper = format!("credential.helper=!{} auth git-credential", shell_quote(gh_bin));
     let spawned = Command::new("git")
         // gh authenticates HTTPS through the credential helper it injects, so a
         // private origin + a bare GH_TOKEN fetches only with this. `-c` APPENDS
         // to the helper list, so a user's own helper still runs first, and it's
         // never consulted for an ssh or local origin.
-        .args(["-C", repo_dir, "-c", &helper, "fetch", "origin", &refspec])
+        // No auto-maintenance, as config so an older git doesn't choke on a
+        // flag (`--no-auto-maintenance` is 2.29+): nothing beyond the one ref.
+        .args(["-C", repo_dir, "-c", &helper, "-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+        // `--no-tags`: an explicit refspec would still auto-follow tags.
+        // `--refmap=`: only this refspec updates a ref, not also the configured
+        // `remote.origin.fetch` mappings, which may point into `refs/heads/`.
+        .args(["fetch", "origin", &refspec, "--no-tags", "--refmap=", "--no-recurse-submodules"])
+        // Empty, not unset: git asks an askpass helper (VS Code terminals set
+        // one) before it checks GIT_TERMINAL_PROMPT, and that pops a dialog.
+        .env("GIT_ASKPASS", "")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_SSH_COMMAND", batch_ssh_command(repo_dir))
+        .envs(http_stall(repo_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
     match spawned.and_then(wait_bounded) {
         Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(format!("couldn't fetch {branch} from origin: {}", last_line(&o.stderr))),
+        Ok(o) => {
+            // The cause is git's `fatal:`/`error:` line; the last line is often
+            // a generic hint ("and the repository exists.").
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let cause = stderr
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with("fatal:") || l.starts_with("error:"));
+            let detail = cause.map(str::to_string).unwrap_or_else(|| last_line(&o.stderr));
+            Err(format!("couldn't fetch {branch} from origin: {detail}"))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             Err("git fetch timed out: check your network and try again".to_string())
         }
@@ -1551,14 +1232,14 @@ fn issue_branch_with(repo_dir: &str, issue_ref: &str, gh_bin: &str) -> Result<Is
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::TempDir;
 
     /// Init a git repo with a deterministic default branch + commit identity, so
     /// commits succeed on a machine with no global git config.
-    fn git(dir: &Path, args: &[&str]) {
+    pub(crate) fn git(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .args(args)
             .current_dir(dir)
@@ -1569,13 +1250,15 @@ mod tests {
         assert!(ok, "git {args:?} failed");
     }
 
-    fn init_repo(dir: &Path) {
+    pub(crate) fn init_repo(dir: &Path) {
         git(dir, &["init", "-b", "main"]);
         git(dir, &["config", "user.email", "t@t"]);
         git(dir, &["config", "user.name", "t"]);
         // A developer with global `commit.gpgsign = true` would otherwise have
         // every commit here block on a signing agent.
         git(dir, &["config", "commit.gpgsign", "false"]);
+        // A global `false` would leave the cleanup's reflog check nothing to read.
+        git(dir, &["config", "core.logAllRefUpdates", "true"]);
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         git(dir, &["add", "."]);
         git(dir, &["commit", "-m", "init"]);
@@ -1861,529 +1544,6 @@ mod tests {
         assert!(joined.contains("diff truncated"), "the drop is noted: {joined:.80}");
     }
 
-    // --- cleanup_merged_workspace ---
-
-    /// A repo (no remote — pins that an unresolvable `origin/HEAD` never blocks
-    /// the gate) with a linked worktree on `branch`. Returns
-    /// `(repo_path, worktree_path, branch, branch_tip_sha)`.
-    fn repo_with_worktree_on(
-        root: &Path,
-        branch: &str,
-    ) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
-        let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "t@t"]);
-        git(&repo, &["config", "commit.gpgsign", "false"]);
-        git(&repo, &["config", "user.name", "t"]);
-        std::fs::write(repo.join("a.txt"), "1").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-m", "init"]);
-        let wt = root.join("wt");
-        git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", branch]);
-        let sha = tip_of(&repo, branch);
-        (repo, wt, branch.to_string(), sha)
-    }
-
-    /// [`repo_with_worktree_on`] with the post-prefix default shape: bare `feat`.
-    fn repo_with_worktree(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
-        repo_with_worktree_on(root, "feat")
-    }
-
-    /// A `gh` stub answering the cleanup lookup (`pr list --head <branch> …`)
-    /// with `<state>\n<oid>`.
-    fn gh_pr_stub(path: &Path, state: &str, oid: &str) {
-        write_stub(
-            path,
-            &format!(
-                "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then\n  printf '{state}\\n{oid}\\n'\n  exit 0\nfi\nexit 1\n"
-            ),
-        );
-    }
-
-    fn cleanup(repo: &Path, wt: &Path, branch: &str, gh: &Path) -> Result<(), String> {
-        cleanup_merged_workspace_with(
-            repo.to_str().unwrap(),
-            wt.to_str().unwrap(),
-            branch,
-            &[],
-            gh.to_str().unwrap(),
-        )
-    }
-
-    fn branch_exists(repo: &Path, branch: &str) -> bool {
-        Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "rev-parse", "--verify", branch])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    }
-
-    #[test]
-    fn cleanup_merged_clean_removes_worktree_and_branch() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
-        assert!(!wt.exists(), "worktree dir removed");
-        assert!(!branch_exists(&repo, &branch), "branch deleted");
-    }
-
-    #[test]
-    fn cleanup_refuses_when_pr_open_and_destroys_nothing() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "OPEN", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains("isn't merged"), "expected 'isn't merged', got: {err}");
-        assert!(wt.exists(), "worktree untouched");
-        assert!(branch_exists(&repo, &branch), "branch untouched");
-    }
-
-    #[test]
-    fn cleanup_refuses_when_no_pr() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, _) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh");
-        write_stub(&gh, "#!/bin/sh\nexit 1\n"); // gh finds no PR
-        assert!(cleanup(&repo, &wt, &branch, &gh).is_err());
-        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-    }
-
-    #[test]
-    fn cleanup_refuses_dirty_worktree() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        std::fs::write(wt.join("scratch.txt"), "wip").unwrap(); // untracked => dirty
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains("uncommitted"), "expected 'uncommitted', got: {err}");
-        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-    }
-
-    #[test]
-    fn cleanup_refuses_commits_beyond_the_merged_pr() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        // The PR's last merged commit is the original tip; the local branch has
-        // since advanced (a commit beyond the PR).
-        std::fs::write(wt.join("more.txt"), "x").unwrap();
-        git(&wt, &["config", "user.email", "t@t"]);
-        git(&wt, &["config", "commit.gpgsign", "false"]);
-        git(&wt, &["config", "user.name", "t"]);
-        git(&wt, &["add", "."]);
-        git(&wt, &["commit", "-m", "beyond"]);
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha); // stale (pre-extra-commit) oid
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains("beyond its merged PR"), "expected 'beyond its merged PR', got: {err}");
-        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-    }
-
-    #[test]
-    fn cleanup_refuses_default_branch() {
-        // Literal main/master arm, unconditional. The gh path doesn't exist, so
-        // passing proves the gate fires before any network call. The fixture
-        // repo has no remote → origin/HEAD is unresolvable → only the literal
-        // arm can refuse.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, _, _) = repo_with_worktree(tmp.path());
-        for default in ["main", "master"] {
-            let err = cleanup(&repo, &wt, default, &tmp.path().join("gh")).unwrap_err();
-            assert!(err.contains("default branch"), "expected default-branch refusal, got: {err}");
-        }
-        assert!(branch_exists(&repo, "main"), "main untouched");
-    }
-
-    #[test]
-    fn cleanup_refuses_default_branch_via_origin_head() {
-        // origin/HEAD arm: the origin's default is `trunk` (NOT main/master, or
-        // the literal arm would make this vacuous). A sibling branch must get
-        // PAST the gate (failing later on the absent gh) — the refusal is "is
-        // the default", not "refuses everything".
-        let tmp = TempDir::new().unwrap();
-        let origin = tmp.path().join("origin");
-        std::fs::create_dir_all(&origin).unwrap();
-        git(&origin, &["init", "-b", "trunk"]);
-        git(&origin, &["config", "user.email", "t@t"]);
-        git(&origin, &["config", "commit.gpgsign", "false"]);
-        git(&origin, &["config", "user.name", "t"]);
-        std::fs::write(origin.join("a.txt"), "1").unwrap();
-        git(&origin, &["add", "."]);
-        git(&origin, &["commit", "-m", "init"]);
-        let clone = tmp.path().join("clone");
-        git(tmp.path(), &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()]);
-        git(&clone, &["branch", "sibling"]);
-
-        let wt = tmp.path().join("no-wt"); // gate fires before any worktree use
-        let gh = tmp.path().join("gh"); // absent
-        let err = cleanup(&clone, &wt, "trunk", &gh).unwrap_err();
-        assert!(err.contains("default branch"), "trunk refused via origin/HEAD: {err}");
-        let err = cleanup(&clone, &wt, "sibling", &gh).unwrap_err();
-        assert!(err.contains("gh CLI not found"), "sibling passes the gate: {err}");
-    }
-
-    #[test]
-    fn cleanup_refuses_empty_dotdot_and_dash_names() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, _, _) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh"); // absent — gate must fire first
-        for bad in ["", "a..b", "-feat"] {
-            let err = cleanup(&repo, &wt, bad, &gh).unwrap_err();
-            assert!(err.contains("malformed"), "{bad:?} refused as malformed, got: {err}");
-        }
-    }
-
-    #[test]
-    fn cleanup_deletes_an_adopted_branch_when_merged() {
-        // The feature's core semantic: a branch kommand0 didn't name (adopted
-        // via --branch / the checkout offer) is cleanable once merged — the
-        // old `kommand0/` ownership gate is gone by design.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree_on(tmp.path(), "feat/login");
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
-        assert!(!wt.exists() && !branch_exists(&repo, &branch), "adopted branch cleaned up");
-    }
-
-    #[test]
-    fn cleanup_accepts_a_legacy_prefixed_branch() {
-        // Workspaces created before the prefix was dropped keep working.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree_on(tmp.path(), "kommand0/legacy");
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
-        assert!(!wt.exists() && !branch_exists(&repo, &branch), "legacy branch cleaned up");
-    }
-
-    #[test]
-    fn cleanup_pr_lookup_handles_numeric_branch() {
-        // An all-digit branch must be looked up via `--head <branch>` — a bare
-        // positional would be parsed by gh as a PR NUMBER. The stub records its
-        // argv and only answers the --head form.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree_on(tmp.path(), "123");
-        let gh = tmp.path().join("gh");
-        write_stub(
-            &gh,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ] && [ \"$4\" = 123 ]; then\n  printf 'MERGED\\n{sha}\\n'\n  exit 0\nfi\nexit 1\n"
-            ),
-        );
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
-        let args = std::fs::read_to_string(format!("{}.args", gh.display())).unwrap();
-        let args: Vec<&str> = args.lines().collect();
-        assert_eq!(&args[..4], &["pr", "list", "--head", "123"], "lookup is --head-based");
-    }
-
-    #[test]
-    fn cleanup_refuses_a_worktree_switched_to_another_branch() {
-        // The workspace's dir is live but a `git switch` inside it moved HEAD off
-        // the workspace's branch: removing the dir would destroy the OTHER
-        // branch's checkout (and its ignored files) on a merged-PR verdict that
-        // was never about it.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        git(&wt, &["switch", "-c", "elsewhere"]);
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains("is on elsewhere, not"), "names both branches: {err}");
-        assert!(wt.exists(), "worktree untouched");
-        assert!(branch_exists(&repo, &branch) && branch_exists(&repo, "elsewhere"), "both branches intact");
-        // Detached HEAD is the same refusal.
-        git(&wt, &["switch", "--detach"]);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains("detached HEAD"), "detached is refused too: {err}");
-        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-    }
-
-    #[test]
-    fn cleanup_refuses_when_pr_has_no_commits() {
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, _) = repo_with_worktree(tmp.path());
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", ""); // empty oid (no commits)
-        assert!(cleanup(&repo, &wt, &branch, &gh).unwrap_err().contains("beyond its merged PR"));
-        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-    }
-
-    #[test]
-    fn cleanup_completes_when_worktree_dir_already_gone() {
-        // A retry after a partial cleanup (worktree removed, branch left) must
-        // still delete the orphaned branch — gh runs from the repo, the missing
-        // worktree skips the dirty check, and `worktree prune` clears the entry.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        std::fs::remove_dir_all(&wt).unwrap(); // worktree dir vanished
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
-        assert!(!branch_exists(&repo, &branch), "orphaned branch deleted");
-    }
-
-    #[test]
-    fn cleanup_does_not_claim_a_removal_when_the_worktree_was_already_gone() {
-        // Nothing was removed on this path, so a failed `branch -D` (the branch
-        // is checked out in the main repo by now) must not say "worktree removed".
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        std::fs::remove_dir_all(&wt).unwrap();
-        git(&repo, &["worktree", "prune"]);
-        git(&repo, &["switch", &branch]);
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.starts_with(&format!("couldn't delete branch {branch}:")), "{err}");
-        assert!(branch_exists(&repo, &branch), "the branch survives the refusal");
-    }
-
-    #[test]
-    fn is_live_worktree_tells_wreckage_from_everything_else() {
-        // The guard the fs fallback rides on: only a dir git has ALREADY stopped
-        // recognizing may be deleted outright, and every adjacent shape has to
-        // land on the protected side.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, _branch, _sha) = repo_with_worktree(tmp.path());
-        assert!(is_live_worktree(wt.to_str().unwrap()), "a linked worktree is live");
-        assert!(is_live_worktree(repo.to_str().unwrap()), "so is the repo itself");
-        let sub = wt.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        assert!(is_live_worktree(sub.to_str().unwrap()), "so is a subdir of one");
-        let nested = tmp.path().join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
-        git(&nested, &["init", "-b", "main"]);
-        assert!(is_live_worktree(nested.to_str().unwrap()), "so is an independent repo");
-        let plain = tmp.path().join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-        assert!(!is_live_worktree(plain.to_str().unwrap()), "a non-repo dir is not");
-        // The wreckage: admin entry gone, dangling `.git` left behind.
-        std::fs::remove_dir_all(repo.join(".git/worktrees/wt")).unwrap();
-        assert!(!is_live_worktree(wt.to_str().unwrap()), "half-deleted tree is not live");
-    }
-
-    #[test]
-    fn cleanup_names_the_leftovers_of_a_half_deleted_worktree() {
-        // The shape a failed removal leaves behind: git dropped the admin entry
-        // and some files before dying, so the dir has a dangling `.git` and no
-        // readable status. The old code dead-ended here ("couldn't read the
-        // worktree's git status") with no way to finish from kommand0 at all.
-        // It must name what to delete and keep the branch, so the retry works.
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        std::fs::remove_dir_all(repo.join(".git/worktrees/wt")).unwrap();
-        std::fs::remove_file(wt.join("a.txt")).unwrap(); // git got this far
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains(wt.to_str().unwrap()), "names the dir to delete: {err}");
-        assert!(wt.exists(), "the leftovers are NOT deleted for us");
-        assert!(branch_exists(&repo, &branch), "branch survives, so a retry can run");
-        // And once the user deletes it, the retry finishes the job.
-        std::fs::remove_dir_all(&wt).unwrap();
-        assert_eq!(cleanup(&repo, &wt, &branch, &gh), Ok(()));
-        assert!(!branch_exists(&repo, &branch), "retry deletes the orphaned branch");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_never_deletes_the_branch_when_the_worktree_survives() {
-        // mkcert-shaped fixture: an IGNORED dir (so kommand0's own dirty gate
-        // passes) whose mode blocks unlinking its contents, so git's remove dies
-        // mid-delete, after dropping the admin entry. Assert the invariant, not
-        // the arm: Ok/Err is the caller's deregister signal, so deleting the
-        // branch while the dir survives would leave a workspace row whose next
-        // cleanup can never resolve a branch tip. Both shapes are legal here: a
-        // root test runner ignores mode 555 and git just succeeds.
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, sha) = repo_with_worktree(tmp.path());
-        // `info/exclude` lives in the common dir, so it covers the worktree too
-        // (no commit, so the branch tip still matches the stubbed PR).
-        std::fs::write(repo.join(".git/info/exclude"), ".certs/\n").unwrap();
-        std::fs::create_dir_all(wt.join(".certs")).unwrap();
-        std::fs::write(wt.join(".certs/k.pem"), "key").unwrap();
-        std::fs::set_permissions(wt.join(".certs"), std::fs::Permissions::from_mode(0o555)).unwrap();
-        let gh = tmp.path().join("gh");
-        gh_pr_stub(&gh, "MERGED", &sha);
-        let res = cleanup(&repo, &wt, &branch, &gh);
-        // Restore before the TempDir drop, or the fixture leaks a temp dir.
-        let _ =
-            std::fs::set_permissions(wt.join(".certs"), std::fs::Permissions::from_mode(0o755));
-        match res {
-            Ok(()) => {
-                assert!(!wt.exists(), "Ok means the dir really is gone");
-                assert!(!branch_exists(&repo, &branch), "Ok deletes the branch");
-            }
-            Err(e) => {
-                assert!(wt.exists(), "Err leaves the leftovers in place: {e}");
-                assert!(branch_exists(&repo, &branch), "Err keeps the branch: {e}");
-                assert!(e.contains("delete") || e.contains("remove"), "actionable: {e}");
-            }
-        }
-    }
-
-    #[test]
-    fn cleanup_refuses_protected_branch_before_gh() {
-        // gh is absent, so passing proves the gate fires before any network
-        // call; with an empty list the same branch reaches gh (the list is
-        // honored, not hardcoded).
-        let tmp = TempDir::new().unwrap();
-        let (repo, wt, branch, _) = repo_with_worktree_on(tmp.path(), "development");
-        let gh = tmp.path().join("gh");
-        let err = cleanup_merged_workspace_with(
-            repo.to_str().unwrap(),
-            wt.to_str().unwrap(),
-            &branch,
-            &["development".to_string()],
-            gh.to_str().unwrap(),
-        )
-        .unwrap_err();
-        assert!(err.contains("protected branch"), "expected protected refusal, got: {err}");
-        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-        let err = cleanup(&repo, &wt, &branch, &gh).unwrap_err();
-        assert!(err.contains("gh CLI not found"), "an empty list lets it through to gh: {err}");
-    }
-
-    // --- scan_merged_branches / delete_branches ---
-
-    /// [`init_repo`] at `<root>/repo` plus `branches`, all at the initial commit.
-    fn repo_with_branches(root: &Path, branches: &[&str]) -> std::path::PathBuf {
-        let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        init_repo(&repo);
-        for b in branches {
-            git(&repo, &["branch", b]);
-        }
-        repo
-    }
-
-    fn tip_of(repo: &Path, branch: &str) -> String {
-        let out = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "rev-parse", &format!("refs/heads/{branch}")])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    #[test]
-    fn scan_classifies_branches_and_skips_gates_without_gh() {
-        let tmp = TempDir::new().unwrap();
-        let repo = repo_with_branches(
-            tmp.path(),
-            &["development", "merged-ok", "feat/x", "open-pr", "no-pr", "other"],
-        );
-        let initial = tip_of(&repo, "main");
-        // One commit beyond what the (stubbed) PR merged.
-        git(&repo, &["switch", "-c", "merged-ahead"]);
-        std::fs::write(repo.join("more.txt"), "x").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-m", "beyond"]);
-        let wt = tmp.path().join("wt");
-        git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"]);
-        git(&repo, &["switch", "other"]); // checked out in the main repo itself
-        let gh = tmp.path().join("gh");
-        write_stub(
-            &gh,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$4\" >> \"$0.args\"\ncase \"$4\" in\n  merged-ok|feat/x|wt-branch|other) printf 'MERGED\\n%s\\n7\\n' \"$(git rev-parse \"refs/heads/$4\")\"; exit 0 ;;\n  merged-ahead) printf 'MERGED\\n{initial}\\n8\\n'; exit 0 ;;\n  open-pr) printf 'OPEN\\n%s\\n9\\n' \"$(git rev-parse \"refs/heads/$4\")\"; exit 0 ;;\n  no-pr) printf 'NONE\\n\\n\\n'; exit 0 ;;\nesac\nexit 1\n"
-            ),
-        );
-
-        let verdicts = scan_merged_branches_with(
-            repo.to_str().unwrap(),
-            &["development".to_string()],
-            gh.to_str().unwrap(),
-        )
-        .unwrap();
-        let of = |name: &str| {
-            verdicts.iter().find(|v| v.branch == name).unwrap_or_else(|| panic!("{name} scanned"))
-        };
-        assert_eq!(verdicts.len(), 9);
-        assert_eq!(of("merged-ok").verdict, Verdict::Delete);
-        assert_eq!(of("merged-ok").pr, Some(7));
-        assert_eq!(of("merged-ok").tip, initial);
-        assert_eq!(of("feat/x").verdict, Verdict::Delete, "refs/heads/ stripped, slash kept");
-        assert_eq!(of("merged-ahead").verdict, Verdict::Skip("commits beyond the merged PR".into()));
-        assert_eq!(of("merged-ahead").pr, Some(8), "the PR number rides along with a skip");
-        assert_eq!(of("open-pr").verdict, Verdict::Skip("PR not merged (OPEN)".into()));
-        assert_eq!(of("no-pr").verdict, Verdict::Skip("no PR".into()));
-        assert_eq!(of("no-pr").pr, None);
-        assert_eq!(of("development").verdict, Verdict::Skip("protected branch".into()));
-        assert_eq!(of("main").verdict, Verdict::Skip("default branch".into()));
-        match &of("wt-branch").verdict {
-            Verdict::CheckedOut { worktree } => assert!(worktree.ends_with("/wt"), "{worktree}"),
-            v => panic!("wt-branch: {v:?}"),
-        }
-        let repo_real = std::fs::canonicalize(&repo).unwrap();
-        assert_eq!(
-            of("other").verdict,
-            Verdict::CheckedOut { worktree: repo_real.to_str().unwrap().to_string() },
-            "the main checkout counts, at the realpath git reports"
-        );
-        // Gated names never reach gh; everything else is asked exactly once.
-        let mut asked: Vec<String> = std::fs::read_to_string(format!("{}.args", gh.display()))
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        asked.sort();
-        assert_eq!(
-            asked,
-            ["feat/x", "merged-ahead", "merged-ok", "no-pr", "open-pr", "other", "wt-branch"]
-        );
-    }
-
-    #[test]
-    fn scan_aborts_when_gh_missing() {
-        let tmp = TempDir::new().unwrap();
-        let repo = repo_with_branches(tmp.path(), &["feat"]);
-        let err = scan_merged_branches_with(
-            repo.to_str().unwrap(),
-            &[],
-            "/nonexistent/definitely/not/gh",
-        )
-        .unwrap_err();
-        assert!(err.contains("gh CLI not found"), "the first gh failure aborts: {err}");
-    }
-
-    #[test]
-    fn delete_branches_refuses_every_gate_and_deletes_the_rest() {
-        let tmp = TempDir::new().unwrap();
-        let repo = repo_with_branches(tmp.path(), &["a", "b", "development"]);
-        let wt = tmp.path().join("wt");
-        git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"]);
-        let sha = tip_of(&repo, "main");
-        let input = [
-            ("a".to_string(), sha.clone()),
-            ("b".to_string(), "0".repeat(40)), // stale tip
-            ("main".to_string(), sha.clone()),
-            ("x..y".to_string(), sha.clone()),
-            ("development".to_string(), sha.clone()),
-            ("wt-branch".to_string(), sha.clone()),
-        ];
-        let results =
-            delete_branches(repo.to_str().unwrap(), &input, &["development".to_string()]);
-        let names: Vec<&str> = results.iter().map(|(b, _)| b.as_str()).collect();
-        assert_eq!(names, ["a", "b", "main", "x..y", "development", "wt-branch"], "input order");
-        assert_eq!(results[0].1, Ok(()));
-        assert_eq!(results[1].1, Err("moved since scan".to_string()));
-        assert!(results[2].1.as_ref().unwrap_err().contains("default branch"));
-        assert!(results[3].1.as_ref().unwrap_err().contains("malformed"));
-        assert!(results[4].1.as_ref().unwrap_err().contains("protected branch"));
-        assert!(results[5].1.is_err(), "git refuses a checked-out branch");
-        assert!(!branch_exists(&repo, "a"), "a deleted");
-        for survivor in ["b", "main", "development", "wt-branch"] {
-            assert!(branch_exists(&repo, survivor), "{survivor} survives");
-        }
-    }
-
     // --- pr_statuses ---
 
     /// A `gh` stub whose `pr list` prints the given JSON array verbatim (and
@@ -2542,8 +1702,9 @@ mod tests {
     /// A real `origin` plus a clone of it, following
     /// `cleanup_refuses_default_branch_via_origin_head`. Origin is a local path,
     /// so `origin_slug` is `None` and no `--repo` lands in the argv (pinning has
-    /// its own test). Nothing ever pushes into it, so its being non-bare is fine.
-    fn issue_fixture(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    /// its own test). Pushes only land on branches origin hasn't checked out, so
+    /// its being non-bare is fine.
+    pub(crate) fn issue_fixture(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let origin = tmp.join("origin");
         std::fs::create_dir_all(&origin).unwrap();
         init_repo(&origin);
@@ -2553,10 +1714,11 @@ mod tests {
         git(&clone, &["config", "user.email", "t@t"]);
         git(&clone, &["config", "user.name", "t"]);
         git(&clone, &["config", "commit.gpgsign", "false"]);
+        git(&clone, &["config", "core.logAllRefUpdates", "true"]);
         (origin, clone)
     }
 
-    fn rev_parse(dir: &Path, rev: &str) -> String {
+    pub(crate) fn rev_parse(dir: &Path, rev: &str) -> String {
         let out = Command::new("git")
             .args(["-C", dir.to_str().unwrap(), "rev-parse", rev])
             .output()
@@ -3073,14 +2235,24 @@ mod tests {
         let gh = tmp.path().join("gh");
         write_stub(
             &gh,
-            "#!/bin/sh\nprintf '%s|%s\\n' \"${GIT_TERMINAL_PROMPT-UNSET}\" \
-             \"${GIT_SSH_COMMAND-UNSET}\" > \"$0.env\"\nexit 1\n",
+            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' \"${GIT_TERMINAL_PROMPT-UNSET}\" \
+             \"${GIT_ASKPASS-UNSET}\" \"${GIT_SSH_COMMAND-UNSET}\" \
+             \"${GIT_HTTP_LOW_SPEED_LIMIT-UNSET}\" \"${GIT_HTTP_LOW_SPEED_TIME-UNSET}\" \
+             > \"$0.env\"\nexit 1\n",
         );
-        let _ = issue_branch_with(tmp.path().to_str().unwrap(), "123", gh.to_str().unwrap());
+        let dir = tmp.path().to_str().unwrap();
+        let _ = issue_branch_with(dir, "123", gh.to_str().unwrap());
         let env = std::fs::read_to_string(format!("{}.env", gh.display())).unwrap();
-        let (prompt, ssh) = env.trim().split_once('|').unwrap();
+        let fields: Vec<&str> = env.trim_end().split('|').collect();
+        let [prompt, askpass, ssh, limit, time] = fields[..] else { panic!("{env}") };
         assert_eq!(prompt, "0", "git can't fall back to a terminal prompt");
-        assert!(ssh.ends_with("-oBatchMode=yes"), "ssh can't ask for a passphrase: {ssh}");
+        assert_eq!(askpass, "", "nor to an askpass helper");
+        assert!(ssh.ends_with(SSH_OPTS), "ssh can't prompt, and gives up on a stall: {ssh}");
+        // Whatever kommand0 sets (only what the user didn't) reaches gh's git.
+        for (var, value) in http_stall(dir) {
+            let seen = if var.ends_with("LIMIT") { limit } else { time };
+            assert_eq!(seen, value, "{var}: nor can a stalled https transfer hang on");
+        }
     }
 
     #[test]
@@ -3205,20 +2377,45 @@ mod tests {
         // pure rule: reading the real environment here would switch the test
         // off for anyone who exports GIT_SSH_COMMAND, and `set_var` is
         // process-global and unsafe.
-        let rows: &[(Option<&str>, Option<&str>, &str)] = &[
-            (None, None, "ssh -oBatchMode=yes"),
-            (None, Some("ssh -i /k/cfg"), "ssh -i /k/cfg -oBatchMode=yes"),
-            (Some("ssh -i /k/env"), None, "ssh -i /k/env -oBatchMode=yes"),
+        let opts = |command: &str| format!("{command} {SSH_OPTS}");
+        // (GIT_SSH_COMMAND, core.sshCommand, GIT_SSH, ssh.variant, the command)
+        type Opt = Option<&'static str>;
+        type Row = (Opt, Opt, Opt, Opt, String);
+        let rows: &[Row] = &[
+            (None, None, None, None, opts("ssh")),
+            (None, Some("ssh -i /k/cfg"), None, None, opts("ssh -i /k/cfg")),
+            (Some("ssh -i /k/env"), None, None, None, opts("ssh -i /k/env")),
             // The environment wins, exactly as it does for git itself.
-            (Some("ssh -i /k/env"), Some("ssh -i /k/cfg"), "ssh -i /k/env -oBatchMode=yes"),
+            (Some("ssh -i /k/env"), Some("ssh -i /k/cfg"), None, None, opts("ssh -i /k/env")),
             // Blank reads as absent, so the config still gets its turn.
-            (Some("   "), Some("ssh -i /k/cfg"), "ssh -i /k/cfg -oBatchMode=yes"),
+            (Some("   "), Some("ssh -i /k/cfg"), None, None, opts("ssh -i /k/cfg")),
             // ssh takes the FIRST value of a repeated option, so someone who
             // asked to be prompted keeps that.
-            (Some("ssh -oBatchMode=no"), None, "ssh -oBatchMode=no -oBatchMode=yes"),
+            (Some("ssh -oBatchMode=no"), None, None, None, opts("ssh -oBatchMode=no")),
+            // GIT_SSH ranks below both, isn't shadowed by ours, and is one word.
+            (None, None, Some("/opt/my tools/ssh"), None, opts("'/opt/my tools/ssh'")),
+            (None, Some("ssh -i /k/cfg"), Some("/opt/wrap"), None, opts("ssh -i /k/cfg")),
+            // No OpenSSH options for what isn't OpenSSH, by name, quoted or not.
+            (None, Some("plink -batch"), None, None, "plink -batch".into()),
+            (None, None, Some("/opt/My Tools/PLINK.exe"), None, "'/opt/My Tools/PLINK.exe'".into()),
+            (None, Some("\"/opt/PuTTY/plink\" -batch"), None, None, "\"/opt/PuTTY/plink\" -batch".into()),
+            (None, Some("'/opt/plink tools/ssh' -v"), None, None, opts("'/opt/plink tools/ssh' -v")),
+            (None, Some("\"/opt/My Tools\"/plink -v"), None, None, "\"/opt/My Tools\"/plink -v".into()),
+            (None, Some("/opt/My\\ Tools/plink -v"), None, None, "/opt/My\\ Tools/plink -v".into()),
+            (None, Some("\"/opt/plink\"/ssh"), None, None, opts("\"/opt/plink\"/ssh")),
+            // Or by variant; a value git doesn't know means ssh, as for git.
+            (None, Some("ssh"), None, Some("simple"), "ssh".into()),
+            (None, Some("wrap"), None, Some("putty"), "wrap".into()),
+            (None, Some("wrap"), None, Some("plink"), "wrap".into()),
+            (None, Some("wrap"), None, Some("tortoiseplink"), "wrap".into()),
+            (None, Some("plink"), None, Some(""), opts("plink")),
+            (None, Some("wrap"), None, Some("ssh"), opts("wrap")),
+            (None, Some("wrap"), None, Some("OpenSSH"), opts("wrap")),
+            (None, Some("wrap"), None, Some("auto"), opts("wrap")),
         ];
-        for (env, cfg, want) in rows {
-            assert_eq!(&ssh_command_with_batch_mode(*env, *cfg), want, "{env:?} / {cfg:?}");
+        for (env, cfg, program, variant, want) in rows {
+            let got = ssh_command_with_batch_mode(*env, *cfg, *program, *variant);
+            assert_eq!(&got, want, "{env:?} / {cfg:?} / {program:?} / {variant:?}");
         }
 
         // The repo-backed half, which does not depend on the environment.
@@ -3231,17 +2428,60 @@ mod tests {
     }
 
     #[test]
-    fn wait_bounded_in_gives_up_on_a_child_that_outlives_the_deadline() {
+    fn wait_bounded_in_gives_up_but_leaves_the_child_to_finish() {
+        // Abandoned, never killed: a slow fetch still lands its ref.
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("finished");
         let child = Command::new("sh")
-            // 100x the deadline: long enough to be deterministic, short enough
-            // that the orphan is gone soon after the suite.
-            .args(["-c", "sleep 5"])
+            .args(["-c", &format!("sleep 0.3; touch '{}'", marker.display())])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let err = wait_bounded_in(child, std::time::Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "the child ran on past the deadline");
+    }
+
+    #[test]
+    fn the_https_stall_limit_yields_to_the_users_own() {
+        // The rule: kommand0's value for each variable the user didn't set.
+        let (limit, time) = (("GIT_HTTP_LOW_SPEED_LIMIT", "1"), ("GIT_HTTP_LOW_SPEED_TIME", "300"));
+        assert_eq!(stall_env(false, false), [limit, time]);
+        assert_eq!(stall_env(true, false), [time]);
+        assert_eq!(stall_env(false, true), [limit]);
+        assert_eq!(stall_env(true, true), []);
+        // And a URL-scoped key counts as set (the environment half is
+        // process-global, so it isn't set here).
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let dir = tmp.path().to_str().unwrap();
+        let limit_is_ours = http_stall(dir).contains(&limit);
+        git(tmp.path(), &["config", "http.https://example.com/.lowSpeedTime", "600"]);
+        let stall = http_stall(dir);
+        assert!(!stall.iter().any(|(var, _)| var.ends_with("TIME")), "{stall:?}");
+        assert_eq!(stall.contains(&limit), limit_is_ours, "the other half is unaffected");
+    }
+
+    #[test]
+    fn the_origin_fetch_updates_only_its_own_ref() {
+        // A configured `remote.origin.fetch` into `refs/heads/` would otherwise
+        // force-update that local branch too (git's opportunistic refmap).
+        let tmp = TempDir::new().unwrap();
+        let (origin, clone) = issue_fixture(tmp.path());
+        git(&clone, &["branch", "wip"]);
+        let wip = rev_parse(&clone, "refs/heads/wip");
+        git(&clone, &["config", "--add", "remote.origin.fetch", "+refs/heads/main:refs/heads/wip"]);
+        std::fs::write(origin.join("b.txt"), "b").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-m", "b"]);
+        fetch_origin_branch(clone.to_str().unwrap(), "main", "gh").unwrap();
+        assert_eq!(rev_parse(&clone, "refs/remotes/origin/main"), rev_parse(&origin, "main"));
+        assert_eq!(rev_parse(&clone, "refs/heads/wip"), wip, "the local branch stays put");
     }
 
     #[test]

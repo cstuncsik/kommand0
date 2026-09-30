@@ -73,11 +73,10 @@ impl AddWorkspaceField {
     }
 }
 
-/// One preview row: rendered as `<branch> <pr> <action>` with the branch column
+/// One preview row: rendered as `<branch> <action>` with the branch column
 /// sized to the width left over, so the action is never pushed off-screen.
 pub(crate) struct RepoCleanupRow {
     pub branch: String,
-    pub pr: String,
     pub action: String,
 }
 
@@ -127,8 +126,12 @@ pub(crate) enum ModalState {
         repo_id: String,
         repo_name: String,
         summary: String,
+        /// Core's notes on the scan (a failed refresh, squash detection off).
+        notes: Vec<String>,
         rows: Vec<RepoCleanupRow>,
         plan: Vec<RepoCleanupItem>,
+        /// What the plain deletes are checked against (the scan's base).
+        base: kommand0_core::Base,
     },
     /// A branch named `name` already exists (local or origin); offer to check it
     /// out instead of forking a fresh branch (which would be suffixed `-2`, …).
@@ -169,8 +172,9 @@ pub(crate) enum ModalResult {
     SubmitRename(String, String, String),
     /// Cleanup confirmed for a workspace id.
     ConfirmCleanup(String),
-    /// Repo cleanup confirmed: (repo_id, the plan to execute).
-    ConfirmRepoCleanup(String, Vec<RepoCleanupItem>),
+    /// Repo cleanup confirmed: (repo_id, the plan to execute, the scan's base
+    /// the plain deletes are checked against).
+    ConfirmRepoCleanup(String, Vec<RepoCleanupItem>, kommand0_core::Base),
     /// Choice from the branch-exists prompt: check out the existing branch when
     /// `checkout`, else fork a fresh (suffixed) branch.
     BranchCheckoutChoice { repo_id: String, name: String, checkout: bool },
@@ -457,9 +461,13 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
             }
             _ => ModalResult::Consumed,
         },
-        ModalState::ConfirmRepoCleanup { repo_id, plan, .. } => match key.code {
+        ModalState::ConfirmRepoCleanup { repo_id, plan, base, .. } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let result = ModalResult::ConfirmRepoCleanup(repo_id.clone(), std::mem::take(plan));
+                let result = ModalResult::ConfirmRepoCleanup(
+                    repo_id.clone(),
+                    std::mem::take(plan),
+                    std::mem::take(base),
+                );
                 *modal = ModalState::None;
                 result
             }
@@ -1066,7 +1074,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             );
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    "Only proceeds if the branch's PR has been merged.",
+                    "Only if merged into the default branch.",
                     Style::default().fg(th.muted),
                 )),
                 inner[2],
@@ -1080,7 +1088,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             }
             if *unpushed {
                 warn.push(Line::styled(
-                    "⚠ Unpushed commits will block cleanup.",
+                    "⚠ Unpushed commits may block cleanup.",
                     Style::default().fg(th.error),
                 ));
             }
@@ -1096,9 +1104,12 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[5],
             );
         }
-        ModalState::ConfirmRepoCleanup { repo_name, summary, rows, .. } => {
-            // Content-sized: border 2 + summary 1 + blank 1 + footer 1 around the rows.
-            let height = (rows.len() + 5).min(frame.area().height.saturating_sub(2) as usize);
+        ModalState::ConfirmRepoCleanup { repo_name, summary, notes, rows, .. } => {
+            // Content-sized: border 2 + summary 1 + blank 1 + footer 1 around the
+            // rows, plus a row per note beyond the first (the blank row holds it).
+            let extra = notes.len().saturating_sub(1);
+            let height =
+                (rows.len() + 5 + extra).min(frame.area().height.saturating_sub(2) as usize);
             let area = frame
                 .area()
                 .centered(Constraint::Percentage(80), Constraint::Length(height as u16));
@@ -1106,7 +1117,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
 
             let inner = Layout::vertical([
                 Constraint::Length(1), // summary
-                Constraint::Length(1), // blank
+                Constraint::Length(1 + extra as u16), // blank, or the notes
                 Constraint::Min(0),   // rows
                 Constraint::Length(1), // footer
             ])
@@ -1126,6 +1137,12 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 Paragraph::new(Line::styled(summary.as_str(), Style::default().fg(th.text))),
                 inner[0],
             );
+            // The notes, the one to act on first, from the otherwise blank row.
+            let note_lines: Vec<Line> = notes
+                .iter()
+                .map(|n| Line::styled(n.as_str(), Style::default().fg(th.dirty)))
+                .collect();
+            frame.render_widget(Paragraph::new(note_lines), inner[1]);
 
             // ponytail: fixed cap with a "+N more" marker; a scrollable list if a
             // real repo overflows a 24-row terminal.
@@ -1137,9 +1154,9 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 .map(|r| UnicodeWidthStr::width(r.action.as_str()))
                 .max()
                 .unwrap_or(0);
-            // 8 = the pr column (6) plus its two separating spaces; the branch
-            // column takes what is left, truncating before the action ever clips.
-            let branch_w = (inner[2].width as usize).saturating_sub(8 + action_max).clamp(10, 30);
+            // 1 = the separating space; the branch column takes what is left,
+            // truncating before the action ever clips.
+            let branch_w = (inner[2].width as usize).saturating_sub(1 + action_max).clamp(10, 30);
             let mut lines: Vec<Line> = visible
                 .iter()
                 .map(|r| {
@@ -1150,7 +1167,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                         branch_w.saturating_sub(UnicodeWidthStr::width(branch.as_str())),
                     );
                     Line::styled(
-                        format!("{branch}{pad} {:<6} {}", r.pr, r.action),
+                        format!("{branch}{pad} {}", r.action),
                         Style::default().fg(th.text),
                     )
                 })
@@ -1434,8 +1451,10 @@ mod tests {
             repo_id: "r1".into(),
             repo_name: "demo".into(),
             summary: String::new(),
+            notes: vec![],
             rows: vec![],
             plan: vec![],
+            base: kommand0_core::Base::default(),
         };
         handle_modal_paste(&mut modal, "ignored");
         assert!(matches!(modal, ModalState::ConfirmRepoCleanup { .. }));

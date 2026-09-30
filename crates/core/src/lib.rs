@@ -1,3 +1,4 @@
+pub mod cleanup;
 pub mod codex;
 pub mod config;
 pub mod git;
@@ -9,12 +10,15 @@ pub mod sort;
 pub mod workspace;
 pub mod worktree;
 
+pub use cleanup::{
+    Base, BranchResults, BranchVerdict, Scan, Verdict, cleanup_merged_workspace, delete_branches,
+    scan_merged_branches,
+};
 pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
 pub use git::{
-    BranchStatus, BranchVerdict, FileDiff, IssueBranch, PrChecks, PrReview, PrState, PrStatus,
-    Verdict, branch_status, cleanup_merged_workspace, delete_branches,
-    diff_files_vs_default_branch, is_issue_ref, issue_branch, pr_statuses, scan_merged_branches,
+    BranchStatus, FileDiff, IssueBranch, PrChecks, PrReview, PrState, PrStatus, branch_status,
+    diff_files_vs_default_branch, is_issue_ref, issue_branch, pr_statuses,
 };
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
@@ -1983,11 +1987,11 @@ impl AppState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoCleanupItem {
     /// A plain local branch: [`delete_branches`] with the scan-time tip.
-    Delete { branch: String, tip: String, pr: Option<u64> },
+    Delete { branch: String, tip: String },
     /// A kommand0 workspace's branch: the workspace cleanup owns it.
-    Workspace { ws_id: String, branch: String, pr: Option<u64> },
+    Workspace { ws_id: String, branch: String },
     /// Left alone; `reason` is what the preview shows.
-    Skip { branch: String, pr: Option<u64>, reason: String },
+    Skip { branch: String, reason: String },
 }
 
 impl RepoCleanupItem {
@@ -1997,17 +2001,6 @@ impl RepoCleanupItem {
                 branch
             }
         }
-    }
-
-    pub fn pr(&self) -> Option<u64> {
-        match self {
-            Self::Delete { pr, .. } | Self::Workspace { pr, .. } | Self::Skip { pr, .. } => *pr,
-        }
-    }
-
-    /// The PR column: `#N`, or `-` without a PR.
-    pub fn pr_label(&self) -> String {
-        self.pr().map(|n| format!("#{n}")).unwrap_or_else(|| "-".to_string())
     }
 
     /// The plan's Delete rows as the `(branch, tip)` pairs [`delete_branches`] takes.
@@ -2045,26 +2038,25 @@ pub fn plan_repo_cleanup(
                 && w.branch_name.as_deref() == Some(v.branch.as_str())
         });
         match (v.verdict, ws) {
-            (Verdict::Skip(reason), _) => skips.push((reason, v.branch, v.pr)),
+            (Verdict::Skip(reason), _) => skips.push((reason, v.branch)),
             (_, Some(ws)) => routed.push(RepoCleanupItem::Workspace {
                 ws_id: ws.id.clone(),
                 branch: v.branch,
-                pr: v.pr,
             }),
             (Verdict::Delete, None) => {
-                deletes.push(RepoCleanupItem::Delete { branch: v.branch, tip: v.tip, pr: v.pr })
+                deletes.push(RepoCleanupItem::Delete { branch: v.branch, tip: v.tip })
             }
             (Verdict::CheckedOut { worktree }, None) => {
                 let hint =
                     if Path::new(&worktree).exists() { "" } else { "; run git worktree prune" };
-                skips.push((format!("checked out at {worktree}{hint}"), v.branch, v.pr));
+                skips.push((format!("checked out at {worktree}{hint}"), v.branch));
             }
         }
     }
     skips.sort();
     deletes.extend(routed);
     deletes.extend(
-        skips.into_iter().map(|(reason, branch, pr)| RepoCleanupItem::Skip { branch, pr, reason }),
+        skips.into_iter().map(|(reason, branch)| RepoCleanupItem::Skip { branch, reason }),
     );
     deletes
 }
@@ -4003,12 +3995,11 @@ mod tests {
         let v = |branch: &str, verdict: Verdict| BranchVerdict {
             branch: branch.into(),
             tip: "t".into(),
-            pr: Some(1),
             verdict,
         };
         let items = plan_repo_cleanup(
             vec![
-                v("zzz", Verdict::Skip("no PR".into())),
+                v("zzz", Verdict::Skip("not merged into main".into())),
                 v("stale-foreign", Verdict::CheckedOut { worktree: missing.clone() }),
                 v("feat", Verdict::Delete), // w1's branch: dir gone + entry pruned shape
                 v("foreign", Verdict::CheckedOut { worktree: existing.clone() }),
@@ -4022,21 +4013,19 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                RepoCleanupItem::Delete { branch: "feat3".into(), tip: "t".into(), pr: Some(1) },
-                RepoCleanupItem::Delete { branch: "loose".into(), tip: "t".into(), pr: Some(1) },
-                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "feat".into(), pr: Some(1) },
-                RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "feat2".into(), pr: Some(1) },
+                RepoCleanupItem::Delete { branch: "feat3".into(), tip: "t".into() },
+                RepoCleanupItem::Delete { branch: "loose".into(), tip: "t".into() },
+                RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "feat".into() },
+                RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "feat2".into() },
                 RepoCleanupItem::Skip {
                     branch: "foreign".into(),
-                    pr: Some(1),
                     reason: format!("checked out at {existing}"),
                 },
                 RepoCleanupItem::Skip {
                     branch: "stale-foreign".into(),
-                    pr: Some(1),
                     reason: format!("checked out at {missing}; run git worktree prune"),
                 },
-                RepoCleanupItem::Skip { branch: "zzz".into(), pr: Some(1), reason: "no PR".into() },
+                RepoCleanupItem::Skip { branch: "zzz".into(), reason: "not merged into main".into() },
             ]
         );
     }

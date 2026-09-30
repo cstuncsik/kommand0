@@ -83,7 +83,7 @@ kmd repo list
 kmd repo delete <name-or-path> [--force]
 kmd repo move <name-or-path> up|down    # reorder the saved order
 kmd repo sort [manual|name-asc|name-desc|added-asc|added-desc]   # omit to show
-kmd repo cleanup <name-or-path> [--dry-run] [--force]  # delete local branches whose PR is merged
+kmd repo cleanup <name-or-path> [--dry-run] [--force]  # delete local branches merged into the default branch (fetches it first, --dry-run too)
 
 # Workspaces
 kmd workspace create [<name>] --repo <name-or-path> [--branch <existing>] [--issue <ref>] [--fork] [--no-worktree]
@@ -160,7 +160,7 @@ cargo run -p kommand0-tui   # from a checkout
 - **Branch/diff status**: each workspace shows its git branch and how far it is ahead/behind its upstream plus whether it has uncommitted changes — a compact `↑2↓1*` segment in the tree row and full detail (`Branch:` / `Changes:`) in the detail pane. Computed off the render loop (never blocks keystrokes), refreshed every couple of seconds and on workspace create/close
 - **PR/CI status**: each own-branch workspace surfaces its GitHub PR at a glance — a compact `#12 ✓` in the tree row (`✓` checks passing · `✗` failing · `○` pending · `⬤` merged · `✕` closed) and a full `PR #12 · open · CI passing · approved` line + URL in the detail pane. One read-only `gh pr list` per repo, off the render loop, refreshed periodically. Requires `gh` installed and authenticated; nothing shows without it. Press `p` to open the PR in your browser
 - **Review a workspace's diff**: press `v` on a workspace to open a two-pane dialog (GitHub-style) — a file tree with collapsible folders on the left, the selected file's diff on the right (`git diff <default>...HEAD`, the committed changes a PR would show, coloured by add / remove / hunk). `Tab` switches focus between the panes; click or select a file. In the file pane `j`/`k` move, `Enter`/`l`/`h` expand/collapse folders; in the diff pane `j`/`k`, `PgUp`/`PgDn`, `g`/`G` scroll; `Esc`/`v`/`q` close. Rebindable as `review-diff`
-- **Clean up merged workspaces**: press `c` (or click `[Clean up]`) to remove a workspace's worktree and delete its branch once its PR is merged. Behind a confirmation, and it only proceeds when it's provably safe — the PR is `MERGED` (per `gh`), the worktree is clean, and the branch has no commits beyond what the PR merged (squash-safe); otherwise it refuses and tells you why. On success the workspace is dropped from the tree
+- **Clean up merged workspaces**: press `c` (or click `[Clean up]`) to remove a workspace's worktree and delete its branch once it is merged, meaning its changes are already on the default branch (by a merge commit, a squash, or a rebase of one commit). That is decided from local git with no GitHub API call; the default branch is fetched first only when the local copy says not merged. Behind a confirmation, and it only proceeds when the branch has commits of its own, none made after the merge (by commit date), and the worktree is clean, counting what git may be set not to show (e.g. untracked files under `status.showUntrackedFiles=no`, edits to a file flagged `--assume-unchanged`); ignored files go with the worktree. Otherwise it refuses and tells you why. On success the workspace is dropped from the tree
 - **Status bar**: bottom row shows the current mode (TREE / CLAUDE), the selected repo/workspace, the live-session count (and how many are active / waiting), and context key hints
 - **Activity indicator**: a workspace's tree row animates its prompt into a spinner while its embedded Claude is actively producing output (debounced, so a stray keystroke doesn't flicker it)
 - **Attention indicator**: when a session produces output you haven't viewed and then goes quiet, its workspace gets a magenta dot (and a "N waiting" count in the status bar) so you can tell at a glance which of your parallel sessions has come back to you. The flag is per-session and latches until you actually open that session (a mid-turn pause won't flicker it) — so a workspace stays flagged while any of its tabs has unseen output, and selecting a workspace in the tree doesn't count as viewing it (you have to open the session to clear it). Optionally ring a terminal bell or raise a desktop notification on that edge — see the `notify` config option below (off by default).
@@ -186,7 +186,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `x` / `Delete` | Tree | Close the embedded Claude pane |
 | `v` | Tree | Review the workspace's diff (two-pane: file tree + selected file's diff; `Tab` switches focus) |
 | `p` | Tree | Open the workspace's PR in a browser |
-| `c` | Tree | Clean up merged workspace / repo: on a workspace row, its merged worktree + branch; on a repo row (or click `[Clean up branches]` in its detail pane), every local branch whose PR is merged (preview, then `y`); branches of kommand0 workspaces are routed to the workspace cleanup, other checkouts and `protected_branches` are skipped |
+| `c` | Tree | Clean up merged workspace / repo: on a workspace row, its merged worktree + branch; on a repo row (or click `[Clean up branches]` in its detail pane), every local branch already merged into the default branch, which is fetched first (preview, then `y`); branches of kommand0 workspaces are routed to the workspace cleanup, other checkouts and `protected_branches` are skipped |
 | `a` | Tree | Add repository (modal) |
 | `w` | Tree | Add workspace to selected repo (modal; a `123` / `#123` / issue URL name creates the branch GitHub links to that issue) |
 | `d` / `D` | Tree | Delete / force-delete selected |
@@ -350,7 +350,7 @@ Optional, hand-edited `config.json` (in the state directory, or at the path in `
 - `claude_bin` — override the `claude` binary (the `KOMMAND0_CLAUDE_BIN` env var still takes precedence).
 - `status_refresh_secs` — how often the background git-status refresh runs (default 2; floored at 1).
 - `tree_width_pct` — the tree (left) pane width as a percent of the terminal (default 30; clamped to 15–60). This is the persistent baseline; the live `<`/`>` keys adjust a per-session value seeded from it (and reset to it next launch). You can also drag the border between the tree and content panes with the mouse to resize it live.
-- `protected_branches`: exact branch names that neither cleanup ever deletes (default `["develop", "development", "staging"]`). A configured list **replaces** the default, so `[]` disables it; `main`, `master` and whatever `origin/HEAD` points at are always refused regardless. It gates the workspace cleanup (`c` on a workspace, `kmd workspace cleanup`) as well as the repo cleanup, and `--force` never bypasses it. The file is re-read when a cleanup runs (no restart needed), and an unparseable or unreadable `config.json` blocks cleanup until it is fixed instead of falling back to the default list. Note that the repo scan sends each local branch name that passes these gates to GitHub as a `gh pr list --head <branch>` filter.
+- `protected_branches`: exact branch names that neither cleanup ever deletes (default `["develop", "development", "staging"]`). A configured list **replaces** the default, so `[]` disables it; `main`, `master` and whatever `origin/HEAD` points at are always refused regardless. It gates the workspace cleanup (`c` on a workspace, `kmd workspace cleanup`) as well as the repo cleanup, and `--force` never bypasses it. The file is re-read when a cleanup runs (no restart needed), and an unparseable or unreadable `config.json` blocks cleanup until it is fixed instead of falling back to the default list.
 - `keybindings` — rebind tree-pane actions: `"<action>": ["<key>", …]`. The listed keys **replace** that action's defaults. Key specs: a single char (`q`, `/`, case-sensitive), a named key (`Up`/`Down`/`Left`/`Right`/`Enter`/`Esc`/`Tab`/`Space`/`Delete`/`Backspace`/`Home`/`End`), with optional `ctrl+`/`alt+`/`shift+`. Actions: `move-up`, `move-down`, `collapse`, `expand`, `last`, `widen-tree`, `shrink-tree`, `activate`, `open`, `close`, `review-diff`, `open-pr-web`, `cleanup`, `filter`, `palette`, `next-waiting`, `prev-waiting`, `archive`, `move-item-up`, `move-item-down`, `sort-by-name`, `sort-by-added`, `add-repo`, `add-workspace`, `delete`, `force-delete`, `help`, `settings`, `quit`. The `gg` motion, `Esc` (clears the filter), and the embedded `Ctrl+A` prefix are fixed (not rebindable). Unknown actions, bad specs, or reusing a reserved key are warned (tree border + log), not fatal. If a rebind leaves an action with no valid keys it shows as `(unbound)` in the help overlay (`?`).
 - `theme` — a built-in palette for the app chrome: `"default"` or `"high-contrast"` (the embedded `claude` pane keeps its own colours either way). Unknown names warn and fall back to default.
 - `theme_colors` — per-role overrides applied on top of `theme`: `"<role>": "<color>"`. Roles: `accent`, `selected`, `active`, `attention`, `dirty`, `error`, `muted`, `text`, `inverse`. Colors: a named color (`cyan`, `light-red`, `darkgray`), an `#rrggbb` hex, a 0–255 palette index, or `reset`/`default` (the terminal's own default color — not the role's built-in). Unknown roles / unparseable colors are warned (tree border + log), not fatal.
@@ -365,6 +365,53 @@ The config is read once at startup, so hand-edits take effect on the next launch
 **No PR/CI status in the tree.** PR status needs the [GitHub CLI](https://cli.github.com):
 `gh` installed and authenticated (`gh auth status` to check, `gh auth login` to fix).
 Without it the tree simply omits the PR segment, nothing else breaks.
+
+**Cleanup keeps a branch GitHub shows as merged.** Cleanup never asks GitHub: a
+branch counts as merged when its changes are already on the default branch,
+which is `origin/HEAD`, else `origin/main`, `origin/master`, `main` or `master`
+(the first that exists; with none, both cleanups stop with an error). The repo
+cleanup fetches that branch first, the workspace cleanup only when the local
+copy says not merged, and a failed fetch is reported once, as a warning (in
+the TUI, the workspace cleanup shows it under its refusal). These are kept on
+purpose, because local git can't prove them merged:
+- a squash whose diff differs from the branch's (a conflict resolved in the
+  merge, or main changed nearby lines before it);
+- a rebase merge of more than one commit, or a branch merged into another
+  branch that was then squashed into the default branch;
+- a squash or one-commit rebase with branch commits made after it, even ones
+  that undo each other (the net change would hide them) or only an amend or a
+  rebase, or when the same change had landed on the default branch before (and
+  was reverted); commit dates decide, so a clock running ahead also keeps a
+  branch merged within that lead (and one running behind can let such commits
+  by);
+- a branch fast-forwarded into the default branch, or one whose changes cancel
+  out: neither has commits of its own;
+- a branch whose only reflog entry is its creation at the current tip (e.g.
+  `git worktree add -b` from a merged checkout), unless it was adopted from
+  `origin/<same name>` (with ref logging off, or once that entry expires, such
+  a branch reads merged; it has no commits to lose);
+- squash merges on git older than 2.38 or in a partial clone (merge commits
+  are still detected);
+- files that need a custom merge driver (drivers never run during the check).
+
+The other way round, a merge later reverted on the default branch still
+counts as merged, because its commit stays in the default branch's history.
+
+If `origin/HEAD` is missing, or the default branch was renamed on the server,
+run `git fetch origin` and then `git remote set-head origin -a`. Delete a
+leftover by hand with `git branch -D <branch>`.
+
+**A fetch fails where plain `git fetch` would prompt.** kommand0's fetches (the
+cleanups' default branch, an issue's linked branch) don't prompt, unless your
+own ssh command asks to (`-oBatchMode=no`): a prompt would hang behind the TUI. It adds batch mode and keepalives to the ssh command
+(`-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes`; `GIT_SSH`
+is honored, and a plink or `simple` variant gets none), so load a
+passphrase-protected key with `ssh-add`. These options win over
+`~/.ssh/config`; to change a keepalive, put your own `-o` in `GIT_SSH_COMMAND`
+or `core.sshCommand`, which win over them. An https transfer gives up after 5
+minutes without progress, unless you set `http.lowSpeedLimit` /
+`http.lowSpeedTime` (or `GIT_HTTP_LOW_SPEED_LIMIT` / `_TIME`) yourself. kommand0
+stops waiting after 20 s and leaves a slow fetch to finish.
 
 **The embedded pane won't open (or exits immediately).** The `claude` binary
 isn't on PATH, or the one found isn't the Claude Code CLI. Install it, or point

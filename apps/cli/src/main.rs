@@ -4,7 +4,7 @@ use std::os::unix::process::CommandExt; // for Command::process_group
 use clap::{Parser, Subcommand, ValueEnum};
 use kommand0_core::workspace::format_timestamp;
 use kommand0_core::{
-    AppState, Config, RepoCleanupItem, SessionStatus, SortMode, Workspace, branch_status,
+    AppState, Config, RepoCleanupItem, Scan, SessionStatus, SortMode, Workspace, branch_status,
     cleanup_merged_workspace, delete_branches, plan_repo_cleanup, scan_merged_branches,
 };
 
@@ -151,11 +151,11 @@ enum RepoAction {
         /// The mode to switch to; omit to print the current one
         mode: Option<SortArg>,
     },
-    /// Delete local branches whose PR is merged (merged kommand0 worktrees are cleaned up too)
+    /// Delete local branches merged into the default branch (merged kommand0 worktrees too)
     Cleanup {
         /// Repo reference (name, path, or ID)
         name: String,
-        /// Print the plan and exit
+        /// Print the plan and exit (still fetches the default branch)
         #[arg(long, conflicts_with = "force")]
         dry_run: bool,
         /// Skip confirmation prompt
@@ -314,6 +314,17 @@ fn wants_checkout(answer: &str) -> bool {
     !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no")
 }
 
+/// A workspace-cleanup refusal is its reason, then core's notes on lines of
+/// their own: the notes go out as warnings, the reason comes back.
+fn warn_notes(refusal: &str) -> &str {
+    let mut lines = refusal.lines();
+    let reason = lines.next().unwrap_or_default();
+    for note in lines {
+        eprintln!("warning: {note}");
+    }
+    reason
+}
+
 /// Shared gate for the destructive `[y/N]` prompts: refuses (exit 1) when
 /// stdin is not a tty, else prints `prompt()` and returns whether the user
 /// confirmed with y/Y (anything else cancels). The prompt is lazy so a
@@ -443,14 +454,17 @@ fn main() -> anyhow::Result<()> {
                 let protected = Config::protected_branches_now().map_err(anyhow::Error::msg)?;
                 let mut state = AppState::load()?;
                 let repo = state.resolve_repo(&name)?.clone();
-                let verdicts =
+                let Scan { verdicts, notes, base } =
                     scan_merged_branches(&repo.path, &protected).map_err(anyhow::Error::msg)?;
                 let plan = plan_repo_cleanup(verdicts, &repo.id, &state.workspaces);
 
                 fn ws_of<'a>(state: &'a AppState, id: &str) -> Option<&'a Workspace> {
                     state.workspaces.iter().find(|w| w.id == id)
                 }
-                println!("{:<30} {:<7} ACTION", "BRANCH", "PR");
+                for note in &notes {
+                    eprintln!("warning: {note}");
+                }
+                println!("{:<30} ACTION", "BRANCH");
                 for item in &plan {
                     let action = match item {
                         RepoCleanupItem::Delete { .. } => "delete".to_string(),
@@ -460,7 +474,7 @@ fn main() -> anyhow::Result<()> {
                         ),
                         RepoCleanupItem::Skip { reason, .. } => format!("skip: {reason}"),
                     };
-                    println!("{:<30} {:<7} {action}", item.branch(), item.pr_label());
+                    println!("{:<30} {action}", item.branch());
                 }
                 let actionable =
                     plan.iter().filter(|i| !matches!(i, RepoCleanupItem::Skip { .. })).count();
@@ -481,15 +495,22 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 let mut failed = 0;
-                for (branch, result) in
-                    delete_branches(&repo.path, &RepoCleanupItem::deletes(&plan), &protected)
-                {
-                    match result {
-                        Ok(()) => println!("Deleted branch: {branch}"),
-                        Err(e) => {
-                            failed += 1;
-                            println!("Could not delete branch {branch}: {e}");
+                let deletes = RepoCleanupItem::deletes(&plan);
+                match delete_branches(&repo.path, &deletes, &protected, &base) {
+                    Ok(results) => {
+                        for (branch, result) in results {
+                            match result {
+                                Ok(()) => println!("Deleted branch: {branch}"),
+                                Err(e) => {
+                                    failed += 1;
+                                    println!("Could not delete branch {branch}: {e}");
+                                }
+                            }
                         }
+                    }
+                    Err(e) => {
+                        failed += deletes.len();
+                        println!("Could not delete branches: {e}");
                     }
                 }
                 for item in &plan {
@@ -511,7 +532,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         Err(e) => {
                             failed += 1;
-                            println!("Could not clean up workspace {ws_name}: {e}");
+                            println!("Could not clean up workspace {ws_name}: {}", warn_notes(&e));
                         }
                     }
                 }
@@ -813,7 +834,7 @@ fn main() -> anyhow::Result<()> {
                         state.delete_workspace_by_id(&ws.id)?;
                         println!("Cleaned up workspace: {name}");
                     }
-                    Err(e) => anyhow::bail!("{e}"),
+                    Err(e) => anyhow::bail!("{}", warn_notes(&e)),
                 }
             }
         },

@@ -4,6 +4,9 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// What kommand0 appends to the ssh command its git runs (core's `SSH_OPTS`).
+const SSH_OPTS: &str = "-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatchMode=yes";
+
 fn run_git(cwd: &Path, args: &[&str]) {
     let ok = Command::new("git")
         .args(args)
@@ -52,9 +55,9 @@ fn kmd_at(cwd: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     cmd.output().unwrap()
 }
 
-/// Put a `git` shim first on PATH for a child process: `body` runs, then the
-/// real git. Returns the PATH value to pass in the child's env (per-child, so
-/// this stays hermetic and parallel-safe).
+/// Put a `git` shim first on PATH for a child process: `body` runs (the real
+/// git is `"$real_git"` in it), then the real git. Returns the PATH value to
+/// pass in the child's env (per-child, so this stays hermetic and parallel-safe).
 fn git_shim(dir: &Path, body: &str) -> String {
     // Resolve the real git BEFORE the shim shadows it, or the shim exec's itself.
     let out = Command::new("sh").args(["-c", "command -v git"]).output().unwrap();
@@ -62,7 +65,10 @@ fn git_shim(dir: &Path, body: &str) -> String {
     assert!(!real_git.is_empty(), "no git on PATH");
     std::fs::create_dir_all(dir).unwrap();
     // Quoted: a git under a path with a space would otherwise split into words.
-    write_stub(&dir.join("git"), &format!("#!/bin/sh\n{body}\nexec \"{real_git}\" \"$@\"\n"));
+    write_stub(
+        &dir.join("git"),
+        &format!("#!/bin/sh\nreal_git=\"{real_git}\"\n{body}\nexec \"$real_git\" \"$@\"\n"),
+    );
     format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default())
 }
 
@@ -350,8 +356,9 @@ fn workspace_create_from_an_issue() {
 fn the_linked_branch_fetch_never_asks_for_credentials() {
     // A PATH shim records how kommand0 actually invokes git: the fetch carries
     // gh's credential helper (a private HTTPS origin authenticated only by a
-    // GH_TOKEN fetches with nothing else), and neither git nor ssh may fall back
-    // to a prompt, which off the UI thread would hang past the timeout.
+    // GH_TOKEN fetches with nothing else), and neither git (a terminal or an
+    // askpass helper, which VS Code terminals set) nor ssh may fall back to a
+    // prompt, which off the UI thread would hang past the timeout.
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
     let repo = tmp.path().join("repo");
@@ -365,8 +372,10 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
     let path = git_shim(
         &tmp.path().join("shim"),
         &format!(
-            "printf '%s [%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
-             \"${{GIT_SSH_COMMAND-UNSET}}\" >> \"{}\"",
+            "printf '%s [%s][%s][%s][%s][%s]\\n' \"$*\" \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
+             \"${{GIT_SSH_COMMAND-UNSET}}\" \"${{GIT_ASKPASS-UNSET}}\" \
+             \"${{GIT_HTTP_LOW_SPEED_LIMIT-UNSET}}\" \"${{GIT_HTTP_LOW_SPEED_TIME-UNSET}}\" \
+             >> \"{}\"",
             log.display()
         ),
     );
@@ -378,6 +387,10 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
             ("PATH", &path),
             // A user's own GIT_SSH_COMMAND must survive, with batch mode added.
             ("GIT_SSH_COMMAND", "ssh -F /dev/null"),
+            ("GIT_ASKPASS", "/opt/editor/askpass.sh"),
+            // No `http.lowSpeed*` of the developer's own.
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
         ],
         &["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()],
     );
@@ -396,15 +409,83 @@ fn the_linked_branch_fetch_never_asks_for_credentials() {
         lines[fetch]
     );
     assert!(
-        lines[fetch].ends_with("[0][ssh -F /dev/null -oBatchMode=yes]"),
-        "no terminal prompt, and batch mode is appended to the user's ssh command: {}",
+        lines[fetch].contains(&format!("[0][ssh -F /dev/null {SSH_OPTS}][]")),
+        "no terminal or askpass prompt, and batch mode and keepalives are appended to the \
+         user's ssh command: {}",
         lines[fetch]
     );
+    // Only checkable when the developer's shell doesn't export its own.
+    if std::env::var_os("GIT_HTTP_LOW_SPEED_LIMIT").is_none()
+        && std::env::var_os("GIT_HTTP_LOW_SPEED_TIME").is_none()
+    {
+        assert!(lines[fetch].ends_with("[1][300]"), "a stalled https transfer gives up: {}", lines[fetch]);
+    }
     let is_ancestor = lines
         .iter()
         .position(|l| l.contains("merge-base --is-ancestor"))
         .unwrap_or_else(|| panic!("no local-branch check in:\n{recorded}"));
     assert!(fetch < is_ancestor, "the local branch is judged against a fresh origin ref");
+}
+
+/// `kmd workspace create --issue 123` with `env`, on a fresh fixture and
+/// without the developer's git config, returning the linked branch's fetch as
+/// a git shim logged it: its argv, then
+/// `[GIT_SSH_COMMAND][GIT_HTTP_LOW_SPEED_LIMIT][GIT_HTTP_LOW_SPEED_TIME]`.
+fn issue_fetch(env: &[(&str, &str)]) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let gh = tmp.path().join("gh");
+    gh_develop_stub(&gh);
+    let log = tmp.path().join("git.log");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!(
+            "printf '%s [%s][%s][%s]\\n' \"$*\" \"${{GIT_SSH_COMMAND-UNSET}}\" \
+             \"${{GIT_HTTP_LOW_SPEED_LIMIT-UNSET}}\" \"${{GIT_HTTP_LOW_SPEED_TIME-UNSET}}\" \
+             >> \"{}\"",
+            log.display()
+        ),
+    );
+    let mut env = env.to_vec();
+    env.extend([
+        ("KOMMAND0_GH_BIN", gh.to_str().unwrap()),
+        ("PATH", path.as_str()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]);
+    let args = ["workspace", "create", "--issue", "123", "--repo", repo.to_str().unwrap()];
+    let out = kmd(&state, &env, &args);
+    assert!(out.status.success(), "create --issue: {}", String::from_utf8_lossy(&out.stderr));
+    let recorded = std::fs::read_to_string(&log).unwrap();
+    let fetch = recorded.lines().find(|l| l.contains("fetch origin +refs/heads/123-add-thing:"));
+    fetch.unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}")).to_string()
+}
+
+#[test]
+fn the_fetch_keeps_a_users_git_ssh_and_stall_time() {
+    // GIT_SSH is a program, not a command line, and the GIT_SSH_COMMAND kommand0
+    // sets would shadow it; a stall time the user exported stands, and git
+    // needs both halves, so kommand0 still sets the other.
+    let env = [
+        ("GIT_SSH_COMMAND", ""),
+        ("GIT_SSH", "/opt/my tools/ssh"),
+        ("GIT_HTTP_LOW_SPEED_TIME", "600"),
+    ];
+    let fetch = issue_fetch(&env);
+    assert!(fetch.contains(&format!("['/opt/my tools/ssh' {SSH_OPTS}]")), "{fetch}");
+    if std::env::var_os("GIT_HTTP_LOW_SPEED_LIMIT").is_none() {
+        assert!(fetch.ends_with("[1][600]"), "{fetch}");
+    }
+}
+
+#[test]
+fn a_plink_variant_gets_no_openssh_options() {
+    // Read from the environment, as git reads it.
+    let env =
+        [("GIT_SSH_COMMAND", ""), ("GIT_SSH", "/opt/my tools/ssh"), ("GIT_SSH_VARIANT", "plink")];
+    let fetch = issue_fetch(&env);
+    assert!(fetch.contains("['/opt/my tools/ssh']"), "{fetch}");
 }
 
 #[test]
@@ -445,8 +526,8 @@ fn the_fetch_keeps_the_repos_own_ssh_command() {
         .find(|l| l.contains("fetch origin +refs/heads/123-add-thing:"))
         .unwrap_or_else(|| panic!("no fetch of the linked branch in:\n{recorded}"));
     assert!(
-        fetch.ends_with("[ssh -i /k/deploy -oBatchMode=yes]"),
-        "the repo's own ssh command survives, with batch mode appended: {fetch}"
+        fetch.ends_with(&format!("[ssh -i /k/deploy {SSH_OPTS}]")),
+        "the repo's own ssh command survives, with kommand0's options appended: {fetch}"
     );
 }
 
@@ -678,29 +759,49 @@ fn workspace_names_are_per_repo_and_ids_disambiguate() {
     assert!(out.contains("dev") && out.contains("alpha"), "the right row shown: {out}");
 }
 
-/// [`setup`] plus two loose branches for the repo cleanup: `stale` (merged,
-/// deletable) and `development` (merged, protected by default), and a `gh`
-/// stub that reports every branch's PR as merged at the branch tip. Returns
-/// `(state_dir, repo_path, gh_stub)`.
-fn setup_for_repo_cleanup(
-    root: &Path,
-) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    let state = setup(root);
-    let repo = root.join("repo");
-    run_git(&repo, &["branch", "stale"]);
-    run_git(&repo, &["branch", "development"]);
-    let gh = root.join("gh");
-    write_stub(
-        &gh,
-        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
-    );
-    (state, repo, gh)
+/// Give `branch` one commit of its own in `dir` (its worktree, or the repo
+/// itself, which switches to it and back), then squash-merge it into main.
+fn squash_merge(repo: &Path, dir: &Path, branch: &str) {
+    if dir == repo {
+        run_git(repo, &["switch", branch]);
+    }
+    std::fs::write(dir.join(format!("{branch}.txt")), branch).unwrap();
+    run_git(dir, &["add", "."]);
+    run_git(dir, &["commit", "-m", branch]);
+    if dir == repo {
+        run_git(repo, &["switch", "main"]);
+    }
+    run_git(repo, &["merge", "--squash", "--ff", branch]);
+    run_git(repo, &["commit", "-m", &format!("squash {branch}")]);
 }
 
-fn repo_cleanup(state: &Path, gh: &Path, repo: &Path, flags: &[&str]) -> Output {
+/// [`setup`] with everything squash-merged into main: the loose `stale`
+/// (deletable), `development` (protected by default) and the `feat`
+/// workspace's branch. `spare` stays fresh. Returns `(state_dir, repo_path)`.
+fn setup_for_repo_cleanup(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let state = setup(root);
+    let repo = root.join("repo");
+    for branch in ["stale", "development"] {
+        run_git(&repo, &["branch", branch]);
+        squash_merge(&repo, &repo, branch);
+    }
+    squash_merge(&repo, &workspace_dir(&state, "feat"), "feat");
+    (state, repo)
+}
+
+/// `kmd repo cleanup <repo> <flags>` with a gh that fails like an exhausted
+/// GitHub API quota and records every call in `<root>/gh.calls`.
+fn repo_cleanup(state: &Path, repo: &Path, flags: &[&str], env: &[(&str, &str)]) -> Output {
+    let gh = state.parent().unwrap().join("gh");
+    write_stub(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\necho 'GraphQL: API rate limit exceeded for user ID 1.' >&2\nexit 1\n",
+    );
     let mut args = vec!["repo", "cleanup", repo.to_str().unwrap()];
     args.extend_from_slice(flags);
-    kmd(state, &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())], &args)
+    let mut env = env.to_vec();
+    env.push(("KOMMAND0_GH_BIN", gh.to_str().unwrap()));
+    kmd(state, &env, &args)
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
@@ -734,9 +835,13 @@ fn row<'a>(table: &'a str, branch: &str) -> &'a str {
 #[test]
 fn repo_cleanup_force_deletes_stale_branches_and_routes_the_workspace() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
     let feat_dir = workspace_dir(&state, "feat");
-    let out = repo_cleanup(&state, &gh, &repo, &["--force"]);
+    // A stale origin/main, so the run goes through the fetch before it decides
+    // (gh's credential helper only answers over https, not for this origin).
+    run_git(&repo, &["push", "origin", "main"]);
+    run_git(&repo, &["update-ref", "refs/remotes/origin/main", "main~1"]);
+    let out = repo_cleanup(&state, &repo, &["--force"], &[]);
     assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
     let text = stdout(&out);
     assert!(text.contains("Deleted branch: stale"), "{text}");
@@ -746,21 +851,27 @@ fn repo_cleanup_force_deletes_stale_branches_and_routes_the_workspace() {
     assert!(!feat_dir.exists(), "feat's worktree removed");
     let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
     assert!(!list.contains("feat"), "workspace row dropped: {list}");
+    // The run fetched: origin/main caught up with main.
+    run_git(&repo, &["merge-base", "--is-ancestor", "main", "refs/remotes/origin/main"]);
     // Idempotent: a second run finds nothing actionable and exits 0.
-    let again = repo_cleanup(&state, &gh, &repo, &["--force"]);
+    let again = repo_cleanup(&state, &repo, &["--force"], &[]);
     assert!(again.status.success(), "rerun: {}", String::from_utf8_lossy(&again.stderr));
     assert!(stdout(&again).contains("Nothing to clean up."), "{}", stdout(&again));
+    // Merged is decided from local git: GitHub's rate limit can't stop it.
+    let calls = std::fs::read_to_string(tmp.path().join("gh.calls")).unwrap_or_default();
+    assert!(calls.is_empty(), "gh was called:\n{calls}");
 }
 
 #[test]
 fn repo_cleanup_dry_run_lists_and_deletes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
     let feat_dir = workspace_dir(&state, "feat");
-    let out = repo_cleanup(&state, &gh, &repo, &["--dry-run"]);
+    let out = repo_cleanup(&state, &repo, &["--dry-run"], &[]);
     assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
     let text = stdout(&out);
-    assert!(row(&text, "stale").ends_with("delete"), "{text}");
+    assert_eq!(text.lines().next(), Some(format!("{:<30} ACTION", "BRANCH").as_str()), "{text}");
+    assert_eq!(row(&text, "stale"), format!("{:<30} delete", "stale"), "{text}");
     assert!(row(&text, "feat").ends_with("clean up workspace 'feat'"), "{text}");
     assert!(row(&text, "development").ends_with("skip: protected branch"), "{text}");
     for b in ["stale", "feat", "development"] {
@@ -770,7 +881,7 @@ fn repo_cleanup_dry_run_lists_and_deletes_nothing() {
 
     // A configured list replaces the built-in default, so `[]` unprotects it.
     std::fs::write(state.join("config.json"), r#"{ "protected_branches": [] }"#).unwrap();
-    let out = repo_cleanup(&state, &gh, &repo, &["--dry-run"]);
+    let out = repo_cleanup(&state, &repo, &["--dry-run"], &[]);
     assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
     let text = stdout(&out);
     assert!(row(&text, "development").ends_with("delete"), "an empty list disables the default: {text}");
@@ -779,9 +890,9 @@ fn repo_cleanup_dry_run_lists_and_deletes_nothing() {
 #[test]
 fn repo_cleanup_aborts_on_invalid_config() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
     std::fs::write(state.join("config.json"), "{ bad").unwrap();
-    let out = repo_cleanup(&state, &gh, &repo, &["--dry-run"]);
+    let out = repo_cleanup(&state, &repo, &["--dry-run"], &[]);
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("invalid"), "names the problem: {err}");
@@ -791,8 +902,8 @@ fn repo_cleanup_aborts_on_invalid_config() {
 #[test]
 fn repo_cleanup_refuses_non_interactive_without_force() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
-    let out = repo_cleanup(&state, &gh, &repo, &[]);
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
+    let out = repo_cleanup(&state, &repo, &[], &[]);
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("refusing to clean up without --force"), "{err}");
@@ -804,10 +915,10 @@ fn repo_cleanup_refuses_non_interactive_without_force() {
 #[test]
 fn repo_cleanup_exits_1_when_a_routed_workspace_refuses() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
     let feat_dir = workspace_dir(&state, "feat");
     std::fs::write(feat_dir.join("scratch.txt"), "wip").unwrap(); // untracked => dirty
-    let out = repo_cleanup(&state, &gh, &repo, &["--force"]);
+    let out = repo_cleanup(&state, &repo, &["--force"], &[]);
     assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let text = stdout(&out);
     assert!(text.contains("Deleted branch: stale"), "the plain delete still ran: {text}");
@@ -823,11 +934,11 @@ fn repo_cleanup_routes_a_workspace_whose_worktree_was_pruned() {
     // branch; routing by branch name still hands it to the workspace cleanup,
     // which deletes the branch and drops the state row instead of orphaning it.
     let tmp = tempfile::tempdir().unwrap();
-    let (state, repo, gh) = setup_for_repo_cleanup(tmp.path());
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
     let feat_dir = workspace_dir(&state, "feat");
     std::fs::remove_dir_all(&feat_dir).unwrap();
     run_git(&repo, &["worktree", "prune"]);
-    let out = repo_cleanup(&state, &gh, &repo, &["--force"]);
+    let out = repo_cleanup(&state, &repo, &["--force"], &[]);
     assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout(&out).contains("Cleaned up workspace: feat"), "{}", stdout(&out));
     assert!(!branch_exists(&repo, "feat"), "branch gone");
@@ -836,10 +947,275 @@ fn repo_cleanup_routes_a_workspace_whose_worktree_was_pruned() {
 }
 
 #[test]
+fn repo_cleanup_dry_run_warns_when_the_default_branch_cannot_be_refreshed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
+    run_git(&repo, &["push", "origin", "main"]);
+    run_git(&repo, &["fetch", "origin"]);
+    run_git(&repo, &["remote", "set-url", "origin", tmp.path().join("gone").to_str().unwrap()]);
+    // A second note: each gets a warning line of its own.
+    run_git(&repo, &["config", "extensions.partialclone", "origin"]);
+    let out = repo_cleanup(&state, &repo, &["--dry-run"], &[]);
+    assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("warning: origin/main not refreshed"), "{err}");
+    assert!(err.contains("warning: squash merges not detected in a partial clone"), "{err}");
+    assert_eq!(err.matches("not refreshed").count(), 1, "said once, not also logged: {err}");
+    let text = stdout(&out);
+    assert!(text.starts_with("BRANCH"), "the table still prints: {text}");
+}
+
+#[test]
+fn repo_cleanup_fails_closed_when_git_cannot_answer() {
+    // Each git call the merged check makes for the squash-merged `stale`,
+    // failing the way a broken git does (exit 128): stale is kept. Two of
+    // them turn squash detection off, with a warning and nothing else.
+    let unmerged = "skip: not merged into main";
+    let arms: &[(&str, &str, &str, &str)] = &[
+        ("merge-base", "*\" merge-base \"*", unmerged, ""),
+        ("commit-tree", "*\" commit-tree \"*", unmerged, ""),
+        ("cherry-mark", "*\"rev-list --cherry-mark\"*", unmerged, ""),
+        // The version probe included.
+        ("merge-tree", "*\" merge-tree \"*", unmerged, "(needs git 2.38 or newer)"),
+        // Only the replay (it carries the merge config), past the capability check.
+        ("replay", "*merge.default=text*merge-tree*", unmerged, ""),
+        // A driver that can't be listed can't be overridden.
+        ("drivers", "*\" config --list \"*", unmerged, "(couldn't read the merge driver config)"),
+        ("reflog", "*\"reflog show\"*", "skip: no commits of its own", ""),
+        // The dates a confirmed squash is checked against: the branch's own,
+        // and those of every landing (one failing alone must not fail open).
+        ("branch dates", "*\"--format=%ct\"*\"..\"*", unmerged, ""),
+        ("landing dates", "*\"--no-walk\"*", unmerged, ""),
+    ];
+    for (what, pattern, want, squash_off) in arms {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, repo) = setup_for_repo_cleanup(tmp.path());
+        let path =
+            git_shim(&tmp.path().join("shim"), &format!("case \"$*\" in\n  {pattern}) exit 128 ;;\nesac"));
+        let out = repo_cleanup(&state, &repo, &["--force"], &[("PATH", &path)]);
+        assert!(out.status.success(), "{what}: {}", String::from_utf8_lossy(&out.stderr));
+        let text = stdout(&out);
+        assert!(row(&text, "stale").ends_with(want), "{what}: {text}");
+        assert!(branch_exists(&repo, "stale"), "{what}: stale survives --force");
+        let err = String::from_utf8_lossy(&out.stderr);
+        if squash_off.is_empty() {
+            assert!(!err.contains("squash merges not detected"), "{what}: {err}");
+        } else {
+            let warning = format!("warning: squash merges not detected {squash_off}");
+            assert!(err.contains(&warning), "{what}: {err}");
+            assert!(!err.contains(" WARN "), "{what}: nothing logged beside it: {err}");
+        }
+    }
+
+    // The ancestor path, through a --no-ff merge.
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
+    run_git(&repo, &["switch", "-c", "nff"]);
+    std::fs::write(repo.join("nff.txt"), "nff").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "nff"]);
+    run_git(&repo, &["switch", "main"]);
+    run_git(&repo, &["merge", "--no-ff", "-m", "merge nff", "nff"]);
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        "case \"$*\" in\n  *\"rev-list --first-parent\"*) exit 128 ;;\nesac",
+    );
+    let out = repo_cleanup(&state, &repo, &["--force"], &[("PATH", &path)]);
+    assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    assert!(row(&text, "nff").ends_with("skip: not merged into main"), "{text}");
+    assert!(branch_exists(&repo, "nff"), "nff survives --force");
+}
+
+#[test]
+fn workspace_cleanup_prints_a_failed_refresh_as_a_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    run_git(&repo, &["push", "origin", "main"]);
+    run_git(&repo, &["fetch", "origin"]);
+    run_git(&repo, &["remote", "set-url", "origin", tmp.path().join("gone").to_str().unwrap()]);
+    let dir = workspace_dir(&state, "feat");
+    std::fs::write(dir.join("f.txt"), "f").unwrap();
+    run_git(&dir, &["add", "."]);
+    run_git(&dir, &["commit", "-m", "never merged"]);
+    let out =
+        kmd(&state, &[("KOMMAND0_GH_BIN", "false")], &["workspace", "cleanup", "feat", "--force"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = err.lines().collect();
+    assert!(lines.iter().any(|l| l.starts_with("warning: origin/main not refreshed: ")), "{err}");
+    let refusal = "Error: the branch isn't merged into origin/main; not cleaning up";
+    assert!(lines.contains(&refusal), "the refusal is a line of its own: {err}");
+}
+
+#[test]
+fn repo_cleanup_deletes_no_plain_branch_once_the_default_branch_is_rewound() {
+    // Rewound after the scan pinned it (here: during the scan's reflog read,
+    // once). The plain deletes stand down as one; the workspace row re-checks
+    // on its own and, its squash gone, refuses too.
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        "case \"$*\" in\n  *\"reflog show\"*) [ -e \"$0.done\" ] || { : > \"$0.done\"; \
+         \"$real_git\" -C \"$2\" update-ref refs/heads/main main~1; } ;;\nesac",
+    );
+    let out = repo_cleanup(&state, &repo, &["--force"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    let refusal = "Could not delete branches: scan again: main was rewound or rewritten";
+    assert!(text.contains(refusal), "{text}");
+    assert!(text.contains("Could not clean up workspace feat"), "{text}");
+    for b in ["stale", "feat"] {
+        assert!(branch_exists(&repo, b), "{b} kept");
+    }
+}
+
+#[test]
+fn repo_cleanup_never_runs_a_merge_driver_under_an_inherited_git_config() {
+    // `GIT_CONFIG` points `git config` alone at one file: the driver listing
+    // missed the repo's drivers, and the replay then ran them.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let lines: String = (1..=8).map(|n| format!("{n}\n")).collect();
+    let commit = |content: String, msg: &str| {
+        std::fs::write(repo.join("f.txt"), content).unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", msg]);
+    };
+    commit(lines.clone(), "f");
+    // A squash that needs no driver, which must still read merged: squash
+    // detection didn't just switch itself off.
+    run_git(&repo, &["switch", "-c", "added"]);
+    std::fs::write(repo.join("new.txt"), "new").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "new"]);
+    run_git(&repo, &["switch", "main"]);
+    run_git(&repo, &["merge", "--squash", "--ff", "added"]);
+    run_git(&repo, &["commit", "-m", "squash added"]);
+    run_git(&repo, &["switch", "-c", "spied"]);
+    commit(lines.replace("2\n", "two\n"), "two");
+    run_git(&repo, &["switch", "main"]);
+    // The replay needs a content merge, so it reaches the driver.
+    commit(lines.replace("7\n", "seven\n"), "seven");
+    run_git(&repo, &["merge", "--squash", "--ff", "spied"]);
+    run_git(&repo, &["commit", "-m", "squash spied"]);
+    let marker = tmp.path().join("driver-ran");
+    run_git(&repo, &["config", "merge.spy.driver", &format!("touch '{}'", marker.display())]);
+    std::fs::write(repo.join(".git/info/attributes"), "* merge=spy\n").unwrap();
+    let _ = Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "merge-tree", "--write-tree", "main^", "spied"])
+        .output()
+        .unwrap();
+    assert!(marker.exists(), "the fixture really reaches the driver");
+    std::fs::remove_file(&marker).unwrap();
+
+    let empty = tmp.path().join("empty.gitconfig");
+    std::fs::write(&empty, "").unwrap();
+    let out = repo_cleanup(&state, &repo, &["--dry-run"], &[("GIT_CONFIG", empty.to_str().unwrap())]);
+    assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!marker.exists(), "the scan ran the repo's merge driver");
+    let text = stdout(&out);
+    assert!(row(&text, "spied").ends_with("skip: not merged into main"), "{text}");
+    assert!(row(&text, "added").ends_with("delete"), "{text}");
+}
+
+#[test]
+fn workspace_cleanup_refuses_when_the_branch_moves_mid_cleanup() {
+    // kmd doesn't stop a live agent, so a commit can land while the cleanup
+    // runs. Before the worktree goes: the status check commits, once.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let dir = workspace_dir(&state, "feat");
+    squash_merge(&repo, &dir, "feat");
+    let marker = tmp.path().join("fired");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!(
+            "case \"$*\" in\n  *\"status --porcelain\"*) if [ ! -e '{m}' ]; then : > '{m}'; \
+             \"$real_git\" -C \"$2\" commit -q --allow-empty -m moved; fi ;;\nesac",
+            m = marker.display()
+        ),
+    );
+    let out = kmd(
+        &state,
+        &[("PATH", &path), ("KOMMAND0_GH_BIN", "false")],
+        &["workspace", "cleanup", "feat", "--force"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("moved while it was being checked"), "{err}");
+    assert!(dir.exists() && branch_exists(&repo, "feat"), "worktree and branch intact");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(list.contains("feat"), "workspace row survives: {list}");
+
+    // After the worktree went, before the delete: the prune moves the branch.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    squash_merge(&repo, &workspace_dir(&state, "feat"), "feat");
+    let tip = |rev: &str| {
+        let out = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "rev-parse", rev])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let merged = tip("refs/heads/feat");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        "case \"$*\" in\n  *\"worktree prune\"*) new=$(\"$real_git\" -C \"$2\" commit-tree \
+         -p refs/heads/feat -m moved 'refs/heads/feat^{tree}') && \
+         \"$real_git\" -C \"$2\" update-ref refs/heads/feat \"$new\" ;;\nesac",
+    );
+    let out = kmd(
+        &state,
+        &[("PATH", &path), ("KOMMAND0_GH_BIN", "false")],
+        &["workspace", "cleanup", "feat", "--force"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let reason = "worktree removed, but couldn't delete branch feat: moved since it was checked";
+    assert!(err.contains(reason), "{err}");
+    assert_eq!(tip("refs/heads/feat^"), merged, "feat is kept, at the commit made mid-cleanup");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(list.contains("feat"), "workspace row survives: {list}");
+}
+
+#[test]
+fn workspace_cleanup_keeps_an_untracked_file_that_appears_at_the_last_moment() {
+    // After the gate, inside `worktree remove`: only the `-c` kommand0 passes
+    // there makes git's own check see it despite the config.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let dir = workspace_dir(&state, "feat");
+    squash_merge(&repo, &dir, "feat");
+    run_git(&repo, &["config", "status.showUntrackedFiles", "no"]);
+    let late = dir.join("late.txt");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!("case \"$*\" in\n  *\"worktree remove\"*) : > '{}' ;;\nesac", late.display()),
+    );
+    let out = kmd(
+        &state,
+        &[("PATH", &path), ("KOMMAND0_GH_BIN", "false")],
+        &["workspace", "cleanup", "feat", "--force"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("couldn't remove the worktree"), "{err}");
+    assert!(late.exists() && branch_exists(&repo, "feat"), "the file and the branch survive");
+}
+
+#[test]
 fn workspace_cleanup_refuses_a_protected_branch_and_a_bad_config() {
     // Bare naming puts the workspace on branch `development`, which the
-    // built-in default list protects; the merged gh stub would otherwise let
-    // the cleanup through.
+    // built-in default list protects; its squash merge would otherwise let the
+    // cleanup through.
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
     let repo = tmp.path().join("repo");
@@ -850,15 +1226,11 @@ fn workspace_cleanup_refuses_a_protected_branch_and_a_bad_config() {
     );
     assert!(create.status.success(), "create: {}", String::from_utf8_lossy(&create.stderr));
     let dir = workspace_dir(&state, "development");
-    let gh = tmp.path().join("gh");
-    write_stub(
-        &gh,
-        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
-    );
+    squash_merge(&repo, &dir, "development");
     let cleanup = || {
         kmd(
             &state,
-            &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+            &[("KOMMAND0_GH_BIN", "false")],
             &["workspace", "cleanup", "development", "--force"],
         )
     };
@@ -882,16 +1254,10 @@ fn workspace_cleanup_refuses_a_protected_branch_and_a_bad_config() {
 fn cleanup_removes_a_merged_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let state = setup(tmp.path());
-    let gh = tmp.path().join("gh");
-    // gh runs from the repo dir; answer the `pr list --head <branch>` lookup by
-    // reporting the branch's tip as the merged commit.
-    write_stub(
-        &gh,
-        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
-    );
+    squash_merge(&tmp.path().join("repo"), &workspace_dir(&state, "feat"), "feat");
     let out = kmd(
         &state,
-        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+        &[("KOMMAND0_GH_BIN", "false")],
         &["workspace", "cleanup", "feat", "--force"],
     );
     assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
@@ -932,14 +1298,10 @@ fn cleanup_succeeds_when_the_id_is_shadowed() {
         .unwrap()
         .to_string();
 
-    let gh = tmp.path().join("gh");
-    write_stub(
-        &gh,
-        "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = list ] && [ \"$3\" = --head ]; then oid=$(git rev-parse \"refs/heads/$4\"); printf 'MERGED\\n%s\\n' \"$oid\"; exit 0; fi\nexit 1\n",
-    );
+    squash_merge(&repo, &workspace_dir(&state, "feat"), "feat");
     let out = kmd(
         &state,
-        &[("KOMMAND0_GH_BIN", gh.to_str().unwrap())],
+        &[("KOMMAND0_GH_BIN", "false")],
         &["workspace", "cleanup", "feat", "--force"],
     );
     assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
