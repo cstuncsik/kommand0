@@ -121,8 +121,11 @@ the repo root as the working directory (can't be combined with `--branch` or
 Pass `--issue <ref>` (a number, `#123`, or an issue URL) to create the workspace
 on the branch GitHub links to that issue, via `gh issue develop`: an existing
 linked branch is reused, otherwise a new one is created on the remote and linked
-(so merging its PR closes the issue). The workspace is named after the branch. A
-positional name that looks like an issue reference is detected the same way, so
+(so merging its PR closes the issue), named `<number>-<title>` the way GitHub
+does it but with the accents stripped (`359-frizbi-ajandek…`, where GitHub's own
+name would keep the `á` and flag the ref on every PR). The workspace is named
+after the branch. A positional name that looks like an issue reference is
+detected the same way, so
 `kmd workspace create 123 --repo x` does the same thing; pass `--branch`,
 `--fork` or `--no-worktree` when you really do want a workspace literally named
 `123`. `--issue` can't be combined with a positional name, `--branch`, `--fork`
