@@ -1,0 +1,32 @@
+Cargo.toml
+  s_f70030a97f0a58::t_163619e8f698ef 29
+CHANGELOG.md
+  s_f70030a97f0a58::t_163619e8f698ef 8-16
+README.md
+  s_f70030a97f0a58::t_163619e8f698ef 109-111
+crates/core/src/worktree.rs
+  s_f70030a97f0a58::t_163619e8f698ef 5-6,133-142,146-148,171,731-750
+  s_f70030a97f0a58::t_32808818a91ff5 751-752
+crates/core/Cargo.toml
+  s_f70030a97f0a58::t_163619e8f698ef 20
+CLAUDE.md
+  s_f70030a97f0a58::t_2734c805bd1119 63-65
+Cargo.lock
+  s_f70030a97f0a58::t_0844d63d4090fc 936,2013-2018,2107-2115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1d657289db530df801614ec4173a41b328c16a52",
+  "prompts": {},
+  "sessions": {
+    "s_f70030a97f0a58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1f44936-dacd-45c4-85c1-7cf037a6cfe5",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
