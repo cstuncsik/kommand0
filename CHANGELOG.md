@@ -5,6 +5,15 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **New branch names are plain ASCII.** A workspace named with accented letters
+  (`359-frizbi-ajándék…`) minted a branch of the same name, which GitHub flags
+  on the PR as "the head ref may contain hidden characters" and escapes into an
+  unreadable `\u00e1…` ref. The branch is now the accent-stripped form of the
+  workspace name (`359-frizbi-ajandek…`); the workspace and its worktree dir
+  keep the name as typed. Existing workspaces are untouched.
+
 ## [0.27.3] - 2026-09-20
 
 ### Fixed

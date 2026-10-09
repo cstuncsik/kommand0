@@ -106,8 +106,9 @@ kmd session clear <workspace>
 kmd profile rename <old> <new>
 ```
 
-`workspace create <name>` forks a branch named `<name>` (suffixed `<name>-2`,
-`-3`, … when that branch already exists). Without `--branch` it detects an
+`workspace create <name>` forks a branch named `<name>` with its accents
+stripped (`ajándék` forks `ajandek`; suffixed `<name>-2`, `-3`, … when that
+branch already exists). Without `--branch` it detects an
 existing branch first: if a branch matching `<name>` already exists (local or
 `origin`), on a terminal it prompts to check it out instead of forking;
 non-interactively (piped/CI) it forks the suffixed branch and notes the actual
