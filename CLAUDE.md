@@ -66,8 +66,9 @@ git worktree. A `kmd` CLI mirrors the core actions.
   is the exact-dir escape hatch), and a one-time legacy migration moves a root
   `state.json`/`config.json` into `profiles/default/` — it MUST run before anything
   creates the state dir. Workspaces are git worktrees on per-workspace branches
-  named after the workspace (suffixed `-2`… on collision; pre-0.11 workspaces may
-  carry a legacy `kommand0/<name>` branch — still fully supported);
+  named after the workspace, accents stripped to ASCII (suffixed `-2`… on
+  collision; pre-0.11 workspaces may carry a legacy `kommand0/<name>` branch —
+  still fully supported);
   a **fallback workspace has no `worktree_path`** (its `working_dir` is the repo
   root) — per-workspace git/PR features gate on `worktree_path.is_some()`.
   Workspace names are unique **per repo**, not globally; new worktrees are created

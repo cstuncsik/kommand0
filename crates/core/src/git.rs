@@ -1086,6 +1086,27 @@ fn refuse_a_foreign_linked_branch(
     Ok(())
 }
 
+/// The branch kommand0 asks GitHub for when it creates an issue's linked
+/// branch: GitHub's own `<number>-<title>` shape (lowercased, every run of
+/// non-alphanumerics one `-`), with the accents stripped. `None` when no word
+/// of the title survives, so the caller leaves the name to GitHub.
+pub(crate) fn issue_branch_name(number: &str, title: &str) -> Option<String> {
+    let folded = crate::worktree::strip_accents(title).to_lowercase();
+    let mut slug = String::new();
+    for word in folded.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+        // ponytail: 60-byte cap keeps the worktree dir far from a filename
+        // limit; raise it if titles come out cut short.
+        if slug.len() + 1 + word.len() > 60 {
+            break;
+        }
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        slug.push_str(word);
+    }
+    (!slug.is_empty()).then(|| format!("{number}-{slug}"))
+}
+
 /// The branch GitHub links to an issue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueBranch {
@@ -1194,10 +1215,28 @@ fn issue_branch_with(repo_dir: &str, issue_ref: &str, gh_bin: &str) -> Result<Is
     }
 
     // No linked branch yet: ask GitHub to create one. No `--base`, linked
-    // branches start from the repo's default branch.
+    // branches start from the repo's default branch. The name is ours
+    // (`issue_branch_name`), not GitHub's: GitHub keeps the title's accents
+    // (`359-frizbi-ajándék…`) and then flags its own ref on every PR. Best
+    // effort: a failed title lookup, or a title with no usable word, leaves
+    // the naming to GitHub as before rather than dead-ending the issue.
+    let mut view: Vec<&str> = vec!["issue", "view", "--json", "title", "--jq", ".title"];
+    if let Some(p) = &pin {
+        view.extend(["--repo", p.as_str()]);
+    }
+    view.extend(["--", number]);
+    let name = match run_gh(gh_bin, repo_dir, &view) {
+        Ok(out) if out.status.success() => {
+            issue_branch_name(number, String::from_utf8_lossy(&out.stdout).trim())
+        }
+        _ => None,
+    };
     let mut args: Vec<&str> = vec!["issue", "develop"];
     if let Some(p) = &pin {
         args.extend(["--repo", p.as_str()]);
+    }
+    if let Some(n) = &name {
+        args.extend(["--name", n.as_str()]);
     }
     args.extend(["--", number]);
     let out = run_gh(gh_bin, repo_dir, &args).map_err(|e| gh_unavailable(&e))?;
@@ -1687,14 +1726,15 @@ pub(crate) mod tests {
         \"${GH_FORCE_TTY-UNSET}\" \"${CLICOLOR_FORCE-UNSET}\" \"${GH_REPO-UNSET}\" >> \"$0.args\"\n";
 
     /// A `gh issue develop` stub: prints `list` for any argv containing
-    /// `--list`, `create` otherwise. Both go through `printf '%s'` from a
-    /// single-quoted literal, so a real TAB stays a tab and a `%` in a URL can't
-    /// be eaten.
+    /// `--list`, the accented title `Ajándék` for `issue view` (so the create
+    /// argv shows the fold: `--name <n>-ajandek`), `create` otherwise. List and
+    /// create go through `printf '%s'` from a single-quoted literal, so a real
+    /// TAB stays a tab and a `%` in a URL can't be eaten.
     fn gh_issue_stub(path: &Path, list: &str, create: &str) {
         write_stub(
             path,
             &format!(
-                "#!/bin/sh\n{GH_ARGS_LINE}case \"$*\" in\n  *--list*) printf '%s' '{list}' ;;\n  *) printf '%s' '{create}' ;;\nesac\nexit 0\n"
+                "#!/bin/sh\n{GH_ARGS_LINE}case \"$*\" in\n  *--list*) printf '%s' '{list}' ;;\n  \"issue view\"*) printf 'Ajándék\\n' ;;\n  *) printf '%s' '{create}' ;;\nesac\nexit 0\n"
             ),
         );
     }
@@ -1958,13 +1998,32 @@ pub(crate) mod tests {
         let err =
             issue_branch_with(repo.to_str().unwrap(), "123", gh.to_str().unwrap()).unwrap_err();
         assert!(err.contains("MARKER-NOPE"), "the create failure surfaces: {err}");
+        // The title lookup is pinned too, and its failure here (the stub fails
+        // everything but `--list`) leaves the naming to GitHub: no `--name`.
         assert_eq!(
             gh_args(&gh),
             [
                 "issue develop --list --repo github.com/o/r -- 123 [][0][]",
+                "issue view --json title --jq .title --repo github.com/o/r -- 123 [][0][]",
                 "issue develop --repo github.com/o/r -- 123 [][0][]",
             ]
         );
+    }
+
+    #[test]
+    fn issue_branch_name_is_github_shaped_without_accents() {
+        assert_eq!(
+            issue_branch_name("359", "Frizbi ajándék hiányzik 4 db azonos tálcás rendelésnél"),
+            Some("359-frizbi-ajandek-hianyzik-4-db-azonos-talcas-rendelesnel".to_string())
+        );
+        assert_eq!(
+            issue_branch_name("7", "  Fix: the (thing)!  "),
+            Some("7-fix-the-thing".to_string()),
+            "punctuation runs fold to one dash, none at the ends"
+        );
+        assert_eq!(issue_branch_name("7", "🚀 …"), None, "no usable word: GitHub names it");
+        let long = issue_branch_name("7", &"word ".repeat(30)).unwrap();
+        assert!(long.len() <= 62 && long.ends_with("word"), "capped at a word boundary: {long}");
     }
 
     #[test]
@@ -2030,8 +2089,12 @@ pub(crate) mod tests {
                     );
                     assert_eq!(
                         gh_args(&gh),
-                        ["issue develop --list -- 123 [][0][]", "issue develop -- 123 [][0][]"],
-                        "no --base, and the create call really ran"
+                        [
+                            "issue develop --list -- 123 [][0][]",
+                            "issue view --json title --jq .title -- 123 [][0][]",
+                            "issue develop --name 123-ajandek -- 123 [][0][]",
+                        ],
+                        "no --base, the name is the folded title, and the create call really ran"
                     );
                     assert_eq!(
                         rev_parse(&clone, &format!("refs/remotes/origin/{branch}")),

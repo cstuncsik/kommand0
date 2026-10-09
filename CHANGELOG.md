@@ -5,6 +5,20 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **New branch names have their accents stripped.** A workspace created from an
+  issue took the branch name GitHub generated from the title, accents included
+  (`359-frizbi-ajándék-hiányzik…`), and a workspace named with accented letters
+  forked a branch of the same name. GitHub then flags that ref on the PR as "the
+  head ref may contain hidden characters" and escapes it into an unreadable
+  `\u00e1…` in every link. The issue branch is now named by kommand0 in GitHub's
+  own `<number>-<title>` shape, accents stripped (`359-frizbi-ajandek-hianyzik…`,
+  via `gh issue develop --name`; when the title can't be read, GitHub names it
+  as before), and a forked branch is the accent-stripped workspace name; the
+  workspace and its worktree dir keep the name as typed. Existing workspaces and
+  already-linked branches are untouched.
+
 ## [0.30.0] - 2026-09-30
 
 ### Fixed
