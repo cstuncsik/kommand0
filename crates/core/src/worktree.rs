@@ -27,7 +27,7 @@ fn is_git_repo(repo_path: &str) -> bool {
 /// exists in the repo. Uses `show-ref --verify` (exact ref lookup), not
 /// `rev-parse` (which applies revision syntax, so e.g. `main^{commit}` would
 /// false-positively resolve).
-fn verify_ref(repo_path: &str, full_ref: &str) -> bool {
+pub(crate) fn verify_ref(repo_path: &str, full_ref: &str) -> bool {
     Command::new("git")
         .args(["-C", repo_path, "show-ref", "--verify", "--quiet", full_ref])
         .stdout(std::process::Stdio::null())
@@ -443,7 +443,7 @@ fn remove_empty_parent(worktree_path: &str) {
 /// Uses `--force` to handle dirty worktrees (since the workspace is being deleted).
 pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<()> {
     if !Path::new(worktree_path).exists() {
-        // Common flow: the merged-PR cleanup already removed the worktree and
+        // Common flow: the merged-workspace cleanup already removed the worktree and
         // the follow-up workspace delete lands here; still clear a now-empty
         // worktrees/<repo-id>/ parent. NOT done on the failure arms below
         // (git refusing can mean the state path never was a worktree).
@@ -501,6 +501,7 @@ mod tests {
         let git = |args: &[&str]| Command::new("git").args(args).current_dir(dir).output().unwrap();
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
     }
@@ -649,7 +650,7 @@ mod tests {
 
     #[test]
     fn remove_worktree_already_gone_still_clears_the_empty_parent() {
-        // The merged-PR cleanup removes the worktree first; the follow-up
+        // The merged-workspace cleanup removes the worktree first; the follow-up
         // workspace delete hits remove_worktree's early return, which must
         // still clear the now-empty worktrees/<repo-id>/ dir.
         let repo = TempDir::new().unwrap();

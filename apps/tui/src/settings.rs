@@ -3,8 +3,8 @@
 //! Each row is one config field, edited as a single text line (blank = unset,
 //! which removes the key from the file). Commits are per-field on Enter via
 //! `Config::update_file`, then mirrored into the running `App` so live knobs
-//! (theme, tree width, notify) apply immediately. `keybindings`/`theme_colors`
-//! stay file-only and are pointed at by a footer hint.
+//! (theme, tree width, notify) apply immediately. `keybindings`/`theme_colors`/
+//! `protected_branches` stay file-only and are pointed at by a footer hint.
 
 use ratatui::{
     style::{Modifier, Style},
@@ -20,8 +20,8 @@ use super::modal::{LineEdit, render_input_with_cursor};
 const NOTIFY_VALUES: &[&str] = &["off", "bell", "desktop", "both"];
 const THEME_VALUES: &[&str] = &["default", "high-contrast"];
 
-/// One editable config field. `keybindings`/`theme_colors` are deliberately
-/// absent (structured values — hand-edit the file).
+/// One editable config field. `keybindings`/`theme_colors`/`protected_branches`
+/// are deliberately absent (structured values: hand-edit the file).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Field {
     ClaudeArgs,
@@ -249,8 +249,13 @@ pub(crate) fn render_settings_overlay(frame: &mut ratatui::Frame, app: &App) {
     }
 
     lines.push(Line::raw(""));
+    // Two lines so the path is not clipped at 80 cols.
     lines.push(Line::styled(
-        format!("    keybindings / theme_colors: edit {}", app.config_path.display()),
+        "    keybindings / theme_colors / protected_branches:",
+        Style::default().fg(th.muted),
+    ));
+    lines.push(Line::styled(
+        format!("      edit {}", app.config_path.display()),
         Style::default().fg(th.muted),
     ));
     if let Some(err) = state.error.as_ref() {

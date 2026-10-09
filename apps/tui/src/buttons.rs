@@ -20,6 +20,8 @@ pub(crate) enum HitAction {
     NewSessionTab { workspace_id: String },
     /// Clean up a merged workspace (the detail-pane `[Clean up]`).
     CleanupWorkspaceFor { workspace_id: String },
+    /// Clean up a repo's merged branches (the detail-pane `[Clean up branches]`).
+    CleanupRepoFor { repo_id: String },
 }
 
 /// A clickable region tracked during rendering.
