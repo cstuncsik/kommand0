@@ -541,33 +541,45 @@ impl KeyMap {
         // `back-to-tree` is the keyboard's way out of the embedded pane and
         // `quit` the way out of kommand0: both can be rebound but never unbound.
         // One left with no key in any of its layers gets its defaults back,
-        // displacing whatever took them (warned by name).
-        for action in [Action::BackToTree, Action::Quit] {
-            let unbound =
-                action.layers().iter().all(|&layer| keymap.chords_for(layer, action).is_empty());
-            if !unbound {
-                continue;
-            }
-            warnings.push(format!(
-                "'{}' cannot be unbound; its default keys are restored",
-                action.name()
-            ));
-            for (spec, default) in DEFAULT_BINDINGS {
-                if *default == action
-                    && let Some(chord) = parse_chord(spec)
-                {
-                    for &layer in action.layers() {
-                        if let Some(prev) = keymap.map.insert((layer, chord), action)
-                            && prev != action
-                        {
-                            warnings.push(format!(
-                                "key '{spec}' reassigned from '{}' back to '{}'",
-                                prev.name(),
-                                action.name()
-                            ));
+        // displacing whatever took them (warned by name). Restoring one can take
+        // the other's configured key (`back-to-tree: ["q"]` plus `quit: []`), so
+        // this repeats until both hold; their defaults are disjoint, so a
+        // restored action is never displaced again and the loop ends.
+        loop {
+            let mut restored = false;
+            for action in [Action::BackToTree, Action::Quit] {
+                let unbound = action
+                    .layers()
+                    .iter()
+                    .all(|&layer| keymap.chords_for(layer, action).is_empty());
+                if !unbound {
+                    continue;
+                }
+                restored = true;
+                warnings.push(format!(
+                    "'{}' cannot be unbound; its default keys are restored",
+                    action.name()
+                ));
+                for (spec, default) in DEFAULT_BINDINGS {
+                    if *default == action
+                        && let Some(chord) = parse_chord(spec)
+                    {
+                        for &layer in action.layers() {
+                            if let Some(prev) = keymap.map.insert((layer, chord), action)
+                                && prev != action
+                            {
+                                warnings.push(format!(
+                                    "key '{spec}' reassigned from '{}' back to '{}'",
+                                    prev.name(),
+                                    action.name()
+                                ));
+                            }
                         }
                     }
                 }
+            }
+            if !restored {
+                break;
             }
         }
         (keymap, warnings)
@@ -964,5 +976,34 @@ mod tests {
         let km = KeyMap::default();
         let slots: usize = DEFAULT_BINDINGS.iter().map(|(_, a)| a.layers().len()).sum();
         assert_eq!(km.map.len(), slots, "every default binding occupies its own (layer, chord) slot");
+    }
+
+    #[test]
+    fn restoring_one_way_out_cannot_unbind_the_other() {
+        // back-to-tree moved onto quit's default `q` and quit emptied: restoring
+        // quit takes `q` back, so back-to-tree must be restored in turn.
+        let mut cfg = HashMap::new();
+        cfg.insert("back-to-tree".to_string(), vec!["q".to_string()]);
+        cfg.insert("quit".to_string(), vec![]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.iter().any(|w| w.contains("'quit' cannot be unbound")), "{warns:?}");
+        assert!(warns.iter().any(|w| w.contains("'back-to-tree' cannot be unbound")), "{warns:?}");
+        assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::BackToTree));
+
+        // The mirror image: quit's only remaining key (pane `Tab`, after a later
+        // tree action took the tree copy) is one back-to-tree's restore takes.
+        let mut cfg = HashMap::new();
+        cfg.insert("back-to-tree".to_string(), vec![]);
+        cfg.insert("quit".to_string(), vec!["Tab".to_string()]);
+        cfg.insert("review-diff".to_string(), vec!["Tab".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.iter().any(|w| w.contains("'back-to-tree' cannot be unbound")), "{warns:?}");
+        assert!(warns.iter().any(|w| w.contains("'quit' cannot be unbound")), "{warns:?}");
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Tab, KeyModifiers::NONE)), Some(Action::BackToTree));
+        assert_eq!(km.resolve(&ev(KeyCode::Tab, KeyModifiers::NONE)), Some(Action::ReviewDiff));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
     }
 }
