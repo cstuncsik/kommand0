@@ -3668,6 +3668,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     // (incl. Ctrl+C, Tab, q, slash commands). kommand0 commands are reached via a
     // tmux-style prefix (Ctrl+A) so there's always a reliable way out:
     //   Ctrl+A then  q = quit · t/Tab/Esc = back to tree · Ctrl+A = literal Ctrl+A
+    // (defaults: the post-prefix keys are the keymap's pane layer, rebindable
+    // except for the tab digits and the literal prefix).
     // A modal (e.g. Rename Session) opens over the embedded pane without leaving
     // Embedded focus, so it must intercept keys before this block forwards them
     // to claude. The modal block below (and the paste/mouse paths) is gated the
@@ -3675,82 +3677,11 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     if app.focus == Focus::Embedded && !app.modal.is_active() {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if app.embedded_prefix {
+            use keymap::Action;
             app.embedded_prefix = false;
-            // The `!ctrl` guards keep `Ctrl+]` (decoded as Char(']') or Char('5')
-            // with CTRL) from being read as a tab command after the prefix.
+            // Fixed (non-rebindable) prefix keys: the tab digits and the
+            // literal prefix. Everything else is the keymap's pane layer.
             match key.code {
-                KeyCode::Char('q') => {
-                    if app.quit_blocked_by_profile_delete() {
-                        return Ok(KeyOutcome::Continue);
-                    }
-                    return Ok(KeyOutcome::Quit);
-                }
-                KeyCode::Char('t') if !ctrl => {
-                    app.focus = Focus::Tree;
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Tab | KeyCode::Esc => {
-                    app.focus = Focus::Tree;
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('c') if !ctrl => {
-                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                        app.new_tab(TabKind::Claude, &ws_id);
-                    }
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('s') if !ctrl => {
-                    // New shell tab ($SHELL / configured shell).
-                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                        app.new_tab(TabKind::Shell, &ws_id);
-                    }
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('e') if !ctrl => {
-                    // New codex tab (cod-E-x: c, x and d are taken).
-                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                        app.new_tab(TabKind::Codex, &ws_id);
-                    }
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('g') if !ctrl => {
-                    // New gemini tab.
-                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                        app.new_tab(TabKind::Gemini, &ws_id);
-                    }
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('o') if !ctrl => {
-                    // New opencode tab.
-                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                        app.new_tab(TabKind::Opencode, &ws_id);
-                    }
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('x') if !ctrl => {
-                    app.close_active_session();
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('d') if !ctrl => {
-                    app.detach_selected_workspace();
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('r') if !ctrl => {
-                    app.open_rename_active_session();
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('[') if !ctrl => {
-                    if let Some(s) = app.selected_sessions_mut() {
-                        s.prev();
-                    }
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char(']') if !ctrl => {
-                    if let Some(s) = app.selected_sessions_mut() {
-                        s.next();
-                    }
-                    return Ok(KeyOutcome::Continue);
-                }
                 KeyCode::Char(c @ '1'..='9') if !ctrl => {
                     let idx = (c as u8 - b'1') as usize;
                     if let Some(s) = app.selected_sessions_mut() {
@@ -3758,19 +3689,64 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     }
                     return Ok(KeyOutcome::Continue);
                 }
-                KeyCode::Char('l') if !ctrl => {
-                    // Last-active tab (tmux prefix-l); no-op with no history.
-                    if let Some(s) = app.selected_sessions_mut() {
-                        s.select_last_active();
-                    }
-                    return Ok(KeyOutcome::Continue);
-                }
                 KeyCode::Char('a') if ctrl => {
                     app.forward_to_embedded(key); // literal Ctrl+A to claude
                     return Ok(KeyOutcome::Continue);
                 }
-                _ => return Ok(KeyOutcome::Continue), // unknown command: swallow
+                _ => {}
             }
+            // Chords carry their modifiers, so `Ctrl+]` (decoded as Char(']')
+            // or Char('5') with CTRL) can't read as the `]` tab command here.
+            match app.keymap.resolve_pane(&key) {
+                Some(Action::Quit) => {
+                    if app.quit_blocked_by_profile_delete() {
+                        return Ok(KeyOutcome::Continue);
+                    }
+                    return Ok(KeyOutcome::Quit);
+                }
+                Some(Action::BackToTree) => app.focus = Focus::Tree,
+                Some(
+                    action @ (Action::NewClaudeTab
+                    | Action::NewShellTab
+                    | Action::NewCodexTab
+                    | Action::NewGeminiTab
+                    | Action::NewOpencodeTab),
+                ) => {
+                    let kind = match action {
+                        Action::NewClaudeTab => TabKind::Claude,
+                        Action::NewShellTab => TabKind::Shell,
+                        Action::NewCodexTab => TabKind::Codex,
+                        Action::NewGeminiTab => TabKind::Gemini,
+                        _ => TabKind::Opencode,
+                    };
+                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
+                        app.new_tab(kind, &ws_id);
+                    }
+                }
+                Some(Action::PrevTab) => {
+                    if let Some(s) = app.selected_sessions_mut() {
+                        s.prev();
+                    }
+                }
+                Some(Action::NextTab) => {
+                    if let Some(s) = app.selected_sessions_mut() {
+                        s.next();
+                    }
+                }
+                Some(Action::LastTab) => {
+                    // Last-active tab (tmux prefix-l); no-op with no history.
+                    if let Some(s) = app.selected_sessions_mut() {
+                        s.select_last_active();
+                    }
+                }
+                Some(Action::RenameTab) => app.open_rename_active_session(),
+                Some(Action::CloseTab) => app.close_active_session(),
+                Some(Action::Detach) => app.detach_selected_workspace(),
+                // Tree-only actions never land in the pane layer; an unbound
+                // key is swallowed, never forwarded.
+                Some(_) | None => {}
+            }
+            return Ok(KeyOutcome::Continue);
         }
         if ctrl && key.code == KeyCode::Char('a') {
             app.embedded_prefix = true; // start a prefix sequence
@@ -4408,6 +4384,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     }
                     _ => {}
                 },
+                // Pane-layer actions never resolve from the tree map.
+                _ => {}
             }
         }
     }
@@ -9619,6 +9597,27 @@ mod key_tests {
             assert_eq!(kind.config_args(&cfg), &[arg.to_string()], "{kind:?} reads its own args field");
             assert_eq!(kind.bin_env(), env, "{kind:?} names its own env override");
         }
+    }
+
+    #[tokio::test]
+    async fn rebound_back_to_tree_works_and_the_default_key_is_dead() {
+        let mut app = test_app();
+        let mut cfg = std::collections::HashMap::new();
+        cfg.insert("back-to-tree".to_string(), vec!["ctrl+t".to_string()]);
+        let (km, warns) = keymap::KeyMap::build(&cfg);
+        assert!(warns.is_empty(), "{warns:?}");
+        app.keymap = km;
+        app.focus = Focus::Embedded;
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        // Ctrl+A then the default `t` no longer leaves the pane (swallowed).
+        handle_key(&mut app, ctrl('a')).await.unwrap();
+        handle_key(&mut app, key(KeyCode::Char('t'))).await.unwrap();
+        assert_eq!(app.focus, Focus::Embedded);
+        // Ctrl+A then the rebound chord does.
+        handle_key(&mut app, ctrl('a')).await.unwrap();
+        handle_key(&mut app, ctrl('t')).await.unwrap();
+        assert_eq!(app.focus, Focus::Tree);
     }
 
     #[tokio::test]

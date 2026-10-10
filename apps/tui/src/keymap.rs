@@ -1,16 +1,18 @@
-//! Rebindable tree-pane key bindings.
+//! Rebindable key bindings: the tree pane, and the embedded pane's post-prefix
+//! layer (`Ctrl+A` then a key).
 //!
-//! A [`KeyMap`] maps a normalized [`KeyChord`] to an [`Action`]; `handle_key`
-//! resolves a press to an action and dispatches it. Defaults match the built-in
-//! bindings; a user's `config.json` `keybindings` (action name → key specs)
-//! replace an action's keys. The embedded `Ctrl+A` prefix and the `gg` motion
-//! are fixed (not rebindable) in this version.
+//! A [`KeyMap`] maps a normalized [`KeyChord`] to an [`Action`] per [`Layer`];
+//! `handle_key` resolves a press to an action and dispatches it. Defaults match
+//! the built-in bindings; a user's `config.json` `keybindings` (action name → key
+//! specs) replace an action's keys in every layer it lives in. Fixed (not
+//! rebindable): the `gg` motion and `Esc` (clears the filter) in the tree; the
+//! `Ctrl+A` prefix key itself, `Ctrl+A 1`-`9` and `Ctrl+A Ctrl+A` in the pane.
 
 use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// A rebindable tree-pane command.
+/// A rebindable command; [`Action::layers`] says where it is bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Action {
     MoveUp,
@@ -44,9 +46,29 @@ pub(crate) enum Action {
     Help,
     OpenSettings,
     Quit,
+    // Embedded-pane post-prefix layer (`Ctrl+A` then a key).
+    NewClaudeTab,
+    NewShellTab,
+    NewCodexTab,
+    NewGeminiTab,
+    NewOpencodeTab,
+    PrevTab,
+    NextTab,
+    LastTab,
+    RenameTab,
+    CloseTab,
+    Detach,
+    BackToTree,
 }
 
-/// Every action, in the order shown in the help overlay.
+/// A key layer: the tree pane, or the embedded pane after an armed `Ctrl+A`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Layer {
+    Tree,
+    Pane,
+}
+
+/// Every action, in the order shown in the help overlay (per layer).
 pub(crate) const ALL_ACTIONS: &[Action] = &[
     Action::MoveUp,
     Action::MoveDown,
@@ -78,6 +100,18 @@ pub(crate) const ALL_ACTIONS: &[Action] = &[
     Action::ForceDelete,
     Action::Help,
     Action::OpenSettings,
+    Action::NewClaudeTab,
+    Action::NewShellTab,
+    Action::NewCodexTab,
+    Action::NewGeminiTab,
+    Action::NewOpencodeTab,
+    Action::PrevTab,
+    Action::NextTab,
+    Action::LastTab,
+    Action::RenameTab,
+    Action::CloseTab,
+    Action::Detach,
+    Action::BackToTree,
     Action::Quit,
 ];
 
@@ -116,6 +150,18 @@ impl Action {
             Action::Help => "help",
             Action::OpenSettings => "settings",
             Action::Quit => "quit",
+            Action::NewClaudeTab => "new-claude",
+            Action::NewShellTab => "new-shell",
+            Action::NewCodexTab => "new-codex",
+            Action::NewGeminiTab => "new-gemini",
+            Action::NewOpencodeTab => "new-opencode",
+            Action::PrevTab => "prev-tab",
+            Action::NextTab => "next-tab",
+            Action::LastTab => "last-tab",
+            Action::RenameTab => "rename-tab",
+            Action::CloseTab => "close-tab",
+            Action::Detach => "detach",
+            Action::BackToTree => "back-to-tree",
         }
     }
 
@@ -153,6 +199,39 @@ impl Action {
             Action::Help => "Help",
             Action::OpenSettings => "Settings",
             Action::Quit => "Quit",
+            Action::NewClaudeTab => "New Claude Code session tab",
+            Action::NewShellTab => "New shell tab (reopens fresh)",
+            Action::NewCodexTab => "New codex session tab",
+            Action::NewGeminiTab => "New gemini session tab",
+            Action::NewOpencodeTab => "New opencode session tab",
+            Action::PrevTab => "Previous tab",
+            Action::NextTab => "Next tab",
+            Action::LastTab => "Jump to the last-active tab",
+            Action::RenameTab => "Rename the active tab",
+            Action::CloseTab => "Close the active tab",
+            Action::Detach => "Detach: close panes, keep sessions",
+            Action::BackToTree => "Back to tree",
+        }
+    }
+
+    /// The layer(s) this action is bound in. `Quit` is in both: the same chord
+    /// quits from the tree and after the prefix in the pane.
+    pub(crate) fn layers(self) -> &'static [Layer] {
+        match self {
+            Action::Quit => &[Layer::Tree, Layer::Pane],
+            Action::NewClaudeTab
+            | Action::NewShellTab
+            | Action::NewCodexTab
+            | Action::NewGeminiTab
+            | Action::NewOpencodeTab
+            | Action::PrevTab
+            | Action::NextTab
+            | Action::LastTab
+            | Action::RenameTab
+            | Action::CloseTab
+            | Action::Detach
+            | Action::BackToTree => &[Layer::Pane],
+            _ => &[Layer::Tree],
         }
     }
 
@@ -187,15 +266,21 @@ fn normalize(code: KeyCode, mods: KeyModifiers) -> KeyChord {
     KeyChord { code, mods }
 }
 
-/// Chords handled by fixed (non-rebindable) pre-checks in `handle_key`, with a
-/// reason for the warning. Binding an action to one of these would never fire.
-fn reserved_reason(chord: &KeyChord) -> Option<&'static str> {
-    if chord.code == KeyCode::Char('g') && chord.mods.is_empty() {
-        Some("the gg motion")
-    } else if chord.code == KeyCode::Esc {
-        Some("clearing the filter")
-    } else {
-        None
+/// Chords handled by fixed (non-rebindable) pre-checks in `handle_key` for a
+/// layer, with a reason for the warning. Binding an action to one of these
+/// would never fire.
+fn reserved_reason(layer: Layer, chord: &KeyChord) -> Option<&'static str> {
+    let plain = chord.mods.is_empty();
+    match layer {
+        Layer::Tree if chord.code == KeyCode::Char('g') && plain => Some("the gg motion"),
+        Layer::Tree if chord.code == KeyCode::Esc => Some("clearing the filter"),
+        Layer::Pane if matches!(chord.code, KeyCode::Char('1'..='9')) && plain => {
+            Some("jumping to tab N")
+        }
+        Layer::Pane if chord.code == KeyCode::Char('a') && chord.mods == KeyModifiers::CONTROL => {
+            Some("the literal Ctrl+A")
+        }
+        _ => None,
     }
 }
 
@@ -284,18 +369,21 @@ fn format_chord(chord: &KeyChord) -> String {
 }
 
 pub(crate) struct KeyMap {
-    map: HashMap<KeyChord, Action>,
+    tree: HashMap<KeyChord, Action>,
+    pane: HashMap<KeyChord, Action>,
 }
 
 impl Default for KeyMap {
     fn default() -> Self {
-        let mut map = HashMap::new();
+        let mut keymap = KeyMap { tree: HashMap::new(), pane: HashMap::new() };
         for (spec, action) in DEFAULT_BINDINGS {
             if let Some(chord) = parse_chord(spec) {
-                map.insert(chord, *action);
+                for &layer in action.layers() {
+                    keymap.map_mut(layer).insert(chord, *action);
+                }
             }
         }
-        KeyMap { map }
+        keymap
     }
 }
 
@@ -339,17 +427,52 @@ const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("?", Action::Help),
     (",", Action::OpenSettings),
     ("q", Action::Quit),
+    // Embedded-pane post-prefix layer (`Ctrl+A` then the key).
+    ("c", Action::NewClaudeTab),
+    ("s", Action::NewShellTab),
+    ("e", Action::NewCodexTab),
+    ("g", Action::NewGeminiTab),
+    ("o", Action::NewOpencodeTab),
+    ("[", Action::PrevTab),
+    ("]", Action::NextTab),
+    ("l", Action::LastTab),
+    ("r", Action::RenameTab),
+    ("x", Action::CloseTab),
+    ("d", Action::Detach),
+    ("t", Action::BackToTree),
+    ("Tab", Action::BackToTree),
+    ("Esc", Action::BackToTree),
 ];
 
 impl KeyMap {
-    /// Resolve a key press to its bound action, if any.
+    fn map(&self, layer: Layer) -> &HashMap<KeyChord, Action> {
+        match layer {
+            Layer::Tree => &self.tree,
+            Layer::Pane => &self.pane,
+        }
+    }
+
+    fn map_mut(&mut self, layer: Layer) -> &mut HashMap<KeyChord, Action> {
+        match layer {
+            Layer::Tree => &mut self.tree,
+            Layer::Pane => &mut self.pane,
+        }
+    }
+
+    /// Resolve a tree-pane key press to its bound action, if any.
     pub(crate) fn resolve(&self, key: &KeyEvent) -> Option<Action> {
-        self.map.get(&normalize(key.code, key.modifiers)).copied()
+        self.tree.get(&normalize(key.code, key.modifiers)).copied()
+    }
+
+    /// Resolve the key after an armed `Ctrl+A` prefix to its bound action, if any.
+    pub(crate) fn resolve_pane(&self, key: &KeyEvent) -> Option<Action> {
+        self.pane.get(&normalize(key.code, key.modifiers)).copied()
     }
 
     /// Build the keymap from config overrides. For each named action, its
-    /// default chords are replaced by the configured ones. Returns warnings for
-    /// unknown actions, unparseable specs, the reserved `g`, and reassignments.
+    /// default chords are replaced by the configured ones in every layer it
+    /// lives in. Returns warnings for unknown actions, unparseable specs,
+    /// reserved keys, and reassignments.
     pub(crate) fn build(config: &HashMap<String, Vec<String>>) -> (Self, Vec<String>) {
         let mut keymap = Self::default();
         let mut warnings = Vec::new();
@@ -364,36 +487,66 @@ impl KeyMap {
                 continue;
             };
             // Replace this action's keys: drop its current chords first.
-            keymap.map.retain(|_, a| *a != action);
+            for &layer in action.layers() {
+                keymap.map_mut(layer).retain(|_, a| *a != action);
+            }
             for spec in specs {
                 let Some(chord) = parse_chord(spec) else {
                     warnings.push(format!("invalid key '{spec}' for '{name}'"));
                     continue;
                 };
-                if let Some(reason) = reserved_reason(&chord) {
+                if let Some(reason) =
+                    action.layers().iter().find_map(|&layer| reserved_reason(layer, &chord))
+                {
                     warnings.push(format!("key '{spec}' is reserved for {reason}; ignored for '{name}'"));
                     continue;
                 }
-                if let Some(prev) = keymap.map.get(&chord)
-                    && *prev != action
-                {
-                    warnings.push(format!(
-                        "key '{spec}' reassigned from '{}' to '{name}'",
-                        prev.name()
-                    ));
+                for &layer in action.layers() {
+                    let map = keymap.map_mut(layer);
+                    if let Some(prev) = map.get(&chord)
+                        && *prev != action
+                    {
+                        warnings.push(format!(
+                            "key '{spec}' reassigned from '{}' to '{name}'",
+                            prev.name()
+                        ));
+                    }
+                    map.insert(chord, action);
                 }
-                keymap.map.insert(chord, action);
+            }
+        }
+        // `back-to-tree` is the keyboard's way out of the embedded pane: it can
+        // be rebound but never unbound.
+        if keymap.chords_for(Action::BackToTree).is_empty() {
+            warnings.push("'back-to-tree' cannot be unbound; its default keys are restored".to_string());
+            for (spec, action) in DEFAULT_BINDINGS {
+                if *action == Action::BackToTree
+                    && let Some(chord) = parse_chord(spec)
+                {
+                    keymap.pane.insert(chord, *action);
+                }
             }
         }
         (keymap, warnings)
     }
 
-    /// Chords bound to an action, sorted for stable help display.
+    /// Chords bound to an action, sorted for stable help display. An action in
+    /// both layers has the same chords in each, so its first layer serves.
     fn chords_for(&self, action: Action) -> Vec<KeyChord> {
-        let mut chords: Vec<KeyChord> =
-            self.map.iter().filter(|(_, a)| **a == action).map(|(c, _)| *c).collect();
+        let mut chords: Vec<KeyChord> = self
+            .map(action.layers()[0])
+            .iter()
+            .filter(|(_, a)| **a == action)
+            .map(|(c, _)| *c)
+            .collect();
         chords.sort_by_key(format_chord);
         chords
+    }
+
+    /// The help-overlay keys column for an action; `None` when unbound.
+    fn keys_label(&self, action: Action) -> Option<String> {
+        let chords = self.chords_for(action);
+        (!chords.is_empty()).then(|| chords.iter().map(format_chord).collect::<Vec<_>>().join(" / "))
     }
 
     /// `(keys, description)` rows for the help overlay's tree section, in
@@ -401,13 +554,25 @@ impl KeyMap {
     pub(crate) fn help_rows(&self) -> Vec<(String, &'static str)> {
         ALL_ACTIONS
             .iter()
+            .filter(|a| a.layers().contains(&Layer::Tree))
             .map(|&action| {
-                let chords = self.chords_for(action);
-                let keys = if chords.is_empty() {
-                    "(unbound)".to_string()
-                } else {
-                    chords.iter().map(format_chord).collect::<Vec<_>>().join(" / ")
-                };
+                let keys = self.keys_label(action).unwrap_or_else(|| "(unbound)".to_string());
+                (keys, action.description())
+            })
+            .collect()
+    }
+
+    /// `(keys, description)` rows for the help overlay's embedded section: the
+    /// post-prefix actions in [`ALL_ACTIONS`] order, each as `Ctrl+A then <keys>`.
+    pub(crate) fn pane_help_rows(&self) -> Vec<(String, &'static str)> {
+        ALL_ACTIONS
+            .iter()
+            .filter(|a| a.layers().contains(&Layer::Pane))
+            .map(|&action| {
+                let keys = self
+                    .keys_label(action)
+                    .map(|k| format!("Ctrl+A then {k}"))
+                    .unwrap_or_else(|| "(unbound)".to_string());
                 (keys, action.description())
             })
             .collect()
@@ -548,9 +713,96 @@ mod tests {
     fn help_rows_cover_all_actions_in_order() {
         let km = KeyMap::default();
         let rows = km.help_rows();
-        assert_eq!(rows.len(), ALL_ACTIONS.len());
+        let tree_count = ALL_ACTIONS.iter().filter(|a| a.layers().contains(&Layer::Tree)).count();
+        assert_eq!(rows.len(), tree_count);
         assert_eq!(rows[0].1, Action::MoveUp.description());
         // MoveUp shows both its chords.
         assert!(rows[0].0.contains('k') && rows[0].0.contains("Up"));
+    }
+
+    #[test]
+    fn pane_layer_defaults_resolve_separately_from_the_tree() {
+        let km = KeyMap::default();
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::BackToTree));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Tab, KeyModifiers::NONE)), Some(Action::BackToTree));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Esc, KeyModifiers::NONE)), Some(Action::BackToTree));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('c'), KeyModifiers::NONE)), Some(Action::NewClaudeTab));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char(']'), KeyModifiers::NONE)), Some(Action::NextTab));
+        // A Ctrl-modified key is a different chord: `Ctrl+]` (decoded as
+        // `]`+CTRL) must not read as the `]` tab command after the prefix.
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char(']'), KeyModifiers::CONTROL)), None);
+        // The same key means something else in the tree; tree keys don't leak in.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::SortByAdded));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('j'), KeyModifiers::NONE)), None);
+        // Quit is shared: `q` in the tree, `Ctrl+A q` in the pane.
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+    }
+
+    #[test]
+    fn config_rebinds_pane_actions_and_the_shared_quit() {
+        let mut cfg = HashMap::new();
+        cfg.insert("back-to-tree".to_string(), vec!["ctrl+t".to_string()]);
+        cfg.insert("quit".to_string(), vec!["ctrl+q".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('t'), KeyModifiers::CONTROL)), Some(Action::BackToTree));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), None);
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Esc, KeyModifiers::NONE)), None);
+        // The tree's `t` (sort by added) is untouched by a pane rebind.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::SortByAdded));
+        // A shared action rebinds in both layers.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::CONTROL)), Some(Action::Quit));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::CONTROL)), Some(Action::Quit));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn back_to_tree_cannot_be_unbound_but_other_pane_actions_can() {
+        let mut cfg = HashMap::new();
+        cfg.insert("back-to-tree".to_string(), vec![]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.iter().any(|w| w.contains("'back-to-tree' cannot be unbound")), "{warns:?}");
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::BackToTree));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Esc, KeyModifiers::NONE)), Some(Action::BackToTree));
+
+        let mut cfg = HashMap::new();
+        cfg.insert("detach".to_string(), vec![]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('d'), KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn pane_reserved_keys_warn_and_tree_reserved_keys_are_free_in_the_pane() {
+        let mut cfg = HashMap::new();
+        // Tab digits and the literal prefix are fixed in the pane layer.
+        cfg.insert("close-tab".to_string(), vec!["1".to_string(), "ctrl+a".to_string(), "X".to_string()]);
+        // Esc is reserved in the tree (clears the filter) but free in the pane.
+        cfg.insert("detach".to_string(), vec!["Esc".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.iter().any(|w| w.contains("reserved for jumping to tab N")), "{warns:?}");
+        assert!(warns.iter().any(|w| w.contains("reserved for the literal Ctrl+A")), "{warns:?}");
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('X'), KeyModifiers::NONE)), Some(Action::CloseTab));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('1'), KeyModifiers::NONE)), None);
+        // Esc moved from back-to-tree to detach (a reassignment, warned).
+        assert!(warns.iter().any(|w| w.contains("reassigned from 'back-to-tree' to 'detach'")), "{warns:?}");
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Esc, KeyModifiers::NONE)), Some(Action::Detach));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::BackToTree));
+    }
+
+    #[test]
+    fn pane_help_rows_cover_the_pane_actions_with_the_prefix() {
+        let km = KeyMap::default();
+        let rows = km.pane_help_rows();
+        let pane_count = ALL_ACTIONS.iter().filter(|a| a.layers().contains(&Layer::Pane)).count();
+        assert_eq!(rows.len(), pane_count);
+        assert_eq!(rows[0], ("Ctrl+A then c".to_string(), Action::NewClaudeTab.description()));
+        // Quit closes the section, showing its shared chord.
+        assert_eq!(rows.last().unwrap(), &("Ctrl+A then q".to_string(), "Quit"));
+        let back = rows.iter().find(|(_, d)| *d == "Back to tree").unwrap();
+        assert!(
+            back.0.starts_with("Ctrl+A then ") && back.0.contains("Tab") && back.0.contains("Esc"),
+            "{back:?}"
+        );
     }
 }

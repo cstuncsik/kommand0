@@ -208,12 +208,14 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // keymap so the overlay reflects the user's config.
     if app.show_help {
         let tree_rows = app.keymap.help_rows();
+        let pane_rows = app.keymap.pane_help_rows();
         let icons = icon_legend(app.theme);
         help::render_help_overlay(
             frame,
             app.focus,
             &mut app.help_scroll,
             &tree_rows,
+            &pane_rows,
             &icons,
             app.theme,
         );

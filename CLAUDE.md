@@ -53,7 +53,8 @@ git worktree. A `kmd` CLI mirrors the core actions.
   must appear in the mouse/paste guards in `main.rs` so clicks/paste don't leak to
   the tree behind them. Global focus is `Focus { Tree, Embedded }` (Tab-switched).
 - **Adding a keybinding = 5 sites in `keymap.rs`**: the `Action` enum, `ALL_ACTIONS`,
-  `name()`, `description()`, `DEFAULT_BINDINGS`. All keys are rebindable via config.
+  `name()`, `description()`, `DEFAULT_BINDINGS` (plus `layers()` for an embedded
+  post-`Ctrl+A` action; `Quit` lives in both layers). All keys are rebindable via config.
 - **State** (`AppState`) persists to `state.json` atomically, 3-way-merged against
   concurrent `kmd` writes. It lives per-profile at `<base>/profiles/<name>/`
   (selected by `--profile` or an inherited `KOMMAND0_PROFILE`; `KOMMAND0_STATE_DIR`
