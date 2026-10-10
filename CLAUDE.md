@@ -58,9 +58,13 @@ git worktree. A `kmd` CLI mirrors the core actions.
 - **Overlays** (help, palette, modal, diff) own the screen: they swallow keys AND
   must appear in the mouse/paste guards in `main.rs` so clicks/paste don't leak to
   the tree behind them. Global focus is `Focus { Tree, Embedded }` (Tab-switched).
-- **Adding a keybinding = 5 sites in `keymap.rs`**: the `Action` enum, `ALL_ACTIONS`,
-  `name()`, `description()`, `DEFAULT_BINDINGS` (plus `layers()` for an embedded
-  post-`Ctrl+A` action; `Quit`/`AddRepo`/`AddWorkspace` live in both layers). All keys are rebindable via config.
+- **Adding a keybinding = 6 sites in `keymap.rs`**: the `Action` enum, `ALL_ACTIONS`,
+  `name()`, `description()`, `DEFAULT_BINDINGS`, `layers()` (exhaustive, so the
+  compiler enforces it; `Quit`/`AddRepo`/`AddWorkspace` live in both layers), plus
+  a dispatch arm in `handle_key` (`main.rs`) and the literal row counts in the
+  keymap help-row tests. The tree match is exhaustive, the pane match is not: a
+  pane action without an arm is silently swallowed. All other keys are
+  rebindable via config.
 - **State** (`AppState`) persists to `state.json` atomically, 3-way-merged against
   concurrent `kmd` writes. It lives per-profile at `<base>/profiles/<name>/`
   (selected by `--profile` or an inherited `KOMMAND0_PROFILE`; `KOMMAND0_STATE_DIR`

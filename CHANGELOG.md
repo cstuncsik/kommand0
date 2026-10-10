@@ -13,15 +13,32 @@ All notable changes to kommand0 are documented here. The format is based on
   `new-opencode`, `prev-tab`, `next-tab`, `last-tab`, `rename-tab`, `close-tab`,
   `detach`, `back-to-tree`; `quit`, `add-repo` and `add-workspace` are shared
   with the tree, so one rebind moves both the tree key and its `Ctrl+A` form),
-  and the help overlay (`?`) shows the live keys.
-  `back-to-tree` can be rebound but never unbound: a config that strips all its
-  keys gets the defaults back, with a warning in the tree border. The prefix key
-  itself, `Ctrl+A 1`–`9` and `Ctrl+A Ctrl+A` stay fixed. The help overlay and the
-  README key table now also list `Ctrl+]`, the prefix-less way back to the tree.
+  and the help overlay (`?`) shows the live keys of each pane.
+  `back-to-tree` and `quit` can be rebound but never unbound: a config that
+  leaves one with no key gets the defaults back, displacing whatever took them,
+  with a warning in the tree border. The prefix key itself, `Ctrl+A` then a
+  digit and `Ctrl+A Ctrl+A` stay fixed.
 - **`Ctrl+A a` / `Ctrl+A w`: add a repository / workspace from the embedded
   pane.** The tree's `a` / `w` modals open over the pane (the session keeps
-  running, typing goes to the modal); the new row appears in the tree, and
-  `Ctrl+A w` targets the shown workspace's repo.
+  running, typing goes to the modal); the new row appears in the tree, the pane
+  keeps showing the session you were in, and `Ctrl+A w` targets the shown
+  workspace's repo.
+
+### Changed
+
+- **After `Ctrl+A`, a modified key is its own chord.** `Ctrl+A Ctrl+Q` no longer
+  quits and `Ctrl+A Alt+<letter>` no longer acts as the plain letter; both are
+  swallowed unless bound.
+
+### Fixed
+
+- **The help overlay and the README key table list `Ctrl+]`**, the prefix-less
+  way back to the tree.
+- **`Ctrl+A q` marks running sessions stopped, like the tree's `q`**, so
+  `state.json` and `kmd` no longer see phantom running sessions until the next
+  launch.
+- **Adding a repository or workspace under a name or newest-first sort keeps the
+  cursor on its row** instead of on whatever slid into its index.
 
 ## [0.30.1] - 2026-10-09
 
