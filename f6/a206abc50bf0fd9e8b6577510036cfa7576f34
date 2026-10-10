@@ -1,0 +1,85 @@
+README.md
+  s_eccf77f92a94cc::t_5d59db830e5d0a 86,89,110-112,121-143,159-160,167,182,193,195,349,362,370,378-423
+  s_eccf77f92a94cc::t_66fddc6981738d 424
+Cargo.toml
+  s_eccf77f92a94cc::t_5d59db830e5d0a 6,29
+apps/tui/src/buttons.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 23-24
+apps/tui/src/modal.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 2,9-11,76-82,124-135,143-149,175-177,464-483,509-520,589-591,882,1077,1091,1107-1195,1239-1291,1449-1460,1647-1671
+  s_eccf77f92a94cc::t_7ca3b1433254ab 1672-1673
+apps/tui/src/mouse.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 101-107
+apps/tui/tests/fixtures/gh-stub-issue
+  s_eccf77f92a94cc::t_5d59db830e5d0a 1-14
+apps/tui/src/settings.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 6-7,23-24,252,254-258
+apps/tui/src/main.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 22-24,50,70-102,906-918,939-951,1045-1048,1054-1057,2032-2051,2060-2063,2129-2138,2187-2191,2563-2565,3023-3028,3575-3602,3604-3655,3657-3674,3678-3749,3752-3820,3824,3827-3919,3923,3925-3926,3930-3997,4468-4469,4471-4483,4574-4582,4587,4651-4653,4818-4824,4827-4828,5290-5294,5300-5303,5378-5380,5407-5409,5415-5423,5507,5560-5562,6428,6557-6568,6570-6574,6579,6581-6582,6585-6590,6594-6597,6601,6603-6609,6611-6619,6623,6625-6878,8348-8388,9143-9156,9522-9574,10219-10221,10264-10966
+  s_eccf77f92a94cc::t_926cb73580be29 10967
+apps/tui/src/render.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 6,823,868-893,970-973,976-978,994,1023-1060,1064,1172-1181,1209-1218,1221-1222,1228-1231,1233-1236,1240,1248-1249,1252,1263-1266,1269-1281,1686-1694,1757-1763
+  s_eccf77f92a94cc::t_7e2e66fbe1b131 1764
+crates/core/Cargo.toml
+  s_eccf77f92a94cc::t_5d59db830e5d0a 20
+.gitignore
+  s_eccf77f92a94cc::t_5d59db830e5d0a 13,15
+crates/core/src/git.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 9-20,82-83,88-91,256,262,272-453,473-494,508,676-698,701-702,704-720,722-744,746,749-778,780-785,787-822,824-972,975-987,991-1031,1033-1080,1082-1083,1086-1087,1089-1100,1102-1103,1105,1107-1108,1110-1174,1176-1180,1183-1230,1232-1236,1238-1247,1249-1270,1274,1281,1292,1296-1300,1358,1472,1716-2561
+crates/core/src/config.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 17-19,21,69-97,136-168,374-420
+CHANGELOG.md
+  s_eccf77f92a94cc::t_5d59db830e5d0a 26-187,1053-1058
+crates/core/src/worktree.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 5-6,30,133-143,147-150,173,448,506,655,734-753
+  s_eccf77f92a94cc::t_b92c26097a0c28 754-755
+apps/cli/tests/cli.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 7-9,28-30,58-91,125-126,137,142,181,225,322-709,720,762-834,836-1031,1034-1141,1145-1260,1301,1304,1642,1781,2032
+apps/tui/src/palette.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 29-30
+crates/core/src/cleanup.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 1-2201
+CLAUDE.md
+  s_eccf77f92a94cc::t_5d59db830e5d0a 52-57,70-72
+crates/core/src/lib.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 1,13-16,20-21,1986-2063,2243,2321,3176,3982-4031
+apps/tui/src/keymap.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 185,187
+apps/cli/src/main.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 7-8,154-164,171-174,190-193,317-327,453-542,556,558-609,802,828,837,1083-1105
+apps/tui/tests/e2e.rs
+  s_eccf77f92a94cc::t_5d59db830e5d0a 1360-1375,1380-1381,1390,1395,1408,1424-1516,1518-1520
+  s_eccf77f92a94cc::t_a1e9d4da90d547 1517,1521
+Cargo.lock
+  s_eccf77f92a94cc::t_2a2c4c6dd55cb1 909,923,936,942,2013-2018,2107-2115
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_add_repo_modal.snap
+  s_eccf77f92a94cc::t_cdfb93b0499176 10
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_add_workspace_modal.snap
+  s_eccf77f92a94cc::t_2d69c67a0b679d 10,15
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_narrow_terminal.snap
+  s_eccf77f92a94cc::t_7c22e659953674 10
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_palette_overlay.snap
+  s_eccf77f92a94cc::t_046309a4b08cb7 10,20-21
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_settings_overlay.snap
+  s_eccf77f92a94cc::t_20b57d83b3d4c3 3,22-23
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_tree_collapsed.snap
+  s_eccf77f92a94cc::t_26b2218f0489fc 10
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_tree_expanded.snap
+  s_eccf77f92a94cc::t_f3c8e252ea940d 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f6a206abc50bf0fd9e8b6577510036cfa7576f34",
+  "prompts": {},
+  "sessions": {
+    "s_eccf77f92a94cc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "617ddb2c-a70e-4d8b-80a6-6d75209bdd7a",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
