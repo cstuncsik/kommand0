@@ -2482,6 +2482,13 @@ impl App {
         };
     }
 
+    /// Open a new tab of `kind` in the selected workspace; nothing without one.
+    fn new_tab_for_selected(&mut self, kind: TabKind) {
+        if let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) {
+            self.new_tab(kind, &ws_id);
+        }
+    }
+
     /// Open an additional tab of `kind` for a workspace (up to the shared cap)
     /// and focus it.
     fn new_tab(&mut self, kind: TabKind, ws_id: &str) {
@@ -3241,7 +3248,10 @@ impl App {
             Ok(_) => {
                 self.workspaces = self.state.workspaces.clone();
                 self.expanded.insert(repo_id);
-                self.rebuild_tree();
+                // Keep the cursor on its row: under a name or newest-first sort
+                // the new workspace can land above it, and from the embedded
+                // pane the cursor is the shown session.
+                self.rebuild_tree_keeping_selection();
                 self.request_branch_status_refresh();
             }
             Err(e) => {
@@ -3259,7 +3269,7 @@ impl App {
         }
     }
 
-    /// Open the Add Repository modal (tree `a`, pane `Ctrl+A a`).
+    /// Open the Add Repository modal (tree `a`, pane `Ctrl+A a`, the `+` button).
     fn open_add_repo_modal(&mut self) {
         self.modal = modal::ModalState::AddRepo {
             input: String::new(),
@@ -3267,6 +3277,21 @@ impl App {
             error: None,
             completions: Vec::new(),
             completion_index: None,
+        };
+    }
+
+    /// Open the Add Workspace modal for a repo (tree `w`, pane `Ctrl+A w`, the
+    /// repo row's `+` button).
+    fn open_add_workspace_modal(&mut self, repo_id: String, repo_name: String) {
+        self.modal = modal::ModalState::AddWorkspace {
+            repo_id,
+            repo_name,
+            input: String::new(),
+            cursor: 0,
+            branch: String::new(),
+            branch_cursor: 0,
+            field: modal::AddWorkspaceField::Name,
+            error: None,
         };
     }
 
@@ -3282,16 +3307,7 @@ impl App {
             _ => None,
         };
         if let Some((repo_id, repo_name)) = repo_info {
-            self.modal = modal::ModalState::AddWorkspace {
-                repo_id,
-                repo_name,
-                input: String::new(),
-                cursor: 0,
-                branch: String::new(),
-                branch_cursor: 0,
-                field: modal::AddWorkspaceField::Name,
-                error: None,
-            };
+            self.open_add_workspace_modal(repo_id, repo_name);
         }
     }
 
@@ -3995,6 +4011,27 @@ impl App {
         }
     }
 
+    /// Quit from either pane (tree `q`, pane `Ctrl+A q`). Refused while a
+    /// profile delete runs; that check comes first so a blocked quit leaves the
+    /// sessions untouched. Otherwise every running session is marked stopped
+    /// before the loop exits.
+    fn request_quit(&mut self) -> KeyOutcome {
+        if self.quit_blocked_by_profile_delete() {
+            return KeyOutcome::Continue;
+        }
+        let running_ids: Vec<String> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|s| s.status == SessionStatus::Running)
+            .map(|s| s.id.clone())
+            .collect();
+        for sid in running_ids {
+            let _ = self.state.update_session_status(&sid, SessionStatus::Stopped);
+        }
+        KeyOutcome::Quit
+    }
+
     /// While a profile delete runs, quitting would kill the worker mid
     /// `remove_dir_all` (the flock dies with the process, but half a
     /// profile would remain): the quit paths block and notice instead.
@@ -4211,6 +4248,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             app.embedded_prefix = false;
             // Fixed (non-rebindable) prefix keys: the tab digits and the
             // literal prefix. Everything else is the keymap's pane layer.
+            // `keymap::reserved_reason` mirrors these two guards (any non-Ctrl
+            // digit, any Ctrl+A); change them together.
             match key.code {
                 KeyCode::Char(c @ '1'..='9') if !ctrl => {
                     let idx = (c as u8 - b'1') as usize;
@@ -4225,34 +4264,17 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 }
                 _ => {}
             }
-            // Chords carry their modifiers, so `Ctrl+]` (decoded as Char(']')
-            // or Char('5') with CTRL) can't read as the `]` tab command here.
+            // `Ctrl+]` arrives as Char(']') or Char('5') with CTRL: the digit
+            // arm above skips Ctrl-modified digits, and a chord carries its
+            // modifiers, so neither reads as the `]` tab command here.
             match app.keymap.resolve_pane(&key) {
-                Some(Action::Quit) => {
-                    if app.quit_blocked_by_profile_delete() {
-                        return Ok(KeyOutcome::Continue);
-                    }
-                    return Ok(KeyOutcome::Quit);
-                }
+                Some(Action::Quit) => return Ok(app.request_quit()),
                 Some(Action::BackToTree) => app.focus = Focus::Tree,
-                Some(
-                    action @ (Action::NewClaudeTab
-                    | Action::NewShellTab
-                    | Action::NewCodexTab
-                    | Action::NewGeminiTab
-                    | Action::NewOpencodeTab),
-                ) => {
-                    let kind = match action {
-                        Action::NewClaudeTab => TabKind::Claude,
-                        Action::NewShellTab => TabKind::Shell,
-                        Action::NewCodexTab => TabKind::Codex,
-                        Action::NewGeminiTab => TabKind::Gemini,
-                        _ => TabKind::Opencode,
-                    };
-                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone()) {
-                        app.new_tab(kind, &ws_id);
-                    }
-                }
+                Some(Action::NewClaudeTab) => app.new_tab_for_selected(TabKind::Claude),
+                Some(Action::NewShellTab) => app.new_tab_for_selected(TabKind::Shell),
+                Some(Action::NewCodexTab) => app.new_tab_for_selected(TabKind::Codex),
+                Some(Action::NewGeminiTab) => app.new_tab_for_selected(TabKind::Gemini),
+                Some(Action::NewOpencodeTab) => app.new_tab_for_selected(TabKind::Opencode),
                 Some(Action::PrevTab) => {
                     if let Some(s) = app.selected_sessions_mut() {
                         s.prev();
@@ -4276,7 +4298,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Some(Action::AddRepo) => app.open_add_repo_modal(),
                 Some(Action::AddWorkspace) => app.open_add_workspace_modal_for_selection(),
                 // Tree-only actions never land in the pane layer; an unbound
-                // key is swallowed, never forwarded.
+                // key is swallowed, never forwarded. A new pane action needs an
+                // arm above: the compiler can't flag one missing behind `Some(_)`.
                 Some(_) | None => {}
             }
             return Ok(KeyOutcome::Continue);
@@ -4487,7 +4510,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // hint shows immediately, pointing the user at the next step.
                     app.expanded.insert(repo.id.clone());
                     app.repos = app.state.repos.clone();
-                    app.rebuild_tree();
+                    // Keep the cursor on its row (a name-sorted list can put the
+                    // new repo above it; from the pane the cursor is the session).
+                    app.rebuild_tree_keeping_selection();
                 }
                 Err(e) => {
                     app.modal = modal::ModalState::AddRepo {
@@ -4748,26 +4773,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         if let Some(action) = app.keymap.resolve(&key) {
             use keymap::Action;
             match action {
-                Action::Quit => {
-                    // Before the session-stopping side effects: a blocked
-                    // quit must leave them untouched.
-                    if app.quit_blocked_by_profile_delete() {
-                        return Ok(KeyOutcome::Continue);
-                    }
-                    let running_ids: Vec<String> = app
-                        .state
-                        .sessions
-                        .iter()
-                        .filter(|s| s.status == SessionStatus::Running)
-                        .map(|s| s.id.clone())
-                        .collect();
-                    for sid in running_ids {
-                        let _ = app
-                            .state
-                            .update_session_status(&sid, SessionStatus::Stopped);
-                    }
-                    return Ok(KeyOutcome::Quit);
-                }
+                Action::Quit => return Ok(app.request_quit()),
                 Action::Help => {
                     app.show_help = !app.show_help;
                     app.help_scroll = 0;
@@ -4921,8 +4927,21 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     }
                     _ => {}
                 },
-                // Pane-layer actions never resolve from the tree map.
-                _ => {}
+                // The pane layer's actions never resolve from the tree map.
+                // Listed rather than `_`, so a new tree action without an arm
+                // here still fails to compile.
+                Action::NewClaudeTab
+                | Action::NewShellTab
+                | Action::NewCodexTab
+                | Action::NewGeminiTab
+                | Action::NewOpencodeTab
+                | Action::PrevTab
+                | Action::NextTab
+                | Action::LastTab
+                | Action::RenameTab
+                | Action::CloseTab
+                | Action::Detach
+                | Action::BackToTree => {}
             }
         }
     }
@@ -5640,27 +5659,10 @@ async fn run(
                         buttons::HitAction::AddWorkspaceFor { repo_id } => {
                             // Open modal to add workspace to this repo
                             if let Some(repo) = app.state.repos.iter().find(|r| r.id == repo_id).cloned() {
-                                app.modal = modal::ModalState::AddWorkspace {
-                                    repo_id,
-                                    repo_name: repo.name,
-                                    input: String::new(),
-                                    cursor: 0,
-                                    branch: String::new(),
-                                    branch_cursor: 0,
-                                    field: modal::AddWorkspaceField::Name,
-                                    error: None,
-                                };
+                                app.open_add_workspace_modal(repo_id, repo.name);
                             }
                         }
-                        buttons::HitAction::AddRepo => {
-                            app.modal = modal::ModalState::AddRepo {
-                                input: String::new(),
-                                cursor: 0,
-                                error: None,
-                                completions: Vec::new(),
-                                completion_index: None,
-                            };
-                        }
+                        buttons::HitAction::AddRepo => app.open_add_repo_modal(),
                     }
                 }
             }
@@ -12366,5 +12368,107 @@ mod key_tests {
             text.contains("Ctrl+]"),
             "help should document the prefix-less way back to the tree:\n{text}"
         );
+        // The post-prefix rows come from the keymap, not a fixed table: a
+        // rebind shows up and the default it replaced is gone. 100 rows so the
+        // whole embedded section fits the popup.
+        let mut tall = Terminal::new(TestBackend::new(100, 100)).unwrap();
+        tall.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&tall);
+        assert!(text.contains("Ctrl+A then c"), "help lists the default new-claude key:\n{text}");
+        let mut cfg = std::collections::HashMap::new();
+        cfg.insert("new-claude".to_string(), vec!["ctrl+n".to_string()]);
+        let (km, warns) = keymap::KeyMap::build(&cfg);
+        assert!(warns.is_empty(), "{warns:?}");
+        app.keymap = km;
+        tall.draw(|frame| render::ui(frame, &mut app)).unwrap();
+        let text = buffer_text(&tall);
+        assert!(text.contains("Ctrl+A then Ctrl+n"), "help follows a pane rebind:\n{text}");
+        assert!(!text.contains("Ctrl+A then c"), "the replaced default is gone:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn adding_a_workspace_from_the_pane_keeps_the_shown_workspace() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        // A workspace to be "in", under a name sort where a new "alpha" lands
+        // above it.
+        app.modal = add_workspace_modal_for("real", "zeta");
+        press(&mut app, KeyCode::Enter).await;
+        let zeta_id =
+            app.workspaces.iter().find(|w| w.name == "zeta").expect("fixture workspace").id.clone();
+        app.state.workspace_sort = kommand0_core::SortMode::NameAsc;
+        app.expanded.insert("real".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row(&zeta_id);
+        app.focus = Focus::Embedded;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)).await.unwrap();
+        press(&mut app, KeyCode::Char('w')).await;
+        for c in "alpha".chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        press(&mut app, KeyCode::Enter).await;
+
+        assert!(!app.modal.is_active(), "the modal closed on submit");
+        assert!(app.workspaces.iter().any(|w| w.name == "alpha"), "the workspace was created");
+        assert_eq!(app.focus, Focus::Embedded, "the pane stays focused");
+        assert_eq!(
+            app.selected_workspace().map(|w| w.name.as_str()),
+            Some("zeta"),
+            "the pane still shows the workspace the user was in"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_repo_from_the_pane_keeps_the_shown_workspace() {
+        let mut app = test_app();
+        app.state.repo_sort = kommand0_core::SortMode::NameAsc;
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.focus = Focus::Embedded;
+        // A directory whose name sorts above the fixture repos ("alpha", "beta").
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("0-first");
+        std::fs::create_dir(&path).unwrap();
+        let path = path.to_string_lossy().to_string();
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)).await.unwrap();
+        press(&mut app, KeyCode::Char('a')).await;
+        for c in path.chars() {
+            press(&mut app, KeyCode::Char(c)).await;
+        }
+        press(&mut app, KeyCode::Enter).await;
+
+        assert!(!app.modal.is_active(), "the modal closed on submit");
+        assert!(app.state.repos.iter().any(|r| r.name == "0-first"), "the repo was added");
+        assert_eq!(app.focus, Focus::Embedded, "the pane stays focused");
+        assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w1"), "the pane still shows w1");
+    }
+
+    #[tokio::test]
+    async fn prefix_then_a_ctrl_digit_is_not_a_tab_jump() {
+        // A legacy terminal reports Ctrl+] as Char('5') with CTRL. After the
+        // prefix it must neither jump to a tab (the digit arm) nor fire a
+        // binding: it is swallowed. Same for any other Ctrl+digit and Ctrl+].
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        let first = tab("a", &["-c", "sleep 30"]);
+        let second = tab("b", &["-c", "sleep 30"]);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![first, second], active: 1, last_active: None },
+        );
+        app.focus = Focus::Embedded;
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        for c in ['5', '1', ']'] {
+            handle_key(&mut app, ctrl('a')).await.unwrap();
+            handle_key(&mut app, ctrl(c)).await.unwrap();
+            assert_eq!(app.embedded["w1"].active, 1, "Ctrl+{c} after the prefix must not switch tabs");
+            assert_eq!(app.focus, Focus::Embedded, "Ctrl+{c} after the prefix is swallowed");
+            assert!(!app.embedded_prefix, "the prefix is consumed");
+        }
     }
 }
