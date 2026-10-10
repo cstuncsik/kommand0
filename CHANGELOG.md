@@ -5,6 +5,8 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-10
+
 ### Added
 
 - **Rebindable `Ctrl+A` commands.** The embedded pane's post-prefix keys (`Ctrl+A`
@@ -1067,7 +1069,8 @@ launches a real interactive `claude` in an embedded PTY pane. Ships two binaries
   `attention`, …) with named/`#rrggbb`/indexed colors. The embedded `claude`
   pane keeps its own colours. Bad theme names / roles / colors warn, not fatal.
 
-[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.30.1...HEAD
+[Unreleased]: https://github.com/cstuncsik/kommand0/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/cstuncsik/kommand0/compare/v0.30.1...v0.31.0
 [0.30.1]: https://github.com/cstuncsik/kommand0/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/cstuncsik/kommand0/compare/v0.29.1...v0.30.0
 [0.29.1]: https://github.com/cstuncsik/kommand0/compare/v0.29.0...v0.29.1
