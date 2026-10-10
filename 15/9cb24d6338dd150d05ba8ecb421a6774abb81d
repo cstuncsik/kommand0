@@ -1,0 +1,30 @@
+apps/tui/src/keymap.rs
+  s_eccf77f92a94cc::t_6f389aa0a76323 9-10,800-802,1006,1013-1016,1050-1057,1059-1070
+  s_eccf77f92a94cc::t_a78b07d1f5be9c 993-996,1058
+  s_eccf77f92a94cc::t_4fe1d30dc92594 11-12,301-308,542-545,551-558,562-579,583-584,900-901,903,905-912,916,918,923-924,928-930,934-937,939,945-966,1071
+README.md
+  s_eccf77f92a94cc::t_6f389aa0a76323 363
+apps/tui/src/main.rs
+  s_eccf77f92a94cc::t_6f389aa0a76323 1498-1500,4023,4292-4297,12365-12368,12372-12373,12393-12394,12407,12413-12420,12452,12458-12463,12476,12478-12479,12485-12505,12507
+  s_eccf77f92a94cc::t_a80b74febe7084 12506
+CLAUDE.md
+  s_eccf77f92a94cc::t_6f389aa0a76323 61-68
+CHANGELOG.md
+  s_eccf77f92a94cc::t_4fe1d30dc92594 17-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "159cb24d6338dd150d05ba8ecb421a6774abb81d",
+  "prompts": {},
+  "sessions": {
+    "s_eccf77f92a94cc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "617ddb2c-a70e-4d8b-80a6-6d75209bdd7a",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
