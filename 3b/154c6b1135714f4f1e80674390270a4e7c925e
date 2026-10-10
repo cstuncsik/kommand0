@@ -1,0 +1,33 @@
+CLAUDE.md
+  s_12400ead133e31::t_a5f87dfe0751d8 56-57
+README.md
+  s_12400ead133e31::t_a5f87dfe0751d8 331
+CHANGELOG.md
+  s_12400ead133e31::t_a5f87dfe0751d8 8-19
+apps/tui/src/render.rs
+  s_12400ead133e31::t_9f400fd5f56755 211,218
+apps/tui/src/keymap.rs
+  s_12400ead133e31::t_9f400fd5f56755 1-2,4-9,15,49-61,64-71,103-114,153-164,202-234,269-283,372-373,378,381-383,386,430-444,448-462,464-469,473-475,490-492,498-500,504-524,526,533-534,536-541,546-551,557,559-575,716-717,722-807
+apps/tui/src/help.rs
+  s_12400ead133e31::t_9f400fd5f56755 33-37,43,46-48,54,58,85-87,95,122-123,125-130
+apps/tui/src/main.rs
+  s_12400ead133e31::t_9f400fd5f56755 3671-3672,3680,3682-3683,3685-3688,3692-3693,3696-3703,3705,3707-3721,3723,3726,3731,3736,3742-3747,3749,9602-9620
+  s_12400ead133e31::t_648968a36c79e5 4387-4388
+  s_12400ead133e31::t_52cfc9f4b90488 9621-9622
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3b154c6b1135714f4f1e80674390270a4e7c925e",
+  "prompts": {},
+  "sessions": {
+    "s_12400ead133e31": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "465e5a6f-7ca5-4e23-bd1e-29161eb1c7b4",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
