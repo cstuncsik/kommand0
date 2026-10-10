@@ -11,12 +11,17 @@ All notable changes to kommand0 are documented here. The format is based on
   then `c`/`s`/`e`/`g`/`o`/`[`/`]`/`l`/`r`/`x`/`d`/`t`) are now `keybindings`
   actions like the tree keys (`new-claude`, `new-shell`, `new-codex`, `new-gemini`,
   `new-opencode`, `prev-tab`, `next-tab`, `last-tab`, `rename-tab`, `close-tab`,
-  `detach`, `back-to-tree`; `quit` is shared with the tree, so one rebind moves
-  both `q` and `Ctrl+A q`), and the help overlay (`?`) shows the live keys.
+  `detach`, `back-to-tree`; `quit`, `add-repo` and `add-workspace` are shared
+  with the tree, so one rebind moves both the tree key and its `Ctrl+A` form),
+  and the help overlay (`?`) shows the live keys.
   `back-to-tree` can be rebound but never unbound: a config that strips all its
   keys gets the defaults back, with a warning in the tree border. The prefix key
   itself, `Ctrl+A 1`–`9` and `Ctrl+A Ctrl+A` stay fixed. The help overlay and the
   README key table now also list `Ctrl+]`, the prefix-less way back to the tree.
+- **`Ctrl+A a` / `Ctrl+A w`: add a repository / workspace from the embedded
+  pane.** The tree's `a` / `w` modals open over the pane (the session keeps
+  running, typing goes to the modal); the new row appears in the tree, and
+  `Ctrl+A w` targets the shown workspace's repo.
 
 ## [0.27.3] - 2026-09-20
 

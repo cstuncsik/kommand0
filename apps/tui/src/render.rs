@@ -321,8 +321,9 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         Focus::Embedded if app.embedded_prefix => {
             // Tab-creation keys lead (per-kind, matching the help overlay); the
             // line right-truncates on narrow terminals, so the tail carries the
-            // keys that also appear in the resting hint or the border title.
-            "Ctrl+A … c claude · e codex · g gemini · o opencode · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9"
+            // keys that also appear in the resting hint, the border title or
+            // (`a` / `w`) the help overlay.
+            "Ctrl+A … c claude · e codex · g gemini · o opencode · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9 · a repo · w ws"
         }
         Focus::Embedded => "Ctrl+A t / Ctrl+] tree · Ctrl+A q quit",
     };

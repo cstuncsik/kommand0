@@ -3147,6 +3147,42 @@ impl App {
         }
     }
 
+    /// Open the Add Repository modal (tree `a`, pane `Ctrl+A a`).
+    fn open_add_repo_modal(&mut self) {
+        self.modal = modal::ModalState::AddRepo {
+            input: String::new(),
+            cursor: 0,
+            error: None,
+            completions: Vec::new(),
+            completion_index: None,
+        };
+    }
+
+    /// Open the Add Workspace modal for the selected row's repo (a repo header
+    /// or any of its workspaces); a hint row is a no-op. From the embedded
+    /// pane the selected row is the shown workspace, so it targets that repo.
+    fn open_add_workspace_modal_for_selection(&mut self) {
+        let repo_info = match self.tree_items.get(self.selected_index) {
+            Some(TreeNode::Repo { id, name, .. }) => Some((id.clone(), name.clone())),
+            Some(TreeNode::Workspace { ws, repo_name }) => {
+                Some((ws.repo_id.clone(), repo_name.clone()))
+            }
+            _ => None,
+        };
+        if let Some((repo_id, repo_name)) = repo_info {
+            self.modal = modal::ModalState::AddWorkspace {
+                repo_id,
+                repo_name,
+                input: String::new(),
+                cursor: 0,
+                branch: String::new(),
+                branch_cursor: 0,
+                field: modal::AddWorkspaceField::Name,
+                error: None,
+            };
+        }
+    }
+
     /// Populate and open the review-diff dialog for a workspace: the PR-style
     /// `git diff <default>...HEAD` of its worktree (committed changes only), as a
     /// collapsible file tree + per-file diff. Computed synchronously — a local git
@@ -3742,6 +3778,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Some(Action::RenameTab) => app.open_rename_active_session(),
                 Some(Action::CloseTab) => app.close_active_session(),
                 Some(Action::Detach) => app.detach_selected_workspace(),
+                // Same modals as the tree's `a` / `w`, opened over the pane.
+                Some(Action::AddRepo) => app.open_add_repo_modal(),
+                Some(Action::AddWorkspace) => app.open_add_workspace_modal_for_selection(),
                 // Tree-only actions never land in the pane layer; an unbound
                 // key is swallowed, never forwarded.
                 Some(_) | None => {}
@@ -4282,36 +4321,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Action::MoveItemDown => app.move_selected(1),
                 Action::SortByName => app.cycle_sort(true),
                 Action::SortByAdded => app.cycle_sort(false),
-                Action::AddRepo => {
-                    app.modal = modal::ModalState::AddRepo {
-                        input: String::new(),
-                        cursor: 0,
-                        error: None,
-                        completions: Vec::new(),
-                        completion_index: None,
-                    };
-                }
-                Action::AddWorkspace => {
-                    let repo_info = match app.tree_items.get(app.selected_index) {
-                        Some(TreeNode::Repo { id, name, .. }) => Some((id.clone(), name.clone())),
-                        Some(TreeNode::Workspace { ws, repo_name }) => {
-                            Some((ws.repo_id.clone(), repo_name.clone()))
-                        }
-                        _ => None,
-                    };
-                    if let Some((repo_id, repo_name)) = repo_info {
-                        app.modal = modal::ModalState::AddWorkspace {
-                            repo_id,
-                            repo_name,
-                            input: String::new(),
-                            cursor: 0,
-                            branch: String::new(),
-                            branch_cursor: 0,
-                            field: modal::AddWorkspaceField::Name,
-                            error: None,
-                        };
-                    }
-                }
+                Action::AddRepo => app.open_add_repo_modal(),
+                Action::AddWorkspace => app.open_add_workspace_modal_for_selection(),
                 Action::Delete => match app.tree_items.get(app.selected_index).cloned() {
                     Some(TreeNode::Workspace { ws, repo_name }) => {
                         app.modal = modal::ModalState::ConfirmDelete {
@@ -9597,6 +9608,40 @@ mod key_tests {
             assert_eq!(kind.config_args(&cfg), &[arg.to_string()], "{kind:?} reads its own args field");
             assert_eq!(kind.bin_env(), env, "{kind:?} names its own env override");
         }
+    }
+
+    #[tokio::test]
+    async fn prefix_a_and_w_open_the_add_modals_over_the_pane() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.focus = Focus::Embedded;
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        handle_key(&mut app, ctrl_a).await.unwrap();
+        press(&mut app, KeyCode::Char('w')).await;
+        match &app.modal {
+            modal::ModalState::AddWorkspace { repo_id, .. } => assert_eq!(repo_id, "r1"),
+            _ => panic!("Ctrl+A w opens the add-workspace modal for the shown workspace's repo"),
+        }
+        assert_eq!(app.focus, Focus::Embedded, "the modal opens over the pane");
+        // Typing now goes to the modal, not the pane.
+        press(&mut app, KeyCode::Char('n')).await;
+        match &app.modal {
+            modal::ModalState::AddWorkspace { input, .. } => assert_eq!(input, "n"),
+            _ => panic!("the modal stays open while typing"),
+        }
+        press(&mut app, KeyCode::Esc).await;
+        assert!(!app.modal.is_active(), "Esc closes the modal");
+        assert_eq!(app.focus, Focus::Embedded, "and leaves the pane focused");
+
+        handle_key(&mut app, ctrl_a).await.unwrap();
+        press(&mut app, KeyCode::Char('a')).await;
+        assert!(
+            matches!(app.modal, modal::ModalState::AddRepo { .. }),
+            "Ctrl+A a opens the add-repo modal"
+        );
     }
 
     #[tokio::test]

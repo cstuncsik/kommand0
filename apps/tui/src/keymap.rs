@@ -214,11 +214,12 @@ impl Action {
         }
     }
 
-    /// The layer(s) this action is bound in. `Quit` is in both: the same chord
-    /// quits from the tree and after the prefix in the pane.
+    /// The layer(s) this action is bound in. Quit / add-repo / add-workspace
+    /// are in both: the same chord works from the tree and after the prefix
+    /// in the pane.
     pub(crate) fn layers(self) -> &'static [Layer] {
         match self {
-            Action::Quit => &[Layer::Tree, Layer::Pane],
+            Action::Quit | Action::AddRepo | Action::AddWorkspace => &[Layer::Tree, Layer::Pane],
             Action::NewClaudeTab
             | Action::NewShellTab
             | Action::NewCodexTab
@@ -734,8 +735,10 @@ mod tests {
         // The same key means something else in the tree; tree keys don't leak in.
         assert_eq!(km.resolve(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::SortByAdded));
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('j'), KeyModifiers::NONE)), None);
-        // Quit is shared: `q` in the tree, `Ctrl+A q` in the pane.
+        // Shared actions: the tree key and its `Ctrl+A` form are one binding.
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('a'), KeyModifiers::NONE)), Some(Action::AddRepo));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('w'), KeyModifiers::NONE)), Some(Action::AddWorkspace));
     }
 
     #[test]
@@ -796,7 +799,9 @@ mod tests {
         let rows = km.pane_help_rows();
         let pane_count = ALL_ACTIONS.iter().filter(|a| a.layers().contains(&Layer::Pane)).count();
         assert_eq!(rows.len(), pane_count);
-        assert_eq!(rows[0], ("Ctrl+A then c".to_string(), Action::NewClaudeTab.description()));
+        // Shared actions keep their tree position, so they lead the section.
+        assert_eq!(rows[0], ("Ctrl+A then a".to_string(), Action::AddRepo.description()));
+        assert_eq!(rows[2], ("Ctrl+A then c".to_string(), Action::NewClaudeTab.description()));
         // Quit closes the section, showing its shared chord.
         assert_eq!(rows.last().unwrap(), &("Ctrl+A then q".to_string(), "Quit"));
         let back = rows.iter().find(|(_, d)| *d == "Back to tree").unwrap();
