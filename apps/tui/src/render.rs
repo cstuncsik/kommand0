@@ -208,12 +208,14 @@ pub fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // keymap so the overlay reflects the user's config.
     if app.show_help {
         let tree_rows = app.keymap.help_rows();
+        let pane_rows = app.keymap.pane_help_rows();
         let icons = icon_legend(app.theme);
         help::render_help_overlay(
             frame,
             app.focus,
             &mut app.help_scroll,
             &tree_rows,
+            &pane_rows,
             &icons,
             app.theme,
         );
@@ -317,10 +319,11 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         // the prefix accepts instead of the resting hint. Pure render: no
         // state lives here.
         Focus::Embedded if app.embedded_prefix => {
-            // Tab-creation keys lead (per-kind, matching the help overlay); the
-            // line right-truncates on narrow terminals, so the tail carries the
-            // keys that also appear in the resting hint or the border title.
-            "Ctrl+A … c claude · e codex · g gemini · o opencode · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9"
+            // Tab-creation keys lead (per kind); the line right-truncates on
+            // narrow terminals, so the tail carries the keys that also appear
+            // in the resting hint, the border title or the help overlay. These
+            // are the defaults: a rebind shows in the help overlay, not here.
+            "Ctrl+A … c claude · e codex · g gemini · o opencode · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9 · a repo · w ws"
         }
         Focus::Embedded => "Ctrl+A t / Ctrl+] tree · Ctrl+A q quit",
     };

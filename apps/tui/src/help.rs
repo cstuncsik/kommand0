@@ -30,75 +30,36 @@ pub struct IconSection {
     pub rows: Vec<IconRow>,
 }
 
-const EMBEDDED_BINDINGS: &[KeyBinding] = &[
+// Embedded-pane rows that aren't keymap actions. The post-prefix commands come
+// from the keymap (`pane_help_rows`), so rebinds show correctly; these are the
+// typing passthrough, the mouse hint and the fixed (non-rebindable) prefix keys.
+// Each row is kept to one unwrapped line (see the scroll-clamp note below).
+const EMBEDDED_FIXED_HEAD: &[KeyBinding] = &[
     KeyBinding {
         keys: "(typing)",
         description: "Goes to the embedded claude",
     },
-    // Kept to one unwrapped line (see the scroll-clamp note below); the tmux
-    // detail lives in the README and the startup hint.
     KeyBinding {
-        keys: "[Alt+Enter]",
+        keys: "Alt+Enter",
         description: "Newline (when Shift+Enter submits)",
     },
     KeyBinding {
-        keys: "[Ctrl+A] then [c]",
-        description: "New Claude Code session tab",
+        keys: "Ctrl+]",
+        description: "Back to tree, no prefix needed",
     },
-    KeyBinding {
-        keys: "[Ctrl+A] then [s]",
-        description: "New shell tab (reopens fresh)",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [e]",
-        description: "New codex session tab",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [g]",
-        description: "New gemini session tab",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [o]",
-        description: "New opencode session tab",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [ / ]",
-        description: "Previous / next tab",
-    },
+];
+
+const EMBEDDED_FIXED_TAIL: &[KeyBinding] = &[
     KeyBinding {
         keys: "(wheel tilt)",
         description: "Prev / next tab (also Shift+wheel)",
     },
     KeyBinding {
-        keys: "[Ctrl+A] then [1]-[9]",
+        keys: "Ctrl+A then 1-9",
         description: "Jump to tab N",
     },
     KeyBinding {
-        keys: "[Ctrl+A] then [l]",
-        description: "Jump to the last-active tab",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [r]",
-        description: "Rename the active tab",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [x]",
-        description: "Close the active tab",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [d]",
-        description: "Detach: close panes, keep sessions",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [t]",
-        description: "Back to tree (also Tab/Esc)",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [q]",
-        description: "Quit kommand0",
-    },
-    KeyBinding {
-        keys: "[Ctrl+A] then [Ctrl+A]",
+        keys: "Ctrl+A then Ctrl+A",
         description: "Send a literal Ctrl+A",
     },
 ];
@@ -125,8 +86,9 @@ fn focus_to_section(focus: Focus) -> &'static str {
     }
 }
 
-/// Render the help overlay. `tree_rows` are the live tree-pane bindings
-/// (`(keys, description)`) from the keymap, so the overlay reflects any rebinds;
+/// Render the help overlay. `tree_rows` / `pane_rows` are the live tree-pane and
+/// post-prefix bindings (`(keys, description)`) from the keymap, so the overlay
+/// reflects any rebinds;
 /// `icon_sections` is the glyph legend, built from the same helpers that draw
 /// the glyphs.
 pub fn render_help_overlay(
@@ -134,6 +96,7 @@ pub fn render_help_overlay(
     focus: Focus,
     scroll: &mut u16,
     tree_rows: &[(String, &'static str)],
+    pane_rows: &[(String, &'static str)],
     icon_sections: &[IconSection],
     theme: Theme,
 ) {
@@ -160,11 +123,15 @@ pub fn render_help_overlay(
     ]));
     lines.push(Line::raw(""));
 
-    // Sections: tree pane bindings come from the keymap (dynamic); the embedded
-    // prefix is fixed (static).
+    // Sections: both panes' bindings come from the keymap (dynamic); the
+    // embedded section wraps its rows in the fixed ones.
     let tree: Vec<(&str, &str)> = tree_rows.iter().map(|(k, d)| (k.as_str(), *d)).collect();
-    let embedded: Vec<(&str, &str)> =
-        EMBEDDED_BINDINGS.iter().map(|b| (b.keys, b.description)).collect();
+    let embedded: Vec<(&str, &str)> = EMBEDDED_FIXED_HEAD
+        .iter()
+        .map(|b| (b.keys, b.description))
+        .chain(pane_rows.iter().map(|(k, d)| (k.as_str(), *d)))
+        .chain(EMBEDDED_FIXED_TAIL.iter().map(|b| (b.keys, b.description)))
+        .collect();
 
     // A section title is bold, and highlighted when it's the pane you're in.
     // The icon sections are never a focus target, so they never highlight.
