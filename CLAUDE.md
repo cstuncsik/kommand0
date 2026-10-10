@@ -49,6 +49,12 @@ git worktree. A `kmd` CLI mirrors the core actions.
   refreshes ~2s; PR/CI status ~60s (network).
 - **All `gh` calls go through `git::run_gh`** — non-interactive (prompts/pager off,
   stdin null), ETXTBSY-retry, 20s timeout. Never invoke `gh` directly.
+- **Network git follows `git::fetch_origin_branch`'s recipe**: `GIT_TERMINAL_PROMPT=0`,
+  an empty `GIT_ASKPASS`, `batch_ssh_command()` (batch mode plus keepalives),
+  `http_stall()`, `-c gc.auto=0 -c maintenance.auto=false`, null stdin, and
+  `wait_bounded`, which stops waiting at 20 s but never kills: a slow fetch still
+  lands, keepalives and the https limit end a dead connection or a stalled
+  transfer, and anything else (a stuck server on a live connection) is abandoned.
 - **Overlays** (help, palette, modal, diff) own the screen: they swallow keys AND
   must appear in the mouse/paste guards in `main.rs` so clicks/paste don't leak to
   the tree behind them. Global focus is `Focus { Tree, Embedded }` (Tab-switched).
@@ -61,8 +67,9 @@ git worktree. A `kmd` CLI mirrors the core actions.
   is the exact-dir escape hatch), and a one-time legacy migration moves a root
   `state.json`/`config.json` into `profiles/default/` — it MUST run before anything
   creates the state dir. Workspaces are git worktrees on per-workspace branches
-  named after the workspace (suffixed `-2`… on collision; pre-0.11 workspaces may
-  carry a legacy `kommand0/<name>` branch — still fully supported);
+  named after the workspace, accents stripped to ASCII (suffixed `-2`… on
+  collision; pre-0.11 workspaces may carry a legacy `kommand0/<name>` branch —
+  still fully supported);
   a **fallback workspace has no `worktree_path`** (its `working_dir` is the repo
   root) — per-workspace git/PR features gate on `worktree_path.is_some()`.
   Workspace names are unique **per repo**, not globally; new worktrees are created

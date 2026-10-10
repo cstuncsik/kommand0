@@ -17,6 +17,7 @@ chrono.workspace = true
 uuid.workspace = true
 dirs.workspace = true
 glob.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

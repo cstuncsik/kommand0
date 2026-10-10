@@ -98,6 +98,13 @@ fn handle_click(app: &mut App, col: u16, row: u16) -> bool {
             if !app.is_hint(item_row) {
                 app.selected_index = item_row;
                 app.update_active_session();
+                // A workspace with a live session takes the keyboard on click
+                // (as Enter on it would): the click means "talk to this
+                // session", and a letter typed into it is harmless where the
+                // same letter as a tree action is not.
+                if app.active_pane_mut().is_some() {
+                    app.focus_embedded_by_click();
+                }
 
                 // Toggle expand on repo nodes
                 if let Some(TreeNode::Repo { .. }) = app.tree_items.get(item_row) {

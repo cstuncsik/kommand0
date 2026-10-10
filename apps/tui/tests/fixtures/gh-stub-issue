@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Fake `gh` for the issue-resolve e2e (selected via KOMMAND0_GH_BIN): reports
+# that issue 123 already has a linked branch, in the piped `branch<TAB>url`
+# shape core parses. Runs with cwd = the repo.
+#
+# The sleep is load-bearing: it holds the worker open long enough for the
+# render loop to paint the "Resolving issue" modal, which is what proves the
+# lookup is NOT running on the render loop.
+if [ "$1" = "issue" ] && [ "$2" = "develop" ]; then
+  sleep 1
+  printf '123-linked\thttps://github.com/o/r/tree/123-linked\n'
+  exit 0
+fi
+exit 1

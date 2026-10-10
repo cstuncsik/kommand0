@@ -2,6 +2,8 @@ use std::path::{Component, Path};
 use std::process::Command;
 
 use anyhow::Result;
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 
 /// Result of attempting to create a git worktree.
 pub enum WorktreeResult {
@@ -25,7 +27,7 @@ fn is_git_repo(repo_path: &str) -> bool {
 /// exists in the repo. Uses `show-ref --verify` (exact ref lookup), not
 /// `rev-parse` (which applies revision syntax, so e.g. `main^{commit}` would
 /// false-positively resolve).
-fn verify_ref(repo_path: &str, full_ref: &str) -> bool {
+pub(crate) fn verify_ref(repo_path: &str, full_ref: &str) -> bool {
     Command::new("git")
         .args(["-C", repo_path, "show-ref", "--verify", "--quiet", full_ref])
         .stdout(std::process::Stdio::null())
@@ -128,11 +130,24 @@ fn unique_branch_name(repo_path: &str, base: &str) -> String {
     format!("{base}-{ts}")
 }
 
+/// `s` with its accents stripped (NFD, then drop the combining marks):
+/// `ajándék` becomes `ajandek`. Every branch kommand0 names goes through this
+/// (a forked workspace branch here, an issue's linked branch in
+/// [`crate::git::issue_branch`]): GitHub flags a non-ASCII head ref on every PR
+/// as "may contain hidden characters" and escapes it (`aj\u00e1nd\u00e9k`) in
+/// the links. Letters that are not a base + mark (`ø`, `ł`, `ß`) pass through
+/// unchanged.
+pub(crate) fn strip_accents(s: &str) -> String {
+    s.nfd().filter(|c| !is_combining_mark(*c)).collect()
+}
+
 /// Create a git worktree for a workspace.
 ///
 /// The worktree is placed at `<base_dir>/worktrees/<repo_id>/<workspace_name>`.
-/// A new branch named after the workspace is created (suffixed `-2`, `-3`, …
-/// when a branch of that name already exists locally or on origin).
+/// A new branch named after the workspace, accents stripped ([`strip_accents`];
+/// the workspace and its worktree dir keep the name as typed), is created
+/// (suffixed `-2`, `-3`, … when a branch of that name already exists locally or
+/// on origin).
 ///
 /// Returns `WorktreeResult::Fallback` if the repo is not a git repo or
 /// if worktree creation fails for any reason.
@@ -155,7 +170,7 @@ pub fn create_worktree(
     };
 
     // Find a unique branch name
-    let branch = unique_branch_name(repo_path, workspace_name);
+    let branch = unique_branch_name(repo_path, &strip_accents(workspace_name));
 
     // Create the worktree on a fresh branch.
     let output = Command::new("git")
@@ -430,7 +445,7 @@ fn remove_empty_parent(worktree_path: &str) {
 /// Uses `--force` to handle dirty worktrees (since the workspace is being deleted).
 pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<()> {
     if !Path::new(worktree_path).exists() {
-        // Common flow: the merged-PR cleanup already removed the worktree and
+        // Common flow: the merged-workspace cleanup already removed the worktree and
         // the follow-up workspace delete lands here; still clear a now-empty
         // worktrees/<repo-id>/ parent. NOT done on the failure arms below
         // (git refusing can mean the state path never was a worktree).
@@ -488,6 +503,7 @@ mod tests {
         let git = |args: &[&str]| Command::new("git").args(args).current_dir(dir).output().unwrap();
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
     }
@@ -636,7 +652,7 @@ mod tests {
 
     #[test]
     fn remove_worktree_already_gone_still_clears_the_empty_parent() {
-        // The merged-PR cleanup removes the worktree first; the follow-up
+        // The merged-workspace cleanup removes the worktree first; the follow-up
         // workspace delete hits remove_worktree's early return, which must
         // still clear the now-empty worktrees/<repo-id>/ dir.
         let repo = TempDir::new().unwrap();
@@ -713,6 +729,28 @@ mod tests {
 
         assert_eq!(unique_branch_name(cp, "feat"), "feat-2");
         assert_eq!(unique_branch_name(cp, "other"), "other", "non-colliding name stays bare");
+    }
+
+    #[test]
+    fn branch_name_drops_the_workspace_names_accents() {
+        // GitHub flags a non-ASCII head ref ("may contain hidden characters"),
+        // so the branch is the accent-stripped name; the worktree dir keeps it.
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        match create_worktree(repo.path().to_str().unwrap(), "r1", "ajándék-tálcás-ő-ű", base.path()) {
+            WorktreeResult::Created { worktree_path, branch_name } => {
+                assert_eq!(branch_name, "ajandek-talcas-o-u");
+                assert!(
+                    worktree_path.ends_with("ajándék-tálcás-ő-ű"),
+                    "dir keeps the typed name: {worktree_path}"
+                );
+            }
+            WorktreeResult::Fallback { reason } => panic!("expected Created, got Fallback: {reason}"),
+        }
+        assert_eq!(strip_accents("Árvíztűrő"), "Arvizturo", "case is kept");
+        assert_eq!(strip_accents("plain-name"), "plain-name", "ascii is untouched");
+        assert_eq!(strip_accents("øl-ß"), "øl-ß", "non-decomposable letters pass through");
     }
 
     #[test]
