@@ -43,6 +43,10 @@ const EMBEDDED_FIXED_HEAD: &[KeyBinding] = &[
         keys: "Alt+Enter",
         description: "Newline (when Shift+Enter submits)",
     },
+    KeyBinding {
+        keys: "Ctrl+]",
+        description: "Back to tree, no prefix needed",
+    },
 ];
 
 const EMBEDDED_FIXED_TAIL: &[KeyBinding] = &[

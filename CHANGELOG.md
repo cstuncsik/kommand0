@@ -15,7 +15,8 @@ All notable changes to kommand0 are documented here. The format is based on
   both `q` and `Ctrl+A q`), and the help overlay (`?`) shows the live keys.
   `back-to-tree` can be rebound but never unbound: a config that strips all its
   keys gets the defaults back, with a warning in the tree border. The prefix key
-  itself, `Ctrl+A 1`–`9` and `Ctrl+A Ctrl+A` stay fixed.
+  itself, `Ctrl+A 1`–`9` and `Ctrl+A Ctrl+A` stay fixed. The help overlay and the
+  README key table now also list `Ctrl+]`, the prefix-less way back to the tree.
 
 ## [0.27.3] - 2026-09-20
 

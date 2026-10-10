@@ -10715,5 +10715,9 @@ mod key_tests {
             text.contains("Alt+Enter"),
             "help should document the newline chord for embedded sessions:\n{text}"
         );
+        assert!(
+            text.contains("Ctrl+]"),
+            "help should document the prefix-less way back to the tree:\n{text}"
+        );
     }
 }
