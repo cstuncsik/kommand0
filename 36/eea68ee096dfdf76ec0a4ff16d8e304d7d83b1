@@ -1,0 +1,21 @@
+apps/tui/src/keymap.rs
+  s_eccf77f92a94cc::t_e3ef81af302ec8 10-11,67,221-222,238-265,302-304,307,311,314,403-405,407,412,416,420,484,489-493,513-515,521-522,530-531,541-556,559-569,576-577,579,581-582,588-590,594-597,600,602-605,611-617,619
+  s_eccf77f92a94cc::t_d21ff65502b7e5 742-743,748-753
+  s_eccf77f92a94cc::t_e5ae4727c172c3 760-763,845-846,858-967
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "36eea68ee096dfdf76ec0a4ff16d8e304d7d83b1",
+  "prompts": {},
+  "sessions": {
+    "s_eccf77f92a94cc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "617ddb2c-a70e-4d8b-80a6-6d75209bdd7a",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
