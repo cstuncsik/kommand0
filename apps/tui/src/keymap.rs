@@ -6,9 +6,10 @@
 //! the built-in bindings; a user's `config.json` `keybindings` (action name → key
 //! specs) replace an action's keys in every layer it lives in. Fixed (not
 //! rebindable): the `gg` motion and `Esc` (clears the filter) in the tree; the
-//! `Ctrl+A` prefix key itself, `Ctrl+A 1`-`9` and `Ctrl+A Ctrl+A` in the pane.
-//! `back-to-tree` and `quit` can be rebound but never unbound: a config that
-//! leaves one with no key in any of its layers gets its defaults back.
+//! `Ctrl+A` prefix key itself, `Ctrl+A 1`-`9` and `Ctrl+A Ctrl+A` in the pane;
+//! and the prefix-less `Ctrl+]` (back to tree), handled before either layer.
+//! `back-to-tree` and `quit` can be rebound but never unbound: a layer left
+//! with no key for one of them gets that action's defaults back there.
 
 use std::collections::HashMap;
 
@@ -297,6 +298,14 @@ fn normalize(code: KeyCode, mods: KeyModifiers) -> KeyChord {
     KeyChord { code, mods }
 }
 
+/// Push a config warning unless the same line is already queued: a shared
+/// action is processed once per layer, and the border counts the lines.
+fn push_unique(warnings: &mut Vec<String>, msg: String) {
+    if !warnings.contains(&msg) {
+        warnings.push(msg);
+    }
+}
+
 /// Chords handled by fixed (non-rebindable) pre-checks in `handle_key` for a
 /// layer, with a reason for the warning. Binding an action to one of these
 /// would never fire. The pane predicates mirror the prefix arms in `handle_key`
@@ -530,50 +539,49 @@ impl KeyMap {
                     if let Some(prev) = keymap.map.insert((layer, chord), action)
                         && prev != action
                     {
-                        warnings.push(format!(
-                            "key '{spec}' reassigned from '{}' to '{name}'",
-                            prev.name()
-                        ));
+                        push_unique(
+                            &mut warnings,
+                            format!("key '{spec}' reassigned from '{}' to '{name}'", prev.name()),
+                        );
                     }
                 }
             }
         }
         // `back-to-tree` is the keyboard's way out of the embedded pane and
-        // `quit` the way out of kommand0: both can be rebound but never unbound.
-        // One left with no key in any of its layers gets its defaults back,
-        // displacing whatever took them (warned by name). Restoring one can take
-        // the other's configured key (`back-to-tree: ["q"]` plus `quit: []`), so
-        // this repeats until both hold; their defaults are disjoint, so a
-        // restored action is never displaced again and the loop ends.
+        // `quit` the way out of kommand0: both can be rebound but never unbound,
+        // in every layer they live in (the tree is the only layer a user with
+        // no workspace can reach). A layer left with no key for one gets that
+        // action's defaults back there, displacing whatever took them (warned
+        // by name). Restoring one can take the other's configured key
+        // (`back-to-tree: ["q"]` plus `quit: []`), so this repeats until both
+        // hold; their defaults are disjoint, so a restored action is never
+        // displaced again and the loop ends.
         loop {
             let mut restored = false;
             for action in [Action::BackToTree, Action::Quit] {
-                let unbound = action
-                    .layers()
-                    .iter()
-                    .all(|&layer| keymap.chords_for(layer, action).is_empty());
-                if !unbound {
-                    continue;
-                }
-                restored = true;
-                warnings.push(format!(
-                    "'{}' cannot be unbound; its default keys are restored",
-                    action.name()
-                ));
-                for (spec, default) in DEFAULT_BINDINGS {
-                    if *default == action
-                        && let Some(chord) = parse_chord(spec)
-                    {
-                        for &layer in action.layers() {
-                            if let Some(prev) = keymap.map.insert((layer, chord), action)
-                                && prev != action
-                            {
-                                warnings.push(format!(
+                for &layer in action.layers() {
+                    if !keymap.chords_for(layer, action).is_empty() {
+                        continue;
+                    }
+                    restored = true;
+                    push_unique(
+                        &mut warnings,
+                        format!("'{}' cannot be unbound; its default keys are restored", action.name()),
+                    );
+                    for (spec, default) in DEFAULT_BINDINGS {
+                        if *default == action
+                            && let Some(chord) = parse_chord(spec)
+                            && let Some(prev) = keymap.map.insert((layer, chord), action)
+                            && prev != action
+                        {
+                            push_unique(
+                                &mut warnings,
+                                format!(
                                     "key '{spec}' reassigned from '{}' back to '{}'",
                                     prev.name(),
                                     action.name()
-                                ));
-                            }
+                                ),
+                            );
                         }
                     }
                 }
@@ -789,6 +797,9 @@ mod tests {
         // A Ctrl-modified key is a different chord: `Ctrl+]` (decoded as
         // `]`+CTRL) must not read as the `]` tab command after the prefix.
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char(']'), KeyModifiers::CONTROL)), None);
+        // Likewise `Ctrl+Q` is not the `q` quit and `Alt+c` is not the `c` tab.
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::CONTROL)), None);
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('c'), KeyModifiers::ALT)), None);
         // The same key means something else in the tree; tree keys don't leak in.
         assert_eq!(km.resolve(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::SortByAdded));
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('j'), KeyModifiers::NONE)), None);
@@ -886,49 +897,73 @@ mod tests {
         assert_eq!(tree_row(&km, Action::AddRepo.description()), "(unbound)");
         assert_eq!(pane_row(&km, Action::AddRepo.description()), "Ctrl+A then a");
 
-        // A pane-only action takes `q`: the pane row for quit goes, the tree's stays.
+        // A pane-only action takes `a`: the pane row for add-repo goes, the
+        // tree's stays.
         let mut cfg = HashMap::new();
-        cfg.insert("detach".to_string(), vec!["q".to_string()]);
+        cfg.insert("detach".to_string(), vec!["a".to_string()]);
         let (km, warns) = KeyMap::build(&cfg);
-        assert!(warns.iter().any(|w| w.contains("reassigned from 'quit' to 'detach'")), "{warns:?}");
-        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Detach));
-        assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
-        assert_eq!(pane_row(&km, "Quit"), "(unbound)");
-        assert_eq!(pane_row(&km, Action::Detach.description()), "Ctrl+A then q");
-        assert_eq!(tree_row(&km, "Quit"), "q");
-        // Exactly one pane row claims `q`.
-        assert_eq!(km.pane_help_rows().iter().filter(|(k, _)| k == "Ctrl+A then q").count(), 1);
+        assert!(warns.iter().any(|w| w.contains("reassigned from 'add-repo' to 'detach'")), "{warns:?}");
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('a'), KeyModifiers::NONE)), Some(Action::Detach));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('a'), KeyModifiers::NONE)), Some(Action::AddRepo));
+        assert_eq!(pane_row(&km, Action::AddRepo.description()), "(unbound)");
+        assert_eq!(pane_row(&km, Action::Detach.description()), "Ctrl+A then a");
+        assert_eq!(tree_row(&km, Action::AddRepo.description()), "a");
+        // Exactly one pane row claims `a`.
+        assert_eq!(km.pane_help_rows().iter().filter(|(k, _)| k == "Ctrl+A then a").count(), 1);
     }
 
     #[test]
-    fn quit_cannot_be_unbound_but_one_layer_may_lose_it() {
+    fn quit_cannot_be_unbound_in_either_layer() {
         // An empty list or a lone typo'd spec would leave no keyboard quit at
-        // all: the defaults come back in both layers, with a warning.
+        // all: the defaults come back in both layers, with one warning line.
         for specs in [vec![], vec!["ctrl-q".to_string()]] {
             let mut cfg = HashMap::new();
             cfg.insert("quit".to_string(), specs);
             let (km, warns) = KeyMap::build(&cfg);
-            assert!(warns.iter().any(|w| w.contains("'quit' cannot be unbound")), "{warns:?}");
+            let restores = warns.iter().filter(|w| w.contains("'quit' cannot be unbound")).count();
+            assert_eq!(restores, 1, "{warns:?}");
             assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
             assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
         }
-        // A tree action taking `q` leaves `Ctrl+A q`: still bound, no restore.
+        // A tree action taking `q` would leave the tree, the only layer a user
+        // without a workspace can reach, with no quit: `q` goes back to quit
+        // there, naming the loser; the pane is untouched.
         let mut cfg = HashMap::new();
         cfg.insert("filter".to_string(), vec!["q".to_string()]);
-        let (km, warns) = KeyMap::build(&cfg);
-        assert!(!warns.iter().any(|w| w.contains("cannot be unbound")), "{warns:?}");
-        assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Filter));
-        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
-        // Both layers taken: the restore displaces both takers, naming them.
-        let mut cfg = HashMap::new();
-        cfg.insert("filter".to_string(), vec!["q".to_string()]);
-        cfg.insert("detach".to_string(), vec!["q".to_string()]);
         let (km, warns) = KeyMap::build(&cfg);
         assert!(warns.iter().any(|w| w.contains("'quit' cannot be unbound")), "{warns:?}");
         assert!(warns.iter().any(|w| w.contains("reassigned from 'filter' back to 'quit'")), "{warns:?}");
-        assert!(warns.iter().any(|w| w.contains("reassigned from 'detach' back to 'quit'")), "{warns:?}");
         assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('/'), KeyModifiers::NONE)), None);
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        // Same for a pane action taking `Ctrl+A q`.
+        let mut cfg = HashMap::new();
+        cfg.insert("detach".to_string(), vec!["q".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.iter().any(|w| w.contains("reassigned from 'detach' back to 'quit'")), "{warns:?}");
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('d'), KeyModifiers::NONE)), None);
+        // Moving quit elsewhere first frees `q` for detach.
+        let mut cfg = HashMap::new();
+        cfg.insert("quit".to_string(), vec!["ctrl+q".to_string()]);
+        cfg.insert("detach".to_string(), vec!["q".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(!warns.iter().any(|w| w.contains("cannot be unbound")), "{warns:?}");
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Detach));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::CONTROL)), Some(Action::Quit));
+        assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::CONTROL)), Some(Action::Quit));
+    }
+
+    #[test]
+    fn shared_action_warnings_are_not_repeated_per_layer() {
+        // `w` is add-workspace's key in both layers; taking it for add-repo is
+        // one issue, so one line (the tree border counts them).
+        let mut cfg = HashMap::new();
+        cfg.insert("add-repo".to_string(), vec!["w".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert_eq!(warns, vec!["key 'w' reassigned from 'add-workspace' to 'add-repo'".to_string()]);
+        assert_eq!(km.resolve(&ev(KeyCode::Char('w'), KeyModifiers::NONE)), Some(Action::AddRepo));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('w'), KeyModifiers::NONE)), Some(Action::AddRepo));
     }
 
     #[test]
@@ -955,7 +990,10 @@ mod tests {
         // accepted and dead; Ctrl+digit and Alt+letter do reach the keymap.
         let mut cfg = HashMap::new();
         cfg.insert("detach".to_string(), vec!["alt+1".to_string(), "ctrl+alt+a".to_string()]);
-        cfg.insert("close-tab".to_string(), vec!["ctrl+1".to_string(), "alt+x".to_string()]);
+        cfg.insert(
+            "close-tab".to_string(),
+            vec!["ctrl+1".to_string(), "alt+x".to_string(), "alt+a".to_string()],
+        );
         let (km, warns) = KeyMap::build(&cfg);
         assert!(warns.iter().any(|w| w.contains("'alt+1' is reserved for jumping to tab N")), "{warns:?}");
         assert!(
@@ -965,14 +1003,17 @@ mod tests {
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('1'), KeyModifiers::ALT)), None);
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('1'), KeyModifiers::CONTROL)), Some(Action::CloseTab));
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('x'), KeyModifiers::ALT)), Some(Action::CloseTab));
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('a'), KeyModifiers::ALT)), Some(Action::CloseTab));
         // Detach lost both specs and is simply unbound (it is not a way out).
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('d'), KeyModifiers::NONE)), None);
     }
 
     #[test]
     fn default_bindings_do_not_collide_within_a_layer() {
-        // A default chord landing twice in one layer would silently overwrite
-        // the earlier action (a new action left out of `layers()`, say).
+        // A default spec repeated within one layer would silently overwrite the
+        // earlier action, and one `parse_chord` rejects would silently vanish;
+        // both show up as fewer map entries than binding slots. (The literal
+        // row counts above are what catch a misclassified `layers()` entry.)
         let km = KeyMap::default();
         let slots: usize = DEFAULT_BINDINGS.iter().map(|(_, a)| a.layers().len()).sum();
         assert_eq!(km.map.len(), slots, "every default binding occupies its own (layer, chord) slot");
@@ -1005,5 +1046,27 @@ mod tests {
         assert_eq!(km.resolve(&ev(KeyCode::Tab, KeyModifiers::NONE)), Some(Action::ReviewDiff));
         assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
+    }
+
+    #[test]
+    fn a_shared_action_is_refused_a_key_reserved_in_either_layer() {
+        let mut cfg = HashMap::new();
+        cfg.insert("add-workspace".to_string(), vec!["1".to_string()]); // pane-reserved
+        cfg.insert("add-repo".to_string(), vec!["g".to_string()]); // tree-reserved
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(
+            warns.iter().any(|w| w.contains("reserved for jumping to tab N; ignored for 'add-workspace'")),
+            "{warns:?}"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("key 'g' is reserved for the gg motion; ignored for 'add-repo'")),
+            "{warns:?}"
+        );
+        // Refused for the tree too, not just the layer that reserves it.
+        assert_eq!(km.resolve(&ev(KeyCode::Char('1'), KeyModifiers::NONE)), None);
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('1'), KeyModifiers::NONE)), None);
+        assert_eq!(km.resolve(&ev(KeyCode::Char('g'), KeyModifiers::NONE)), None);
+        // The pane's own `g` (new gemini tab) is untouched.
+        assert_eq!(km.resolve_pane(&ev(KeyCode::Char('g'), KeyModifiers::NONE)), Some(Action::NewGeminiTab));
     }
 }

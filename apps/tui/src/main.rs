@@ -1495,8 +1495,9 @@ impl App {
     /// Flip any persisted `Running` session to `Stopped`. A `Running` left in
     /// `state.json` is stale — a crash/SIGKILL skipped the clean-quit
     /// normalization — and no stream session is ever resurrected, so it would
-    /// otherwise show a phantom "running" tree icon. Called once at startup;
-    /// returns the number normalized (the caller saves if > 0).
+    /// otherwise show a phantom "running" tree icon. Called at startup and on
+    /// a clean quit; returns the number normalized (the startup caller saves
+    /// if > 0).
     pub(crate) fn normalize_stale_running(&mut self) -> usize {
         let stale: Vec<String> = self
             .state
@@ -4019,16 +4020,7 @@ impl App {
         if self.quit_blocked_by_profile_delete() {
             return KeyOutcome::Continue;
         }
-        let running_ids: Vec<String> = self
-            .state
-            .sessions
-            .iter()
-            .filter(|s| s.status == SessionStatus::Running)
-            .map(|s| s.id.clone())
-            .collect();
-        for sid in running_ids {
-            let _ = self.state.update_session_status(&sid, SessionStatus::Stopped);
-        }
+        self.normalize_stale_running();
         KeyOutcome::Quit
     }
 
@@ -4297,10 +4289,12 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 // Same modals as the tree's `a` / `w`, opened over the pane.
                 Some(Action::AddRepo) => app.open_add_repo_modal(),
                 Some(Action::AddWorkspace) => app.open_add_workspace_modal_for_selection(),
-                // Tree-only actions never land in the pane layer; an unbound
-                // key is swallowed, never forwarded. A new pane action needs an
-                // arm above: the compiler can't flag one missing behind `Some(_)`.
-                Some(_) | None => {}
+                // An unbound key is swallowed, never forwarded. Tree-only
+                // actions never land in the pane layer, so a resolved action
+                // without an arm above is a new pane action missing one: the
+                // compiler can't flag that, the log does.
+                Some(action) => tracing::warn!("pane action {action:?} has no dispatch arm"),
+                None => {}
             }
             return Ok(KeyOutcome::Continue);
         }
@@ -12368,9 +12362,15 @@ mod key_tests {
             text.contains("Ctrl+]"),
             "help should document the prefix-less way back to the tree:\n{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn help_overlay_follows_a_pane_rebind() {
         // The post-prefix rows come from the keymap, not a fixed table: a
         // rebind shows up and the default it replaced is gone. 100 rows so the
         // whole embedded section fits the popup.
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('?')).await;
         let mut tall = Terminal::new(TestBackend::new(100, 100)).unwrap();
         tall.draw(|frame| render::ui(frame, &mut app)).unwrap();
         let text = buffer_text(&tall);
@@ -12390,8 +12390,8 @@ mod key_tests {
     async fn adding_a_workspace_from_the_pane_keeps_the_shown_workspace() {
         let mut app = test_app();
         let _repo = add_real_repo(&mut app, "feat");
-        // A workspace to be "in", under a name sort where a new "alpha" lands
-        // above it.
+        // A workspace to be "in", under a name sort where a new "aardvark"
+        // lands above it.
         app.modal = add_workspace_modal_for("real", "zeta");
         press(&mut app, KeyCode::Enter).await;
         let zeta_id =
@@ -12404,13 +12404,20 @@ mod key_tests {
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)).await.unwrap();
         press(&mut app, KeyCode::Char('w')).await;
-        for c in "alpha".chars() {
+        for c in "aardvark".chars() {
             press(&mut app, KeyCode::Char(c)).await;
         }
         press(&mut app, KeyCode::Enter).await;
 
         assert!(!app.modal.is_active(), "the modal closed on submit");
-        assert!(app.workspaces.iter().any(|w| w.name == "alpha"), "the workspace was created");
+        assert!(app.workspaces.iter().any(|w| w.name == "aardvark"), "the workspace was created");
+        let row_of = |app: &App, name: &str| {
+            app.tree_items
+                .iter()
+                .position(|n| matches!(n, TreeNode::Workspace { ws, .. } if ws.name == name))
+                .unwrap()
+        };
+        assert!(row_of(&app, "aardvark") < row_of(&app, "zeta"), "the new row lands above the shown one");
         assert_eq!(app.focus, Focus::Embedded, "the pane stays focused");
         assert_eq!(
             app.selected_workspace().map(|w| w.name.as_str()),
@@ -12442,15 +12449,18 @@ mod key_tests {
 
         assert!(!app.modal.is_active(), "the modal closed on submit");
         assert!(app.state.repos.iter().any(|r| r.name == "0-first"), "the repo was added");
+        assert_eq!(tree_repos(&app)[0], "0-first", "the new repo lands above the shown one");
         assert_eq!(app.focus, Focus::Embedded, "the pane stays focused");
         assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w1"), "the pane still shows w1");
     }
 
     #[tokio::test]
-    async fn prefix_then_a_ctrl_digit_is_not_a_tab_jump() {
-        // A legacy terminal reports Ctrl+] as Char('5') with CTRL. After the
-        // prefix it must neither jump to a tab (the digit arm) nor fire a
-        // binding: it is swallowed. Same for any other Ctrl+digit and Ctrl+].
+    async fn prefix_then_a_ctrl_modified_key_is_swallowed() {
+        // Ctrl+1 probes the digit arm's `!ctrl` guard (with two tabs, a jump to
+        // tab 1 would flip `active`). A legacy terminal reports Ctrl+] as
+        // Char('5') with CTRL: like Ctrl+] itself it must fall through to the
+        // keymap and resolve to nothing. Ctrl+Q no longer quits: a modified key
+        // is its own chord. All are swallowed, prefix consumed.
         let mut app = test_app();
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
@@ -12463,12 +12473,36 @@ mod key_tests {
         );
         app.focus = Focus::Embedded;
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-        for c in ['5', '1', ']'] {
+        for c in ['1', '5', ']', 'q'] {
             handle_key(&mut app, ctrl('a')).await.unwrap();
-            handle_key(&mut app, ctrl(c)).await.unwrap();
+            let out = handle_key(&mut app, ctrl(c)).await.unwrap();
+            assert_eq!(out, KeyOutcome::Continue, "Ctrl+{c} after the prefix neither quits nor leaves");
             assert_eq!(app.embedded["w1"].active, 1, "Ctrl+{c} after the prefix must not switch tabs");
             assert_eq!(app.focus, Focus::Embedded, "Ctrl+{c} after the prefix is swallowed");
             assert!(!app.embedded_prefix, "the prefix is consumed");
+        }
+    }
+
+    #[tokio::test]
+    async fn quit_from_either_pane_marks_running_sessions_stopped() {
+        for from_pane in [false, true] {
+            let mut app = test_app();
+            app.state.sessions.push(kommand0_core::Session {
+                id: "s1".into(),
+                workspace_id: "w1".into(),
+                claude_session_id: None,
+                pid: None,
+                status: SessionStatus::Running,
+                created_at: 0,
+                ended_at: None,
+                log_file: "/tmp/s1.log".into(),
+            });
+            if from_pane {
+                app.focus = Focus::Embedded;
+                app.embedded_prefix = true;
+            }
+            assert_eq!(press(&mut app, KeyCode::Char('q')).await, KeyOutcome::Quit, "from_pane={from_pane}");
+            assert_eq!(app.state.sessions[0].status, SessionStatus::Stopped, "from_pane={from_pane}");
         }
     }
 }

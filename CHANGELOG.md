@@ -14,10 +14,10 @@ All notable changes to kommand0 are documented here. The format is based on
   `detach`, `back-to-tree`; `quit`, `add-repo` and `add-workspace` are shared
   with the tree, so one rebind moves both the tree key and its `Ctrl+A` form),
   and the help overlay (`?`) shows the live keys of each pane.
-  `back-to-tree` and `quit` can be rebound but never unbound: a config that
-  leaves one with no key gets the defaults back, displacing whatever took them,
-  with a warning in the tree border. The prefix key itself, `Ctrl+A` then a
-  digit and `Ctrl+A Ctrl+A` stay fixed.
+  `back-to-tree` and `quit` can be rebound but never unbound: a pane left with
+  no key for one of them gets the defaults back there, displacing whatever took
+  them, with a warning in the tree border. The prefix key itself, `Ctrl+A` then
+  a digit and `Ctrl+A Ctrl+A` stay fixed.
 - **`Ctrl+A a` / `Ctrl+A w`: add a repository / workspace from the embedded
   pane.** The tree's `a` / `w` modals open over the pane (the session keeps
   running, typing goes to the modal); the new row appears in the tree, the pane
