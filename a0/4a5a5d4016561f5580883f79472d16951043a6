@@ -15,23 +15,31 @@ apps/tui/src/main.rs
   s_3ac0ac761ce924::t_a611d7c7a4023b 554
   s_3ac0ac761ce924::t_ca5345e52a5552 391-392
   s_3ac0ac761ce924::t_cedb34904e8937 8905,8930,8975
+  s_3ac0ac761ce924::t_af82f55f6b6a10 4289
+  s_3ac0ac761ce924::t_db4c80b9da3b8c 4952
 CHANGELOG.md
   s_3ac0ac761ce924::t_c0257aa802dda0 8-9,216
 crates/core/src/config.rs
   s_3ac0ac761ce924::t_c5acbcf5c9260b 45-49
+  s_3ac0ac761ce924::t_3057abb7895511 93-94
 apps/tui/src/render.rs
   s_3ac0ac761ce924::t_4f5dc27bc564d4 107
   s_3ac0ac761ce924::t_787aa7414d6ba4 930
+  s_3ac0ac761ce924::t_550cd265e3e2af 327
 apps/tui/tests/e2e.rs
   s_3ac0ac761ce924::t_a2ef2576ba9f90 118,728-731,741,770-775,783-787,801-802,813,824,826,838-842,853-854,856
 apps/tui/src/settings.rs
   s_3ac0ac761ce924::t_f78e47bedf5aca 36-37,55-56,76-77,99-100,120-124,133-134,186-187,313-314
 README.md
   s_3ac0ac761ce924::t_c0257aa802dda0 157,203,276,349-350,372
+  s_3ac0ac761ce924::t_7de1302be1e17a 367
 apps/tui/src/snapshots/kommand0__key_tests__snapshot_palette_overlay.snap
   s_3ac0ac761ce924::t_1635e5b169c703 20
 apps/tui/src/snapshots/kommand0__key_tests__snapshot_settings_overlay.snap
   s_3ac0ac761ce924::t_9888dfe0b9db95 17-18
+apps/tui/src/keymap.rs
+  s_3ac0ac761ce924::t_030b54a290b97f 58,112,163,213,236,484
+  s_3ac0ac761ce924::t_e75105328768ad 874-875
 ---
 {
   "schema_version": "authorship/3.0.0",
