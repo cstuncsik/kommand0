@@ -17,13 +17,13 @@ expression: "render_to_string(&mut app, 100, 30)"
 │                   │   New codex — ws-one  —  alpha                           │                   │
 │                   │   New gemini — ws-one  —  alpha                          │                   │
 │                   │   New opencode — ws-one  —  alpha                        │                   │
+│                   │   New pi — ws-one  —  alpha                              │                   │
 │                   │   Clean up branches: alpha  —  repo                      │                   │
 │                   │   Clean up branches: beta  —  repo                       │                   │
 │                   │   Sort repos by manual order  —  order                   │                   │
 │                   │   Sort repos by name (A→Z)  —  order                     │                   │
 │                   │   Sort repos by name (Z→A)  —  order                     │                   │
 │                   │   Sort repos by date added (oldest first)  —  order      │                   │
-│                   │   Sort repos by date added (newest first)  —  order      │                   │
 │                   │ Enter run  ↑↓ move  Esc cancel                           │                   │
 │                   └──────────────────────────────────────────────────────────┘                   │
 │                            ││                                                                    │

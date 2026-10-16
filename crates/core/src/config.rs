@@ -42,6 +42,11 @@ pub struct Config {
     /// Override the `opencode` binary. Lower precedence than the
     /// `KOMMAND0_OPENCODE_BIN` env var; falls back to `opencode`.
     pub opencode_bin: Option<String>,
+    /// Extra args appended to every embedded `pi` spawn.
+    pub pi_args: Vec<String>,
+    /// Override the `pi` binary. Lower precedence than the
+    /// `KOMMAND0_PI_BIN` env var; falls back to `pi`.
+    pub pi_bin: Option<String>,
     /// Seconds between background git-status refreshes (default 2).
     pub status_refresh_secs: Option<u64>,
     /// Tree-pane key rebindings: action name (e.g. `"quit"`) → key specs (e.g.
@@ -85,6 +90,8 @@ impl Default for Config {
             gemini_bin: None,
             opencode_args: Vec::new(),
             opencode_bin: None,
+            pi_args: Vec::new(),
+            pi_bin: None,
             status_refresh_secs: None,
             keybindings: Default::default(),
             theme: None,

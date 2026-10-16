@@ -104,6 +104,7 @@ pub(crate) fn icon_legend(th: Theme) -> Vec<help::IconSection> {
                 row(">", th.muted, "Codex tab"),
                 row("\u{2726}", th.muted, "Gemini tab"),
                 row("\u{25CB}", th.muted, "Opencode tab"),
+                row("\u{03C0}", th.muted, "Pi tab"),
             ],
         },
     ]
@@ -323,7 +324,7 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             // narrow terminals, so the tail carries the keys that also appear
             // in the resting hint, the border title or the help overlay. These
             // are the defaults: a rebind shows in the help overlay, not here.
-            "Ctrl+A … c claude · e codex · g gemini · o opencode · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9 · a repo · w ws"
+            "Ctrl+A … c claude · e codex · g gemini · o opencode · p pi · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9 · a repo · w ws"
         }
         Focus::Embedded => "Ctrl+A t / Ctrl+] tree · Ctrl+A q quit",
     };
@@ -926,7 +927,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .unwrap_or("claude");
         let mut block = Block::default()
             .title(format!(
-                " {ws_name} — {kind_label} · Ctrl+A: c claude · e codex · g gemini · o opencode · s shell · [ ] switch · r rename · x close · t tree · q quit "
+                " {ws_name} — {kind_label} · Ctrl+A: c claude · e codex · g gemini · o opencode · p pi · s shell · [ ] switch · r rename · x close · t tree · q quit "
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border));
