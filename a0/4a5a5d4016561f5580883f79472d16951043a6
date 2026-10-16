@@ -1,0 +1,51 @@
+apps/tui/src/main.rs
+  s_3ac0ac761ce924::t_d366734bfe9cdd 490-493,506,518,530,543
+  s_3ac0ac761ce924::t_d13bfd7178554a 395-397
+  s_3ac0ac761ce924::t_d9b4e00ab5c3a7 7209,7224,7255,7263,7276,7299,7304-7306,11060-11073,11128-11136,11192,11208,11216-11217,11237,11241,11248,11341
+  s_3ac0ac761ce924::t_a7199986a01fa4 435
+  s_3ac0ac761ce924::t_7aa270239bacce 409,421
+  s_3ac0ac761ce924::t_57c63279366c0b 451,456,461
+  s_3ac0ac761ce924::t_9c9f77ffc2fbdd 1582,1644
+  s_3ac0ac761ce924::t_c30d6ac129b8ab 393-394
+  s_3ac0ac761ce924::t_302b9436bbd6e7 4269-4271
+  s_3ac0ac761ce924::t_82c6e1fb046b8d 239,248-249
+  s_3ac0ac761ce924::t_7ac824d5aec802 7264-7266
+  s_3ac0ac761ce924::t_cebea270a28c1a 588
+  s_3ac0ac761ce924::t_88beeb15842512 2142-2146
+  s_3ac0ac761ce924::t_a611d7c7a4023b 554
+  s_3ac0ac761ce924::t_ca5345e52a5552 391-392
+  s_3ac0ac761ce924::t_cedb34904e8937 8905,8930,8975
+CHANGELOG.md
+  s_3ac0ac761ce924::t_c0257aa802dda0 8-9,216
+crates/core/src/config.rs
+  s_3ac0ac761ce924::t_c5acbcf5c9260b 45-49
+apps/tui/src/render.rs
+  s_3ac0ac761ce924::t_4f5dc27bc564d4 107
+  s_3ac0ac761ce924::t_787aa7414d6ba4 930
+apps/tui/tests/e2e.rs
+  s_3ac0ac761ce924::t_a2ef2576ba9f90 118,728-731,741,770-775,783-787,801-802,813,824,826,838-842,853-854,856
+apps/tui/src/settings.rs
+  s_3ac0ac761ce924::t_f78e47bedf5aca 36-37,55-56,76-77,99-100,120-124,133-134,186-187,313-314
+README.md
+  s_3ac0ac761ce924::t_c0257aa802dda0 157,203,276,349-350,372
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_palette_overlay.snap
+  s_3ac0ac761ce924::t_1635e5b169c703 20
+apps/tui/src/snapshots/kommand0__key_tests__snapshot_settings_overlay.snap
+  s_3ac0ac761ce924::t_9888dfe0b9db95 17-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a04a5a5d4016561f5580883f79472d16951043a6",
+  "prompts": {},
+  "sessions": {
+    "s_3ac0ac761ce924": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ae852035-3812-4e4b-8d3b-cc6454e45279",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
