@@ -115,6 +115,7 @@ impl Tui {
         cmd.env_remove("KOMMAND0_CODEX_BIN");
         cmd.env_remove("KOMMAND0_GEMINI_BIN");
         cmd.env_remove("KOMMAND0_OPENCODE_BIN");
+        cmd.env_remove("KOMMAND0_PI_BIN");
         cmd.env_remove("KOMMAND0_GH_BIN");
         cmd.env_remove("KOMMAND0_PROFILE");
         // Deterministic keyboard setup whether or not the test run itself
@@ -724,9 +725,10 @@ fn ctrl_a_s_opens_a_shell_tab() {
 }
 
 #[test]
-fn ctrl_a_e_g_o_open_agent_tabs() {
-    // All three agent binaries are the embed-stub, so each prefix key opens a
-    // deterministic tab; the strip marks codex `>`, gemini `✦`, opencode `○`.
+fn ctrl_a_e_g_o_p_open_agent_tabs() {
+    // All four agent binaries are the embed-stub, so each prefix key opens a
+    // deterministic tab; the strip marks codex `>`, gemini `✦`, opencode `○`,
+    // pi `π`.
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());
     let mut tui = Tui::launch_with(
@@ -736,6 +738,7 @@ fn ctrl_a_e_g_o_open_agent_tabs() {
             ("KOMMAND0_CODEX_BIN", "embed-stub"),
             ("KOMMAND0_GEMINI_BIN", "embed-stub"),
             ("KOMMAND0_OPENCODE_BIN", "embed-stub"),
+            ("KOMMAND0_PI_BIN", "embed-stub"),
         ],
     );
 
@@ -764,6 +767,12 @@ fn ctrl_a_e_g_o_open_agent_tabs() {
     tui.send("o");
     tui.wait_for_row(1, "4○");
 
+    // Ctrl+A p: a pi tab, spawned with a pre-assigned session id.
+    tui.send("\x01");
+    tui.send("p");
+    tui.wait_for_row(1, "5π");
+    tui.wait_for(" PI ");
+
     tui.send("\x01");
     tui.send("q");
     tui.wait_exit();
@@ -771,10 +780,11 @@ fn ctrl_a_e_g_o_open_agent_tabs() {
 
 #[test]
 fn reopen_restores_agent_tabs_in_order() {
-    // A stored mixed row (claude id, gemini id, codex tab- sentinel) reopens
-    // as the same tab row: claude and gemini resume (gemini with the BARE
-    // uuid, its prefix stripped), the codex tab- sentinel respawns fresh (a
-    // kommand0 mint is never a resume target). All three entries survive quit.
+    // A stored mixed row (claude id, gemini id, codex tab- sentinel, pi id)
+    // reopens as the same tab row: claude and gemini resume (gemini with the
+    // BARE uuid, its prefix stripped), pi resumes via --session-id, the codex
+    // tab- sentinel respawns fresh (a kommand0 mint is never a resume
+    // target). All four entries survive quit.
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().to_str().unwrap();
     let state = serde_json::json!({
@@ -788,7 +798,8 @@ fn reopen_restores_agent_tabs_in_order() {
             "w1": [
                 "11111111-1111-1111-1111-111111111111",
                 "gemini:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-                "codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"
+                "codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc",
+                "pi:dddddddd-dddd-dddd-dddd-dddddddddddd"
             ]
         }
     })
@@ -799,6 +810,7 @@ fn reopen_restores_agent_tabs_in_order() {
             ("KOMMAND0_CLAUDE_BIN", "embed-stub"),
             ("KOMMAND0_CODEX_BIN", "embed-stub"),
             ("KOMMAND0_GEMINI_BIN", "embed-stub"),
+            ("KOMMAND0_PI_BIN", "embed-stub"),
         ],
     );
 
@@ -809,8 +821,9 @@ fn reopen_restores_agent_tabs_in_order() {
     tui.send("e");
     tui.wait_for("--resume"); // tab 1 (claude) resumed, not freshly created
     tui.wait_for("11111111"); // and it is the active tab
-    tui.wait_for_row(1, "2✦"); // gemini and codex kinds restored, in order
+    tui.wait_for_row(1, "2✦"); // gemini, codex and pi kinds restored, in order
     tui.wait_for_row(1, "3>");
+    tui.wait_for_row(1, "4π");
 
     // Ctrl+A 2: the gemini tab resumed with the BARE uuid (prefix stripped).
     tui.send("\x01");
@@ -822,6 +835,11 @@ fn reopen_restores_agent_tabs_in_order() {
     tui.send("3");
     tui.wait_for("ARGS:[]");
 
+    // Ctrl+A 4: the pi tab resumed its BARE uuid via --session-id.
+    tui.send("\x01");
+    tui.send("4");
+    tui.wait_for("ARGS:[--session-id dddddddd");
+
     tui.send("\x01");
     tui.send("q");
     tui.wait_exit();
@@ -832,9 +850,10 @@ fn reopen_restores_agent_tabs_in_order() {
         serde_json::json!([
             "11111111-1111-1111-1111-111111111111",
             "gemini:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-            "codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc"
+            "codex:tab-cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "pi:dddddddd-dddd-dddd-dddd-dddddddddddd"
         ]),
-        "all three seeded entries survive quit: {st}"
+        "all four seeded entries survive quit: {st}"
     );
 }
 

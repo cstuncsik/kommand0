@@ -5,6 +5,16 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Pi session tabs**: `Ctrl+A p` (the new `new-pi` keybinding action) and a
+  "New pi" palette entry open an embedded [pi](https://github.com/earendil-works/pi)
+  coding agent, marked `π` in the tab strip. Like Claude and gemini tabs, a pi tab
+  pre-assigns its session id and resumes the conversation when the workspace
+  reopens (via pi's `--session-id`, which needs pi 0.76 or newer). New config
+  fields `pi_bin`/`pi_args` (also on the settings page), with a `KOMMAND0_PI_BIN`
+  env override taking precedence.
+
 ## [0.31.0] - 2026-10-10
 
 ### Added

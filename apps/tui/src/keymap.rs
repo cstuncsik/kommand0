@@ -55,6 +55,7 @@ pub(crate) enum Action {
     NewCodexTab,
     NewGeminiTab,
     NewOpencodeTab,
+    NewPiTab,
     PrevTab,
     NextTab,
     LastTab,
@@ -108,6 +109,7 @@ pub(crate) const ALL_ACTIONS: &[Action] = &[
     Action::NewCodexTab,
     Action::NewGeminiTab,
     Action::NewOpencodeTab,
+    Action::NewPiTab,
     Action::PrevTab,
     Action::NextTab,
     Action::LastTab,
@@ -158,6 +160,7 @@ impl Action {
             Action::NewCodexTab => "new-codex",
             Action::NewGeminiTab => "new-gemini",
             Action::NewOpencodeTab => "new-opencode",
+            Action::NewPiTab => "new-pi",
             Action::PrevTab => "prev-tab",
             Action::NextTab => "next-tab",
             Action::LastTab => "last-tab",
@@ -207,6 +210,7 @@ impl Action {
             Action::NewCodexTab => "New codex session tab",
             Action::NewGeminiTab => "New gemini session tab",
             Action::NewOpencodeTab => "New opencode session tab",
+            Action::NewPiTab => "New pi session tab",
             Action::PrevTab => "Previous tab",
             Action::NextTab => "Next tab",
             Action::LastTab => "Jump to the last-active tab",
@@ -229,6 +233,7 @@ impl Action {
             | Action::NewCodexTab
             | Action::NewGeminiTab
             | Action::NewOpencodeTab
+            | Action::NewPiTab
             | Action::PrevTab
             | Action::NextTab
             | Action::LastTab
@@ -476,6 +481,7 @@ const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("e", Action::NewCodexTab),
     ("g", Action::NewGeminiTab),
     ("o", Action::NewOpencodeTab),
+    ("p", Action::NewPiTab),
     ("[", Action::PrevTab),
     ("]", Action::NextTab),
     ("l", Action::LastTab),
@@ -865,8 +871,8 @@ mod tests {
     fn pane_help_rows_cover_the_pane_actions_with_the_prefix() {
         let km = KeyMap::default();
         let rows = km.pane_help_rows();
-        // 12 pane-only actions plus the 3 shared with the tree (see above).
-        assert_eq!(rows.len(), 15);
+        // 13 pane-only actions plus the 3 shared with the tree (see above).
+        assert_eq!(rows.len(), 16);
         // Shared actions keep their tree position, so they lead the section.
         assert_eq!(rows[0], ("Ctrl+A then a".to_string(), Action::AddRepo.description()));
         assert_eq!(rows[2], ("Ctrl+A then c".to_string(), Action::NewClaudeTab.description()));

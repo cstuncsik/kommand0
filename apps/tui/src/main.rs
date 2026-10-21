@@ -236,7 +236,7 @@ const CODEX_EARLY_CAPTURE_POLL_EVERY: Duration = Duration::from_millis(500);
 /// persist on a successful spawn (`None` when a reopen keeps its prior entry).
 /// A prior entry whose bare part is a valid resume target resumes it (see
 /// [`TabKind::resume_args`], which also guards the argv against a hand-edited
-/// entry smuggling flags). Otherwise claude/gemini fall through to a fresh
+/// entry smuggling flags). Otherwise claude/gemini/pi fall through to a fresh
 /// mint (converging junk entries), while the non-resumable kinds spawn bare
 /// and keep the entry as an opaque key: a capture-kind entry off the resume
 /// path never reaches an argv, so junk sentinels are harmless.
@@ -245,7 +245,8 @@ const CODEX_EARLY_CAPTURE_POLL_EVERY: Duration = Duration::from_millis(500);
 /// still persisted but no conversation exists on disk. Reopening then runs the
 /// kind's resume argv, which the tool rejects and exits non-zero, caught by
 /// [`resume_failed`], which forgets the id so the next open starts fresh. So
-/// the worst case self-heals in one reopen.
+/// the worst case self-heals in one reopen. (Pi's resume argv creates the
+/// missing session instead, so a pi tab never hits this.)
 fn session_args(kind: TabKind, prior_id: Option<&str>) -> (Vec<String>, Option<String>) {
     if let Some(id) = prior_id {
         let bare = id.strip_prefix(kind.id_prefix()).unwrap_or(id);
@@ -387,12 +388,13 @@ pub(crate) enum DiffFocus {
 }
 
 /// What a session tab runs. Every kind persists an entry across restarts:
-/// claude and gemini pre-assign a uuid and reopen with `--resume` (the
-/// conversation continues); codex and opencode capture the session id their
-/// CLI prints when a session closes (teardown SIGTERMs them at quit/detach
-/// to coax that hint out, see [`App::capture_panes_on_teardown`]), and codex
-/// ids are additionally captured from its session store right after a fresh
-/// spawn (see [`App::request_codex_early_capture`]); captured ids resume on
+/// claude, gemini and pi pre-assign a uuid and reopen with it (`--resume`;
+/// pi's `--session-id`), so the conversation continues; codex and opencode
+/// capture the session id their CLI prints when a session closes (teardown
+/// SIGTERMs them at quit/detach to coax that hint out, see
+/// [`App::capture_panes_on_teardown`]), and codex ids are additionally
+/// captured from its session store right after a fresh spawn (see
+/// [`App::request_codex_early_capture`]); captured ids resume on
 /// reopen, anything uncaptured respawns fresh. A shell's process, unlike a
 /// conversation, can't be resumed. All kind-specific knobs live in the
 /// accessors below, one match arm each, so adding a kind is a
@@ -404,6 +406,7 @@ pub(crate) enum TabKind {
     Codex,
     Gemini,
     Opencode,
+    Pi,
 }
 
 impl TabKind {
@@ -415,6 +418,7 @@ impl TabKind {
             TabKind::Codex => "codex",
             TabKind::Gemini => "gemini",
             TabKind::Opencode => "opencode",
+            TabKind::Pi => "pi",
         }
     }
 
@@ -428,6 +432,7 @@ impl TabKind {
             TabKind::Codex => "codex:",
             TabKind::Gemini => "gemini:",
             TabKind::Opencode => "opencode:",
+            TabKind::Pi => "pi:",
         }
     }
 
@@ -443,16 +448,17 @@ impl TabKind {
             TabKind::Codex => "codex:tab-",
             TabKind::Gemini => "gemini:",
             TabKind::Opencode => "opencode:tab-",
+            TabKind::Pi => "pi:",
         }
     }
 
     /// Whether the kind pre-assigns a session id at spawn: a reopen always
-    /// resumes and an exited tab always keeps its entry (claude/gemini).
+    /// resumes and an exited tab always keeps its entry (claude/gemini/pi).
     /// The capture kinds (codex/opencode) resume only ids captured from
     /// their exit hint; shell never resumes.
     fn resumable(self) -> bool {
         match self {
-            TabKind::Claude | TabKind::Gemini => true,
+            TabKind::Claude | TabKind::Gemini | TabKind::Pi => true,
             TabKind::Shell | TabKind::Codex | TabKind::Opencode => false,
         }
     }
@@ -481,6 +487,10 @@ impl TabKind {
                     && tail.chars().all(|c| c.is_ascii_alphanumeric()))
                 .then(|| vec!["-s".to_string(), bare.to_string()])
             }
+            // Pi's `--resume` is an interactive picker; `--session-id` opens
+            // the exact project session, creating it when missing.
+            TabKind::Pi => AppState::is_valid_session_uuid(bare)
+                .then(|| vec!["--session-id".to_string(), bare.to_string()]),
             TabKind::Shell => None,
         }
     }
@@ -493,6 +503,7 @@ impl TabKind {
             TabKind::Codex => "KOMMAND0_CODEX_BIN",
             TabKind::Gemini => "KOMMAND0_GEMINI_BIN",
             TabKind::Opencode => "KOMMAND0_OPENCODE_BIN",
+            TabKind::Pi => "KOMMAND0_PI_BIN",
         }
     }
 
@@ -504,6 +515,7 @@ impl TabKind {
             TabKind::Codex => cfg.codex_bin.as_deref(),
             TabKind::Gemini => cfg.gemini_bin.as_deref(),
             TabKind::Opencode => cfg.opencode_bin.as_deref(),
+            TabKind::Pi => cfg.pi_bin.as_deref(),
         }
     }
 
@@ -515,6 +527,7 @@ impl TabKind {
             TabKind::Codex => &cfg.codex_args,
             TabKind::Gemini => &cfg.gemini_args,
             TabKind::Opencode => &cfg.opencode_args,
+            TabKind::Pi => &cfg.pi_args,
         }
     }
 
@@ -527,6 +540,7 @@ impl TabKind {
             TabKind::Codex => ">",
             TabKind::Gemini => "✦",
             TabKind::Opencode => "○",
+            TabKind::Pi => "π",
         }
     }
 
@@ -537,7 +551,7 @@ impl TabKind {
     fn captures_exit_hint(self) -> bool {
         match self {
             TabKind::Codex | TabKind::Opencode => true,
-            TabKind::Claude | TabKind::Shell | TabKind::Gemini => false,
+            TabKind::Claude | TabKind::Shell | TabKind::Gemini | TabKind::Pi => false,
         }
     }
 
@@ -571,7 +585,7 @@ impl TabKind {
     /// form) is claude's: legacy tolerance, and unknown junk fails fast into
     /// the existing forget/heal nets.
     fn from_session_id(id: &str) -> Self {
-        [TabKind::Shell, TabKind::Codex, TabKind::Gemini, TabKind::Opencode]
+        [TabKind::Shell, TabKind::Codex, TabKind::Gemini, TabKind::Opencode, TabKind::Pi]
             .into_iter()
             .find(|k| id.starts_with(k.id_prefix()))
             .unwrap_or(TabKind::Claude)
@@ -1565,7 +1579,7 @@ impl App {
     /// Spawn a pane of `kind` (no persistence, no tab append). `prior_id`
     /// reopens that persisted entry (a valid resume target resumes, the rest
     /// respawn fresh); `None` mints a fresh one. Returns the pane plus its
-    /// `(session_id, was_resume)`, or the spawn error. A junk claude/gemini
+    /// `(session_id, was_resume)`, or the spawn error. A junk claude/gemini/pi
     /// `prior_id` (failed the uuid guard) spawns fresh, and the returned
     /// `session_id` IS that mint: the caller persists the swap. A
     /// capture-kind (codex/opencode) entry that isn't a captured tool id
@@ -1627,7 +1641,7 @@ impl App {
     /// Spawn one tab of `kind` for a workspace and append it. `prior_id`
     /// reopens that persisted entry (a valid resume target resumes, the rest
     /// respawn fresh); `None` mints + persists a fresh one; a junk
-    /// claude/gemini entry is replaced in state by the fresh mint spawned in
+    /// claude/gemini/pi entry is replaced in state by the fresh mint spawned in
     /// its stead, while a capture-kind (codex/opencode) entry off the resume
     /// path is kept as-is (an opaque key that never reaches an argv).
     /// Returns whether the pane started (on failure `embed_error` is set, and
@@ -2124,6 +2138,11 @@ impl App {
                 "new opencode",
                 format!("New opencode — {}", w.name),
                 PaletteAction::NewSession { ws_id: w.id.clone(), kind: TabKind::Opencode },
+            ));
+            out.push(mk(
+                "new pi",
+                format!("New pi — {}", w.name),
+                PaletteAction::NewSession { ws_id: w.id.clone(), kind: TabKind::Pi },
             ));
         }
 
@@ -4267,6 +4286,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Some(Action::NewCodexTab) => app.new_tab_for_selected(TabKind::Codex),
                 Some(Action::NewGeminiTab) => app.new_tab_for_selected(TabKind::Gemini),
                 Some(Action::NewOpencodeTab) => app.new_tab_for_selected(TabKind::Opencode),
+                Some(Action::NewPiTab) => app.new_tab_for_selected(TabKind::Pi),
                 Some(Action::PrevTab) => {
                     if let Some(s) = app.selected_sessions_mut() {
                         s.prev();
@@ -4929,6 +4949,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 | Action::NewCodexTab
                 | Action::NewGeminiTab
                 | Action::NewOpencodeTab
+                | Action::NewPiTab
                 | Action::PrevTab
                 | Action::NextTab
                 | Action::LastTab
@@ -7185,6 +7206,7 @@ mod key_tests {
         app.config.codex_bin = Some("sh".to_string());
         app.config.gemini_bin = Some("sh".to_string());
         app.config.opencode_bin = Some("sh".to_string());
+        app.config.pi_bin = Some("sh".to_string());
         if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
             w.working_dir = "/tmp".into();
         }
@@ -7199,6 +7221,7 @@ mod key_tests {
             ("New codex — ws-one", TabKind::Codex, "codex:"),
             ("New gemini — ws-one", TabKind::Gemini, "gemini:"),
             ("New opencode — ws-one", TabKind::Opencode, "opencode:"),
+            ("New pi — ws-one", TabKind::Pi, "pi:"),
         ] {
             let action = app
                 .palette_candidates()
@@ -7229,6 +7252,7 @@ mod key_tests {
         app.config.codex_bin = Some("sh".to_string());
         app.config.gemini_bin = Some("sh".to_string());
         app.config.opencode_bin = Some("sh".to_string());
+        app.config.pi_bin = Some("sh".to_string());
         if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
             w.working_dir = "/tmp".into();
         }
@@ -7236,10 +7260,10 @@ mod key_tests {
         app.rebuild_tree();
         app.select_workspace_row("w1");
         // Ten interleaved entries of every kind: one past MAX_SESSION_TABS, so
-        // the cap shows too. The gemini entry and one claude entry carry real
-        // uuids (only kommand0-minted uuids resume, see session_args' junk
-        // guard); the junk claude ids fall through to fresh mints, and the
-        // persisted slots converge on those mints.
+        // the cap shows too. The gemini and pi entries and one claude entry
+        // carry real uuids (only kommand0-minted uuids resume, see
+        // session_args' junk guard); the junk claude ids fall through to
+        // fresh mints, and the persisted slots converge on those mints.
         let seeded: Vec<String> = [
             "c0",
             "shell:s1",
@@ -7249,7 +7273,7 @@ mod key_tests {
             "55555555-5555-4555-8555-555555555555",
             "shell:s6",
             "c7",
-            "shell:s8",
+            "pi:88888888-8888-4888-8888-888888888888",
             "c9",
         ]
         .iter()
@@ -7272,14 +7296,14 @@ mod key_tests {
             TabKind::Claude,
             TabKind::Shell,
             TabKind::Claude,
-            TabKind::Shell,
+            TabKind::Pi,
         ];
         for ((tab, want), want_kind) in s.tabs.iter().zip(&seeded).zip(want_kinds) {
             assert_eq!(tab.kind, want_kind, "kind follows the sentinel for {want}");
             match want_kind {
-                TabKind::Gemini => {
-                    assert_eq!(&tab.id, want, "a valid gemini uuid is kept");
-                    assert!(tab.was_resume, "a reopened gemini uuid resumes")
+                TabKind::Gemini | TabKind::Pi => {
+                    assert_eq!(&tab.id, want, "a valid {want_kind:?} uuid is kept");
+                    assert!(tab.was_resume, "a reopened {want_kind:?} uuid resumes")
                 }
                 TabKind::Shell | TabKind::Codex | TabKind::Opencode => {
                     assert_eq!(&tab.id, want, "non-resumable sentinels reopen as-is");
@@ -8878,7 +8902,7 @@ mod key_tests {
     async fn settings_invalid_number_keeps_edit_open_with_error() {
         let mut app = test_app();
         press(&mut app, KeyCode::Char(',')).await;
-        for _ in 0..11 {
+        for _ in 0..13 {
             press(&mut app, KeyCode::Char('j')).await; // -> status_refresh_secs
         }
         press(&mut app, KeyCode::Enter).await;
@@ -8903,7 +8927,7 @@ mod key_tests {
     async fn settings_tree_width_commit_applies_and_clamps() {
         let mut app = test_app();
         press(&mut app, KeyCode::Char(',')).await;
-        for _ in 0..12 {
+        for _ in 0..14 {
             press(&mut app, KeyCode::Char('j')).await; // -> tree_width_pct (last row)
         }
         press(&mut app, KeyCode::Enter).await;
@@ -8948,7 +8972,7 @@ mod key_tests {
         // A hand-edited role override must survive a theme change from the page.
         app.config.theme_colors.insert("accent".into(), "#ff8800".into());
         press(&mut app, KeyCode::Char(',')).await;
-        for _ in 0..10 {
+        for _ in 0..12 {
             press(&mut app, KeyCode::Char('j')).await; // -> theme
         }
         press(&mut app, KeyCode::Enter).await;
@@ -11033,6 +11057,20 @@ mod key_tests {
         );
         assert!(minted.is_none());
 
+        // Pi mints like gemini but reopens with --session-id (pi's --resume
+        // is an interactive picker; --session-id opens or creates the id).
+        let (args, minted) = session_args(TabKind::Pi, None);
+        assert_eq!(args[0], "--session-id");
+        assert_eq!(minted.unwrap(), format!("pi:{}", args[1]));
+        let (args, minted) =
+            session_args(TabKind::Pi, Some("pi:12345678-1234-4123-8123-123456789abc"));
+        assert_eq!(
+            args,
+            vec!["--session-id".to_string(), "12345678-1234-4123-8123-123456789abc".to_string()],
+            "pi resumes its bare uuid via --session-id, never the --resume picker"
+        );
+        assert!(minted.is_none());
+
         // Shell/codex/opencode: no session args; a fresh tab mints its
         // persisted sentinel, a reopen of a non-captured entry keeps the
         // prior one.
@@ -11087,13 +11125,15 @@ mod key_tests {
                 "the fresh mint is returned to persist and matches the argv"
             );
         }
-        let (args, minted) = session_args(TabKind::Gemini, Some("gemini:--yolo"));
-        assert_eq!(args[0], "--session-id", "junk gemini id spawns fresh: {args:?}");
-        assert_eq!(
-            minted.unwrap(),
-            format!("gemini:{}", args[1]),
-            "the mint keeps the kind prefix and its bare uuid is the argv's"
-        );
+        for (kind, junk) in [(TabKind::Gemini, "gemini:--yolo"), (TabKind::Pi, "pi:--yolo")] {
+            let (args, minted) = session_args(kind, Some(junk));
+            assert_eq!(args[0], "--session-id", "junk {kind:?} id spawns fresh: {args:?}");
+            assert_eq!(
+                minted.unwrap(),
+                format!("{}{}", kind.id_prefix(), args[1]),
+                "the mint keeps the kind prefix and its bare uuid is the argv's"
+            );
+        }
         // Capture kinds: an ineligible entry (a tab- sentinel, a smuggled
         // flag, a non-canonical uuid, a malformed ses_ id) keeps its entry
         // and spawns bare; nothing junk ever reaches the argv.
@@ -11149,7 +11189,7 @@ mod key_tests {
         );
         // Non-capture kinds never scan, even on a hint-bearing screen.
         let screen = format!("codex resume {uuid}\nopencode -s {ses}\n");
-        for kind in [TabKind::Claude, TabKind::Gemini, TabKind::Shell] {
+        for kind in [TabKind::Claude, TabKind::Gemini, TabKind::Shell, TabKind::Pi] {
             assert_eq!(kind.capture_exit_hint(&screen), None, "{kind:?} never captures");
         }
     }
@@ -11165,6 +11205,7 @@ mod key_tests {
             TabKind::Codex,
             TabKind::Gemini,
             TabKind::Opencode,
+            TabKind::Pi,
         ];
         for k in all {
             match k {
@@ -11172,7 +11213,8 @@ mod key_tests {
                 | TabKind::Shell
                 | TabKind::Codex
                 | TabKind::Gemini
-                | TabKind::Opencode => {}
+                | TabKind::Opencode
+                | TabKind::Pi => {}
             }
             let id = format!("{}12345678-1234-4123-8123-123456789abc", k.id_prefix());
             assert_eq!(TabKind::from_session_id(&id), k, "roundtrip for {id}");
@@ -11192,15 +11234,18 @@ mod key_tests {
             codex_bin: Some("codex-bin".to_string()),
             gemini_bin: Some("gemini-bin".to_string()),
             opencode_bin: Some("opencode-bin".to_string()),
+            pi_bin: Some("pi-bin".to_string()),
             codex_args: vec!["codex-arg".to_string()],
             gemini_args: vec!["gemini-arg".to_string()],
             opencode_args: vec!["opencode-arg".to_string()],
+            pi_args: vec!["pi-arg".to_string()],
             ..Config::default()
         };
         for (kind, bin, arg, env) in [
             (TabKind::Codex, "codex-bin", "codex-arg", "KOMMAND0_CODEX_BIN"),
             (TabKind::Gemini, "gemini-bin", "gemini-arg", "KOMMAND0_GEMINI_BIN"),
             (TabKind::Opencode, "opencode-bin", "opencode-arg", "KOMMAND0_OPENCODE_BIN"),
+            (TabKind::Pi, "pi-bin", "pi-arg", "KOMMAND0_PI_BIN"),
         ] {
             assert_eq!(kind.config_bin(&cfg), Some(bin), "{kind:?} reads its own bin field");
             assert_eq!(kind.config_args(&cfg), &[arg.to_string()], "{kind:?} reads its own args field");
@@ -11293,6 +11338,7 @@ mod key_tests {
         assert_eq!(pick_bin(TabKind::Codex, None, None), "codex");
         assert_eq!(pick_bin(TabKind::Gemini, None, None), "gemini");
         assert_eq!(pick_bin(TabKind::Opencode, None, None), "opencode");
+        assert_eq!(pick_bin(TabKind::Pi, None, None), "pi");
         // An empty config bin is ignored too (else the spawn would fail on "").
         assert_eq!(pick_bin(TabKind::Claude, None, Some("")), "claude");
         // Shell keeps the same env > config head; its ambient $SHELL then

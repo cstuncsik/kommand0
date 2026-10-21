@@ -33,6 +33,8 @@ pub(crate) enum Field {
     GeminiBin,
     OpencodeArgs,
     OpencodeBin,
+    PiArgs,
+    PiBin,
     Notify,
     Theme,
     StatusRefreshSecs,
@@ -50,6 +52,8 @@ pub(crate) const FIELDS: &[Field] = &[
     Field::GeminiBin,
     Field::OpencodeArgs,
     Field::OpencodeBin,
+    Field::PiArgs,
+    Field::PiBin,
     Field::Notify,
     Field::Theme,
     Field::StatusRefreshSecs,
@@ -69,6 +73,8 @@ impl Field {
             Field::GeminiBin => "gemini_bin",
             Field::OpencodeArgs => "opencode_args",
             Field::OpencodeBin => "opencode_bin",
+            Field::PiArgs => "pi_args",
+            Field::PiBin => "pi_bin",
             Field::Notify => "notify",
             Field::Theme => "theme",
             Field::StatusRefreshSecs => "status_refresh_secs",
@@ -90,6 +96,8 @@ impl Field {
             Field::GeminiBin => cfg.gemini_bin.clone().unwrap_or_default(),
             Field::OpencodeArgs => shell_words::join(&cfg.opencode_args),
             Field::OpencodeBin => cfg.opencode_bin.clone().unwrap_or_default(),
+            Field::PiArgs => shell_words::join(&cfg.pi_args),
+            Field::PiBin => cfg.pi_bin.clone().unwrap_or_default(),
             Field::Notify => cfg.notify.clone().unwrap_or_default(),
             Field::Theme => cfg.theme.clone().unwrap_or_default(),
             Field::StatusRefreshSecs => {
@@ -109,7 +117,11 @@ impl Field {
             return Ok(None);
         }
         match self {
-            Field::ClaudeArgs | Field::CodexArgs | Field::GeminiArgs | Field::OpencodeArgs => {
+            Field::ClaudeArgs
+            | Field::CodexArgs
+            | Field::GeminiArgs
+            | Field::OpencodeArgs
+            | Field::PiArgs => {
                 let args =
                     shell_words::split(raw).map_err(|e| format!("{}: {e}", self.key()))?;
                 Ok(Some(serde_json::json!(args)))
@@ -118,7 +130,8 @@ impl Field {
             | Field::Shell
             | Field::CodexBin
             | Field::GeminiBin
-            | Field::OpencodeBin => Ok(Some(serde_json::json!(raw))),
+            | Field::OpencodeBin
+            | Field::PiBin => Ok(Some(serde_json::json!(raw))),
             Field::Notify => {
                 if NOTIFY_VALUES.contains(&raw) {
                     Ok(Some(serde_json::json!(raw)))
@@ -170,6 +183,8 @@ impl Field {
             Field::GeminiBin => cfg.gemini_bin = as_string(value),
             Field::OpencodeArgs => cfg.opencode_args = as_args(value),
             Field::OpencodeBin => cfg.opencode_bin = as_string(value),
+            Field::PiArgs => cfg.pi_args = as_args(value),
+            Field::PiBin => cfg.pi_bin = as_string(value),
             Field::Notify => cfg.notify = as_string(value),
             Field::Theme => cfg.theme = as_string(value),
             Field::StatusRefreshSecs => cfg.status_refresh_secs = value.and_then(|v| v.as_u64()),
@@ -295,6 +310,8 @@ mod tests {
             (Field::GeminiBin, "gemini-dev"),
             (Field::OpencodeArgs, "--model anthropic/claude"),
             (Field::OpencodeBin, "opencode-dev"),
+            (Field::PiArgs, "--model sonnet:high"),
+            (Field::PiBin, "pi-dev"),
             (Field::Notify, "bell"),
             (Field::Theme, "high-contrast"),
             (Field::StatusRefreshSecs, "5"),
