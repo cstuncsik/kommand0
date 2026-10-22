@@ -665,6 +665,72 @@ fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
     }
 }
 
+/// What `show-ref --exists refs/heads/<branch>` answered.
+enum RefProbe {
+    /// Exit 2: the ref does not exist.
+    Missing,
+    /// Exit 0: it does.
+    Present,
+    /// Exit 129: a git older than 2.43, which has no `--exists`.
+    OldGit,
+    /// Anything else (1 corrupt, 128 no repo, no code, a spawn error), logged.
+    Failed,
+}
+
+/// Whether git says `refs/heads/<branch>` exists. Only [`RefProbe::Missing`]
+/// may end with nothing to delete; a failure must never read as that.
+fn probe_branch(repo_path: &str, branch: &str) -> RefProbe {
+    match Command::new("git")
+        .args(["-C", repo_path, "show-ref", "--exists", &format!("refs/heads/{branch}")])
+        .output()
+    {
+        Ok(o) if o.status.code() == Some(2) => RefProbe::Missing,
+        Ok(o) if o.status.success() => RefProbe::Present,
+        Ok(o) if o.status.code() == Some(129) => RefProbe::OldGit,
+        Ok(o) => {
+            tracing::warn!(
+                "git show-ref --exists {branch} failed ({}): {}",
+                o.status,
+                last_line(&o.stderr)
+            );
+            RefProbe::Failed
+        }
+        Err(e) => {
+            tracing::warn!("git show-ref --exists {branch}: {e}");
+            RefProbe::Failed
+        }
+    }
+}
+
+/// The branch `worktree_path`'s HEAD is on, when it is one this can record and
+/// delete: a born branch (its tip resolves in `repo_path`; a nested foreign
+/// repo counts as live, and its HEAD is followed only if the repo has a born
+/// branch of that name, else it is refused as unborn) with a name
+/// `is_valid_branch_name` accepts (stricter than git). The workspace's own
+/// `branch` is reported as is, born or
+/// not: the caller knows (its tip resolved, or it is the one that is gone).
+/// Else what a refusal calls it: "a detached HEAD" (also when git failed),
+/// "an unborn branch <b>", the full ref outside refs/heads/, or the invalid
+/// name. Full ref, not `--short` (a same-named tag makes `--short` print
+/// `heads/<b>`).
+fn worktree_head(repo_path: &str, worktree_path: &str, branch: &str) -> Result<String, String> {
+    let head = match Command::new("git")
+        .args(["-C", worktree_path, "symbolic-ref", "HEAD"])
+        .output()
+    {
+        Ok(o) if o.status.success() => last_line(&o.stdout),
+        _ => return Err("a detached HEAD".to_string()),
+    };
+    match head.strip_prefix("refs/heads/") {
+        Some(b) if !is_valid_branch_name(b) => Err(b.to_string()),
+        Some(b) if b != branch && branch_tip(repo_path, b).is_none() => {
+            Err(format!("an unborn branch {b}"))
+        }
+        Some(b) => Ok(b.to_string()),
+        None => Err(head),
+    }
+}
+
 /// Remove a merged workspace's worktree and delete its branch, but only when
 /// every check holds. Returns a message (deleting nothing) unless ALL hold:
 /// - the branch is not the repo's default branch (see [`is_default_branch`]),
@@ -677,8 +743,13 @@ fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
 ///   answer, i.e. when the local copy says not merged;
 /// - it isn't a branch created at a merged tip without a commit of its own
 ///   (see [`fresh_by_reflog`]);
-/// - the worktree, if it still exists, is live and its HEAD is still on
-///   `branch` (a `git switch` inside it made the dir another branch's checkout);
+/// - the worktree, if it still exists, is live (see [`is_live_worktree`]; a
+///   nested foreign repo counts as live; its HEAD is followed only if the repo
+///   has a born branch of that name, else it is refused as unborn). When its
+///   HEAD is on another born branch (a `git switch` inside it made the dir
+///   that branch's checkout), only `branch` is deleted, the dir stays, and the
+///   result is [`Cleaned::Followed`]; a detached HEAD, an unborn branch or a
+///   name [`is_valid_branch_name`] rejects is refused instead;
 /// - the worktree is clean (see [`uncommitted_work`]; an unreadable status
 ///   aborts rather than assuming clean); and
 /// - the branch is still at the checked tip right before the worktree is
@@ -697,8 +768,15 @@ fn branch_tip(repo_path: &str, branch: &str) -> Option<String> {
 /// git refused and touched nothing (its own reason is reported, nothing is
 /// deleted), or it died mid-delete after dropping the admin entry, leaving an
 /// unusable half-deleted tree that this finishes deleting. Either way the branch
-/// survives an `Err`, so a retry re-runs every gate: `Ok`/`Err` is the caller's
-/// deregister signal, so a path that deletes the branch must return `Ok`.
+/// survives an `Err`, so a retry re-runs every gate. The result is the caller's
+/// signal for the workspace row: [`Cleaned::Removed`] deregisters it,
+/// [`Cleaned::Followed`] re-points its `branch_name`, `Err` keeps it, so a path
+/// that deletes the branch must return `Ok`. A branch git says is missing
+/// (`show-ref --exists`, git 2.43 or newer; older git keeps the tip refusal)
+/// skips the merge check: with the dir gone too there is nothing left to
+/// delete, and the result is `Removed` after a `worktree prune`, so a row
+/// pointing at nothing can always be cleared past the name gate above; a live
+/// dir on another branch is followed as above, nothing deleted.
 ///
 /// An `Err` is the refusal on its first line, then, for "not merged", any notes
 /// (see [`Scan::notes`]) on lines of their own.
@@ -707,11 +785,54 @@ pub fn cleanup_merged_workspace(
     worktree_path: &str,
     branch: &str,
     protected: &[String],
-) -> Result<(), String> {
+) -> Result<Cleaned, String> {
     refuse_branch_delete(repo_path, branch, protected).map_err(|r| r.message(branch))?;
+    let tip_refusal = || "couldn't resolve the branch tip; not cleaning up".to_string();
+    let wreckage = || {
+        format!("a failed removal left files behind: delete {worktree_path}, then clean up again")
+    };
+    let prune = || {
+        let _ = Command::new("git").args(["-C", repo_path, "worktree", "prune"]).output();
+    };
 
     let Some(tip) = branch_tip(repo_path, branch) else {
-        return Err("couldn't resolve the branch tip; not cleaning up".to_string());
+        // Only a ref git says is missing may end with nothing to delete.
+        match probe_branch(repo_path, branch) {
+            RefProbe::Missing => {}
+            RefProbe::OldGit => {
+                return Err(format!(
+                    "{} (clearing a row whose branch is gone needs git 2.43 or newer)",
+                    tip_refusal()
+                ));
+            }
+            RefProbe::Present | RefProbe::Failed => return Err(tip_refusal()),
+        }
+        match std::path::Path::new(worktree_path).try_exists() {
+            Ok(false) => {
+                prune();
+                return Ok(Cleaned::Removed);
+            }
+            Ok(true) => {}
+            Err(e) => {
+                // `exists()` would read a permission error as absent.
+                tracing::warn!("cleanup: can't probe {worktree_path}: {e}");
+                return Err(tip_refusal());
+            }
+        }
+        if !is_live_worktree(worktree_path) {
+            return Err(wreckage());
+        }
+        // Nothing to delete and nothing to merge-check: the row can only follow
+        // the branch the live dir is on.
+        return match worktree_head(repo_path, worktree_path, branch) {
+            Ok(on) if on != branch => Ok(Cleaned::Followed { branch: on }),
+            // The dir still names the gone branch (unborn, or back since the
+            // probe): nothing to follow, the tip refusal stands.
+            Ok(_) => Err(tip_refusal()),
+            Err(on) => Err(format!(
+                "the worktree is on {on} and branch {branch} is gone; switch it to a branch or delete it by hand"
+            )),
+        };
     };
     let mut target = merge_target(repo_path, false)?;
     let mut merged = merged_into(repo_path, &target, branch, &tip);
@@ -752,32 +873,28 @@ pub fn cleanup_merged_workspace(
         // prove what survived, so say so rather than dead-end on an unreadable
         // status (the old message) or delete a path we can't vouch for.
         if !is_live_worktree(worktree_path) {
-            return Err(format!(
-                "a failed removal left files behind: delete {worktree_path}, then clean up again"
-            ));
+            return Err(wreckage());
         }
-        // HEAD must still be on `branch`: after a `git switch` inside the
-        // worktree the dir is another branch's checkout, and removing it would
-        // take that checkout (ignored files included) with it. Full ref, not
-        // `--short`: with a same-named tag `--short` prints `heads/<b>`.
-        let head = match Command::new("git")
-            .args(["-C", worktree_path, "symbolic-ref", "HEAD"])
-            .output()
-        {
-            Ok(o) if o.status.success() => last_line(&o.stdout),
-            _ => String::new(), // detached (exit 128), or git itself failed
-        };
-        if head != format!("refs/heads/{branch}") {
-            let on = match head.strip_prefix("refs/heads/") {
-                Some(b) => b,
-                None if head.is_empty() => "a detached HEAD",
-                None => head.as_str(),
-            };
-            return Err(format!(
-                "the worktree is on {on}, not {branch}; switch back or delete it by hand"
-            ));
+        match worktree_head(repo_path, worktree_path, branch) {
+            Ok(on) if on == branch => uncommitted_work(worktree_path)?,
+            // After a `git switch` inside the worktree the dir is another
+            // branch's checkout, and removing it would take that checkout
+            // (ignored files included) with it: only `branch` goes, and the
+            // row follows `on`.
+            Ok(on) => {
+                // A stale entry of a hand-deleted second worktree can still
+                // claim `branch`, which would make git refuse the delete.
+                prune();
+                delete_local_branch(repo_path, branch, &tip)
+                    .map_err(|e| format!("couldn't delete branch {branch}: {e}"))?;
+                return Ok(Cleaned::Followed { branch: on });
+            }
+            Err(on) => {
+                return Err(format!(
+                    "the worktree is on {on}, not {branch}; switch back or delete it by hand"
+                ));
+            }
         }
-        uncommitted_work(worktree_path)?;
     }
 
     // Still the tip that was checked: a commit made meanwhile (an agent in the
@@ -824,19 +941,35 @@ pub fn cleanup_merged_workspace(
     }
     // Clean up any stale worktree admin entry (whether we removed it or it was
     // already gone) so the branch is deletable.
-    let _ = Command::new("git")
-        .args(["-C", repo_path, "worktree", "prune"])
-        .output();
+    prune();
 
     // The delete re-checks the tip, because kmd doesn't stop a live agent: a
     // commit landed since the first check keeps the branch.
-    delete_local_branch(repo_path, branch, &tip).map_err(|e| {
-        if worktree_exists {
-            format!("worktree removed, but couldn't delete branch {branch}: {e}")
-        } else {
-            format!("couldn't delete branch {branch}: {e}")
-        }
-    })
+    delete_local_branch(repo_path, branch, &tip)
+        .map_err(|e| {
+            if worktree_exists {
+                format!("worktree removed, but couldn't delete branch {branch}: {e}")
+            } else {
+                format!("couldn't delete branch {branch}: {e}")
+            }
+        })
+        .map(|()| Cleaned::Removed)
+}
+
+/// How a cleanup ended, and what the caller does with the workspace row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cleaned {
+    /// The worktree and the branch are gone (or already were): drop the row.
+    Removed,
+    /// The worktree is live on `branch`, not the workspace's, so it stays (a
+    /// removal would take that checkout, ignored files included) and only the
+    /// workspace's branch is gone: record `branch` as the row's branch. It may
+    /// be the default branch (the next cleanup refuses it like any trunk row,
+    /// and should its dir vanish later, only a delete clears the row) or
+    /// already another row's branch (e.g. after that row's dir was deleted by
+    /// hand or moved on; both rows fail safe, git refuses to delete a
+    /// checked-out branch).
+    Followed { branch: String },
 }
 
 /// What the repo-wide scan decided for one local branch.
@@ -1059,7 +1192,7 @@ mod tests {
         git(clone, &["remote", "set-url", "origin", root.join("gone").to_str().unwrap()]);
     }
 
-    fn cleanup(repo: &Path, wt: &Path, branch: &str) -> Result<(), String> {
+    fn cleanup(repo: &Path, wt: &Path, branch: &str) -> Result<Cleaned, String> {
         cleanup_merged_workspace(repo.to_str().unwrap(), wt.to_str().unwrap(), branch, &[])
     }
 
@@ -1131,7 +1264,7 @@ mod tests {
         let wt = tmp.path().join("wt");
         let wt_arg = wt.to_str().unwrap();
         git(&clone, &["worktree", "add", "--track", "-b", "pr-head", wt_arg, "origin/pr-head"]);
-        assert_eq!(cleanup(&clone, &wt, "pr-head"), Ok(()));
+        assert_eq!(cleanup(&clone, &wt, "pr-head"), Ok(Cleaned::Removed));
         assert!(!wt.exists() && !branch_exists(&clone, "pr-head"), "adopted branch cleaned up");
     }
 
@@ -1269,7 +1402,7 @@ mod tests {
                 .unwrap();
             let tags = String::from_utf8_lossy(&tags.stdout);
             assert!(tags.contains("h work.txt") || tags.contains("S work.txt"), "{case}: {tags}");
-            assert_eq!(cleanup(&repo, &wt, "feat"), Ok(()), "{case}");
+            assert_eq!(cleanup(&repo, &wt, "feat"), Ok(Cleaned::Removed), "{case}");
             assert!(!wt.exists() && !branch_exists(&repo, "feat"), "{case}");
         }
     }
@@ -1449,7 +1582,7 @@ mod tests {
         let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         git(&wt, &["update-index", "--skip-worktree", "work.txt"]);
         std::fs::remove_file(wt.join("work.txt")).unwrap();
-        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()));
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(Cleaned::Removed));
         assert!(!wt.exists() && !branch_exists(&repo, &branch));
     }
 
@@ -1512,29 +1645,210 @@ mod tests {
         for name in ["feat", "feat/login", "kommand0/legacy"] {
             let tmp = TempDir::new().unwrap();
             let (repo, wt, branch) = merged_worktree_on(tmp.path(), name);
-            assert_eq!(cleanup(&repo, &wt, &branch), Ok(()), "{name}");
+            assert_eq!(cleanup(&repo, &wt, &branch), Ok(Cleaned::Removed), "{name}");
             assert!(!wt.exists() && !branch_exists(&repo, &branch), "{name} cleaned up");
         }
     }
 
     #[test]
-    fn cleanup_refuses_a_worktree_switched_to_another_branch() {
+    fn cleanup_follows_a_worktree_switched_to_another_branch() {
         // The workspace's dir is live but a `git switch` inside it moved HEAD off
         // the workspace's branch: removing the dir would destroy the OTHER
         // branch's checkout (and its ignored files) on a merged verdict that
-        // was never about it.
+        // was never about it, so only the merged branch goes and the row
+        // follows the branch checked out there.
         let tmp = TempDir::new().unwrap();
         let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         git(&wt, &["switch", "-c", "elsewhere"]);
-        let err = cleanup(&repo, &wt, &branch).unwrap_err();
-        assert!(err.contains("is on elsewhere, not"), "names both branches: {err}");
-        assert!(wt.exists(), "worktree untouched");
-        assert!(branch_exists(&repo, &branch) && branch_exists(&repo, "elsewhere"), "both branches intact");
-        // Detached HEAD is the same refusal.
+        // A detached HEAD has no branch to follow: that refusal stays.
         git(&wt, &["switch", "--detach"]);
         let err = cleanup(&repo, &wt, &branch).unwrap_err();
-        assert!(err.contains("detached HEAD"), "detached is refused too: {err}");
-        assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
+        assert!(err.contains("detached HEAD"), "detached is refused: {err}");
+        assert!(wt.exists(), "worktree untouched");
+        assert!(branch_exists(&repo, &branch) && branch_exists(&repo, "elsewhere"), "both branches intact");
+        git(&wt, &["switch", "elsewhere"]);
+        // The issue's shape is a fix in progress, i.e. a dirty checkout.
+        std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
+        let followed = Ok(Cleaned::Followed { branch: "elsewhere".to_string() });
+        assert_eq!(cleanup(&repo, &wt, &branch), followed);
+        assert!(!branch_exists(&repo, &branch), "the merged branch is deleted");
+        assert!(branch_exists(&repo, "elsewhere"), "the branch checked out there survives");
+        assert!(wt.join("scratch.txt").exists(), "the dir and its work survive");
+    }
+
+    #[test]
+    fn cleanup_clears_a_row_whose_worktree_and_branch_are_already_gone() {
+        // The issue's shape: cleaned up by hand, the row points at nothing. The
+        // stale admin entry stays (a `worktree remove` would have pruned it).
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        std::fs::remove_dir_all(&wt).unwrap();
+        git(&repo, &["update-ref", "-d", "refs/heads/feat"]);
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(Cleaned::Removed));
+        assert!(branch_exists(&repo, "main"), "nothing else touched");
+        assert!(!repo.join(".git/worktrees/wt").exists(), "the stale entry is pruned");
+        // Fail closed: git failing to answer is not "nothing left to delete".
+        let err = cleanup(&tmp.path().join("nowhere"), &wt, "feat").unwrap_err();
+        assert_eq!(err, "couldn't resolve the branch tip; not cleaning up");
+        // Nor is a ref git can't read (`show-ref --exists` exits 1, not 2):
+        // the same refusal, and no prune either.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        std::fs::remove_dir_all(&wt).unwrap();
+        std::fs::write(repo.join(".git/refs/heads/feat"), "garbage\n").unwrap();
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert_eq!(err, "couldn't resolve the branch tip; not cleaning up");
+        assert!(repo.join(".git/worktrees/wt").exists(), "no prune ran");
+    }
+
+    #[test]
+    fn cleanup_still_names_the_leftovers_when_the_branch_is_gone_too() {
+        // Wreckage (#118) whose branch a hand `branch -D` already took: the dir
+        // is real state git can't vouch for, so the refusal still names it, and
+        // deleting it by hand lands in the nothing-left shape.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        std::fs::remove_dir_all(repo.join(".git/worktrees/wt")).unwrap();
+        git(&repo, &["branch", "-D", "feat"]);
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        let wt_arg = wt.to_str().unwrap();
+        assert_eq!(err, format!("a failed removal left files behind: delete {wt_arg}, then clean up again"));
+        assert!(wt.exists(), "the leftovers are NOT deleted for us");
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(Cleaned::Removed), "the retry finishes");
+    }
+
+    #[test]
+    fn cleanup_refuses_an_unborn_workspace_branch() {
+        // The ref is gone but the live worktree's HEAD still names it: nothing
+        // to follow, and the dir is not nothing.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&repo, &["update-ref", "-d", "refs/heads/feat"]);
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert_eq!(err, "couldn't resolve the branch tip; not cleaning up");
+        assert!(wt.join("work.txt").exists(), "worktree untouched");
+    }
+
+    #[test]
+    fn cleanup_follows_a_live_worktree_whose_branch_is_already_gone() {
+        // A repo-level cleanup (or a hand `branch -D`) took the branch while the
+        // dir lives on another one: nothing to delete, the row follows the dir.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&wt, &["switch", "-c", "elsewhere"]);
+        git(&repo, &["branch", "-D", "feat"]);
+        git(&wt, &["switch", "--detach"]);
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert_eq!(
+            err,
+            "the worktree is on a detached HEAD and branch feat is gone; switch it to a branch or delete it by hand"
+        );
+        assert!(wt.exists() && branch_exists(&repo, "elsewhere"), "nothing destroyed");
+        git(&wt, &["switch", "elsewhere"]);
+        let followed = Ok(Cleaned::Followed { branch: "elsewhere".to_string() });
+        assert_eq!(cleanup(&repo, &wt, &branch), followed);
+        assert!(wt.exists() && branch_exists(&repo, "elsewhere"), "nothing deleted");
+    }
+
+    #[test]
+    fn cleanup_refuses_an_unmerged_branch_whose_worktree_moved() {
+        // The merged gate runs before the HEAD gate: an unmerged branch is never
+        // deleted just because its dir moved on.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = repo_with_worktree(tmp.path());
+        commit_file(&wt, "work.txt", "work");
+        git(&wt, &["switch", "-c", "elsewhere"]);
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert_eq!(err, "the branch isn't merged into main; not cleaning up");
+        assert!(wt.exists(), "worktree untouched");
+        assert!(branch_exists(&repo, &branch) && branch_exists(&repo, "elsewhere"), "both branches intact");
+    }
+
+    #[test]
+    fn cleanup_refuses_to_follow_an_invalid_branch_name() {
+        // A name the validator rejects (it is stricter than git) would stick as
+        // a `branch_name` no later cleanup accepts: refuse, delete nothing.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&repo, &["update-ref", "refs/heads/-evil", "HEAD"]);
+        git(&wt, &["symbolic-ref", "HEAD", "refs/heads/-evil"]);
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert_eq!(err, "the worktree is on -evil, not feat; switch back or delete it by hand");
+        assert!(branch_exists(&repo, &branch) && wt.exists(), "nothing destroyed");
+    }
+
+    #[test]
+    fn cleanup_refuses_to_follow_a_dir_replaced_by_another_repo() {
+        // The workspace dir is now a foreign repo (live to git, so not
+        // wreckage): its HEAD name resolves there, not in the main repo, so
+        // the row never follows it.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        std::fs::remove_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        init_repo(&wt);
+        git(&wt, &["switch", "-c", "other"]);
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.contains("an unborn branch other"), "{err}");
+        assert!(branch_exists(&repo, &branch), "the branch survives");
+    }
+
+    #[test]
+    fn cleanup_refuses_to_follow_an_unborn_branch() {
+        // `switch --orphan` names a branch with no commit: nothing a row could
+        // track, and nothing the next cleanup could resolve.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&wt, &["switch", "--orphan", "nowhere"]);
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.contains("an unborn branch nowhere"), "{err}");
+        assert!(branch_exists(&repo, &branch) && wt.exists(), "nothing destroyed");
+    }
+
+    #[test]
+    fn cleanup_prunes_a_stale_entry_that_still_claims_the_branch_before_following() {
+        // A second worktree on the merged branch, deleted by hand: its stale
+        // admin entry would make `branch -D` refuse, so the follow path prunes
+        // first, like the removal path does.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&wt, &["switch", "-c", "elsewhere"]);
+        let wt2 = tmp.path().join("wt2");
+        git(&repo, &["worktree", "add", wt2.to_str().unwrap(), "feat"]);
+        std::fs::remove_dir_all(&wt2).unwrap();
+        let followed = Ok(Cleaned::Followed { branch: "elsewhere".to_string() });
+        assert_eq!(cleanup(&repo, &wt, &branch), followed);
+        assert!(!branch_exists(&repo, &branch), "the merged branch is deleted");
+    }
+
+    #[test]
+    fn cleanup_keeps_a_branch_checked_out_elsewhere_when_following() {
+        // The merged branch is checked out in the main repo by now: git refuses
+        // the delete, and the message must not claim a removal either.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&wt, &["switch", "-c", "elsewhere"]);
+        git(&repo, &["switch", "feat"]);
+        let err = cleanup(&repo, &wt, &branch).unwrap_err();
+        assert!(err.starts_with("couldn't delete branch feat:"), "{err}");
+        assert!(!err.contains("worktree removed"), "{err}");
+        assert!(branch_exists(&repo, &branch) && branch_exists(&repo, "elsewhere"), "both branches intact");
+        assert!(wt.exists(), "worktree untouched");
+    }
+
+    #[test]
+    fn cleanup_follows_onto_the_default_branch() {
+        // Trunk protection governs the branch being deleted, not the one the
+        // row ends up tracking: the next cleanup of the row refuses it like any
+        // trunk row, which beats recreating the dead end here.
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        git(&repo, &["switch", "--detach"]);
+        git(&wt, &["switch", "main"]);
+        let followed = Ok(Cleaned::Followed { branch: "main".to_string() });
+        assert_eq!(cleanup(&repo, &wt, &branch), followed);
+        assert!(!branch_exists(&repo, &branch) && wt.exists(), "feat gone, the dir kept");
     }
 
     #[test]
@@ -1546,7 +1860,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         std::fs::remove_dir_all(&wt).unwrap(); // worktree dir vanished
-        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()));
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(Cleaned::Removed));
         assert!(!branch_exists(&repo, &branch), "orphaned branch deleted");
     }
 
@@ -1605,7 +1919,7 @@ mod tests {
         assert!(branch_exists(&repo, &branch), "branch survives, so a retry can run");
         // And once the user deletes it, the retry finishes the job.
         std::fs::remove_dir_all(&wt).unwrap();
-        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()));
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(Cleaned::Removed));
         assert!(!branch_exists(&repo, &branch), "retry deletes the orphaned branch");
     }
 
@@ -1633,10 +1947,11 @@ mod tests {
         let _ =
             std::fs::set_permissions(wt.join(".certs"), std::fs::Permissions::from_mode(0o755));
         match res {
-            Ok(()) => {
+            Ok(Cleaned::Removed) => {
                 assert!(!wt.exists(), "Ok means the dir really is gone");
                 assert!(!branch_exists(&repo, &branch), "Ok deletes the branch");
             }
+            Ok(Cleaned::Followed { .. }) => panic!("followed a worktree that is on its own branch"),
             Err(e) => {
                 assert!(wt.exists(), "Err leaves the leftovers in place: {e}");
                 assert!(branch_exists(&repo, &branch), "Err keeps the branch: {e}");
@@ -1667,14 +1982,14 @@ mod tests {
             assert!(err.contains("protected branch"), "{name}: expected protected refusal, got: {err}");
         }
         assert!(wt.exists() && branch_exists(&repo, &branch), "nothing destroyed");
-        assert_eq!(cleanup(&repo, &wt, &branch), Ok(()), "an empty list lets it through");
+        assert_eq!(cleanup(&repo, &wt, &branch), Ok(Cleaned::Removed), "an empty list lets it through");
     }
 
     #[test]
     fn cleanup_fetches_when_the_squash_landed_after_the_last_fetch() {
         let tmp = TempDir::new().unwrap();
         let (_origin, clone, wt) = clone_with_upstream_squash(tmp.path());
-        assert_eq!(cleanup(&clone, &wt, "feat"), Ok(()));
+        assert_eq!(cleanup(&clone, &wt, "feat"), Ok(Cleaned::Removed));
         assert!(!wt.exists() && !branch_exists(&clone, "feat"), "cleaned up after the fetch");
     }
 
@@ -1685,7 +2000,7 @@ mod tests {
         git(&clone, &["fetch", "origin"]);
         commit_file(&origin, "later.txt", "later");
         let fetched = rev_parse(&clone, "refs/remotes/origin/main");
-        assert_eq!(cleanup(&clone, &wt, "feat"), Ok(()));
+        assert_eq!(cleanup(&clone, &wt, "feat"), Ok(Cleaned::Removed));
         assert_eq!(rev_parse(&clone, "refs/remotes/origin/main"), fetched, "origin/main never refetched");
     }
 

@@ -947,6 +947,30 @@ fn repo_cleanup_routes_a_workspace_whose_worktree_was_pruned() {
 }
 
 #[test]
+fn repo_cleanup_follows_a_workspace_whose_worktree_moved() {
+    // The scan still sees `feat` merged and checked out nowhere, routes it to
+    // the workspace, and the workspace cleanup follows the dir to `elsewhere`
+    // (fresh off `feat`, so the scan skips it as having no commits of its own).
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, repo) = setup_for_repo_cleanup(tmp.path());
+    let feat_dir = workspace_dir(&state, "feat");
+    run_git(&feat_dir, &["switch", "-c", "elsewhere"]);
+    let out = repo_cleanup(&state, &repo, &["--force"], &[]);
+    assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    assert!(text.contains("Deleted branch: stale"), "{text}");
+    assert!(
+        text.contains("Cleaned up workspace: feat (branch feat is gone; now tracks elsewhere, worktree kept)"),
+        "{text}"
+    );
+    assert!(!branch_exists(&repo, "feat") && feat_dir.exists(), "only the branch went");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(list.contains("feat"), "workspace row kept: {list}");
+    let json = std::fs::read_to_string(state.join("state.json")).unwrap();
+    assert!(json.contains("\"branch_name\": \"elsewhere\""), "{json}");
+}
+
+#[test]
 fn repo_cleanup_dry_run_warns_when_the_default_branch_cannot_be_refreshed() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, repo) = setup_for_repo_cleanup(tmp.path());
@@ -1323,6 +1347,60 @@ fn cleanup_succeeds_when_the_id_is_shadowed() {
         .unwrap()
         .to_string();
     assert!(std::path::Path::new(&shadow_dir).exists(), "shadow worktree untouched");
+}
+
+#[test]
+fn cleanup_follows_a_worktree_switched_to_another_branch() {
+    // Only the merged branch goes; the dir stays and the row tracks the branch
+    // checked out there.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    let dir = workspace_dir(&state, "feat");
+    squash_merge(&repo, &dir, "feat");
+    run_git(&dir, &["switch", "-c", "elsewhere"]);
+    let out = kmd(
+        &state,
+        &[("KOMMAND0_GH_BIN", "false")],
+        &["workspace", "cleanup", "feat", "--force"],
+    );
+    assert!(out.status.success(), "cleanup: {}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    assert!(
+        text.contains("Cleaned up workspace: feat (branch feat is gone; now tracks elsewhere, worktree kept)"),
+        "{text}"
+    );
+    assert!(!branch_exists(&repo, "feat") && dir.exists(), "only the branch went");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(list.contains("feat"), "workspace row kept: {list}");
+    // `workspace show` prints no branch, so the file is the oracle.
+    let json = std::fs::read_to_string(state.join("state.json")).unwrap();
+    assert!(json.contains("\"branch_name\": \"elsewhere\""), "{json}");
+}
+
+#[test]
+fn workspace_cleanup_names_the_git_floor_when_show_ref_cannot_probe() {
+    // A git without `show-ref --exists` (exit 129) can't tell a gone branch
+    // from a failure: the row stays, and the refusal says what it needs.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    std::fs::remove_dir_all(workspace_dir(&state, "feat")).unwrap();
+    run_git(&repo, &["update-ref", "-d", "refs/heads/feat"]);
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        "for a in \"$@\"; do [ \"$a\" = show-ref ] && exit 129; done",
+    );
+    let out = kmd(
+        &state,
+        &[("PATH", &path), ("KOMMAND0_GH_BIN", "false")],
+        &["workspace", "cleanup", "feat", "--force"],
+    );
+    assert!(!out.status.success(), "refused: {}", stdout(&out));
+    let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("needs git 2.43 or newer"), "{text}");
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(list.contains("feat"), "workspace row kept: {list}");
 }
 
 #[test]

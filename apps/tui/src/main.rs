@@ -20,7 +20,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyEvent, KeyEventKind};
 use kommand0_core::{
-    AppState, Config, DEFAULT_PROFILE, RepoCleanupItem, RepoEntry, SessionStatus, Workspace,
+    AppState, Cleaned, Config, DEFAULT_PROFILE, RepoCleanupItem, RepoEntry, SessionStatus,
+    Workspace,
 };
 use ratatui::{
     DefaultTerminal,
@@ -905,6 +906,9 @@ pub(crate) struct App {
     /// A PR-status refresh worker is running; gates re-spawning (always cleared
     /// when its result arrives, even on a partial/empty map).
     pr_status_inflight: bool,
+    /// A follow re-pointed a row while a PR refresh was in flight: run another
+    /// when it lands.
+    pr_status_rerun: bool,
     /// Worker → event-loop channel carrying a fresh `ws_id` → PrStatus map.
     pr_status_tx: Option<tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::PrStatus>>>,
     /// When the periodic PR-status refresh last fired (time-based).
@@ -912,10 +916,12 @@ pub(crate) struct App {
 
     /// Workspaces with a cleanup in flight (gates re-triggering; shows progress).
     pub(crate) cleanup_inflight: HashSet<String>,
-    /// Last cleanup *failure* per workspace (a success deletes the workspace).
-    pub(crate) cleanup_result: HashMap<String, String>,
+    /// Last cleanup outcome per workspace whose row survived: `(message,
+    /// is_error)`, a refusal or a followed worktree; a removal deletes the row
+    /// and its entry.
+    pub(crate) cleanup_result: HashMap<String, (String, bool)>,
     /// Cleanup worker → event-loop channel carrying `(workspace_id, result)`.
-    cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<(), String>)>>,
+    cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<Cleaned, String>)>>,
 
     /// The repo whose merged-branch scan or delete is running (at most one).
     pub(crate) repo_cleanup_inflight: Option<String>,
@@ -1051,6 +1057,7 @@ impl App {
             last_status_refresh: None,
             pr_status: HashMap::new(),
             pr_status_inflight: false,
+            pr_status_rerun: false,
             pr_status_tx: None,
             last_pr_status_refresh: None,
             cleanup_inflight: HashSet::new(),
@@ -3595,12 +3602,15 @@ impl App {
         let st = self.branch_status.get(ws_id);
         let dirty = st.map(|s| s.dirty).unwrap_or(false);
         let unpushed = st.map(|s| s.ahead > 0).unwrap_or(false);
+        // The live HEAD the status saw (None when detached, so no hint then).
+        let worktree_on = st.and_then(|s| s.branch.clone()).filter(|on| *on != branch);
         self.modal = modal::ModalState::ConfirmCleanup {
             ws_id: ws_id.to_string(),
             ws_name,
             branch,
             dirty,
             unpushed,
+            worktree_on,
         };
     }
 
@@ -3844,7 +3854,24 @@ impl App {
         let routed: Vec<&str> = plan
             .iter()
             .filter_map(|item| match item {
-                RepoCleanupItem::Workspace { ws_id, .. } => Some(ws_id.as_str()),
+                RepoCleanupItem::Workspace { ws_id, branch } => {
+                    // The plan names the branch the row had at scan time; a
+                    // cleanup that followed the worktree since re-pointed it,
+                    // and the workspace cleanup reads the current one.
+                    let current = self
+                        .workspaces
+                        .iter()
+                        .find(|w| w.id == *ws_id)
+                        .and_then(|w| w.branch_name.as_deref());
+                    if current == Some(branch.as_str()) {
+                        Some(ws_id.as_str())
+                    } else {
+                        tracing::warn!(
+                            "repo cleanup: workspace {ws_id} no longer tracks {branch}; skipped, scan again"
+                        );
+                        None
+                    }
+                }
                 _ => None,
             })
             .collect();
@@ -3907,6 +3934,66 @@ impl App {
             format!("Deleted {total} branches")
         };
         self.repo_cleanup_result.insert(repo_id, (line, !failed.is_empty()));
+    }
+
+    /// A workspace cleanup landed: a removal drops the row, a followed worktree
+    /// re-points it, a refusal shows in its pane.
+    fn on_cleanup_done(&mut self, ws_id: String, result: Result<Cleaned, String>) {
+        self.cleanup_inflight.remove(&ws_id);
+        match result {
+            // Saves through `delete_workspace_by_id` (a plain save, no 3-way
+            // merge), unlike the Followed arm below: pre-existing, a follow-up.
+            Ok(Cleaned::Removed) => {
+                // The worktree + branch are gone; drop the workspace too
+                // (exact id; a no-op if it was already deleted meanwhile,
+                // even when a new workspace has reused the id as a name).
+                if self.state.delete_workspace_by_id(&ws_id).is_ok() {
+                    self.workspaces = self.state.workspaces.clone();
+                    self.expanded_icon_rows.remove(&ws_id);
+                    self.cleanup_result.remove(&ws_id);
+                    self.rebuild_tree();
+                    // clamp_selection re-seats off any hint row AND
+                    // re-syncs the active session (a raw clamp skipped
+                    // both, stranding focus/selection after cleanup).
+                    self.clamp_selection();
+                    // Rows shifted under selected_index, so a DIFFERENT
+                    // workspace's pane can now be the visible one (the
+                    // one pane-switch route with no key and no Down), and
+                    // a highlight (or live drag) must not carry over.
+                    self.pane_selection = None;
+                }
+            }
+            Ok(Cleaned::Followed { branch }) => {
+                // The dir is `branch`'s checkout and stays; the row tracks it
+                // from now on.
+                if let Some(ws) = self.state.workspaces.iter_mut().find(|w| w.id == ws_id) {
+                    let was = ws.branch_name.replace(branch.clone()).unwrap_or_default();
+                    self.workspaces = self.state.workspaces.clone();
+                    self.rebuild_tree();
+                    self.clamp_selection(); // a branch filter may have hidden the row
+                    // Rows may have shifted under the selection, as after a
+                    // removal: a highlight (or live drag) must not carry over.
+                    self.pane_selection = None;
+                    self.save_state();
+                    // The old branch's PR must not linger on the row; a refresh
+                    // already in flight may still land it, so run one more.
+                    self.pr_status.remove(&ws_id);
+                    self.pr_status_rerun = self.pr_status_inflight;
+                    self.request_pr_status_refresh();
+                    let line = format!(
+                        "branch {was} is gone; the worktree is on {branch}, which this workspace now tracks"
+                    );
+                    self.cleanup_result.insert(ws_id, (line, false));
+                }
+            }
+            Err(msg) => {
+                // The pane may cut off a long refusal's bottom
+                // (its notes included); the log keeps it whole.
+                tracing::warn!("cleanup: {msg}");
+                self.cleanup_result.insert(ws_id, (msg, true));
+            }
+        }
+        self.request_branch_status_refresh();
     }
 
     /// Resolve an issue reference to its linked branch off the render loop (up
@@ -5316,9 +5403,9 @@ async fn run(
     app.request_pr_status_refresh();
     app.last_pr_status_refresh = Some(Instant::now());
 
-    // Cleanup worker → event loop, carrying `(workspace_id, Ok(()) | Err(msg))`.
+    // Cleanup worker → event loop, carrying `(workspace_id, Ok(Cleaned) | Err(msg))`.
     let (cleanup_tx, mut cleanup_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, Result<(), String>)>();
+        tokio::sync::mpsc::unbounded_channel::<(String, Result<Cleaned, String>)>();
     app.cleanup_tx = Some(cleanup_tx);
 
     // Repo-cleanup worker → event loop (the scan's plan, then the delete results).
@@ -5408,43 +5495,15 @@ async fn run(
                 // entries for deleted workspaces / closed PRs) and allow the next.
                 app.pr_status = pr_status;
                 app.pr_status_inflight = false;
+                if std::mem::take(&mut app.pr_status_rerun) {
+                    app.request_pr_status_refresh();
+                }
             }
             Some((req, result)) = issue_rx.recv() => {
                 app.finish_issue_resolve(req, result);
             }
             Some((ws_id, result)) = cleanup_rx.recv() => {
-                app.cleanup_inflight.remove(&ws_id);
-                match result {
-                    Ok(()) => {
-                        // The worktree + branch are gone; drop the workspace too
-                        // (exact id; a no-op if it was already deleted meanwhile,
-                        // even when a new workspace has reused the id as a name).
-                        if app.state.delete_workspace_by_id(&ws_id).is_ok() {
-                            app.workspaces = app.state.workspaces.clone();
-                            app.expanded_icon_rows.remove(&ws_id);
-                            app.cleanup_result.remove(&ws_id);
-                            app.rebuild_tree();
-                            // clamp_selection re-seats off any hint row AND
-                            // re-syncs the active session (a raw clamp skipped
-                            // both, stranding focus/selection after cleanup).
-                            app.clamp_selection();
-                            // Rows shifted under selected_index — a DIFFERENT
-                            // workspace's pane can now be the visible one (the
-                            // one pane-switch route with no key and no Down),
-                            // so a highlight (or live drag) must not carry over.
-                            // (Inside the select! loop — unit-unreachable;
-                            // review-only coverage.)
-                            app.pane_selection = None;
-                        }
-                    }
-                    Err(msg) => {
-                        // The pane may cut off a long refusal's bottom
-                        // (its notes included); the log keeps it whole.
-                        tracing::warn!("cleanup: {msg}");
-                        app.cleanup_result.insert(ws_id, msg);
-                    }
-                }
-                app.request_branch_status_refresh();
+                app.on_cleanup_done(ws_id, result);
             }
             Some(msg) = repo_cleanup_rx.recv() => {
                 app.repo_cleanup_inflight = None;
@@ -10250,6 +10309,42 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn cleanup_modal_hints_when_the_worktree_is_on_another_branch() {
+        // The cached status saw the worktree on another branch: the modal says
+        // the dir stays, in place of the dirty/unpushed warnings (they describe
+        // that checkout, not the branch being deleted).
+        async fn modal_text(worktree_on: &str) -> String {
+            let mut app = test_app();
+            app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+            app.workspaces[0].branch_name = Some("ws-one".into());
+            app.expanded.insert("r1".to_string());
+            app.rebuild_tree();
+            app.select_workspace_row("w1");
+            app.branch_status.insert(
+                "w1".to_string(),
+                kommand0_core::BranchStatus {
+                    branch: Some(worktree_on.into()),
+                    ahead: 0,
+                    behind: 0,
+                    dirty: true,
+                    has_upstream: false,
+                },
+            );
+            press(&mut app, KeyCode::Char('c')).await;
+            render_to_string(&mut app, 80, 24)
+        }
+        let text = modal_text("elsewhere").await;
+        assert!(text.contains("Worktree is on elsewhere"), "{text}");
+        assert!(text.contains("Only branch ws-one"), "{text}");
+        assert!(!text.contains("Uncommitted changes will block"), "{text}");
+        assert!(text.contains(": clean up"), "the footer is still visible:\n{text}");
+        // On its own branch there is nothing to hint: the dirty warning stands.
+        let text = modal_text("ws-one").await;
+        assert!(!text.contains("Worktree is on"), "{text}");
+        assert!(text.contains("Uncommitted changes will block"), "{text}");
+    }
+
+    #[tokio::test]
     async fn cleanup_affordance_and_states_render() {
         let mut app = test_app();
         app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
@@ -10273,7 +10368,7 @@ mod key_tests {
         app.cleanup_inflight.remove("w1");
 
         app.cleanup_result
-            .insert("w1".to_string(), "uncommitted changes".to_string());
+            .insert("w1".to_string(), ("uncommitted changes".to_string(), true));
         let text = draw(&mut app);
         assert!(
             text.contains("Cleanup blocked:") && text.contains("uncommitted"),
@@ -10294,7 +10389,7 @@ mod key_tests {
         app.rebuild_tree();
         app.select_workspace_row("w1");
         let refusal = "the branch isn't merged into origin/main; not cleaning up";
-        app.cleanup_result.insert("w1".to_string(), format!("{refusal}\n{STALE_NOTE}"));
+        app.cleanup_result.insert("w1".to_string(), (format!("{refusal}\n{STALE_NOTE}"), true));
         let text = render_to_string(&mut app, 80, 24);
         assert!(text.contains("Cleanup blocked: the branch"), "{text}");
         let note = text
@@ -10318,7 +10413,7 @@ mod key_tests {
         let refusal = "work.txt is flagged assume-unchanged, which hides its edits from git; \
                        clear it with `git update-index --no-assume-unchanged -- work.txt`, then \
                        commit or discard them";
-        app.cleanup_result.insert("w1".to_string(), refusal.to_string());
+        app.cleanup_result.insert("w1".to_string(), (refusal.to_string(), true));
         app
     }
 
@@ -10435,6 +10530,7 @@ mod key_tests {
             branch: "b".into(),
             dirty: false,
             unpushed: false,
+            worktree_on: None,
         };
         app.on_repo_cleanup_scanned("r1".into(), Ok(scan_of(vec![delete_item("stale")], &[])));
         assert!(
@@ -10781,6 +10877,126 @@ mod key_tests {
         );
         app.on_repo_cleanup_deleted("real".into(), vec![("a".into(), Ok(())), ("b".into(), Ok(()))]);
         assert_eq!(app.repo_cleanup_result["real"], ("Deleted 2 branches".to_string(), false));
+    }
+
+    #[tokio::test]
+    async fn y_skips_a_routed_workspace_whose_branch_moved_since_the_scan() {
+        // A follow re-pointed the row after the plan was made: confirming the
+        // old preview must not clean up a branch it never showed.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "release");
+        let wt = tempfile::TempDir::new().unwrap();
+        route_w1_to_real(&mut app, &wt.path().join("wt"), "main");
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cleanup_tx = Some(cleanup_tx);
+        let (repo_tx, mut repo_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(repo_tx);
+        let path = app.repos.iter().find(|r| r.id == "real").unwrap().path.clone();
+        let base = kommand0_core::scan_merged_branches(&path, &[]).unwrap().base;
+        let items = vec![
+            RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "feat".into() },
+            RepoCleanupItem::Delete {
+                branch: "stale".into(),
+                tip: "0000000000000000000000000000000000000000".into(),
+            },
+        ];
+        app.open_repo_cleanup_modal("real".into(), RepoScan { items, notes: vec![], base });
+
+        press(&mut app, KeyCode::Char('y')).await;
+
+        assert!(!app.cleanup_inflight.contains("w1"), "the stale row is not routed");
+        assert!(cleanup_rx.try_recv().is_err(), "no workspace cleanup was spawned");
+        assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("real"), "the plain delete still runs");
+        let msg = recv(&mut repo_rx).await;
+        assert!(matches!(msg, RepoCleanupMsg::Deleted(..)), "{msg:?}");
+    }
+
+    #[tokio::test]
+    async fn a_followed_cleanup_repoints_the_row_instead_of_dropping_it() {
+        // The worktree was switched to another branch: core deletes only the
+        // merged branch, and the row tracks the one checked out there.
+        let mut app = test_app();
+        let repo = add_real_repo(&mut app, "feat");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wt = tmp.path().join("wt");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(repo.path(), &["worktree", "add", wt.to_str().unwrap(), "feat"]);
+        std::fs::write(wt.join("work.txt"), "work").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-m", "work"]);
+        git(repo.path(), &["merge", "--squash", "--ff", "feat"]);
+        git(repo.path(), &["commit", "-m", "squash feat"]);
+        git(&wt, &["switch", "-c", "elsewhere"]);
+        route_w1_to_real(&mut app, &wt, "feat");
+        app.state.workspaces = app.workspaces.clone(); // the arm edits `state`
+        app.expanded.insert("real".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cleanup_tx = Some(cleanup_tx);
+
+        app.start_cleanup("w1");
+        let (ws_id, result) = recv(&mut cleanup_rx).await;
+        assert_eq!(result, Ok(Cleaned::Followed { branch: "elsewhere".to_string() }));
+        app.pr_status.insert(
+            "w1".to_string(),
+            kommand0_core::PrStatus {
+                number: 42,
+                state: kommand0_core::PrState::Open,
+                checks: kommand0_core::PrChecks::Passing,
+                review: kommand0_core::PrReview::Approved,
+                url: "https://github.com/x/y/pull/42".into(),
+            },
+        );
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+        app.pr_status_inflight = true; // a refresh that may still land feat's PR
+        app.on_cleanup_done(ws_id, result);
+
+        assert!(!app.pr_status.contains_key("w1"), "the old branch's PR is dropped");
+        assert!(app.pane_selection.is_none(), "no stale highlight");
+        assert!(app.pr_status_rerun, "the in-flight refresh is followed by another");
+        assert_eq!(app.workspaces.len(), 1, "the row survives");
+        assert_eq!(app.workspaces[0].branch_name.as_deref(), Some("elsewhere"));
+        assert_eq!(
+            app.state_baseline.workspaces[0].branch_name.as_deref(),
+            Some("elsewhere"),
+            "persisted: the baseline moves only after a successful save"
+        );
+        assert!(wt.exists(), "the dir is kept");
+        let feat = std::process::Command::new("git")
+            .args(["-C", repo.path().to_str().unwrap(), "rev-parse", "--verify", "refs/heads/feat"])
+            .output()
+            .unwrap();
+        assert!(!feat.status.success(), "the merged branch is deleted");
+        let text = render_to_string(&mut app, 100, 40);
+        assert!(text.contains("Cleaned up: ") && text.contains("now tracks"), "{text}");
+        assert!(!text.contains("Cleanup blocked"), "{text}");
+        let th = app.theme;
+        assert_eq!(fg_of(&mut app, 100, 40, "Cleaned up:"), th.text, "not an error");
+    }
+
+    #[tokio::test]
+    async fn a_removed_cleanup_drops_the_row_and_its_leftovers() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/tmp/alpha/gone".into());
+        app.workspaces[0].branch_name = Some("ws-one".into());
+        app.state.workspaces = app.workspaces.clone();
+        app.cleanup_result.insert("w1".to_string(), ("stale refusal".to_string(), true));
+        app.expanded_icon_rows.insert("w1".to_string());
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+
+        app.on_cleanup_done("w1".into(), Ok(Cleaned::Removed));
+
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "the row is gone");
+        assert!(app.state.workspaces.iter().all(|w| w.id != "w1"), "from the state too");
+        assert!(!app.cleanup_result.contains_key("w1"), "its outcome line is gone");
+        assert!(!app.expanded_icon_rows.contains("w1"), "its icon-row entry is gone");
+        assert!(app.pane_selection.is_none(), "no stale highlight");
     }
 
     #[tokio::test]
