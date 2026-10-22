@@ -1,0 +1,72 @@
+crates/core/src/workspace.rs
+  s_8c3dae337e2187::t_06aea7e6495159 17-18
+apps/tui/src/main.rs
+  s_8c3dae337e2187::t_239d717e57c8bb 10283-10317
+  s_8c3dae337e2187::t_d680120d822353 916-919,921
+  s_8c3dae337e2187::t_e17841e1f675f4 10363
+  s_8c3dae337e2187::t_de161bfe2c5225 23-24
+  s_8c3dae337e2187::t_9511f149f54c93 10504
+  s_8c3dae337e2187::t_85e2b055e7a02b 10854-10904
+  s_8c3dae337e2187::t_aa3a9af5a12432 3601-3602,3609
+  s_8c3dae337e2187::t_e8e515c8b6d7ca 3923-3925
+  s_8c3dae337e2187::t_417cc1f4cf4ca6 5477
+  s_8c3dae337e2187::t_053754a70b00a5 5380,5382
+  s_8c3dae337e2187::t_add596500f7ae4 3945-3962
+  s_8c3dae337e2187::t_6f54438ee2b2c5 10342
+  s_8c3dae337e2187::t_5108a85b361035 10387
+  s_8c3dae337e2187::t_8d9ec2c7b63a60 3918-3922,3926-3944,3963-3972
+  s_8c3dae337e2187::t_b216a2b92568f0 10282
+  s_8c3dae337e2187::t_65a87dd141e7be 10853
+README.md
+  s_8c3dae337e2187::t_c9a42de4c2de27 167
+apps/tui/src/modal.rs
+  s_8c3dae337e2187::t_31abdb239e3853 1086-1088,1090-1091,1094-1095,1097-1109
+  s_8c3dae337e2187::t_608db9795b4af8 1037
+  s_8c3dae337e2187::t_ff9cca48c35dd5 123-124
+CHANGELOG.md
+  s_8c3dae337e2187::t_0f2a173b7ed1ec 8-21
+crates/core/src/lib.rs
+  s_8c3dae337e2187::t_269ab33e6fc71b 1845-1856
+  s_8c3dae337e2187::t_9c122321cfcb11 14-15
+apps/cli/src/main.rs
+  s_8c3dae337e2187::t_f5095be76e1c77 529,534-538
+  s_8c3dae337e2187::t_d0c0a589c10f45 7-9
+  s_8c3dae337e2187::t_0da874db396bdd 836,844-848
+  s_8c3dae337e2187::t_59d742be3d3f1c 539
+  s_8c3dae337e2187::t_5eef87fddeecf0 849
+crates/core/src/cleanup.rs
+  s_8c3dae337e2187::t_d2d1fa41b2e4c1 726-732
+  s_8c3dae337e2187::t_7994e1527023f5 907
+  s_8c3dae337e2187::t_64f0325b8101a8 768
+  s_8c3dae337e2187::t_c8a44e1657b79c 770-776,779-795
+  s_8c3dae337e2187::t_2cad57ab78456d 836,838-859
+  s_8c3dae337e2187::t_c45e6cdda583f9 1616,1620-1621,1625-1626,1628,1631-1693,1696-1785
+  s_8c3dae337e2187::t_24991142e43ca8 1157,1229,1367,1547,1610,1797,1856,1919,1926,1937
+  s_8c3dae337e2187::t_b948af4864da18 1884,1888
+  s_8c3dae337e2187::t_cbe81098e0ef5f 751-759
+  s_8c3dae337e2187::t_f9d8780a51e653 911-934
+  s_8c3dae337e2187::t_6ed4d81d0f73be 668-713
+apps/tui/src/render.rs
+  s_8c3dae337e2187::t_30c66574c7136b 1221,1223-1227,1230,1233
+apps/cli/tests/cli.rs
+  s_8c3dae337e2187::t_5034232ae358da 950-972
+  s_8c3dae337e2187::t_39c04b0ffae29f 1353-1380
+  s_8c3dae337e2187::t_281f4bb42a8840 949
+  s_8c3dae337e2187::t_6267866f110370 1352
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7865c5db6e8240852caf92c80a15e03264773056",
+  "prompts": {},
+  "sessions": {
+    "s_8c3dae337e2187": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "73605743-eb2f-43de-9ded-a9832487c892",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
