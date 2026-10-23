@@ -718,8 +718,7 @@ fn probe_branch(repo_path: &str, branch: &str) -> RefProbe {
 /// absolute path from a linked one, so the output is joined onto `dir`
 /// first; `canonicalize` also folds symlinks (`/var` vs `/private/var`).
 /// None (logged by `check_git_stdout`) when git can't answer or the path
-/// can't be resolved. A repo path containing a newline is not a supported
-/// shape (the trimmed single line is taken as is).
+/// can't be resolved.
 fn common_dir(dir: &str) -> Option<std::path::PathBuf> {
     let rel = check_git_stdout(dir, &["rev-parse", "--git-common-dir"], &[])?;
     std::fs::canonicalize(std::path::Path::new(dir).join(rel))

@@ -1837,13 +1837,11 @@ impl AppState {
     /// worktree to another branch). Exact id and no save, like
     /// [`Self::remove_workspace`]; `false` when no row has that id.
     pub fn set_workspace_branch(&mut self, id: &str, branch: &str) -> bool {
-        match self.workspaces.iter_mut().find(|w| w.id == id) {
-            Some(ws) => {
-                ws.branch_name = Some(branch.to_string());
-                true
-            }
-            None => false,
-        }
+        let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == id) else {
+            return false;
+        };
+        ws.branch_name = Some(branch.to_string());
+        true
     }
 
     /// Archive a workspace (set active=false) with custom base directory.
@@ -2064,8 +2062,9 @@ pub fn plan_repo_cleanup(
         }
     }
     for v in verdicts {
-        // First match wins: names are unique per repo, and git refuses one
-        // branch in two worktrees.
+        // First match wins: two rows can share a branch after a Followed
+        // re-point; only the first is routed, and the other surfaces as a
+        // gone-branch row once the branch is gone.
         let ws = workspaces.iter().find(|w| {
             w.repo_id == repo_id
                 && w.worktree_path.is_some()
