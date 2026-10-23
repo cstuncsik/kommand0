@@ -1,0 +1,20 @@
+crates/core/src/cleanup.rs
+  s_9fb71106c43ff2::t_d2348e219948c3 71-80,780-781,845-847,896,943-945
+  s_9fb71106c43ff2::t_5a1742ce96b301 2009-2048
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "02bd0a65c26e82296f4d6b58adedd7ddece80622",
+  "prompts": {},
+  "sessions": {
+    "s_9fb71106c43ff2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e9c72bd2-8233-48ea-9b65-6cdca6848e32",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
