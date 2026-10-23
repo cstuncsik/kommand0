@@ -3984,6 +3984,58 @@ impl App {
         self.pane_selection = None;
     }
 
+    /// The repo-level twin of `workspace_delete_blocked_by_cleanup`: a repo
+    /// delete removes every row's worktree, so it waits while any of the repo's
+    /// rows has a cleanup in flight. Logs the refusal.
+    fn repo_delete_blocked_by_cleanup(&self, repo_id: &str) -> bool {
+        let blocked = self
+            .workspaces
+            .iter()
+            .any(|w| w.repo_id == repo_id && self.cleanup_inflight.contains(&w.id));
+        if blocked {
+            tracing::info!("delete: repo {repo_id} has a workspace cleanup in flight; ignored");
+        }
+        blocked
+    }
+
+    /// Delete repo `repo_id` with every row under it: stop the rows' Running
+    /// sessions, drop their panes and per-row UI entries, cascade through
+    /// `state.delete_repo` (rows, worktrees, sessions; it saves) and resync.
+    /// The one path behind `d`+`y`, `D` and [Delete] on a repo row. Refused
+    /// while any of its rows has a cleanup in flight.
+    fn delete_repo(&mut self, repo_id: &str) {
+        if self.repo_delete_blocked_by_cleanup(repo_id) {
+            return;
+        }
+        let ws_ids: Vec<String> = self
+            .state
+            .workspaces
+            .iter()
+            .filter(|w| w.repo_id == repo_id)
+            .map(|w| w.id.clone())
+            .collect();
+        for ws_id in &ws_ids {
+            if let Some(sid) = self
+                .state
+                .find_session_by_workspace(ws_id)
+                .filter(|s| s.status == SessionStatus::Running)
+                .map(|s| s.id.clone())
+            {
+                let _ = self.state.update_session_status(&sid, SessionStatus::Stopped);
+            }
+            self.embedded.remove(ws_id);
+            self.expanded_icon_rows.remove(ws_id);
+            self.cleanup_result.remove(ws_id);
+        }
+        let _ = self.state.delete_repo(repo_id);
+        self.expanded.remove(repo_id);
+        self.repos = self.state.repos.clone();
+        self.workspaces = self.state.workspaces.clone();
+        self.rebuild_tree();
+        self.clamp_selection();
+        self.pane_selection = None;
+    }
+
     /// A workspace cleanup landed: a removal drops the row, a followed worktree
     /// re-points it, a refusal shows in its pane.
     fn on_cleanup_done(&mut self, ws_id: String, result: Result<Cleaned, String>) {
@@ -4661,31 +4713,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         app.delete_workspace(&id);
                     }
                     modal::DeleteTarget::Repo { id, .. } => {
-                        // Stop all running sessions for this repo's workspaces
-                        let ws_ids: Vec<String> = app
-                            .state
-                            .workspaces
-                            .iter()
-                            .filter(|w| w.repo_id == id)
-                            .map(|w| w.id.clone())
-                            .collect();
-                        for ws_id in &ws_ids {
-                            if let Some(s) = app.state.find_session_by_workspace(ws_id)
-                                && s.status == SessionStatus::Running
-                            {
-                                let sid = s.id.clone();
-                                let _ = app
-                                    .state
-                                    .update_session_status(&sid, SessionStatus::Stopped);
-                            }
-                            app.embedded.remove(ws_id);
-                        }
-                        let _ = app.state.delete_repo(&id);
-                        app.repos = app.state.repos.clone();
-                        app.workspaces = app.state.workspaces.clone();
-                        app.expanded.remove(&id);
-                        app.rebuild_tree();
-                        app.update_active_session();
+                        app.delete_repo(&id);
                     }
                     modal::DeleteTarget::Profile { name, .. } => {
                         app.start_profile_delete(&name);
@@ -4970,7 +4998,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Action::AddRepo => app.open_add_repo_modal(),
                 Action::AddWorkspace => app.open_add_workspace_modal_for_selection(),
                 Action::Delete => match app.tree_items.get(app.selected_index).cloned() {
-                    Some(TreeNode::Workspace { ws, repo_name }) => {
+                    Some(TreeNode::Workspace { ws, repo_name })
+                        if !app.workspace_delete_blocked_by_cleanup(&ws.id) =>
+                    {
                         app.modal = modal::ModalState::ConfirmDelete {
                             target: modal::DeleteTarget::Workspace {
                                 id: ws.id,
@@ -4979,7 +5009,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             },
                         };
                     }
-                    Some(TreeNode::Repo { id, name, .. }) => {
+                    Some(TreeNode::Repo { id, name, .. })
+                        if !app.repo_delete_blocked_by_cleanup(&id) =>
+                    {
                         let ws_count =
                             app.workspaces.iter().filter(|w| w.repo_id == id).count();
                         app.modal = modal::ModalState::ConfirmDelete {
@@ -5000,30 +5032,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         app.delete_workspace(&ws.id);
                     }
                     Some(TreeNode::Repo { id, .. }) => {
-                        let ws_ids: Vec<String> = app
-                            .state
-                            .workspaces
-                            .iter()
-                            .filter(|w| w.repo_id == id)
-                            .map(|w| w.id.clone())
-                            .collect();
-                        for ws_id in &ws_ids {
-                            if let Some(s) = app.state.find_session_by_workspace(ws_id)
-                                && s.status == SessionStatus::Running
-                            {
-                                let sid = s.id.clone();
-                                let _ = app
-                                    .state
-                                    .update_session_status(&sid, SessionStatus::Stopped);
-                            }
-                            app.embedded.remove(ws_id);
-                        }
-                        let _ = app.state.delete_repo(&id);
-                        app.repos = app.state.repos.clone();
-                        app.workspaces = app.state.workspaces.clone();
-                        app.expanded.remove(&id);
-                        app.rebuild_tree();
-                        app.update_active_session();
+                        app.delete_repo(&id);
                     }
                     _ => {}
                 },
@@ -5685,31 +5694,10 @@ async fn run(
                             app.delete_workspace(&workspace_id);
                         }
                         buttons::HitAction::DeleteRepoFor { repo_name } => {
-                            // Stop all running sessions for this repo's workspaces
+                            // Resolve the name once; the helper keys on the id.
+                            // Event loop only, so unit tests cover it through `D`.
                             if let Ok(repo) = app.state.resolve_repo(&repo_name).cloned() {
-                                let ws_ids: Vec<String> = app.state.workspaces.iter()
-                                    .filter(|w| w.repo_id == repo.id)
-                                    .map(|w| w.id.clone())
-                                    .collect();
-                                for ws_id in &ws_ids {
-                                    if let Some(session_id) = app.state.find_session_by_workspace(ws_id)
-                                        .filter(|s| s.status == SessionStatus::Running)
-                                        .map(|s| s.id.clone())
-                                    {
-                                        let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
-                                    }
-                                    app.embedded.remove(ws_id);
-                                    app.expanded_icon_rows.remove(ws_id);
-                                }
-                                if app.state.delete_repo(&repo_name).is_ok() {
-                                    app.expanded.remove(&repo.id);
-                                    app.repos = app.state.repos.clone();
-                                    app.workspaces = app.state.workspaces.clone();
-                                    app.rebuild_tree();
-                                    // Re-seat off any hint row and re-sync the
-                                    // active session (clamp_selection does both).
-                                    app.clamp_selection();
-                                }
+                                app.delete_repo(&repo.id);
                             }
                         }
                         buttons::HitAction::AddWorkspaceFor { repo_id } => {
@@ -10992,6 +10980,138 @@ mod key_tests {
             app.state_baseline.workspaces.iter().all(|w| w.id != "w1"),
             "persisted with a merge-save: the baseline moves only after a successful save"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_is_ignored_while_the_rows_cleanup_runs() {
+        let mut app = test_app();
+        // Under a TempDir, like the Removed test: the accept side's delete
+        // runs `remove_worktree` on the path.
+        let wt = tempfile::TempDir::new().unwrap();
+        app.workspaces[0].worktree_path =
+            Some(wt.path().join("wt").to_string_lossy().into_owned());
+        app.workspaces[0].branch_name = Some("ws-one".into());
+        app.workspaces.push(mk_ws("w2", "ws-two", "r1", None)); // a fallback row
+        app.state.workspaces = app.workspaces.clone();
+        app.state.sessions.push(kommand0_core::Session {
+            id: "s1".into(),
+            workspace_id: "w1".into(),
+            claude_session_id: None,
+            pid: None,
+            status: SessionStatus::Running,
+            created_at: 0,
+            ended_at: None,
+            log_file: String::new(),
+        });
+        // No PTY: pins that the delete drops the pane entry.
+        app.embedded.insert(
+            "w1".into(),
+            WorkspaceSessions { tabs: vec![], active: 0, last_active: None },
+        );
+        // The baseline holds both rows, so the baseline checks below bite.
+        app.state_baseline = app.state.clone();
+        app.expanded.insert("r1".into());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        assert!(matches!(app.tree_items[app.selected_index], TreeNode::Workspace { .. }));
+        app.cleanup_inflight.insert("w1".into());
+
+        // Refused while the cleanup owns the row: `d` opens nothing, `D` and a
+        // confirmed modal change nothing (the handler clears the modal before
+        // dispatch either way, so the modal is not the signal there).
+        press(&mut app, KeyCode::Char('d')).await;
+        assert!(matches!(app.modal, modal::ModalState::None), "d opens no modal");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert_eq!(app.workspaces.len(), 2, "D is ignored");
+        assert!(app.embedded.contains_key("w1"), "the pane entry survives");
+        app.modal = modal::ModalState::ConfirmDelete {
+            target: modal::DeleteTarget::Workspace {
+                id: "w1".into(),
+                name: "ws-one".into(),
+                repo: "alpha".into(),
+            },
+        };
+        press(&mut app, KeyCode::Char('y')).await;
+        assert_eq!(app.workspaces.len(), 2, "a confirmed delete is ignored");
+        assert_eq!(app.state.sessions[0].status, SessionStatus::Running, "session untouched");
+
+        // Per row: a sibling with no cleanup in flight still deletes.
+        app.select_workspace_row("w2");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.workspaces.iter().all(|w| w.id != "w2"), "w2 is gone");
+        assert!(app.workspaces.iter().any(|w| w.id == "w1"), "w1 stays");
+        assert!(app.state_baseline.workspaces.iter().all(|w| w.id != "w2"), "w2's delete saved");
+        assert!(app.state_baseline.workspaces.iter().any(|w| w.id == "w1"), "w1 still persisted");
+
+        // Once the cleanup is done the same keys delete. `D` is the same path
+        // as the [Delete] button, whose arm is event-loop only.
+        app.cleanup_inflight.remove("w1");
+        app.select_workspace_row("w1");
+        press(&mut app, KeyCode::Char('d')).await;
+        assert!(matches!(
+            &app.modal,
+            modal::ModalState::ConfirmDelete {
+                target: modal::DeleteTarget::Workspace { id, .. }
+            } if id == "w1"
+        ));
+        press(&mut app, KeyCode::Char('y')).await;
+        assert!(app.workspaces.is_empty());
+        assert!(app.state.workspaces.is_empty());
+        assert!(!app.embedded.contains_key("w1"), "the pane entry is dropped");
+        assert!(
+            app.state_baseline.workspaces.iter().all(|w| w.id != "w1"),
+            "persisted with one merge-save"
+        );
+        let s1 = &app.state.sessions[0];
+        assert_eq!(s1.status, SessionStatus::Stopped, "its legacy session is stopped");
+        assert!(s1.ended_at.is_some());
+        assert_eq!(app.repos.len(), 2, "nothing deleted the repo");
+    }
+
+    #[tokio::test]
+    async fn repo_delete_is_ignored_while_one_of_its_rows_cleans_up() {
+        let mut app = test_app();
+        app.cleanup_inflight.insert("w1".into());
+        app.select_repo_row("r1");
+
+        // Refused while a row's cleanup owns its worktree: `d` opens nothing,
+        // `D` and a confirmed modal change nothing.
+        press(&mut app, KeyCode::Char('d')).await;
+        assert!(matches!(app.modal, modal::ModalState::None), "d opens no modal");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert_eq!(app.repos.len(), 2, "D is ignored");
+        assert_eq!(app.workspaces.len(), 1);
+        app.modal = modal::ModalState::ConfirmDelete {
+            target: modal::DeleteTarget::Repo {
+                id: "r1".into(),
+                name: "alpha".into(),
+                workspace_count: 1,
+            },
+        };
+        press(&mut app, KeyCode::Char('y')).await;
+        assert_eq!(app.repos.len(), 2, "a confirmed delete is ignored");
+        assert!(app.workspaces.iter().any(|w| w.id == "w1"));
+
+        // Per repo: another repo still deletes.
+        app.select_repo_row("r2");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.repos.iter().all(|r| r.id != "r2"), "r2 is gone");
+        assert!(app.repos.iter().any(|r| r.id == "r1"), "r1 stays");
+        assert!(app.workspaces.iter().any(|w| w.id == "w1"), "w1 stays");
+
+        // Once the cleanup is done the same keys delete.
+        app.cleanup_inflight.remove("w1");
+        app.select_repo_row("r1");
+        press(&mut app, KeyCode::Char('d')).await;
+        assert!(matches!(
+            &app.modal,
+            modal::ModalState::ConfirmDelete {
+                target: modal::DeleteTarget::Repo { id, workspace_count: 1, .. }
+            } if id == "r1"
+        ));
+        press(&mut app, KeyCode::Char('y')).await;
+        assert!(app.repos.is_empty());
+        assert!(app.workspaces.is_empty());
     }
 
     #[tokio::test]
