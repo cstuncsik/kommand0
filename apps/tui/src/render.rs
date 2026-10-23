@@ -478,7 +478,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         };
 
                         // Build repo line icons: ✕ (delete) + (add workspace)
-                        let icons = repo_line_icons(th, id, name, pane_inner_width);
+                        let icons = repo_line_icons(th, id, pane_inner_width);
 
                         let prefix = format!("{indicator}{name}");
                         let prefix_width = UnicodeWidthStr::width(prefix.as_str());
@@ -1625,7 +1625,7 @@ pub(crate) fn workspace_icon_cluster(
 }
 
 /// Build icons for a repo line: ✕ (delete repo) + (add workspace)
-fn repo_line_icons(th: Theme, repo_id: &str, repo_name: &str, pane_inner_width: usize) -> IconCluster {
+fn repo_line_icons(th: Theme, repo_id: &str, pane_inner_width: usize) -> IconCluster {
     let icon_style = Style::default().fg(th.accent);
 
     if pane_inner_width < 20 {
@@ -1650,7 +1650,7 @@ fn repo_line_icons(th: Theme, repo_id: &str, repo_name: &str, pane_inner_width: 
         hit_regions: vec![
             (
                 HitAction::DeleteRepoFor {
-                    repo_name: repo_name.to_string(),
+                    repo_id: repo_id.to_string(),
                 },
                 2,
             ),
@@ -2014,13 +2014,13 @@ mod tests {
 
     #[test]
     fn repo_line_icons_normal_width() {
-        let icons = repo_line_icons(Theme::default(), "r-1", "myrepo", 40);
+        let icons = repo_line_icons(Theme::default(), "r-1", 40);
         assert_eq!(icons.total_width, 4); // delete + add
         assert_eq!(icons.hit_regions.len(), 2);
         assert_eq!(
             icons.hit_regions[0].0,
             HitAction::DeleteRepoFor {
-                repo_name: "myrepo".to_string()
+                repo_id: "r-1".to_string()
             }
         );
         assert_eq!(
@@ -2033,7 +2033,7 @@ mod tests {
 
     #[test]
     fn repo_line_icons_narrow_hidden() {
-        let icons = repo_line_icons(Theme::default(), "r-1", "myrepo", 15);
+        let icons = repo_line_icons(Theme::default(), "r-1", 15);
         assert_eq!(icons.total_width, 0);
         assert!(icons.hit_regions.is_empty());
     }
@@ -2044,7 +2044,7 @@ mod tests {
         // chrome color comes from the theme rather than a hardcoded `Color`.
         let custom = ratatui::style::Color::Rgb(1, 2, 3);
         let theme = Theme { accent: custom, ..Theme::default() };
-        let icons = repo_line_icons(theme, "r-1", "myrepo", 40);
+        let icons = repo_line_icons(theme, "r-1", 40);
         assert!(
             icons.spans.iter().all(|s| s.style.fg == Some(custom)),
             "repo icon spans should use the theme accent color"

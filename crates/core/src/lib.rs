@@ -898,23 +898,14 @@ impl AppState {
         prune_repos.sort();
         prune_repos.dedup();
         for repo_path in &prune_repos {
-            let out = std::process::Command::new("git")
-                .args(["-C", repo_path, "worktree", "prune"])
-                .output();
-            match out {
-                Ok(out) if out.status.success() => {}
-                // git's stderr can echo arbitrary path bytes: never raw.
-                Ok(out) => warnings.push(format!(
+            // git's stderr can echo arbitrary path bytes: never raw.
+            if let Err(e) = worktree::prune_worktrees(repo_path) {
+                warnings.push(format!(
                     "couldn't prune worktrees in {}: {} (run `git worktree prune` \
                      there by hand)",
                     repo_path.escape_debug(),
-                    String::from_utf8_lossy(&out.stderr).trim().escape_debug()
-                )),
-                Err(e) => warnings.push(format!(
-                    "couldn't prune worktrees in {}: {e} (run `git worktree prune` \
-                     there by hand)",
-                    repo_path.escape_debug()
-                )),
+                    e.escape_debug()
+                ));
             }
         }
         Ok((summary, warnings))
@@ -1162,6 +1153,13 @@ impl AppState {
     /// Scope: this protects concurrent CLI *adds* and *deletes*. A CLI *in-place
     /// edit* to a row the TUI also holds is still lost on the TUI's next save —
     /// there's no per-field/version comparison, and "mine wins" overwrites it.
+    ///
+    /// The result is referentially consistent for what came from disk: a row
+    /// another process added under a parent the merge no longer has (a
+    /// workspace created under a repo we deleted meanwhile) is dropped too,
+    /// its worktree dir and session log, if any, left on disk like every
+    /// mine-wins loss. Rows we hold are written back as they are, so a legacy
+    /// orphan we loaded does not flip-flop between merge-saves and plain saves.
     pub fn merged_over(&self, baseline: &AppState, disk: AppState) -> AppState {
         use std::collections::HashSet;
 
@@ -1204,7 +1202,7 @@ impl AppState {
             out
         }
 
-        AppState {
+        let mut merged = AppState {
             version: Self::STATE_VERSION,
             repos: merge_vec(&self.repos, &baseline.repos, disk.repos, |r| r.id.as_str()),
             workspaces: merge_vec(&self.workspaces, &baseline.workspaces, disk.workspaces, |w| {
@@ -1225,7 +1223,26 @@ impl AppState {
             // rather than a stale on-disk value clobbering the live tree.
             repo_sort: self.repo_sort,
             workspace_sort: self.workspace_sort,
-        }
+        };
+        // Children of a parent the merge dropped would persist as orphans.
+        // Only disk-only rows are checked: what we hold is written back as is.
+        let mine_ws: HashSet<&str> = self.workspaces.iter().map(|w| w.id.as_str()).collect();
+        let repo_ids: HashSet<&str> = merged.repos.iter().map(|r| r.id.as_str()).collect();
+        merged.workspaces.retain(|w| {
+            mine_ws.contains(w.id.as_str()) || repo_ids.contains(w.repo_id.as_str())
+        });
+        let mine_sessions: HashSet<&str> = self.sessions.iter().map(|s| s.id.as_str()).collect();
+        let ws_ids: HashSet<&str> = merged.workspaces.iter().map(|w| w.id.as_str()).collect();
+        merged.sessions.retain(|s| {
+            mine_sessions.contains(s.id.as_str()) || ws_ids.contains(s.workspace_id.as_str())
+        });
+        merged
+            .embedded_sessions
+            .retain(|k, _| self.embedded_sessions.contains_key(k) || ws_ids.contains(k.as_str()));
+        merged
+            .embedded_titles
+            .retain(|k, _| self.embedded_titles.contains_key(k) || ws_ids.contains(k.as_str()));
+        merged
     }
 
     /// Mint a persisted embedded-session entry: `prefix` + a fresh UUID v4.
@@ -1460,7 +1477,25 @@ impl AppState {
         repo_ref: &str,
         base: &Path,
     ) -> anyhow::Result<RepoEntry> {
-        let repo = self.resolve_repo(repo_ref)?.clone();
+        let id = self.resolve_repo(repo_ref)?.id.clone();
+        let repo = self.remove_repo(&id).ok_or_else(|| anyhow::anyhow!("repo not found: {id}"))?;
+        self.save_to(base)?;
+        Ok(repo)
+    }
+
+    /// Delete a repo, saving state to the default state directory.
+    pub fn delete_repo(&mut self, repo_ref: &str) -> anyhow::Result<RepoEntry> {
+        self.delete_repo_with_base(repo_ref, Self::state_dir().as_path())
+    }
+
+    /// Remove the repo with EXACTLY this id (never a name match) and everything
+    /// under it from the in-memory state: its sessions (and their log files),
+    /// its workspaces (and their worktrees) with their `embedded_sessions`/
+    /// `embedded_titles` entries, then the repo. No save, like
+    /// [`Self::remove_workspace`]: the caller persists. `None` when no repo
+    /// has that id, a no-op. User-facing refs stay on [`Self::delete_repo`].
+    pub fn remove_repo(&mut self, id: &str) -> Option<RepoEntry> {
+        let repo = self.repos.iter().find(|r| r.id == id)?.clone();
 
         // Collect workspace IDs for this repo
         let ws_ids: Vec<String> = self
@@ -1504,14 +1539,7 @@ impl AppState {
 
         // Remove the repo itself
         self.repos.retain(|r| r.id != repo.id);
-
-        self.save_to(base)?;
-        Ok(repo)
-    }
-
-    /// Delete a repo, saving state to the default state directory.
-    pub fn delete_repo(&mut self, repo_ref: &str) -> anyhow::Result<RepoEntry> {
-        self.delete_repo_with_base(repo_ref, Self::state_dir().as_path())
+        Some(repo)
     }
 
     // --- Workspace methods ---
@@ -1740,7 +1768,7 @@ impl AppState {
     /// Trade-off: in that shadow state the TUI's by-id archive/activate
     /// calls hit the error and silently no-op until the shadowing row is
     /// deleted by its own id; destructive deletes are immune, they use the
-    /// exact-id [`Self::delete_workspace_by_id`] path instead.
+    /// exact-id [`Self::remove_workspace`] path instead.
     fn workspace_index(&self, ws_ref: &str) -> anyhow::Result<usize> {
         let matches: Vec<usize> = self
             .workspaces
@@ -1781,10 +1809,9 @@ impl AppState {
         Ok(&self.workspaces[self.workspace_index(ws_ref)?])
     }
 
-    /// Shared removal body once a delete entry point has resolved the row
-    /// index: drop the row, its embedded-session bookkeeping, and its
-    /// worktree, then save.
-    fn remove_workspace_at(&mut self, idx: usize, base: &Path) -> anyhow::Result<Workspace> {
+    /// Shared removal body once an entry point has resolved the row index: drop
+    /// the row, its embedded-session bookkeeping and its git worktree. No save.
+    fn remove_workspace_at(&mut self, idx: usize) -> Workspace {
         let removed = self.workspaces.remove(idx);
         self.embedded_sessions.remove(&removed.id);
         self.embedded_titles.remove(&removed.id);
@@ -1795,9 +1822,7 @@ impl AppState {
         {
             let _ = worktree::remove_worktree(&repo.path, wt_path);
         }
-
-        self.save_to(base)?;
-        Ok(removed)
+        removed
     }
 
     /// Delete a workspace by name or ID, saving to custom base directory.
@@ -1808,7 +1833,9 @@ impl AppState {
         base: &Path,
     ) -> anyhow::Result<Workspace> {
         let idx = self.workspace_index(ws_ref)?;
-        self.remove_workspace_at(idx, base)
+        let removed = self.remove_workspace_at(idx);
+        self.save_to(base)?;
+        Ok(removed)
     }
 
     /// Delete a workspace by name or ID, saving to the default state directory.
@@ -1816,42 +1843,31 @@ impl AppState {
         self.delete_workspace_with_base(ws_ref, Self::state_dir().as_path())
     }
 
-    /// Delete a workspace by its EXACT id, never falling back to a name
-    /// match: "workspace not found" when the id is absent. For callers
-    /// holding an authentic state-held id (the TUI's tree actions, the CLI
-    /// cleanup's second step): immune to name shadowing AND to the race
-    /// where the row is deleted meanwhile and a new workspace is created
-    /// NAMED that id string, which a ws_ref lookup would mis-target.
-    /// User-facing refs stay on [`Self::delete_workspace`].
-    pub fn delete_workspace_by_id_with_base(
-        &mut self,
-        id: &str,
-        base: &Path,
-    ) -> anyhow::Result<Workspace> {
-        let idx = self
-            .workspaces
-            .iter()
-            .position(|w| w.id == id)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {id}"))?;
-        self.remove_workspace_at(idx, base)
+    /// Remove the workspace with EXACTLY this id (never a name match) from the
+    /// in-memory state: the row, its `embedded_sessions`/`embedded_titles`
+    /// entries and its git worktree ([`worktree::remove_worktree`], idempotent:
+    /// a dir already gone still clears an empty `worktrees/<repo-id>/`). No
+    /// save: the caller persists (`save_to`, or the TUI's merge-aware
+    /// `save_state`), so a concurrent `kmd` write is merged, not clobbered.
+    /// `None` when no row has that id, a no-op: immune to name shadowing AND to
+    /// the race where the row was deleted meanwhile and a new workspace is NAMED
+    /// that id string, which a ws_ref lookup would mis-target. For callers
+    /// holding a state-held id (the TUI's tree actions, the cleanups);
+    /// user-facing refs stay on [`Self::delete_workspace`].
+    pub fn remove_workspace(&mut self, id: &str) -> Option<Workspace> {
+        let idx = self.workspaces.iter().position(|w| w.id == id)?;
+        Some(self.remove_workspace_at(idx))
     }
 
-    /// [`Self::delete_workspace_by_id_with_base`] against the default state
-    /// directory.
-    pub fn delete_workspace_by_id(&mut self, id: &str) -> anyhow::Result<Workspace> {
-        self.delete_workspace_by_id_with_base(id, Self::state_dir().as_path())
-    }
-
-    /// Record `branch` as workspace `id`'s branch (a cleanup followed its worktree
-    /// to another branch) and save. Exact id, like [`Self::delete_workspace_by_id`].
-    pub fn set_workspace_branch_by_id(&mut self, id: &str, branch: &str) -> anyhow::Result<()> {
-        let ws = self
-            .workspaces
-            .iter_mut()
-            .find(|w| w.id == id)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {id}"))?;
+    /// Record `branch` as workspace `id`'s branch (a cleanup followed its
+    /// worktree to another branch). Exact id and no save, like
+    /// [`Self::remove_workspace`]; `false` when no row has that id.
+    pub fn set_workspace_branch(&mut self, id: &str, branch: &str) -> bool {
+        let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == id) else {
+            return false;
+        };
         ws.branch_name = Some(branch.to_string());
-        self.save()
+        true
     }
 
     /// Archive a workspace (set active=false) with custom base directory.
@@ -1948,22 +1964,14 @@ impl AppState {
         self.sessions.iter_mut().find(|s| s.id == session_id)
     }
 
-    /// Update session status, saving state to a custom base directory.
-    /// Sets ended_at for terminal states (Stopped, Failed, Exited).
-    pub fn update_session_status_with_base(
-        &mut self,
-        session_id: &str,
-        status: SessionStatus,
-        base: &Path,
-    ) -> anyhow::Result<()> {
-        let session = self
-            .sessions
-            .iter_mut()
-            .find(|s| s.id == session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
-
+    /// Record `status` on `session_id`, stamping `ended_at` for a terminal state
+    /// (Stopped, Failed, Exited). No save; `false` when no session has that id.
+    /// [`Self::update_session_status`] is the saving form.
+    pub fn set_session_status(&mut self, session_id: &str, status: SessionStatus) -> bool {
+        let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else {
+            return false;
+        };
         session.status = status.clone();
-
         match status {
             SessionStatus::Stopped | SessionStatus::Failed | SessionStatus::Exited => {
                 session.ended_at = Some(
@@ -1975,7 +1983,21 @@ impl AppState {
             }
             SessionStatus::Running => {}
         }
+        true
+    }
 
+    /// Update session status, saving state to a custom base directory.
+    /// Sets ended_at for terminal states (Stopped, Failed, Exited); see
+    /// [`Self::set_session_status`].
+    pub fn update_session_status_with_base(
+        &mut self,
+        session_id: &str,
+        status: SessionStatus,
+        base: &Path,
+    ) -> anyhow::Result<()> {
+        if !self.set_session_status(session_id, status) {
+            bail!("session not found: {session_id}");
+        }
         self.save_to(base)?;
         Ok(())
     }
@@ -2032,18 +2054,43 @@ impl RepoCleanupItem {
 /// the state.json row, whatever state the worktree dir or its admin entry is in
 /// (a manually deleted + pruned worktree scans as a bare Delete). Any other
 /// CheckedOut is a Skip naming the path, plus "; run git worktree prune" when the
-/// dir no longer exists. Output order: Delete, Workspace, Skip (skips sorted by
-/// reason). Routes by name only: no path comparison, so symlinked state dirs
-/// and realpath differences are irrelevant.
+/// dir no longer exists. An own-branch row whose `branch_name` matches no
+/// verdict at all (its branch is gone) becomes a Workspace item too, after the
+/// scanned ones: the workspace cleanup clears or follows it; a malformed name is
+/// a Skip ("malformed branch name"). Output order: Delete, Workspace (scanned
+/// rows, then gone-branch rows), Skip (skips sorted by reason). Routes by name
+/// only: no path comparison, so symlinked state dirs and realpath differences
+/// are irrelevant.
 pub fn plan_repo_cleanup(
     verdicts: Vec<BranchVerdict>,
     repo_id: &str,
     workspaces: &[Workspace],
 ) -> Vec<RepoCleanupItem> {
     let (mut deletes, mut routed, mut skips) = (Vec::new(), Vec::new(), Vec::new());
+    // Rows whose branch the scan never saw: it is gone (or never was). Routed
+    // like any other and with no marker: the workspace cleanup decides whether
+    // there is nothing left (Removed), a live dir on another branch (Followed)
+    // or wreckage (a refusal), so the preview must not promise "nothing left".
+    // A name `is_valid_branch_name` rejects (hand-edited state) is a Skip: it
+    // would be echoed raw by the CLI and torn down for a certain refusal.
+    let mut gone = Vec::new();
+    for w in workspaces.iter().filter(|w| w.repo_id == repo_id && w.worktree_path.is_some()) {
+        let Some(branch) = w.branch_name.as_deref() else {
+            continue;
+        };
+        if verdicts.iter().any(|v| v.branch == branch) {
+            continue;
+        }
+        if git::is_valid_branch_name(branch) {
+            gone.push(RepoCleanupItem::Workspace { ws_id: w.id.clone(), branch: branch.to_string() });
+        } else {
+            skips.push(("malformed branch name".to_string(), branch.escape_debug().to_string()));
+        }
+    }
     for v in verdicts {
-        // First match wins: names are unique per repo, and git refuses one
-        // branch in two worktrees.
+        // First match wins: two rows can share a branch after a Followed
+        // re-point; only the first is routed, and the other surfaces as a
+        // gone-branch row once the branch is gone.
         let ws = workspaces.iter().find(|w| {
             w.repo_id == repo_id
                 && w.worktree_path.is_some()
@@ -2065,6 +2112,7 @@ pub fn plan_repo_cleanup(
             }
         }
     }
+    routed.extend(gone);
     skips.sort();
     deletes.extend(routed);
     deletes.extend(
@@ -2105,6 +2153,11 @@ mod tests {
                 added_at: Some(100 + i as u64),
             })
             .collect()
+    }
+
+    /// A state holding repo `r` (the parent every `ws` row points at) and `workspaces`.
+    fn under_r(workspaces: Vec<Workspace>) -> AppState {
+        AppState { repos: repos_named(&["r"]), workspaces, ..Default::default() }
     }
 
     fn repo_order(state: &AppState) -> Vec<String> {
@@ -2262,10 +2315,9 @@ mod tests {
     fn merge_preserves_cli_adds_and_respects_tui_deletes() {
         // baseline = what the TUI loaded; mine = TUI's in-memory state (deleted B,
         // added C); disk = the file now (a CLI added D; B not yet deleted on disk).
-        let baseline = AppState { workspaces: vec![ws("A", "a"), ws("B", "b")], ..Default::default() };
-        let mine = AppState { workspaces: vec![ws("A", "a"), ws("C", "c")], ..Default::default() };
-        let disk =
-            AppState { workspaces: vec![ws("A", "a"), ws("B", "b"), ws("D", "d")], ..Default::default() };
+        let baseline = under_r(vec![ws("A", "a"), ws("B", "b")]);
+        let mine = under_r(vec![ws("A", "a"), ws("C", "c")]);
+        let disk = under_r(vec![ws("A", "a"), ws("B", "b"), ws("D", "d")]);
 
         let merged = mine.merged_over(&baseline, disk);
         let ids: std::collections::HashSet<&str> =
@@ -2279,9 +2331,9 @@ mod tests {
 
     #[test]
     fn merge_lets_mine_win_on_a_conflicting_edit() {
-        let baseline = AppState { workspaces: vec![ws("A", "v1")], ..Default::default() };
-        let mine = AppState { workspaces: vec![ws("A", "mine")], ..Default::default() };
-        let disk = AppState { workspaces: vec![ws("A", "disk")], ..Default::default() };
+        let baseline = under_r(vec![ws("A", "v1")]);
+        let mine = under_r(vec![ws("A", "mine")]);
+        let disk = under_r(vec![ws("A", "disk")]);
         let merged = mine.merged_over(&baseline, disk);
         assert_eq!(merged.workspaces.len(), 1);
         assert_eq!(merged.workspaces[0].name, "mine", "in-memory copy wins for a shared id");
@@ -2292,12 +2344,14 @@ mod tests {
         let mk = |pairs: &[(&str, &str)]| -> HashMap<String, Vec<String>> {
             pairs.iter().map(|(k, v)| (k.to_string(), vec![v.to_string()])).collect()
         };
-        let baseline = AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b")]), ..Default::default() };
+        // All three hold rows A, B and C, so only the maps differ.
+        let rows = || vec![ws("A", "a"), ws("B", "b"), ws("C", "c")];
+        let baseline = AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b")]), ..under_r(rows()) };
         // TUI deleted B and re-tabbed A with a shell tab (the merge treats the
         // Vec opaquely, so a sentinel entry rides through untouched); a CLI added C.
-        let mine = AppState { embedded_sessions: mk(&[("A", "shell:a2")]), ..Default::default() };
+        let mine = AppState { embedded_sessions: mk(&[("A", "shell:a2")]), ..under_r(rows()) };
         let disk =
-            AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b"), ("C", "c")]), ..Default::default() };
+            AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b"), ("C", "c")]), ..under_r(rows()) };
         let merged = mine.merged_over(&baseline, disk);
         assert_eq!(merged.embedded_sessions.get("A").unwrap(), &vec!["shell:a2".to_string()], "mine wins");
         assert!(!merged.embedded_sessions.contains_key("B"), "TUI delete respected");
@@ -2308,16 +2362,63 @@ mod tests {
     fn merge_save_reloads_and_preserves_a_concurrent_add() {
         let tmp = TempDir::new().unwrap();
         // Disk already has a workspace the TUI never saw (a CLI added it).
-        let disk = AppState { workspaces: vec![ws("cli", "from-cli")], ..Default::default() };
+        let disk = under_r(vec![ws("cli", "from-cli")]);
         disk.save_to(tmp.path()).unwrap();
-        // The TUI loaded an empty baseline, created its own workspace, and saves.
-        let baseline = AppState::default();
-        let mine = AppState { workspaces: vec![ws("tui", "from-tui")], ..Default::default() };
+        // The TUI loaded a row-less baseline, created its own workspace, and saves.
+        let baseline = under_r(vec![]);
+        let mine = under_r(vec![ws("tui", "from-tui")]);
         mine.merge_save_to(&baseline, tmp.path()).unwrap();
         let on_disk = AppState::load_from(tmp.path()).unwrap();
         let ids: std::collections::HashSet<&str> =
             on_disk.workspaces.iter().map(|w| w.id.as_str()).collect();
         assert!(ids.contains("cli") && ids.contains("tui"), "both survive the save: {ids:?}");
+    }
+
+    #[test]
+    fn merge_drops_children_of_a_deleted_parent() {
+        // We deleted repo r; a CLI added W under it meanwhile, with a session,
+        // a tab row and a title. The merge keeps our delete, so everything
+        // keyed on W must go with it rather than land orphaned in state.json.
+        let baseline = under_r(vec![]);
+        let disk = || AppState {
+            sessions: vec![Session {
+                id: "S".into(),
+                workspace_id: "W".into(),
+                claude_session_id: None,
+                pid: None,
+                status: SessionStatus::Running,
+                created_at: 0,
+                ended_at: None,
+                log_file: String::new(),
+            }],
+            embedded_sessions: HashMap::from([("W".to_string(), vec!["c".to_string()])]),
+            embedded_titles: HashMap::from([(
+                "W".to_string(),
+                HashMap::from([("c".to_string(), "title".to_string())]),
+            )]),
+            ..under_r(vec![ws("W", "w")])
+        };
+
+        let merged = AppState::default().merged_over(&baseline, disk());
+        assert!(merged.repos.is_empty(), "our delete wins");
+        assert!(merged.workspaces.is_empty(), "the row under the deleted repo goes too");
+        assert!(merged.sessions.is_empty(), "and its session");
+        assert!(merged.embedded_sessions.is_empty(), "and its tab row");
+        assert!(merged.embedded_titles.is_empty(), "and its titles");
+
+        // Control: with the repo still held, everything under it survives.
+        let merged = under_r(vec![]).merged_over(&baseline, disk());
+        assert_eq!(merged.workspaces.len(), 1, "a concurrent add under a live repo survives");
+        assert_eq!(merged.sessions.len(), 1);
+        assert!(merged.embedded_sessions.contains_key("W"));
+        assert!(merged.embedded_titles.contains_key("W"));
+
+        // A legacy orphan WE hold (its repo row missing in every copy) is written
+        // back as is: the sweep is for disk-only rows, so it cannot flip-flop
+        // between our merge-saves and the next plain save.
+        let mine = AppState { workspaces: vec![ws("orphan", "o")], ..Default::default() };
+        let merged = mine.merged_over(&AppState::default(), AppState::default());
+        assert_eq!(merged.workspaces.len(), 1, "a held orphan survives the sweep");
     }
 
     #[test]
@@ -2479,24 +2580,79 @@ mod tests {
     }
 
     #[test]
-    fn delete_workspace_by_id_ignores_name_shadowing() {
+    fn exact_id_mutators_ignore_name_shadowing() {
         // Shadow state: workspace A is NAMED exactly workspace B's id. The
-        // exact-id delete must hit the id-matched row, never the name.
-        let tmp = TempDir::new().unwrap();
+        // exact-id mutators must hit the id-matched row, never the name.
         let mut state = AppState::default();
         state.workspaces.push(ws("b-id", "b-name"));
         state.workspaces.push(ws("a-id", "b-id")); // A named exactly B's id
-        let removed = state.delete_workspace_by_id_with_base("b-id", tmp.path()).unwrap();
+        let removed = state.remove_workspace("b-id").unwrap();
         assert_eq!(removed.id, "b-id", "the id match wins over the shadowing name");
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.workspaces[0].id, "a-id", "the shadowing row is untouched");
 
         // The id row is gone and a workspace NAMED that id string remains
-        // (the deleted-row-plus-name-reuse race): the by-id delete must NOT
-        // fall back to the name match. Error, nothing mutated.
-        let err = state.delete_workspace_by_id_with_base("b-id", tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("workspace not found"), "{err}");
-        assert_eq!(state.workspaces.len(), 1, "no name-match fallback delete");
+        // (the deleted-row-plus-name-reuse race): the exact-id mutators must
+        // NOT fall back to the name match. A no-op, nothing mutated.
+        assert!(state.remove_workspace("b-id").is_none(), "no name-match fallback delete");
+        assert_eq!(state.workspaces.len(), 1);
+        assert!(!state.set_workspace_branch("b-id", "x"), "the row NAMED b-id does not count");
+        assert_eq!(state.workspaces[0].branch_name, None, "the shadowing row is untouched");
+        assert!(state.set_workspace_branch("a-id", "moved"));
+        assert_eq!(state.workspaces[0].branch_name.as_deref(), Some("moved"));
+    }
+
+    /// Repos A and B, with B NAMED exactly A's id, each with one workspace.
+    fn shadowed_repos() -> AppState {
+        let mut repos = repos_named(&["a-id", "b-id"]);
+        repos[0].name = "alpha".into();
+        repos[1].name = "a-id".into();
+        AppState {
+            repos,
+            workspaces: vec![
+                Workspace { repo_id: "a-id".into(), ..ws("wa", "wa") },
+                Workspace { repo_id: "b-id".into(), ..ws("wb", "wb") },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remove_repo_ignores_name_shadowing() {
+        let mut state = shadowed_repos();
+        let removed = state.remove_repo("a-id").unwrap();
+        assert_eq!(removed.id, "a-id", "the id match wins over the shadowing name");
+        assert_eq!(state.repos.len(), 1);
+        assert_eq!(state.repos[0].id, "b-id", "the shadowing repo is untouched");
+        assert_eq!(state.workspaces.len(), 1, "A's row went with it");
+        assert_eq!(state.workspaces[0].id, "wb");
+        assert!(state.remove_repo("a-id").is_none(), "no name-match fallback");
+        assert_eq!(state.repos.len(), 1);
+    }
+
+    #[test]
+    fn delete_repo_still_resolves_a_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = shadowed_repos();
+        let removed = state.delete_repo_with_base("a-id", tmp.path()).unwrap();
+        assert_eq!(removed.id, "b-id", "the name match, as before");
+        assert_eq!(state.repos.len(), 1);
+        assert_eq!(state.repos[0].id, "a-id");
+        assert_eq!(AppState::load_from(tmp.path()).unwrap().repos.len(), 1, "saved");
+    }
+
+    #[test]
+    fn set_session_status_stamps_ended_at() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        state.workspaces.push(ws("w", "w"));
+        let id = state.create_session_with_base("w", tmp.path()).unwrap().id;
+        assert_eq!(state.sessions[0].status, SessionStatus::Running);
+        assert!(state.sessions[0].ended_at.is_none());
+        assert!(state.set_session_status(&id, SessionStatus::Stopped));
+        assert_eq!(state.sessions[0].status, SessionStatus::Stopped);
+        assert!(state.sessions[0].ended_at.is_some(), "a terminal state is stamped");
+        assert!(!state.set_session_status("nope", SessionStatus::Stopped));
     }
 
     #[test]
@@ -4003,7 +4159,17 @@ mod tests {
             branch_name: Some(branch.into()),
             ..ws(id, id)
         };
-        let workspaces = [own("w1", "r", "feat"), own("w2", "r", "feat2"), own("w3", "r2", "feat3")];
+        let workspaces = [
+            own("w1", "r", "feat"),
+            own("w2", "r", "feat2"),
+            own("w3", "r2", "feat3"),
+            own("w4", "r", "gone"), // no verdict at all: its branch is gone
+            own("w7", "r", "zzz"), // zzz has a Skip verdict: matched, so not gone
+            own("w7b", "r", "bad\u{7}name"), // gone AND malformed: a Skip
+            // A fallback row (no worktree) and another repo's row: never listed.
+            Workspace { repo_id: "r".into(), branch_name: Some("gone2".into()), ..ws("w5", "w5") },
+            own("w6", "r2", "gone3"),
+        ];
         let v = |branch: &str, verdict: Verdict| BranchVerdict {
             branch: branch.into(),
             tip: "t".into(),
@@ -4029,6 +4195,7 @@ mod tests {
                 RepoCleanupItem::Delete { branch: "loose".into(), tip: "t".into() },
                 RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "feat".into() },
                 RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "feat2".into() },
+                RepoCleanupItem::Workspace { ws_id: "w4".into(), branch: "gone".into() },
                 RepoCleanupItem::Skip {
                     branch: "foreign".into(),
                     reason: format!("checked out at {existing}"),
@@ -4036,6 +4203,10 @@ mod tests {
                 RepoCleanupItem::Skip {
                     branch: "stale-foreign".into(),
                     reason: format!("checked out at {missing}; run git worktree prune"),
+                },
+                RepoCleanupItem::Skip {
+                    branch: "bad\\u{7}name".into(),
+                    reason: "malformed branch name".into(),
                 },
                 RepoCleanupItem::Skip { branch: "zzz".into(), reason: "not merged into main".into() },
             ]

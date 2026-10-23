@@ -1293,6 +1293,46 @@ fn cleanup_removes_a_merged_workspace() {
 }
 
 #[test]
+fn workspace_cleanup_keeps_a_workspace_created_while_it_ran() {
+    // The cleanup's fetch can take up to 20 s, and a `workspace create` that
+    // lands meanwhile must survive the save. The shim fires one from inside
+    // `branch -D`, the last git call before the save (the nested kmd inherits
+    // the hermetic state dir; `create` never runs `branch -D`, so no recursion).
+    let tmp = tempfile::tempdir().unwrap();
+    let state = setup(tmp.path());
+    let repo = tmp.path().join("repo");
+    squash_merge(&repo, &workspace_dir(&state, "feat"), "feat");
+    let path = git_shim(
+        &tmp.path().join("shim"),
+        &format!(
+            "if [ \"$3\" = branch ] && [ \"$4\" = -D ]; then \
+             \"{}\" workspace create other --repo \"{}\" >\"$0.nested\" 2>&1; fi",
+            env!("CARGO_BIN_EXE_kmd"),
+            repo.display()
+        ),
+    );
+    let out = kmd(
+        &state,
+        &[("PATH", &path), ("KOMMAND0_GH_BIN", "false")],
+        &["workspace", "cleanup", "feat", "--force"],
+    );
+    assert!(
+        out.status.success(),
+        "cleanup: {}{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let nested = std::fs::read_to_string(tmp.path().join("shim/git.nested")).unwrap_or_default();
+    let list = stdout(&kmd(&state, &[], &["workspace", "list", "--all"]));
+    assert!(
+        list.contains("other"),
+        "the workspace created mid-cleanup survives the save: {list}\n{nested}"
+    );
+    assert!(!list.contains("feat"), "the cleaned-up row is gone: {list}");
+    assert!(!branch_exists(&repo, "feat"), "the cleanup itself still ran");
+}
+
+#[test]
 fn cleanup_succeeds_when_the_id_is_shadowed() {
     // A workspace NAMED another workspace's id must not break cleanup: the
     // post-cleanup row drop matches the exact id only, so the right row goes
