@@ -1,0 +1,23 @@
+crates/core/src/worktree.rs
+  s_9fb71106c43ff2::t_2c0cd22641bc13 493-503
+crates/core/src/cleanup.rs
+  s_9fb71106c43ff2::t_2c0cd22641bc13 795
+crates/core/src/lib.rs
+  s_9fb71106c43ff2::t_2c0cd22641bc13 901-903,907-908
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3939145c56e2868d8f8ba72bf1242bb6e6f045b7",
+  "prompts": {},
+  "sessions": {
+    "s_9fb71106c43ff2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e9c72bd2-8233-48ea-9b65-6cdca6848e32",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
