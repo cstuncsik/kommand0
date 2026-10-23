@@ -5714,12 +5714,9 @@ async fn run(
                             // loop only, so unit tests cover it through `D`.
                             app.delete_workspace(&workspace_id);
                         }
-                        buttons::HitAction::DeleteRepoFor { repo_name } => {
-                            // Resolve the name once; the helper keys on the id.
+                        buttons::HitAction::DeleteRepoFor { repo_id } => {
                             // Event loop only, so unit tests cover it through `D`.
-                            if let Ok(id) = app.state.resolve_repo(&repo_name).map(|r| r.id.clone()) {
-                                app.delete_repo(&id);
-                            }
+                            app.delete_repo(&repo_id);
                         }
                         buttons::HitAction::AddWorkspaceFor { repo_id } => {
                             // Open modal to add workspace to this repo

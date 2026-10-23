@@ -11,7 +11,7 @@ pub(crate) enum HitAction {
     FocusComposerFor { workspace_id: String },
     ToggleIconsFor { workspace_id: String },
     DeleteWorkspaceFor { workspace_id: String },
-    DeleteRepoFor { repo_name: String },
+    DeleteRepoFor { repo_id: String },
     AddWorkspaceFor { repo_id: String },
     AddRepo,
     /// Select session tab `index` of a workspace (click on the tab strip).
