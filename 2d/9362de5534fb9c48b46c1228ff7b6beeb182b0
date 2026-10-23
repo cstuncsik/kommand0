@@ -1,0 +1,19 @@
+apps/tui/src/main.rs
+  s_9fb71106c43ff2::t_fa09d926d626e7 11055-11058,11060,11062,11094-11095,11097,11099
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2d9362de5534fb9c48b46c1228ff7b6beeb182b0",
+  "prompts": {},
+  "sessions": {
+    "s_9fb71106c43ff2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e9c72bd2-8233-48ea-9b65-6cdca6848e32",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
