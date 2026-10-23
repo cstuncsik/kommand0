@@ -28,10 +28,11 @@ All notable changes to kommand0 are documented here. The format is based on
   `kmd workspace cleanup` and `kmd repo cleanup` print
   `Cleaned up workspace: <name> (branch <b> is gone; now tracks <x>, worktree kept)`
   and keep the row.
-- **Workspace deletes and `kmd` cleanups no longer overwrite a concurrent
-  state write** (#128). `d`, `D`, the [Delete] button, a cleanup that removed
-  the row, `kmd workspace cleanup` and `kmd repo cleanup` now persist with a
-  3-way merge-save, so a `kmd workspace create` (or a TUI save) that landed
+- **Workspace and repo deletes and `kmd` cleanups no longer overwrite a
+  concurrent state write** (#128). `d`, `D` and the `[Delete]` button on a
+  workspace or repo row, a cleanup that removed the row,
+  `kmd workspace cleanup` and `kmd repo cleanup` now persist with a 3-way
+  merge-save, so a `kmd workspace create` (or a TUI save) that landed
   meanwhile survives.
 - **Cleanup refuses to follow a dir replaced by another repository** (#128). A
   workspace dir that is now an independent repo on a branch name the main repo
@@ -41,7 +42,7 @@ All notable changes to kommand0 are documented here. The format is based on
   (#128): a permission error while probing the worktree says "couldn't check
   the worktree"; the branch and the row are kept.
 - **`d` is ignored while that row's cleanup runs** (#128), as are `D` and the
-  [Delete] button; a repo delete is likewise ignored while a cleanup of its
+  `[Delete]` button; a repo delete is likewise ignored while a cleanup of its
   rows or of its branches runs.
 
 ## [0.32.0] - 2026-10-21
