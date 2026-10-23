@@ -1153,6 +1153,11 @@ impl AppState {
     /// Scope: this protects concurrent CLI *adds* and *deletes*. A CLI *in-place
     /// edit* to a row the TUI also holds is still lost on the TUI's next save —
     /// there's no per-field/version comparison, and "mine wins" overwrites it.
+    ///
+    /// The result is referentially consistent: a row whose parent is gone from
+    /// the merge (e.g. a workspace another process added under a repo we
+    /// deleted meanwhile) is dropped too; its worktree dir, if any, is left on
+    /// disk, like every mine-wins loss.
     pub fn merged_over(&self, baseline: &AppState, disk: AppState) -> AppState {
         use std::collections::HashSet;
 
@@ -1195,7 +1200,7 @@ impl AppState {
             out
         }
 
-        AppState {
+        let mut merged = AppState {
             version: Self::STATE_VERSION,
             repos: merge_vec(&self.repos, &baseline.repos, disk.repos, |r| r.id.as_str()),
             workspaces: merge_vec(&self.workspaces, &baseline.workspaces, disk.workspaces, |w| {
@@ -1216,7 +1221,15 @@ impl AppState {
             // rather than a stale on-disk value clobbering the live tree.
             repo_sort: self.repo_sort,
             workspace_sort: self.workspace_sort,
-        }
+        };
+        // Children of a parent the merge dropped would persist as orphans.
+        let repo_ids: HashSet<&str> = merged.repos.iter().map(|r| r.id.as_str()).collect();
+        merged.workspaces.retain(|w| repo_ids.contains(w.repo_id.as_str()));
+        let ws_ids: HashSet<&str> = merged.workspaces.iter().map(|w| w.id.as_str()).collect();
+        merged.sessions.retain(|s| ws_ids.contains(s.workspace_id.as_str()));
+        merged.embedded_sessions.retain(|k, _| ws_ids.contains(k.as_str()));
+        merged.embedded_titles.retain(|k, _| ws_ids.contains(k.as_str()));
+        merged
     }
 
     /// Mint a persisted embedded-session entry: `prefix` + a fresh UUID v4.
@@ -2129,6 +2142,11 @@ mod tests {
             .collect()
     }
 
+    /// A state holding repo `r` (the parent every `ws` row points at) and `workspaces`.
+    fn under_r(workspaces: Vec<Workspace>) -> AppState {
+        AppState { repos: repos_named(&["r"]), workspaces, ..Default::default() }
+    }
+
     fn repo_order(state: &AppState) -> Vec<String> {
         let mut repos = state.repos.clone();
         sort::sort_repos(&mut repos, state.repo_sort);
@@ -2284,10 +2302,9 @@ mod tests {
     fn merge_preserves_cli_adds_and_respects_tui_deletes() {
         // baseline = what the TUI loaded; mine = TUI's in-memory state (deleted B,
         // added C); disk = the file now (a CLI added D; B not yet deleted on disk).
-        let baseline = AppState { workspaces: vec![ws("A", "a"), ws("B", "b")], ..Default::default() };
-        let mine = AppState { workspaces: vec![ws("A", "a"), ws("C", "c")], ..Default::default() };
-        let disk =
-            AppState { workspaces: vec![ws("A", "a"), ws("B", "b"), ws("D", "d")], ..Default::default() };
+        let baseline = under_r(vec![ws("A", "a"), ws("B", "b")]);
+        let mine = under_r(vec![ws("A", "a"), ws("C", "c")]);
+        let disk = under_r(vec![ws("A", "a"), ws("B", "b"), ws("D", "d")]);
 
         let merged = mine.merged_over(&baseline, disk);
         let ids: std::collections::HashSet<&str> =
@@ -2301,9 +2318,9 @@ mod tests {
 
     #[test]
     fn merge_lets_mine_win_on_a_conflicting_edit() {
-        let baseline = AppState { workspaces: vec![ws("A", "v1")], ..Default::default() };
-        let mine = AppState { workspaces: vec![ws("A", "mine")], ..Default::default() };
-        let disk = AppState { workspaces: vec![ws("A", "disk")], ..Default::default() };
+        let baseline = under_r(vec![ws("A", "v1")]);
+        let mine = under_r(vec![ws("A", "mine")]);
+        let disk = under_r(vec![ws("A", "disk")]);
         let merged = mine.merged_over(&baseline, disk);
         assert_eq!(merged.workspaces.len(), 1);
         assert_eq!(merged.workspaces[0].name, "mine", "in-memory copy wins for a shared id");
@@ -2314,12 +2331,14 @@ mod tests {
         let mk = |pairs: &[(&str, &str)]| -> HashMap<String, Vec<String>> {
             pairs.iter().map(|(k, v)| (k.to_string(), vec![v.to_string()])).collect()
         };
-        let baseline = AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b")]), ..Default::default() };
+        // All three hold rows A, B and C, so only the maps differ.
+        let rows = || vec![ws("A", "a"), ws("B", "b"), ws("C", "c")];
+        let baseline = AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b")]), ..under_r(rows()) };
         // TUI deleted B and re-tabbed A with a shell tab (the merge treats the
         // Vec opaquely, so a sentinel entry rides through untouched); a CLI added C.
-        let mine = AppState { embedded_sessions: mk(&[("A", "shell:a2")]), ..Default::default() };
+        let mine = AppState { embedded_sessions: mk(&[("A", "shell:a2")]), ..under_r(rows()) };
         let disk =
-            AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b"), ("C", "c")]), ..Default::default() };
+            AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b"), ("C", "c")]), ..under_r(rows()) };
         let merged = mine.merged_over(&baseline, disk);
         assert_eq!(merged.embedded_sessions.get("A").unwrap(), &vec!["shell:a2".to_string()], "mine wins");
         assert!(!merged.embedded_sessions.contains_key("B"), "TUI delete respected");
@@ -2330,16 +2349,56 @@ mod tests {
     fn merge_save_reloads_and_preserves_a_concurrent_add() {
         let tmp = TempDir::new().unwrap();
         // Disk already has a workspace the TUI never saw (a CLI added it).
-        let disk = AppState { workspaces: vec![ws("cli", "from-cli")], ..Default::default() };
+        let disk = under_r(vec![ws("cli", "from-cli")]);
         disk.save_to(tmp.path()).unwrap();
-        // The TUI loaded an empty baseline, created its own workspace, and saves.
-        let baseline = AppState::default();
-        let mine = AppState { workspaces: vec![ws("tui", "from-tui")], ..Default::default() };
+        // The TUI loaded a row-less baseline, created its own workspace, and saves.
+        let baseline = under_r(vec![]);
+        let mine = under_r(vec![ws("tui", "from-tui")]);
         mine.merge_save_to(&baseline, tmp.path()).unwrap();
         let on_disk = AppState::load_from(tmp.path()).unwrap();
         let ids: std::collections::HashSet<&str> =
             on_disk.workspaces.iter().map(|w| w.id.as_str()).collect();
         assert!(ids.contains("cli") && ids.contains("tui"), "both survive the save: {ids:?}");
+    }
+
+    #[test]
+    fn merge_drops_children_of_a_deleted_parent() {
+        // We deleted repo r; a CLI added W under it meanwhile, with a session,
+        // a tab row and a title. The merge keeps our delete, so everything
+        // keyed on W must go with it rather than land orphaned in state.json.
+        let baseline = under_r(vec![]);
+        let disk = || AppState {
+            sessions: vec![Session {
+                id: "S".into(),
+                workspace_id: "W".into(),
+                claude_session_id: None,
+                pid: None,
+                status: SessionStatus::Running,
+                created_at: 0,
+                ended_at: None,
+                log_file: String::new(),
+            }],
+            embedded_sessions: HashMap::from([("W".to_string(), vec!["c".to_string()])]),
+            embedded_titles: HashMap::from([(
+                "W".to_string(),
+                HashMap::from([("c".to_string(), "title".to_string())]),
+            )]),
+            ..under_r(vec![ws("W", "w")])
+        };
+
+        let merged = AppState::default().merged_over(&baseline, disk());
+        assert!(merged.repos.is_empty(), "our delete wins");
+        assert!(merged.workspaces.is_empty(), "the row under the deleted repo goes too");
+        assert!(merged.sessions.is_empty(), "and its session");
+        assert!(merged.embedded_sessions.is_empty(), "and its tab row");
+        assert!(merged.embedded_titles.is_empty(), "and its titles");
+
+        // Control: with the repo still held, everything under it survives.
+        let merged = under_r(vec![]).merged_over(&baseline, disk());
+        assert_eq!(merged.workspaces.len(), 1, "a concurrent add under a live repo survives");
+        assert_eq!(merged.sessions.len(), 1);
+        assert!(merged.embedded_sessions.contains_key("W"));
+        assert!(merged.embedded_titles.contains_key("W"));
     }
 
     #[test]
