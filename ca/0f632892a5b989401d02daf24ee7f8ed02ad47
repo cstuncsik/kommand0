@@ -1,0 +1,20 @@
+CHANGELOG.md
+  s_9fb71106c43ff2::t_a6c448b2d5c8c1 8-17,31-43
+  s_9fb71106c43ff2::t_35ba10725603da 44-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ca0f632892a5b989401d02daf24ee7f8ed02ad47",
+  "prompts": {},
+  "sessions": {
+    "s_9fb71106c43ff2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e9c72bd2-8233-48ea-9b65-6cdca6848e32",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": null
+    }
+  }
+}
