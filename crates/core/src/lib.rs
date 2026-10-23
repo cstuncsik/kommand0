@@ -2019,15 +2019,39 @@ impl RepoCleanupItem {
 /// the state.json row, whatever state the worktree dir or its admin entry is in
 /// (a manually deleted + pruned worktree scans as a bare Delete). Any other
 /// CheckedOut is a Skip naming the path, plus "; run git worktree prune" when the
-/// dir no longer exists. Output order: Delete, Workspace, Skip (skips sorted by
-/// reason). Routes by name only: no path comparison, so symlinked state dirs
-/// and realpath differences are irrelevant.
+/// dir no longer exists. An own-branch row whose `branch_name` matches no
+/// verdict at all (its branch is gone) becomes a Workspace item too, after the
+/// scanned ones: the workspace cleanup clears or follows it; a malformed name is
+/// a Skip ("malformed branch name"). Output order: Delete, Workspace (scanned
+/// rows, then gone-branch rows), Skip (skips sorted by reason). Routes by name
+/// only: no path comparison, so symlinked state dirs and realpath differences
+/// are irrelevant.
 pub fn plan_repo_cleanup(
     verdicts: Vec<BranchVerdict>,
     repo_id: &str,
     workspaces: &[Workspace],
 ) -> Vec<RepoCleanupItem> {
     let (mut deletes, mut routed, mut skips) = (Vec::new(), Vec::new(), Vec::new());
+    // Rows whose branch the scan never saw: it is gone (or never was). Routed
+    // like any other and with no marker: the workspace cleanup decides whether
+    // there is nothing left (Removed), a live dir on another branch (Followed)
+    // or wreckage (a refusal), so the preview must not promise "nothing left".
+    // A name `is_valid_branch_name` rejects (hand-edited state) is a Skip: it
+    // would be echoed raw by the CLI and torn down for a certain refusal.
+    let mut gone = Vec::new();
+    for w in workspaces.iter().filter(|w| w.repo_id == repo_id && w.worktree_path.is_some()) {
+        let Some(branch) = w.branch_name.as_deref() else {
+            continue;
+        };
+        if verdicts.iter().any(|v| v.branch == branch) {
+            continue;
+        }
+        if git::is_valid_branch_name(branch) {
+            gone.push(RepoCleanupItem::Workspace { ws_id: w.id.clone(), branch: branch.to_string() });
+        } else {
+            skips.push(("malformed branch name".to_string(), branch.escape_debug().to_string()));
+        }
+    }
     for v in verdicts {
         // First match wins: names are unique per repo, and git refuses one
         // branch in two worktrees.
@@ -2052,6 +2076,7 @@ pub fn plan_repo_cleanup(
             }
         }
     }
+    routed.extend(gone);
     skips.sort();
     deletes.extend(routed);
     deletes.extend(
@@ -4006,7 +4031,17 @@ mod tests {
             branch_name: Some(branch.into()),
             ..ws(id, id)
         };
-        let workspaces = [own("w1", "r", "feat"), own("w2", "r", "feat2"), own("w3", "r2", "feat3")];
+        let workspaces = [
+            own("w1", "r", "feat"),
+            own("w2", "r", "feat2"),
+            own("w3", "r2", "feat3"),
+            own("w4", "r", "gone"), // no verdict at all: its branch is gone
+            own("w7", "r", "zzz"), // zzz has a Skip verdict: matched, so not gone
+            own("w7b", "r", "bad\u{7}name"), // gone AND malformed: a Skip
+            // A fallback row (no worktree) and another repo's row: never listed.
+            Workspace { repo_id: "r".into(), branch_name: Some("gone2".into()), ..ws("w5", "w5") },
+            own("w6", "r2", "gone3"),
+        ];
         let v = |branch: &str, verdict: Verdict| BranchVerdict {
             branch: branch.into(),
             tip: "t".into(),
@@ -4032,6 +4067,7 @@ mod tests {
                 RepoCleanupItem::Delete { branch: "loose".into(), tip: "t".into() },
                 RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "feat".into() },
                 RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "feat2".into() },
+                RepoCleanupItem::Workspace { ws_id: "w4".into(), branch: "gone".into() },
                 RepoCleanupItem::Skip {
                     branch: "foreign".into(),
                     reason: format!("checked out at {existing}"),
@@ -4039,6 +4075,10 @@ mod tests {
                 RepoCleanupItem::Skip {
                     branch: "stale-foreign".into(),
                     reason: format!("checked out at {missing}; run git worktree prune"),
+                },
+                RepoCleanupItem::Skip {
+                    branch: "bad\\u{7}name".into(),
+                    reason: "malformed branch name".into(),
                 },
                 RepoCleanupItem::Skip { branch: "zzz".into(), reason: "not merged into main".into() },
             ]
