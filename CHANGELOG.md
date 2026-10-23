@@ -33,7 +33,8 @@ All notable changes to kommand0 are documented here. The format is based on
   workspace or repo row, a cleanup that removed the row,
   `kmd workspace cleanup` and `kmd repo cleanup` now persist with a 3-way
   merge-save, so a `kmd workspace create` (or a TUI save) that landed
-  meanwhile survives.
+  meanwhile survives. A row another process added under a repo deleted
+  meanwhile is dropped with it (its worktree dir is left on disk).
 - **Cleanup refuses to follow a dir replaced by another repository** (#128). A
   workspace dir that is now an independent repo on a branch name the main repo
   also has (e.g. `main`) is refused as "on another repository" instead of

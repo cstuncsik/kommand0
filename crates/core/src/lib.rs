@@ -1154,10 +1154,12 @@ impl AppState {
     /// edit* to a row the TUI also holds is still lost on the TUI's next save —
     /// there's no per-field/version comparison, and "mine wins" overwrites it.
     ///
-    /// The result is referentially consistent: a row whose parent is gone from
-    /// the merge (e.g. a workspace another process added under a repo we
-    /// deleted meanwhile) is dropped too; its worktree dir, if any, is left on
-    /// disk, like every mine-wins loss.
+    /// The result is referentially consistent for what came from disk: a row
+    /// another process added under a parent the merge no longer has (a
+    /// workspace created under a repo we deleted meanwhile) is dropped too,
+    /// its worktree dir and session log, if any, left on disk like every
+    /// mine-wins loss. Rows we hold are written back as they are, so a legacy
+    /// orphan we loaded does not flip-flop between merge-saves and plain saves.
     pub fn merged_over(&self, baseline: &AppState, disk: AppState) -> AppState {
         use std::collections::HashSet;
 
@@ -1223,12 +1225,23 @@ impl AppState {
             workspace_sort: self.workspace_sort,
         };
         // Children of a parent the merge dropped would persist as orphans.
+        // Only disk-only rows are checked: what we hold is written back as is.
+        let mine_ws: HashSet<&str> = self.workspaces.iter().map(|w| w.id.as_str()).collect();
         let repo_ids: HashSet<&str> = merged.repos.iter().map(|r| r.id.as_str()).collect();
-        merged.workspaces.retain(|w| repo_ids.contains(w.repo_id.as_str()));
+        merged.workspaces.retain(|w| {
+            mine_ws.contains(w.id.as_str()) || repo_ids.contains(w.repo_id.as_str())
+        });
+        let mine_sessions: HashSet<&str> = self.sessions.iter().map(|s| s.id.as_str()).collect();
         let ws_ids: HashSet<&str> = merged.workspaces.iter().map(|w| w.id.as_str()).collect();
-        merged.sessions.retain(|s| ws_ids.contains(s.workspace_id.as_str()));
-        merged.embedded_sessions.retain(|k, _| ws_ids.contains(k.as_str()));
-        merged.embedded_titles.retain(|k, _| ws_ids.contains(k.as_str()));
+        merged.sessions.retain(|s| {
+            mine_sessions.contains(s.id.as_str()) || ws_ids.contains(s.workspace_id.as_str())
+        });
+        merged
+            .embedded_sessions
+            .retain(|k, _| self.embedded_sessions.contains_key(k) || ws_ids.contains(k.as_str()));
+        merged
+            .embedded_titles
+            .retain(|k, _| self.embedded_titles.contains_key(k) || ws_ids.contains(k.as_str()));
         merged
     }
 
@@ -2399,6 +2412,13 @@ mod tests {
         assert_eq!(merged.sessions.len(), 1);
         assert!(merged.embedded_sessions.contains_key("W"));
         assert!(merged.embedded_titles.contains_key("W"));
+
+        // A legacy orphan WE hold (its repo row missing in every copy) is written
+        // back as is: the sweep is for disk-only rows, so it cannot flip-flop
+        // between our merge-saves and the next plain save.
+        let mine = AppState { workspaces: vec![ws("orphan", "o")], ..Default::default() };
+        let merged = mine.merged_over(&AppState::default(), AppState::default());
+        assert_eq!(merged.workspaces.len(), 1, "a held orphan survives the sweep");
     }
 
     #[test]
