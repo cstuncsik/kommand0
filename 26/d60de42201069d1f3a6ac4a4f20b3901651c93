@@ -1,0 +1,19 @@
+CHANGELOG.md
+  s_9fb71106c43ff2::t_9fb054f4cfbb6a 31-35,45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "26d60de42201069d1f3a6ac4a4f20b3901651c93",
+  "prompts": {},
+  "sessions": {
+    "s_9fb71106c43ff2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e9c72bd2-8233-48ea-9b65-6cdca6848e32",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
