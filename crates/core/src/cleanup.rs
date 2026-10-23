@@ -792,7 +792,7 @@ pub fn cleanup_merged_workspace(
         format!("a failed removal left files behind: delete {worktree_path}, then clean up again")
     };
     let prune = || {
-        let _ = Command::new("git").args(["-C", repo_path, "worktree", "prune"]).output();
+        let _ = crate::worktree::prune_worktrees(repo_path);
     };
 
     let Some(tip) = branch_tip(repo_path, branch) else {

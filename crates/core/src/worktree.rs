@@ -490,6 +490,17 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<()> {
     }
 }
 
+/// `git worktree prune` in `repo_path`: clears stale `.git/worktrees/<n>`
+/// entries. `Err` is git's trimmed stderr (lossy) or the spawn error, for a
+/// caller that wants to warn; best-effort callers ignore it.
+pub(crate) fn prune_worktrees(repo_path: &str) -> std::result::Result<(), String> {
+    match Command::new("git").args(["-C", repo_path, "worktree", "prune"]).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -898,23 +898,14 @@ impl AppState {
         prune_repos.sort();
         prune_repos.dedup();
         for repo_path in &prune_repos {
-            let out = std::process::Command::new("git")
-                .args(["-C", repo_path, "worktree", "prune"])
-                .output();
-            match out {
-                Ok(out) if out.status.success() => {}
-                // git's stderr can echo arbitrary path bytes: never raw.
-                Ok(out) => warnings.push(format!(
+            // git's stderr can echo arbitrary path bytes: never raw.
+            if let Err(e) = worktree::prune_worktrees(repo_path) {
+                warnings.push(format!(
                     "couldn't prune worktrees in {}: {} (run `git worktree prune` \
                      there by hand)",
                     repo_path.escape_debug(),
-                    String::from_utf8_lossy(&out.stderr).trim().escape_debug()
-                )),
-                Err(e) => warnings.push(format!(
-                    "couldn't prune worktrees in {}: {e} (run `git worktree prune` \
-                     there by hand)",
-                    repo_path.escape_debug()
-                )),
+                    e.escape_debug()
+                ));
             }
         }
         Ok((summary, warnings))
