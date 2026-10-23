@@ -4017,11 +4017,12 @@ impl App {
         blocked
     }
 
-    /// Delete repo `repo_id` with every row under it: stop the rows' Running
-    /// sessions, drop their panes and per-row UI entries, cascade through
-    /// `state.delete_repo` (rows, worktrees, sessions; it saves) and resync.
-    /// The one path behind `d`+`y`, `D` and [Delete] on a repo row. Refused
-    /// while any of its rows has a cleanup in flight.
+    /// Delete repo `repo_id` with every row under it: drop the rows' panes and
+    /// per-row UI entries, remove the repo and everything under it (exact id:
+    /// rows, worktrees, sessions) and persist with ONE merge-aware save. The
+    /// one path behind `d`+`y`, `D` and `[Delete]` on a repo row. Refused
+    /// while any of its rows has a cleanup in flight; a no-op when the repo
+    /// is already gone.
     fn delete_repo(&mut self, repo_id: &str) {
         if self.repo_delete_blocked_by_cleanup(repo_id) {
             return;
@@ -4034,19 +4035,14 @@ impl App {
             .map(|w| w.id.clone())
             .collect();
         for ws_id in &ws_ids {
-            if let Some(sid) = self
-                .state
-                .find_session_by_workspace(ws_id)
-                .filter(|s| s.status == SessionStatus::Running)
-                .map(|s| s.id.clone())
-            {
-                let _ = self.state.update_session_status(&sid, SessionStatus::Stopped);
-            }
             self.embedded.remove(ws_id);
             self.expanded_icon_rows.remove(ws_id);
             self.cleanup_result.remove(ws_id);
         }
-        let _ = self.state.delete_repo(repo_id);
+        if self.state.remove_repo(repo_id).is_none() {
+            return;
+        }
+        self.save_state();
         self.expanded.remove(repo_id);
         self.repos = self.state.repos.clone();
         self.workspaces = self.state.workspaces.clone();
@@ -5718,8 +5714,8 @@ async fn run(
                         buttons::HitAction::DeleteRepoFor { repo_name } => {
                             // Resolve the name once; the helper keys on the id.
                             // Event loop only, so unit tests cover it through `D`.
-                            if let Ok(repo) = app.state.resolve_repo(&repo_name).cloned() {
-                                app.delete_repo(&repo.id);
+                            if let Ok(id) = app.state.resolve_repo(&repo_name).map(|r| r.id.clone()) {
+                                app.delete_repo(&id);
                             }
                         }
                         buttons::HitAction::AddWorkspaceFor { repo_id } => {
@@ -11060,7 +11056,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn adding_a_repo_re_baselines_after_its_plain_save() {
+    async fn deleting_a_repo_added_this_session_drops_it_from_disk() {
         let mut app = test_app();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().to_string_lossy().to_string();
@@ -11084,6 +11080,30 @@ mod key_tests {
         assert!(
             app.state_baseline.repos.iter().any(|r| r.id == id),
             "the baseline tracks the plain-saved repo"
+        );
+
+        app.delete_repo(&id);
+        assert!(
+            app.state_baseline.repos.iter().all(|r| r.id != id),
+            "the merge-save drops the repo from disk"
+        );
+    }
+
+    #[test]
+    fn repo_delete_targets_the_id_not_a_same_named_repo() {
+        let mut app = test_app();
+        // beta is NAMED alpha's id: a name-first lookup would delete beta.
+        app.repos[1].name = "r1".into();
+        app.state.repos[1].name = "r1".into();
+
+        app.delete_repo("r1");
+
+        assert!(app.repos.iter().all(|r| r.id != "r1"), "the repo with id r1 is gone");
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "and its row with it");
+        assert!(app.repos.iter().any(|r| r.id == "r2"), "the repo NAMED r1 survives");
+        assert!(
+            app.state_baseline.repos.iter().all(|r| r.id != "r1"),
+            "persisted with a merge-save"
         );
     }
 

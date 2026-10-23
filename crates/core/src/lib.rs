@@ -1451,7 +1451,25 @@ impl AppState {
         repo_ref: &str,
         base: &Path,
     ) -> anyhow::Result<RepoEntry> {
-        let repo = self.resolve_repo(repo_ref)?.clone();
+        let id = self.resolve_repo(repo_ref)?.id.clone();
+        let repo = self.remove_repo(&id).ok_or_else(|| anyhow::anyhow!("repo not found: {id}"))?;
+        self.save_to(base)?;
+        Ok(repo)
+    }
+
+    /// Delete a repo, saving state to the default state directory.
+    pub fn delete_repo(&mut self, repo_ref: &str) -> anyhow::Result<RepoEntry> {
+        self.delete_repo_with_base(repo_ref, Self::state_dir().as_path())
+    }
+
+    /// Remove the repo with EXACTLY this id (never a name match) and everything
+    /// under it from the in-memory state: its sessions (and their log files),
+    /// its workspaces (and their worktrees) with their `embedded_sessions`/
+    /// `embedded_titles` entries, then the repo. No save, like
+    /// [`Self::remove_workspace`]: the caller persists. `None` when no repo
+    /// has that id, a no-op. User-facing refs stay on [`Self::delete_repo`].
+    pub fn remove_repo(&mut self, id: &str) -> Option<RepoEntry> {
+        let repo = self.repos.iter().find(|r| r.id == id)?.clone();
 
         // Collect workspace IDs for this repo
         let ws_ids: Vec<String> = self
@@ -1495,14 +1513,7 @@ impl AppState {
 
         // Remove the repo itself
         self.repos.retain(|r| r.id != repo.id);
-
-        self.save_to(base)?;
-        Ok(repo)
-    }
-
-    /// Delete a repo, saving state to the default state directory.
-    pub fn delete_repo(&mut self, repo_ref: &str) -> anyhow::Result<RepoEntry> {
-        self.delete_repo_with_base(repo_ref, Self::state_dir().as_path())
+        Some(repo)
     }
 
     // --- Workspace methods ---
@@ -2511,6 +2522,45 @@ mod tests {
         assert_eq!(state.workspaces[0].branch_name, None, "the shadowing row is untouched");
         assert!(state.set_workspace_branch("a-id", "moved"));
         assert_eq!(state.workspaces[0].branch_name.as_deref(), Some("moved"));
+    }
+
+    /// Repos A and B, with B NAMED exactly A's id, each with one workspace.
+    fn shadowed_repos() -> AppState {
+        let mut repos = repos_named(&["a-id", "b-id"]);
+        repos[0].name = "alpha".into();
+        repos[1].name = "a-id".into();
+        AppState {
+            repos,
+            workspaces: vec![
+                Workspace { repo_id: "a-id".into(), ..ws("wa", "wa") },
+                Workspace { repo_id: "b-id".into(), ..ws("wb", "wb") },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remove_repo_ignores_name_shadowing() {
+        let mut state = shadowed_repos();
+        let removed = state.remove_repo("a-id").unwrap();
+        assert_eq!(removed.id, "a-id", "the id match wins over the shadowing name");
+        assert_eq!(state.repos.len(), 1);
+        assert_eq!(state.repos[0].id, "b-id", "the shadowing repo is untouched");
+        assert_eq!(state.workspaces.len(), 1, "A's row went with it");
+        assert_eq!(state.workspaces[0].id, "wb");
+        assert!(state.remove_repo("a-id").is_none(), "no name-match fallback");
+        assert_eq!(state.repos.len(), 1);
+    }
+
+    #[test]
+    fn delete_repo_still_resolves_a_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = shadowed_repos();
+        let removed = state.delete_repo_with_base("a-id", tmp.path()).unwrap();
+        assert_eq!(removed.id, "b-id", "the name match, as before");
+        assert_eq!(state.repos.len(), 1);
+        assert_eq!(state.repos[0].id, "a-id");
+        assert_eq!(AppState::load_from(tmp.path()).unwrap().repos.len(), 1, "saved");
     }
 
     #[test]
