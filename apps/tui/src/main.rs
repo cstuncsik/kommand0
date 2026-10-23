@@ -4004,13 +4004,15 @@ impl App {
     }
 
     /// The repo-level twin of `workspace_delete_blocked_by_cleanup`: a repo
-    /// delete removes every row's worktree, so it waits while any of the repo's
-    /// rows has a cleanup in flight. Logs the refusal.
+    /// delete removes every row's worktree and the repo's branches, so it is
+    /// refused while any of the repo's rows has a cleanup in flight or while
+    /// the repo's own branch-delete phase runs. Logs the refusal.
     fn repo_delete_blocked_by_cleanup(&self, repo_id: &str) -> bool {
-        let blocked = self
-            .workspaces
-            .iter()
-            .any(|w| w.repo_id == repo_id && self.cleanup_inflight.contains(&w.id));
+        let blocked = self.repo_cleanup_inflight.as_deref() == Some(repo_id)
+            || self
+                .workspaces
+                .iter()
+                .any(|w| w.repo_id == repo_id && self.cleanup_inflight.contains(&w.id));
         if blocked {
             tracing::info!("delete: repo {repo_id} has a workspace cleanup in flight; ignored");
         }
@@ -11224,8 +11226,15 @@ mod key_tests {
         assert!(app.repos.iter().any(|r| r.id == "r1"), "r1 stays");
         assert!(app.workspaces.iter().any(|w| w.id == "w1"), "w1 stays");
 
-        // Once the cleanup is done the same keys delete.
+        // The repo's own branch-delete phase owns its branches: refused too.
         app.cleanup_inflight.remove("w1");
+        app.repo_cleanup_inflight = Some("r1".into());
+        app.select_repo_row("r1");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert_eq!(app.repos.len(), 1, "D is ignored while the branch delete runs");
+        app.repo_cleanup_inflight = None;
+
+        // Once the cleanups are done the same keys delete.
         app.select_repo_row("r1");
         press(&mut app, KeyCode::Char('d')).await;
         assert!(matches!(
