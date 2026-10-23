@@ -3275,6 +3275,11 @@ impl App {
     ) {
         match result {
             Ok(_) => {
+                // The create plain-saved the whole state, so disk is exactly
+                // `state` now: re-baseline, or a later merge-save reads the new
+                // row as a concurrent add and keeps it after a delete (goes
+                // away with the merge-save-everywhere follow-up).
+                self.state_baseline = self.state.clone();
                 self.workspaces = self.state.workspaces.clone();
                 self.expanded.insert(repo_id);
                 // Keep the cursor on its row: under a name or newest-first sort
@@ -4703,6 +4708,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             }
             modal::ModalResult::SubmitRepo(path) => match app.state.add_repo(&path) {
                 Ok(repo) => {
+                    // The add plain-saved the whole state: re-baseline, as
+                    // `finish_add_workspace` does.
+                    app.state_baseline = app.state.clone();
                     // Expand the just-added repo so its "(no workspaces — press w)"
                     // hint shows immediately, pointing the user at the next step.
                     app.expanded.insert(repo.id.clone());
@@ -11027,6 +11035,55 @@ mod key_tests {
         assert!(
             app.state_baseline.workspaces.iter().all(|w| w.id != "w1"),
             "persisted with a merge-save: the baseline moves only after a successful save"
+        );
+    }
+
+    #[test]
+    fn deleting_a_workspace_created_this_session_drops_it_from_disk() {
+        // The create plain-saves without moving the baseline, so a later
+        // merge-save would read the new row as a concurrent add and keep it.
+        let mut app = test_app();
+        let row = mk_ws("w9", "ws-nine", "r1", None);
+        app.state.workspaces.push(row.clone()); // what the create does in memory
+
+        app.finish_add_workspace(Ok(row), "r1".into(), "alpha".into(), "ws-nine".into(), String::new());
+        assert!(
+            app.state_baseline.workspaces.iter().any(|w| w.id == "w9"),
+            "the baseline tracks the plain-saved row"
+        );
+
+        app.delete_workspace("w9");
+        assert!(
+            app.state_baseline.workspaces.iter().all(|w| w.id != "w9"),
+            "the merge-save drops the row from disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_repo_re_baselines_after_its_plain_save() {
+        let mut app = test_app();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        app.modal = modal::ModalState::AddRepo {
+            input: path.clone(),
+            cursor: path.len(),
+            error: None,
+            completions: Vec::new(),
+            completion_index: None,
+        };
+        press(&mut app, KeyCode::Enter).await;
+
+        let id = app
+            .state
+            .repos
+            .iter()
+            .find(|r| r.id != "r1" && r.id != "r2")
+            .expect("repo was added")
+            .id
+            .clone();
+        assert!(
+            app.state_baseline.repos.iter().any(|r| r.id == id),
+            "the baseline tracks the plain-saved repo"
         );
     }
 
