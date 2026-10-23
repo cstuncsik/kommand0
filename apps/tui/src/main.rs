@@ -11052,9 +11052,14 @@ mod key_tests {
             "the baseline tracks the plain-saved row"
         );
 
+        // The merge the delete's save performs: disk holds what the create
+        // plain-saved, against the baseline as it stands at delete time.
+        let disk = app.state.clone();
+        let baseline = app.state_baseline.clone();
         app.delete_workspace("w9");
+        let merged = app.state.merged_over(&baseline, disk);
         assert!(
-            app.state_baseline.workspaces.iter().all(|w| w.id != "w9"),
+            merged.workspaces.iter().all(|w| w.id != "w9"),
             "the merge-save drops the row from disk"
         );
     }
@@ -11086,9 +11091,12 @@ mod key_tests {
             "the baseline tracks the plain-saved repo"
         );
 
+        let disk = app.state.clone();
+        let baseline = app.state_baseline.clone();
         app.delete_repo(&id);
+        let merged = app.state.merged_over(&baseline, disk);
         assert!(
-            app.state_baseline.repos.iter().all(|r| r.id != id),
+            merged.repos.iter().all(|r| r.id != id),
             "the merge-save drops the repo from disk"
         );
     }
