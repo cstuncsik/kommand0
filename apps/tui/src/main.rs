@@ -79,13 +79,15 @@ struct RepoScan {
 }
 
 /// Repo-cleanup worker -> event loop: the scan, or the delete phase's
-/// per-branch results. Both carry the repo id. `Scanned(_, Err)` also carries
-/// a delete-phase failure that produced no per-branch results (the config
-/// read, or the default branch rewound since the scan).
+/// per-branch results plus the count of plan rows skipped as stale at confirm
+/// time (one result line per repo, so the delete phase appends rather than
+/// overwrites). Both carry the repo id. `Scanned(_, Err)` also carries a
+/// delete-phase failure that produced no per-branch results (the config read,
+/// or the default branch rewound since the scan).
 #[derive(Debug)]
 enum RepoCleanupMsg {
     Scanned(String, Result<RepoScan, String>),
-    Deleted(String, kommand0_core::BranchResults),
+    Deleted(String, kommand0_core::BranchResults, usize),
 }
 
 /// `(to delete, via workspace cleanup, skipped)` for a repo cleanup plan.
@@ -3851,6 +3853,7 @@ impl App {
         plan: Vec<RepoCleanupItem>,
         base: kommand0_core::Base,
     ) {
+        let mut skipped = 0usize;
         let routed: Vec<&str> = plan
             .iter()
             .filter_map(|item| match item {
@@ -3869,6 +3872,7 @@ impl App {
                         tracing::warn!(
                             "repo cleanup: workspace {ws_id} no longer tracks {branch}; skipped, scan again"
                         );
+                        skipped += 1;
                         None
                     }
                 }
@@ -3876,6 +3880,11 @@ impl App {
             })
             .collect();
         self.start_cleanups(&routed);
+        if skipped > 0 {
+            // Shown now, next to the spinner; the delete phase appends it to its line.
+            self.repo_cleanup_result
+                .insert(repo_id.clone(), (format!("{skipped} skipped: scan again"), true));
+        }
         let deletes = RepoCleanupItem::deletes(&plan);
         if deletes.is_empty() {
             return;
@@ -3901,18 +3910,20 @@ impl App {
                 kommand0_core::delete_branches(&path, &deletes, &protected, &base)
             });
             guard.payload = Some(match deleted {
-                Ok(results) => RepoCleanupMsg::Deleted(repo_id, results),
+                Ok(results) => RepoCleanupMsg::Deleted(repo_id, results, skipped),
                 Err(e) => RepoCleanupMsg::Scanned(repo_id, Err(e)),
             });
         });
     }
 
     /// The delete phase landed: one result line for the repo (the pane may
-    /// cut off its bottom); every failure also goes to the log in full.
+    /// cut off its bottom), with the confirm-time skip count appended; every
+    /// failure also goes to the log in full.
     fn on_repo_cleanup_deleted(
         &mut self,
         repo_id: String,
         results: kommand0_core::BranchResults,
+        skipped: usize,
     ) {
         let mut failed = Vec::new();
         for (branch, result) in &results {
@@ -3922,7 +3933,7 @@ impl App {
             }
         }
         let total = results.len();
-        let line = if !failed.is_empty() {
+        let mut line = if !failed.is_empty() {
             format!(
                 "Deleted {} of {total} branches; failed: {}",
                 total - failed.len(),
@@ -3933,7 +3944,10 @@ impl App {
         } else {
             format!("Deleted {total} branches")
         };
-        self.repo_cleanup_result.insert(repo_id, (line, !failed.is_empty()));
+        if skipped > 0 {
+            line.push_str(&format!("; {skipped} skipped: scan again"));
+        }
+        self.repo_cleanup_result.insert(repo_id, (line, !failed.is_empty() || skipped > 0));
     }
 
     /// `d`/`D`/[Delete] on a row whose cleanup is running would force-remove
@@ -5517,8 +5531,8 @@ async fn run(
                 app.repo_cleanup_inflight = None;
                 match msg {
                     RepoCleanupMsg::Scanned(id, result) => app.on_repo_cleanup_scanned(id, result),
-                    RepoCleanupMsg::Deleted(id, results) => {
-                        app.on_repo_cleanup_deleted(id, results);
+                    RepoCleanupMsg::Deleted(id, results, skipped) => {
+                        app.on_repo_cleanup_deleted(id, results, skipped);
                     }
                 }
             }
@@ -10833,11 +10847,12 @@ mod key_tests {
         let msg = recv(&mut repo_rx).await;
         app.repo_cleanup_inflight = None;
         match msg {
-            RepoCleanupMsg::Deleted(id, results) => {
+            RepoCleanupMsg::Deleted(id, results, skipped) => {
                 assert_eq!(id, "real");
                 let moved = Err("moved since it was checked".to_string());
                 assert_eq!(results, vec![("stale".to_string(), moved)]);
-                app.on_repo_cleanup_deleted(id, results);
+                assert_eq!(skipped, 0, "the row still tracked its branch");
+                app.on_repo_cleanup_deleted(id, results, skipped);
             }
             other => panic!("expected the delete results, got {other:?}"),
         }
@@ -10845,8 +10860,14 @@ mod key_tests {
             app.repo_cleanup_result["real"],
             ("Deleted 0 of 1 branches; failed: stale (moved since it was checked)".to_string(), true)
         );
-        app.on_repo_cleanup_deleted("real".into(), vec![("a".into(), Ok(())), ("b".into(), Ok(()))]);
+        app.on_repo_cleanup_deleted("real".into(), vec![("a".into(), Ok(())), ("b".into(), Ok(()))], 0);
         assert_eq!(app.repo_cleanup_result["real"], ("Deleted 2 branches".to_string(), false));
+        // A skipped row is appended and makes the line an error on its own.
+        app.on_repo_cleanup_deleted("real".into(), vec![("a".into(), Ok(()))], 1);
+        assert_eq!(
+            app.repo_cleanup_result["real"],
+            ("Deleted 1 branch; 1 skipped: scan again".to_string(), true)
+        );
     }
 
     #[tokio::test]
@@ -10870,15 +10891,42 @@ mod key_tests {
                 tip: "0000000000000000000000000000000000000000".into(),
             },
         ];
-        app.open_repo_cleanup_modal("real".into(), RepoScan { items, notes: vec![], base });
+        app.open_repo_cleanup_modal(
+            "real".into(),
+            RepoScan { items, notes: vec![], base: base.clone() },
+        );
 
         press(&mut app, KeyCode::Char('y')).await;
 
         assert!(!app.cleanup_inflight.contains("w1"), "the stale row is not routed");
         assert!(cleanup_rx.try_recv().is_err(), "no workspace cleanup was spawned");
         assert_eq!(app.repo_cleanup_inflight.as_deref(), Some("real"), "the plain delete still runs");
+        // Reported right away, next to the spinner.
+        assert_eq!(app.repo_cleanup_result["real"], ("1 skipped: scan again".to_string(), true));
         let msg = recv(&mut repo_rx).await;
-        assert!(matches!(msg, RepoCleanupMsg::Deleted(..)), "{msg:?}");
+        app.repo_cleanup_inflight = None; // the event loop's job, not the handler's
+        let (id, results, skipped) = match msg {
+            RepoCleanupMsg::Deleted(id, results, skipped) => (id, results, skipped),
+            other => panic!("expected the delete results, got {other:?}"),
+        };
+        assert_eq!(skipped, 1);
+        app.on_repo_cleanup_deleted(id, results, skipped);
+        let (line, is_error) = &app.repo_cleanup_result["real"];
+        assert!(line.ends_with("; 1 skipped: scan again") && *is_error, "{line}");
+
+        // With nothing to delete the skipped line stands alone and no delete runs.
+        app.open_repo_cleanup_modal(
+            "real".into(),
+            RepoScan {
+                items: vec![RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "feat".into() }],
+                notes: vec![],
+                base,
+            },
+        );
+        press(&mut app, KeyCode::Char('y')).await;
+        assert_eq!(app.repo_cleanup_result["real"], ("1 skipped: scan again".to_string(), true));
+        assert!(app.repo_cleanup_inflight.is_none(), "no delete phase");
+        assert!(repo_rx.try_recv().is_err(), "no worker spawned");
     }
 
     #[tokio::test]
@@ -11157,6 +11205,7 @@ mod key_tests {
         assert!(elapsed >= TEARDOWN_CAPTURE_GRACE, "the grace was paid, so the tabs were in scope ({elapsed:?})");
         assert!(elapsed < 2 * TEARDOWN_CAPTURE_GRACE, "paid once, not per workspace ({elapsed:?})");
         assert!(app.cleanup_inflight.contains("w1") && app.cleanup_inflight.contains("w2"));
+        assert!(!app.repo_cleanup_result.contains_key("real"), "nothing skipped, no line");
     }
 
     #[tokio::test]
