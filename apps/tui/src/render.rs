@@ -1196,7 +1196,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 }
             }
 
-            // Clean-up affordance + last failure (own-branch workspaces).
+            // Clean-up affordance + last outcome (own-branch workspaces).
             let cleanup_inflight = app.cleanup_inflight.contains(&ws.id);
             if has_branch || cleanup_inflight || app.cleanup_result.contains_key(&ws.id) {
                 lines.push(Line::raw(""));
@@ -1218,17 +1218,19 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         HitAction::CleanupWorkspaceFor { workspace_id: ws.id.clone() },
                     );
                 }
-                if let Some(msg) = app.cleanup_result.get(&ws.id) {
+                if let Some((msg, is_error)) = app.cleanup_result.get(&ws.id) {
                     tail_from = lines.len();
+                    let (label, color) = if *is_error {
+                        ("Cleanup blocked: ", th.error)
+                    } else {
+                        ("Cleaned up: ", th.text)
+                    };
                     let mut msg_lines = msg.lines();
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            "Cleanup blocked: ",
-                            Style::default().fg(th.error).add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
                         Span::styled(
                             msg_lines.next().unwrap_or_default().to_string(),
-                            Style::default().fg(th.error),
+                            Style::default().fg(color),
                         ),
                     ]));
                     // Core's notes: warnings, as in the repo pane.

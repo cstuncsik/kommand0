@@ -120,6 +120,8 @@ pub(crate) enum ModalState {
         branch: String,
         dirty: bool,
         unpushed: bool,
+        /// The branch the cached status saw the worktree on, when it isn't `branch`.
+        worktree_on: Option<String>,
     },
     /// Preview of a repo's merged-branch scan; `y` hands `plan` back to the app.
     ConfirmRepoCleanup {
@@ -1032,6 +1034,7 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
             branch,
             dirty,
             unpushed,
+            worktree_on,
             ..
         } => {
             let area = centered_rect(60, 35, frame.area());
@@ -1080,17 +1083,30 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[2],
             );
             let mut warn = Vec::new();
-            if *dirty {
+            if let Some(on) = worktree_on {
+                // Dirty/unpushed describe that checkout, not `branch`; core
+                // decides from the live HEAD.
                 warn.push(Line::styled(
-                    "⚠ Uncommitted changes will block cleanup.",
-                    Style::default().fg(th.error),
+                    format!("Worktree is on {on}: kept; this workspace will track it."),
+                    Style::default().fg(th.dirty),
                 ));
-            }
-            if *unpushed {
                 warn.push(Line::styled(
-                    "⚠ Unpushed commits may block cleanup.",
-                    Style::default().fg(th.error),
+                    format!("Only branch {branch} is deleted."),
+                    Style::default().fg(th.dirty),
                 ));
+            } else {
+                if *dirty {
+                    warn.push(Line::styled(
+                        "⚠ Uncommitted changes will block cleanup.",
+                        Style::default().fg(th.error),
+                    ));
+                }
+                if *unpushed {
+                    warn.push(Line::styled(
+                        "⚠ Unpushed commits may block cleanup.",
+                        Style::default().fg(th.error),
+                    ));
+                }
             }
             frame.render_widget(Paragraph::new(warn), inner[3]);
 

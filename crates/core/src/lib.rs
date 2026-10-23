@@ -11,8 +11,8 @@ pub mod workspace;
 pub mod worktree;
 
 pub use cleanup::{
-    Base, BranchResults, BranchVerdict, Scan, Verdict, cleanup_merged_workspace, delete_branches,
-    scan_merged_branches,
+    Base, BranchResults, BranchVerdict, Cleaned, Scan, Verdict, cleanup_merged_workspace,
+    delete_branches, scan_merged_branches,
 };
 pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
@@ -1840,6 +1840,18 @@ impl AppState {
     /// directory.
     pub fn delete_workspace_by_id(&mut self, id: &str) -> anyhow::Result<Workspace> {
         self.delete_workspace_by_id_with_base(id, Self::state_dir().as_path())
+    }
+
+    /// Record `branch` as workspace `id`'s branch (a cleanup followed its worktree
+    /// to another branch) and save. Exact id, like [`Self::delete_workspace_by_id`].
+    pub fn set_workspace_branch_by_id(&mut self, id: &str, branch: &str) -> anyhow::Result<()> {
+        let ws = self
+            .workspaces
+            .iter_mut()
+            .find(|w| w.id == id)
+            .ok_or_else(|| anyhow::anyhow!("workspace not found: {id}"))?;
+        ws.branch_name = Some(branch.to_string());
+        self.save()
     }
 
     /// Archive a workspace (set active=false) with custom base directory.

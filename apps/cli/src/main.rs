@@ -4,8 +4,9 @@ use std::os::unix::process::CommandExt; // for Command::process_group
 use clap::{Parser, Subcommand, ValueEnum};
 use kommand0_core::workspace::format_timestamp;
 use kommand0_core::{
-    AppState, Config, RepoCleanupItem, Scan, SessionStatus, SortMode, Workspace, branch_status,
-    cleanup_merged_workspace, delete_branches, plan_repo_cleanup, scan_merged_branches,
+    AppState, Cleaned, Config, RepoCleanupItem, Scan, SessionStatus, SortMode, Workspace,
+    branch_status, cleanup_merged_workspace, delete_branches, plan_repo_cleanup,
+    scan_merged_branches,
 };
 
 /// Clap mirror of [`SortMode`]: keeps clap out of the core crate while giving
@@ -525,10 +526,16 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     };
                     match cleanup_merged_workspace(&repo.path, &worktree, branch, &protected) {
-                        Ok(()) => {
+                        Ok(Cleaned::Removed) => {
                             // Exact id, never the name: see WorkspaceAction::Cleanup.
                             state.delete_workspace_by_id(ws_id)?;
                             println!("Cleaned up workspace: {ws_name}");
+                        }
+                        Ok(Cleaned::Followed { branch: on }) => {
+                            state.set_workspace_branch_by_id(ws_id, &on)?;
+                            println!(
+                                "Cleaned up workspace: {ws_name} (branch {branch} is gone; now tracks {on}, worktree kept)"
+                            );
                         }
                         Err(e) => {
                             failed += 1;
@@ -826,13 +833,19 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 match cleanup_merged_workspace(&repo, &worktree, &branch, &protected) {
-                    Ok(()) => {
+                    Ok(Cleaned::Removed) => {
                         // The worktree + branch are gone; drop the workspace
                         // entry by exact id (never re-resolve the user's string
                         // after the destructive git work, and never fall back
                         // to a name match on the id).
                         state.delete_workspace_by_id(&ws.id)?;
                         println!("Cleaned up workspace: {name}");
+                    }
+                    Ok(Cleaned::Followed { branch: on }) => {
+                        state.set_workspace_branch_by_id(&ws.id, &on)?;
+                        println!(
+                            "Cleaned up workspace: {name} (branch {branch} is gone; now tracks {on}, worktree kept)"
+                        );
                     }
                     Err(e) => anyhow::bail!("{}", warn_notes(&e)),
                 }

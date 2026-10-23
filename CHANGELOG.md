@@ -5,6 +5,20 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Workspace cleanup no longer dead-ends on a row it cannot resolve** (#119). A
+  workspace whose worktree and branch are both already gone is now cleaned up
+  (nothing to delete, the row is dropped; needs git 2.43 or newer) instead of
+  refusing with "couldn't resolve the branch tip", and a workspace whose
+  worktree moved to another branch now follows it: the merged branch is
+  deleted, the dir is kept, and the row tracks the branch checked out there. A
+  detached HEAD, an unborn branch, or a name kommand0 cannot track still
+  refuse. The cleanup modal says so when the cached status can tell;
+  `kmd workspace cleanup` and `kmd repo cleanup` print
+  `Cleaned up workspace: <name> (branch <b> is gone; now tracks <x>, worktree kept)`
+  and keep the row.
+
 ## [0.32.0] - 2026-10-21
 
 ### Added
