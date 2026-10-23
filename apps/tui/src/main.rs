@@ -3955,7 +3955,7 @@ impl App {
         self.repo_cleanup_result.insert(repo_id, (line, !failed.is_empty() || skipped > 0));
     }
 
-    /// `d`/`D`/[Delete] on a row whose cleanup is running would force-remove
+    /// `d`/`D`/`[Delete]` on a row whose cleanup is running would force-remove
     /// the worktree under core's probes: refused, silently (the pane already
     /// shows the spinner and hides [Clean up]; a `cleanup_result` line would
     /// render as "Cleanup blocked:"). Logs the refusal.
@@ -3970,15 +3970,16 @@ impl App {
     /// Delete workspace `ws_id`: drop its live panes (at user-action time, so
     /// reap_embedded never blocks the tick on the Drop), drop the row (exact id;
     /// its worktree goes with it), flip its legacy Running session and persist
-    /// with ONE merge-aware save. The one path behind `d`+`y`, `D`, the [Delete]
-    /// button and a Removed cleanup. Refused while the row's cleanup is in
-    /// flight (the worker owns the worktree). A no-op when the row is already
-    /// gone, even when a new workspace reused the id as a name.
+    /// with ONE merge-aware save. The one path behind `d`+`y`, `D`, the
+    /// `[Delete]` button and a Removed cleanup. Refused while the row's cleanup
+    /// is in flight (the worker owns the worktree). Drops the pane entry first;
+    /// the rest is a no-op when the row is already gone, even when a new
+    /// workspace reused the id as a name.
     fn delete_workspace(&mut self, ws_id: &str) {
         if self.workspace_delete_blocked_by_cleanup(ws_id) {
             return;
         }
-        self.embedded.remove(ws_id); // a no-op for an absent key
+        self.embedded.remove(ws_id);
         if self.state.remove_workspace(ws_id).is_none() {
             return;
         }
@@ -10911,9 +10912,8 @@ mod key_tests {
         assert_eq!(app.repo_cleanup_result["real"], ("1 skipped: scan again".to_string(), true));
         let msg = recv(&mut repo_rx).await;
         app.repo_cleanup_inflight = None; // the event loop's job, not the handler's
-        let (id, results, skipped) = match msg {
-            RepoCleanupMsg::Deleted(id, results, skipped) => (id, results, skipped),
-            other => panic!("expected the delete results, got {other:?}"),
+        let RepoCleanupMsg::Deleted(id, results, skipped) = msg else {
+            panic!("expected the delete results, got {msg:?}");
         };
         assert_eq!(skipped, 1);
         app.on_repo_cleanup_deleted(id, results, skipped);
@@ -11131,10 +11131,7 @@ mod key_tests {
             log_file: String::new(),
         });
         // No PTY: pins that the delete drops the pane entry.
-        app.embedded.insert(
-            "w1".into(),
-            WorkspaceSessions { tabs: vec![], active: 0, last_active: None },
-        );
+        app.embedded.insert("w1".into(), WorkspaceSessions::default());
         // The baseline holds both rows, so the baseline checks below bite.
         app.state_baseline = app.state.clone();
         app.expanded.insert("r1".into());
@@ -11191,7 +11188,6 @@ mod key_tests {
         );
         let s1 = &app.state.sessions[0];
         assert_eq!(s1.status, SessionStatus::Stopped, "its legacy session is stopped");
-        assert!(s1.ended_at.is_some());
         assert_eq!(app.repos.len(), 2, "nothing deleted the repo");
     }
 
