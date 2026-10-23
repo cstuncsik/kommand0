@@ -3957,7 +3957,7 @@ impl App {
 
     /// `d`/`D`/`[Delete]` on a row whose cleanup is running would force-remove
     /// the worktree under core's probes: refused, silently (the pane already
-    /// shows the spinner and hides [Clean up]; a `cleanup_result` line would
+    /// shows the spinner and hides `[Clean up]`; a `cleanup_result` line would
     /// render as "Cleanup blocked:"). Logs the refusal.
     fn workspace_delete_blocked_by_cleanup(&self, ws_id: &str) -> bool {
         let blocked = self.cleanup_inflight.contains(ws_id);
@@ -4007,7 +4007,8 @@ impl App {
     /// The repo-level twin of `workspace_delete_blocked_by_cleanup`: a repo
     /// delete removes every row's worktree and the repo's branches, so it is
     /// refused while any of the repo's rows has a cleanup in flight or while
-    /// the repo's own branch-delete phase runs. Logs the refusal.
+    /// the repo's own merged-branch scan or delete runs
+    /// (`repo_cleanup_inflight`). Logs the refusal.
     fn repo_delete_blocked_by_cleanup(&self, repo_id: &str) -> bool {
         let blocked = self.repo_cleanup_inflight.as_deref() == Some(repo_id)
             || self
@@ -4015,17 +4016,17 @@ impl App {
                 .iter()
                 .any(|w| w.repo_id == repo_id && self.cleanup_inflight.contains(&w.id));
         if blocked {
-            tracing::info!("delete: repo {repo_id} has a workspace cleanup in flight; ignored");
+            tracing::info!("delete: repo {repo_id} has a cleanup in flight; ignored");
         }
         blocked
     }
 
-    /// Delete repo `repo_id` with every row under it: drop the rows' panes and
-    /// per-row UI entries, remove the repo and everything under it (exact id:
-    /// rows, worktrees, sessions) and persist with ONE merge-aware save. The
-    /// one path behind `d`+`y`, `D` and `[Delete]` on a repo row. Refused
-    /// while any of its rows has a cleanup in flight; a no-op when the repo
-    /// is already gone.
+    /// Delete repo `repo_id` with every row under it: drop the rows' panes,
+    /// per-row UI entries and the repo's own cleanup outcome, remove the repo
+    /// and everything under it (exact id: rows, worktrees, sessions) and
+    /// persist with ONE merge-aware save. The one path behind `d`+`y`, `D`
+    /// and `[Delete]` on a repo row. Refused per
+    /// `repo_delete_blocked_by_cleanup`; a no-op when the repo is already gone.
     fn delete_repo(&mut self, repo_id: &str) {
         if self.repo_delete_blocked_by_cleanup(repo_id) {
             return;
@@ -4044,6 +4045,10 @@ impl App {
         }
         if self.state.remove_repo(repo_id).is_none() {
             return;
+        }
+        self.repo_cleanup_result.remove(repo_id);
+        if self.repo_cleanup_pending.as_ref().is_some_and(|(id, _)| id == repo_id) {
+            self.repo_cleanup_pending = None;
         }
         self.save_state();
         self.expanded.remove(repo_id);
@@ -11104,6 +11109,18 @@ mod key_tests {
             app.state_baseline.repos.iter().all(|r| r.id != "r1"),
             "persisted with a merge-save"
         );
+    }
+
+    #[test]
+    fn repo_delete_clears_its_cleanup_leftovers() {
+        let mut app = test_app();
+        app.repo_cleanup_result.insert("r1".into(), ("Cleanup failed: x".into(), true));
+        app.repo_cleanup_pending = Some(("r1".into(), scan_of(vec![delete_item("stale")], &[])));
+
+        app.delete_repo("r1");
+
+        assert!(!app.repo_cleanup_result.contains_key("r1"), "its outcome line is gone");
+        assert!(app.repo_cleanup_pending.is_none(), "its parked scan is gone");
     }
 
     #[tokio::test]
