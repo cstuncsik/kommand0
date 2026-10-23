@@ -5,6 +5,16 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **The repo cleanup preview lists workspace rows whose branch is already gone**
+  (#128), routed through the workspace cleanup like any other row (so
+  `kmd repo cleanup` prints them as `clean up workspace '<name>'`); a row whose
+  branch name is malformed is skipped as "malformed branch name".
+- **A confirmed repo plan that skipped moved rows says so** (#128): the repo
+  pane reads `N skipped: scan again` (appended to the delete line when plain
+  branches were deleted too).
+
 ### Fixed
 
 - **Workspace cleanup no longer dead-ends on a row it cannot resolve** (#119). A
@@ -18,6 +28,21 @@ All notable changes to kommand0 are documented here. The format is based on
   `kmd workspace cleanup` and `kmd repo cleanup` print
   `Cleaned up workspace: <name> (branch <b> is gone; now tracks <x>, worktree kept)`
   and keep the row.
+- **Workspace deletes and `kmd` cleanups no longer overwrite a concurrent
+  state write** (#128). `d`, `D`, the [Delete] button, a cleanup that removed
+  the row, `kmd workspace cleanup` and `kmd repo cleanup` now persist with a
+  3-way merge-save, so a `kmd workspace create` (or a TUI save) that landed
+  meanwhile survives.
+- **Cleanup refuses to follow a dir replaced by another repository** (#128). A
+  workspace dir that is now an independent repo on a branch name the main repo
+  also has (e.g. `main`) is refused as "on another repository" instead of
+  being followed onto that name.
+- **An unreadable worktree path now refuses instead of reading as absent**
+  (#128): a permission error while probing the worktree says "couldn't check
+  the worktree"; the branch and the row are kept.
+- **`d` is ignored while that row's cleanup runs** (#128), as are `D` and the
+  [Delete] button; a repo delete is likewise ignored while a cleanup of its
+  rows or of its branches runs.
 
 ## [0.32.0] - 2026-10-21
 
