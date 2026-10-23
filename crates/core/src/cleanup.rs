@@ -702,18 +702,42 @@ fn probe_branch(repo_path: &str, branch: &str) -> RefProbe {
     }
 }
 
+/// `dir`'s git common dir, canonicalized: the identity of the repository a
+/// path belongs to (the main repo and every linked worktree share one).
+/// `rev-parse --git-common-dir` prints `.git` from a main worktree and an
+/// absolute path from a linked one, so the output is joined onto `dir`
+/// first; `canonicalize` also folds symlinks (`/var` vs `/private/var`).
+/// None (logged by `check_git_stdout`) when git can't answer or the path
+/// can't be resolved. A repo path containing a newline is not a supported
+/// shape (the trimmed single line is taken as is).
+fn common_dir(dir: &str) -> Option<std::path::PathBuf> {
+    let rel = check_git_stdout(dir, &["rev-parse", "--git-common-dir"], &[])?;
+    std::fs::canonicalize(std::path::Path::new(dir).join(rel))
+        .inspect_err(|e| tracing::warn!("cleanup: can't resolve the git dir of {dir}: {e}"))
+        .ok()
+}
+
 /// The branch `worktree_path`'s HEAD is on, when it is one this can record and
-/// delete: a born branch (its tip resolves in `repo_path`; a nested foreign
-/// repo counts as live, and its HEAD is followed only if the repo has a born
-/// branch of that name, else it is refused as unborn) with a name
+/// delete: a born branch (its tip resolves in `repo_path`; a dir that is
+/// another repository (its common dir differs from `repo_path`'s) is refused
+/// as "another repository", whatever its HEAD names) with a name
 /// `is_valid_branch_name` accepts (stricter than git). The workspace's own
 /// `branch` is reported as is, born or
 /// not: the caller knows (its tip resolved, or it is the one that is gone).
-/// Else what a refusal calls it: "a detached HEAD" (also when git failed),
-/// "an unborn branch <b>", the full ref outside refs/heads/, or the invalid
-/// name. Full ref, not `--short` (a same-named tag makes `--short` print
-/// `heads/<b>`).
+/// Else what a refusal calls it: "another repository" (also when the probe
+/// fails), "a detached HEAD" (also when git failed), "an unborn branch <b>",
+/// the full ref outside refs/heads/, or the invalid name. Full ref, not
+/// `--short` (a same-named tag makes `--short` print `heads/<b>`).
 fn worktree_head(repo_path: &str, worktree_path: &str, branch: &str) -> Result<String, String> {
+    // A dir replaced by an independent repository is live to git and may sit
+    // on a branch name this repo also has (`git init` lands on main, and the
+    // foreign repo can even be on a branch NAMED like the workspace's): the
+    // identity check keeps the row off a foreign checkout. Fails closed when a
+    // probe can't answer.
+    match (common_dir(repo_path), common_dir(worktree_path)) {
+        (Some(repo), Some(wt)) if repo == wt => {}
+        _ => return Err("another repository".to_string()),
+    }
     let head = match Command::new("git")
         .args(["-C", worktree_path, "symbolic-ref", "HEAD"])
         .output()
@@ -744,9 +768,8 @@ fn worktree_head(repo_path: &str, worktree_path: &str, branch: &str) -> Result<S
 /// - it isn't a branch created at a merged tip without a commit of its own
 ///   (see [`fresh_by_reflog`]);
 /// - the worktree, if it still exists, is live (see [`is_live_worktree`]; a
-///   nested foreign repo counts as live; its HEAD is followed only if the repo
-///   has a born branch of that name, else it is refused as unborn). When its
-///   HEAD is on another born branch (a `git switch` inside it made the dir
+///   nested foreign repo counts as live but is refused as another repository).
+///   When its HEAD is on another born branch (a `git switch` inside it made the dir
 ///   that branch's checkout), only `branch` is deleted, the dir stays, and the
 ///   result is [`Cleaned::Followed`]; a detached HEAD, an unborn branch or a
 ///   name [`is_valid_branch_name`] rejects is refused instead;
@@ -1781,17 +1804,34 @@ mod tests {
     #[test]
     fn cleanup_refuses_to_follow_a_dir_replaced_by_another_repo() {
         // The workspace dir is now a foreign repo (live to git, so not
-        // wreckage): its HEAD name resolves there, not in the main repo, so
-        // the row never follows it.
+        // wreckage) sitting on `main`, a branch the main repo has too: its HEAD
+        // name resolves in BOTH repos, so only the repository identity keeps
+        // the row off it.
         let tmp = TempDir::new().unwrap();
         let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
         std::fs::remove_dir_all(&wt).unwrap();
         std::fs::create_dir_all(&wt).unwrap();
         init_repo(&wt);
-        git(&wt, &["switch", "-c", "other"]);
-        let err = cleanup(&repo, &wt, &branch).unwrap_err();
-        assert!(err.contains("an unborn branch other"), "{err}");
+        let refusal =
+            "the worktree is on another repository, not feat; switch back or delete it by hand";
+        assert_eq!(cleanup(&repo, &wt, &branch).unwrap_err(), refusal);
         assert!(branch_exists(&repo, &branch), "the branch survives");
+        assert!(wt.join("a.txt").exists(), "the foreign repo is untouched");
+
+        // Its HEAD names the workspace branch itself: before the gate, that
+        // went straight into the dirty check.
+        git(&wt, &["switch", "-c", "feat"]);
+        assert_eq!(cleanup(&repo, &wt, &branch).unwrap_err(), refusal);
+        assert!(branch_exists(&repo, &branch), "the branch survives");
+        assert!(wt.join("a.txt").exists(), "the foreign repo is untouched");
+
+        // The branch gone too (the nothing-left path): the same gate, worded
+        // for a row with nothing left to delete.
+        git(&repo, &["update-ref", "-d", "refs/heads/feat"]);
+        let refusal = "the worktree is on another repository and branch feat is gone; \
+                       switch it to a branch or delete it by hand";
+        assert_eq!(cleanup(&repo, &wt, &branch).unwrap_err(), refusal);
+        assert!(wt.join("a.txt").exists(), "the foreign repo is untouched");
     }
 
     #[test]
