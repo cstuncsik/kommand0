@@ -3936,32 +3936,62 @@ impl App {
         self.repo_cleanup_result.insert(repo_id, (line, !failed.is_empty()));
     }
 
+    /// `d`/`D`/[Delete] on a row whose cleanup is running would force-remove
+    /// the worktree under core's probes: refused, silently (the pane already
+    /// shows the spinner and hides [Clean up]; a `cleanup_result` line would
+    /// render as "Cleanup blocked:"). Logs the refusal.
+    fn workspace_delete_blocked_by_cleanup(&self, ws_id: &str) -> bool {
+        let blocked = self.cleanup_inflight.contains(ws_id);
+        if blocked {
+            tracing::info!("delete: workspace {ws_id} has a cleanup in flight; ignored");
+        }
+        blocked
+    }
+
+    /// Delete workspace `ws_id`: drop its live panes (at user-action time, so
+    /// reap_embedded never blocks the tick on the Drop), drop the row (exact id;
+    /// its worktree goes with it), flip its legacy Running session and persist
+    /// with ONE merge-aware save. The one path behind `d`+`y`, `D`, the [Delete]
+    /// button and a Removed cleanup. Refused while the row's cleanup is in
+    /// flight (the worker owns the worktree). A no-op when the row is already
+    /// gone, even when a new workspace reused the id as a name.
+    fn delete_workspace(&mut self, ws_id: &str) {
+        if self.workspace_delete_blocked_by_cleanup(ws_id) {
+            return;
+        }
+        self.embedded.remove(ws_id); // a no-op for an absent key
+        if self.state.remove_workspace(ws_id).is_none() {
+            return;
+        }
+        if let Some(sid) = self
+            .state
+            .find_session_by_workspace(ws_id)
+            .filter(|s| s.status == SessionStatus::Running)
+            .map(|s| s.id.clone())
+        {
+            self.state.set_session_status(&sid, SessionStatus::Stopped);
+        }
+        self.save_state();
+        self.workspaces = self.state.workspaces.clone();
+        self.expanded_icon_rows.remove(ws_id);
+        self.cleanup_result.remove(ws_id);
+        self.rebuild_tree();
+        // clamp_selection re-seats off any hint row AND re-syncs the active
+        // session (a raw clamp skipped both, stranding focus/selection).
+        self.clamp_selection();
+        // Rows shifted under selected_index, so a DIFFERENT workspace's pane can
+        // now be the visible one; a highlight (or live drag) must not carry over.
+        self.pane_selection = None;
+    }
+
     /// A workspace cleanup landed: a removal drops the row, a followed worktree
     /// re-points it, a refusal shows in its pane.
     fn on_cleanup_done(&mut self, ws_id: String, result: Result<Cleaned, String>) {
         self.cleanup_inflight.remove(&ws_id);
         match result {
-            // Saves through `delete_workspace_by_id` (a plain save, no 3-way
-            // merge), unlike the Followed arm below: pre-existing, a follow-up.
             Ok(Cleaned::Removed) => {
-                // The worktree + branch are gone; drop the workspace too
-                // (exact id; a no-op if it was already deleted meanwhile,
-                // even when a new workspace has reused the id as a name).
-                if self.state.delete_workspace_by_id(&ws_id).is_ok() {
-                    self.workspaces = self.state.workspaces.clone();
-                    self.expanded_icon_rows.remove(&ws_id);
-                    self.cleanup_result.remove(&ws_id);
-                    self.rebuild_tree();
-                    // clamp_selection re-seats off any hint row AND
-                    // re-syncs the active session (a raw clamp skipped
-                    // both, stranding focus/selection after cleanup).
-                    self.clamp_selection();
-                    // Rows shifted under selected_index, so a DIFFERENT
-                    // workspace's pane can now be the visible one (the
-                    // one pane-switch route with no key and no Down), and
-                    // a highlight (or live drag) must not carry over.
-                    self.pane_selection = None;
-                }
+                // The worktree + branch are gone; drop the workspace too.
+                self.delete_workspace(&ws_id);
             }
             Ok(Cleaned::Followed { branch }) => {
                 // The dir is `branch`'s checkout and stays; the row tracks it
@@ -4628,24 +4658,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             modal::ModalResult::ConfirmDelete(target) => {
                 match target {
                     modal::DeleteTarget::Workspace { id, .. } => {
-                        if let Some(sid) = app
-                            .state
-                            .find_session_by_workspace(&id)
-                            .filter(|s| s.status == SessionStatus::Running)
-                            .map(|s| s.id.clone())
-                        {
-                            let _ = app
-                                .state
-                                .update_session_status(&sid, SessionStatus::Stopped);
-                        }
-                        // Tear the embedded pane down here (at user-action
-                        // time) rather than letting reap_embedded block the
-                        // 50ms tick on the pane's Drop.
-                        app.embedded.remove(&id);
-                        let _ = app.state.delete_workspace_by_id(&id);
-                        app.workspaces = app.state.workspaces.clone();
-                        app.rebuild_tree();
-                        app.update_active_session();
+                        app.delete_workspace(&id);
                     }
                     modal::DeleteTarget::Repo { id, .. } => {
                         // Stop all running sessions for this repo's workspaces
@@ -4984,21 +4997,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         // The tree node carries the workspace: key everything
                         // on its id (a by-name refetch could hit another
                         // repo's same-named workspace and its live session).
-                        if let Some(sid) = app
-                            .state
-                            .find_session_by_workspace(&ws.id)
-                            .filter(|s| s.status == SessionStatus::Running)
-                            .map(|s| s.id.clone())
-                        {
-                            let _ = app
-                                .state
-                                .update_session_status(&sid, SessionStatus::Stopped);
-                        }
-                        app.embedded.remove(&ws.id);
-                        let _ = app.state.delete_workspace_by_id(&ws.id);
-                        app.workspaces = app.state.workspaces.clone();
-                        app.rebuild_tree();
-                        app.update_active_session();
+                        app.delete_workspace(&ws.id);
                     }
                     Some(TreeNode::Repo { id, .. }) => {
                         let ws_ids: Vec<String> = app
@@ -5681,26 +5680,9 @@ async fn run(
                             }
                         }
                         buttons::HitAction::DeleteWorkspaceFor { workspace_id } => {
-                            // Only act while the workspace still exists
-                            if let Some(ws) = app.state.workspaces.iter().find(|w| w.id == workspace_id).cloned() {
-                                // Stop running session first
-                                if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
-                                    .filter(|s| s.status == SessionStatus::Running)
-                                    .map(|s| s.id.clone())
-                                {
-                                    let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
-                                }
-                                if app.state.delete_workspace_by_id(&ws.id).is_ok() {
-                                    app.embedded.remove(&workspace_id);
-                                    app.expanded_icon_rows.remove(&workspace_id);
-                                    app.repos = app.state.repos.clone();
-                                    app.workspaces = app.state.workspaces.clone();
-                                    app.rebuild_tree();
-                                    // Re-seat off any hint row and re-sync the
-                                    // active session (clamp_selection does both).
-                                    app.clamp_selection();
-                                }
-                            }
+                            // A row already gone is the helper's no-op. Event
+                            // loop only, so unit tests cover it through `D`.
+                            app.delete_workspace(&workspace_id);
                         }
                         buttons::HitAction::DeleteRepoFor { repo_name } => {
                             // Stop all running sessions for this repo's workspaces
@@ -10982,21 +10964,34 @@ mod key_tests {
     #[tokio::test]
     async fn a_removed_cleanup_drops_the_row_and_its_leftovers() {
         let mut app = test_app();
-        app.workspaces[0].worktree_path = Some("/tmp/alpha/gone".into());
+        // Under a TempDir: the delete's `remove_worktree` clears an absent
+        // path's empty parent, which for `/tmp/alpha/gone` is the developer's
+        // `/tmp/alpha`.
+        let wt = tempfile::TempDir::new().unwrap();
+        app.workspaces[0].worktree_path =
+            Some(wt.path().join("gone").to_string_lossy().into_owned());
         app.workspaces[0].branch_name = Some("ws-one".into());
         app.state.workspaces = app.workspaces.clone();
         app.cleanup_result.insert("w1".to_string(), ("stale refusal".to_string(), true));
         app.expanded_icon_rows.insert("w1".to_string());
         app.pane_selection =
             Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+        // In flight, as when the worker's message lands: the arm must clear it
+        // before the delete, whose guard refuses a row with a cleanup running.
+        app.cleanup_inflight.insert("w1".into());
 
         app.on_cleanup_done("w1".into(), Ok(Cleaned::Removed));
 
+        assert!(!app.cleanup_inflight.contains("w1"), "no longer in flight");
         assert!(app.workspaces.iter().all(|w| w.id != "w1"), "the row is gone");
         assert!(app.state.workspaces.iter().all(|w| w.id != "w1"), "from the state too");
         assert!(!app.cleanup_result.contains_key("w1"), "its outcome line is gone");
         assert!(!app.expanded_icon_rows.contains("w1"), "its icon-row entry is gone");
         assert!(app.pane_selection.is_none(), "no stale highlight");
+        assert!(
+            app.state_baseline.workspaces.iter().all(|w| w.id != "w1"),
+            "persisted with a merge-save: the baseline moves only after a successful save"
+        );
     }
 
     #[tokio::test]

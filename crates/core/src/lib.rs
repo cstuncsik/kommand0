@@ -1740,7 +1740,7 @@ impl AppState {
     /// Trade-off: in that shadow state the TUI's by-id archive/activate
     /// calls hit the error and silently no-op until the shadowing row is
     /// deleted by its own id; destructive deletes are immune, they use the
-    /// exact-id [`Self::delete_workspace_by_id`] path instead.
+    /// exact-id [`Self::remove_workspace`] path instead.
     fn workspace_index(&self, ws_ref: &str) -> anyhow::Result<usize> {
         let matches: Vec<usize> = self
             .workspaces
@@ -1781,10 +1781,9 @@ impl AppState {
         Ok(&self.workspaces[self.workspace_index(ws_ref)?])
     }
 
-    /// Shared removal body once a delete entry point has resolved the row
-    /// index: drop the row, its embedded-session bookkeeping, and its
-    /// worktree, then save.
-    fn remove_workspace_at(&mut self, idx: usize, base: &Path) -> anyhow::Result<Workspace> {
+    /// Shared removal body once an entry point has resolved the row index: drop
+    /// the row, its embedded-session bookkeeping and its git worktree. No save.
+    fn remove_workspace_at(&mut self, idx: usize) -> Workspace {
         let removed = self.workspaces.remove(idx);
         self.embedded_sessions.remove(&removed.id);
         self.embedded_titles.remove(&removed.id);
@@ -1795,9 +1794,7 @@ impl AppState {
         {
             let _ = worktree::remove_worktree(&repo.path, wt_path);
         }
-
-        self.save_to(base)?;
-        Ok(removed)
+        removed
     }
 
     /// Delete a workspace by name or ID, saving to custom base directory.
@@ -1808,7 +1805,9 @@ impl AppState {
         base: &Path,
     ) -> anyhow::Result<Workspace> {
         let idx = self.workspace_index(ws_ref)?;
-        self.remove_workspace_at(idx, base)
+        let removed = self.remove_workspace_at(idx);
+        self.save_to(base)?;
+        Ok(removed)
     }
 
     /// Delete a workspace by name or ID, saving to the default state directory.
@@ -1816,42 +1815,33 @@ impl AppState {
         self.delete_workspace_with_base(ws_ref, Self::state_dir().as_path())
     }
 
-    /// Delete a workspace by its EXACT id, never falling back to a name
-    /// match: "workspace not found" when the id is absent. For callers
-    /// holding an authentic state-held id (the TUI's tree actions, the CLI
-    /// cleanup's second step): immune to name shadowing AND to the race
-    /// where the row is deleted meanwhile and a new workspace is created
-    /// NAMED that id string, which a ws_ref lookup would mis-target.
-    /// User-facing refs stay on [`Self::delete_workspace`].
-    pub fn delete_workspace_by_id_with_base(
-        &mut self,
-        id: &str,
-        base: &Path,
-    ) -> anyhow::Result<Workspace> {
-        let idx = self
-            .workspaces
-            .iter()
-            .position(|w| w.id == id)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {id}"))?;
-        self.remove_workspace_at(idx, base)
+    /// Remove the workspace with EXACTLY this id (never a name match) from the
+    /// in-memory state: the row, its `embedded_sessions`/`embedded_titles`
+    /// entries and its git worktree ([`worktree::remove_worktree`], idempotent:
+    /// a dir already gone still clears an empty `worktrees/<repo-id>/`). No
+    /// save: the caller persists (`save_to`, or the TUI's merge-aware
+    /// `save_state`), so a concurrent `kmd` write is merged, not clobbered.
+    /// `None` when no row has that id, a no-op: immune to name shadowing AND to
+    /// the race where the row was deleted meanwhile and a new workspace is NAMED
+    /// that id string, which a ws_ref lookup would mis-target. For callers
+    /// holding a state-held id (the TUI's tree actions, the cleanups);
+    /// user-facing refs stay on [`Self::delete_workspace`].
+    pub fn remove_workspace(&mut self, id: &str) -> Option<Workspace> {
+        let idx = self.workspaces.iter().position(|w| w.id == id)?;
+        Some(self.remove_workspace_at(idx))
     }
 
-    /// [`Self::delete_workspace_by_id_with_base`] against the default state
-    /// directory.
-    pub fn delete_workspace_by_id(&mut self, id: &str) -> anyhow::Result<Workspace> {
-        self.delete_workspace_by_id_with_base(id, Self::state_dir().as_path())
-    }
-
-    /// Record `branch` as workspace `id`'s branch (a cleanup followed its worktree
-    /// to another branch) and save. Exact id, like [`Self::delete_workspace_by_id`].
-    pub fn set_workspace_branch_by_id(&mut self, id: &str, branch: &str) -> anyhow::Result<()> {
-        let ws = self
-            .workspaces
-            .iter_mut()
-            .find(|w| w.id == id)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {id}"))?;
-        ws.branch_name = Some(branch.to_string());
-        self.save()
+    /// Record `branch` as workspace `id`'s branch (a cleanup followed its
+    /// worktree to another branch). Exact id and no save, like
+    /// [`Self::remove_workspace`]; `false` when no row has that id.
+    pub fn set_workspace_branch(&mut self, id: &str, branch: &str) -> bool {
+        match self.workspaces.iter_mut().find(|w| w.id == id) {
+            Some(ws) => {
+                ws.branch_name = Some(branch.to_string());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Archive a workspace (set active=false) with custom base directory.
@@ -1948,22 +1938,14 @@ impl AppState {
         self.sessions.iter_mut().find(|s| s.id == session_id)
     }
 
-    /// Update session status, saving state to a custom base directory.
-    /// Sets ended_at for terminal states (Stopped, Failed, Exited).
-    pub fn update_session_status_with_base(
-        &mut self,
-        session_id: &str,
-        status: SessionStatus,
-        base: &Path,
-    ) -> anyhow::Result<()> {
-        let session = self
-            .sessions
-            .iter_mut()
-            .find(|s| s.id == session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
-
+    /// Record `status` on `session_id`, stamping `ended_at` for a terminal state
+    /// (Stopped, Failed, Exited). No save; `false` when no session has that id.
+    /// [`Self::update_session_status`] is the saving form.
+    pub fn set_session_status(&mut self, session_id: &str, status: SessionStatus) -> bool {
+        let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else {
+            return false;
+        };
         session.status = status.clone();
-
         match status {
             SessionStatus::Stopped | SessionStatus::Failed | SessionStatus::Exited => {
                 session.ended_at = Some(
@@ -1975,7 +1957,21 @@ impl AppState {
             }
             SessionStatus::Running => {}
         }
+        true
+    }
 
+    /// Update session status, saving state to a custom base directory.
+    /// Sets ended_at for terminal states (Stopped, Failed, Exited); see
+    /// [`Self::set_session_status`].
+    pub fn update_session_status_with_base(
+        &mut self,
+        session_id: &str,
+        status: SessionStatus,
+        base: &Path,
+    ) -> anyhow::Result<()> {
+        if !self.set_session_status(session_id, status) {
+            bail!("session not found: {session_id}");
+        }
         self.save_to(base)?;
         Ok(())
     }
@@ -2479,24 +2475,40 @@ mod tests {
     }
 
     #[test]
-    fn delete_workspace_by_id_ignores_name_shadowing() {
+    fn exact_id_mutators_ignore_name_shadowing() {
         // Shadow state: workspace A is NAMED exactly workspace B's id. The
-        // exact-id delete must hit the id-matched row, never the name.
-        let tmp = TempDir::new().unwrap();
+        // exact-id mutators must hit the id-matched row, never the name.
         let mut state = AppState::default();
         state.workspaces.push(ws("b-id", "b-name"));
         state.workspaces.push(ws("a-id", "b-id")); // A named exactly B's id
-        let removed = state.delete_workspace_by_id_with_base("b-id", tmp.path()).unwrap();
+        let removed = state.remove_workspace("b-id").unwrap();
         assert_eq!(removed.id, "b-id", "the id match wins over the shadowing name");
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.workspaces[0].id, "a-id", "the shadowing row is untouched");
 
         // The id row is gone and a workspace NAMED that id string remains
-        // (the deleted-row-plus-name-reuse race): the by-id delete must NOT
-        // fall back to the name match. Error, nothing mutated.
-        let err = state.delete_workspace_by_id_with_base("b-id", tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("workspace not found"), "{err}");
-        assert_eq!(state.workspaces.len(), 1, "no name-match fallback delete");
+        // (the deleted-row-plus-name-reuse race): the exact-id mutators must
+        // NOT fall back to the name match. A no-op, nothing mutated.
+        assert!(state.remove_workspace("b-id").is_none(), "no name-match fallback delete");
+        assert_eq!(state.workspaces.len(), 1);
+        assert!(!state.set_workspace_branch("b-id", "x"), "the row NAMED b-id does not count");
+        assert_eq!(state.workspaces[0].branch_name, None, "the shadowing row is untouched");
+        assert!(state.set_workspace_branch("a-id", "moved"));
+        assert_eq!(state.workspaces[0].branch_name.as_deref(), Some("moved"));
+    }
+
+    #[test]
+    fn set_session_status_stamps_ended_at() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        state.workspaces.push(ws("w", "w"));
+        let id = state.create_session_with_base("w", tmp.path()).unwrap().id;
+        assert_eq!(state.sessions[0].status, SessionStatus::Running);
+        assert!(state.sessions[0].ended_at.is_none());
+        assert!(state.set_session_status(&id, SessionStatus::Stopped));
+        assert_eq!(state.sessions[0].status, SessionStatus::Stopped);
+        assert!(state.sessions[0].ended_at.is_some(), "a terminal state is stamped");
+        assert!(!state.set_session_status("nope", SessionStatus::Stopped));
     }
 
     #[test]
