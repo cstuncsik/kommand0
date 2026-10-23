@@ -68,6 +68,16 @@ fn is_live_worktree(worktree_path: &str) -> bool {
     }
 }
 
+/// Whether `worktree_path` exists. `Err` (logged) when that can't be told,
+/// e.g. EACCES on a parent: `exists()` reads that as absent, and absent is
+/// what lets a branch go, so every probe here fails closed instead.
+fn worktree_present(worktree_path: &str) -> Result<bool, String> {
+    std::path::Path::new(worktree_path).try_exists().map_err(|e| {
+        tracing::warn!("cleanup: can't probe {worktree_path}: {e}");
+        format!("couldn't check the worktree ({e}); not cleaning up")
+    })
+}
+
 /// Env for every merged-check spawn: replace refs and grafts can't fake a
 /// merge, a partial clone never fetches (or prompts) mid-check, no system-wide
 /// attributes apply, and the replay's driver overrides read `false`.
@@ -767,6 +777,8 @@ fn worktree_head(repo_path: &str, worktree_path: &str, branch: &str) -> Result<S
 ///   answer, i.e. when the local copy says not merged;
 /// - it isn't a branch created at a merged tip without a commit of its own
 ///   (see [`fresh_by_reflog`]);
+/// - the worktree path can be probed at all (a permission error refuses with
+///   "couldn't check the worktree"; the branch and the row are kept);
 /// - the worktree, if it still exists, is live (see [`is_live_worktree`]; a
 ///   nested foreign repo counts as live but is refused as another repository).
 ///   When its HEAD is on another born branch (a `git switch` inside it made the dir
@@ -830,17 +842,9 @@ pub fn cleanup_merged_workspace(
             }
             RefProbe::Present | RefProbe::Failed => return Err(tip_refusal()),
         }
-        match std::path::Path::new(worktree_path).try_exists() {
-            Ok(false) => {
-                prune();
-                return Ok(Cleaned::Removed);
-            }
-            Ok(true) => {}
-            Err(e) => {
-                // `exists()` would read a permission error as absent.
-                tracing::warn!("cleanup: can't probe {worktree_path}: {e}");
-                return Err(tip_refusal());
-            }
+        if !worktree_present(worktree_path)? {
+            prune();
+            return Ok(Cleaned::Removed);
         }
         if !is_live_worktree(worktree_path) {
             return Err(wreckage());
@@ -889,7 +893,7 @@ pub fn cleanup_merged_workspace(
     // The worktree must be clean — but only check if it still exists (a retry
     // after a partial cleanup has no worktree left to be dirty). An unreadable
     // status on an existing worktree aborts (never assume safe).
-    let worktree_exists = std::path::Path::new(worktree_path).exists();
+    let worktree_exists = worktree_present(worktree_path)?;
     if worktree_exists {
         // A dir git no longer recognizes is wreckage from an earlier removal
         // that died mid-delete: there is no status to read, and nothing here can
@@ -936,7 +940,9 @@ pub fn cleanup_merged_workspace(
             .args(LOOK_AT_THE_DISK)
             .args(["worktree", "remove", worktree_path])
             .output();
-        if std::path::Path::new(worktree_path).exists() {
+        // Fail closed here too: an unreadable path must not read as removed,
+        // or the branch goes while the dir may survive.
+        if worktree_present(worktree_path)? {
             if is_live_worktree(worktree_path) {
                 // Git refused before touching a byte. Report ITS reason: it
                 // checks things this gate doesn't (a dirty submodule, since its
@@ -1998,6 +2004,46 @@ mod tests {
                 assert!(e.contains("delete") || e.contains("remove"), "actionable: {e}");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_refuses_when_the_worktree_path_cannot_be_probed() {
+        // The worktree moved under a dir nobody may search: `exists()` reads
+        // EACCES as absent, and absent is what lets the branch go while the
+        // dir survives. Both paths that probe it must refuse instead.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let (repo, wt, branch) = merged_worktree_on(tmp.path(), "feat");
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let moved = locked.join("wt");
+        std::fs::rename(&wt, &moved).unwrap();
+        let mode = |m: u32| std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        let probe = moved.try_exists();
+        let res = cleanup(&repo, &moved, &branch);
+        // Restore before any assert, or a panic leaks the TempDir.
+        mode(0o755).unwrap();
+        if probe.is_ok() {
+            eprintln!("skipped: the mode is not enforced here (root)");
+            return;
+        }
+        let err = res.unwrap_err();
+        assert!(err.starts_with("couldn't check the worktree ("), "{err}");
+        assert!(err.ends_with("); not cleaning up"), "{err}");
+        assert!(branch_exists(&repo, &branch), "the branch survives");
+        assert!(moved.exists(), "the dir survives");
+
+        // The nothing-left path (its branch gone) probes the same way.
+        git(&repo, &["update-ref", "-d", "refs/heads/feat"]);
+        mode(0o000).unwrap();
+        let res = cleanup(&repo, &moved, &branch);
+        mode(0o755).unwrap();
+        let err = res.unwrap_err();
+        assert!(err.starts_with("couldn't check the worktree ("), "{err}");
+        assert!(err.ends_with("); not cleaning up"), "{err}");
+        assert!(moved.exists(), "the dir survives");
     }
 
     #[test]
