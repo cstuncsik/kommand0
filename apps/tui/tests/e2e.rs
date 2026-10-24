@@ -509,6 +509,47 @@ fn review_diff_overlay_opens_and_closes() {
 }
 
 #[test]
+fn review_diff_shows_a_real_worktrees_files() {
+    // The diff is computed on a worker; its reply must reach the open dialog.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let wt = dir.path().join("wt");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "user.name", "t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+    run_git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "feat"]);
+    std::fs::write(wt.join("diff-me.txt"), "1").unwrap();
+    run_git(&wt, &["add", "."]);
+    run_git(&wt, &["commit", "-m", "work"]);
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": wt.to_str().unwrap(), "active": true, "created_at": 0,
+            "worktree_path": wt.to_str().unwrap(), "branch_name": "feat"
+        }],
+        "sessions": []
+    })
+    .to_string();
+
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "false")]);
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.wait_for("no upstream"); // a status pass landed too
+    tui.send("v");
+    tui.wait_for("diff-me.txt");
+
+    tui.send_esc();
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn tree_navigation_expands_repo_with_l() {
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());

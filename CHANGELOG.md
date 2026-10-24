@@ -38,6 +38,8 @@ All notable changes to kommand0 are documented here. The format is based on
   background, and quitting waits for them. Detaching, stopping or starting a
   cleanup with codex or opencode tabs still waits up to 1.5 s to capture their
   session id.
+- **Opening the review diff (`v`) no longer freezes the UI on a big branch**:
+  git computes it in the background while the dialog says "Loading diff…".
 
 ## [0.32.1] - 2026-10-23
 

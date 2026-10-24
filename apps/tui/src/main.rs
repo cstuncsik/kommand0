@@ -76,7 +76,8 @@ const PR_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Carries a background worker's result to the event loop, sending on drop
 /// so the loop always gets a message (and clears the matching `*_inflight`
 /// flag) even if the worker thread panics before finishing. Shared by the
-/// status/PR refreshes, cleanup, the issue resolve, and profile delete.
+/// status/PR refreshes, cleanup, the issue resolve, the review diff, and
+/// profile delete.
 struct SendOnDrop<T> {
     tx: tokio::sync::mpsc::UnboundedSender<T>,
     payload: Option<T>,
@@ -99,6 +100,10 @@ type ProfileDeleteMsg =
 /// What a git-status pass sends back: each checked row's status, `None` when
 /// git couldn't read it.
 type StatusMsg = Vec<(String, Option<kommand0_core::BranchStatus>)>;
+
+/// What the review-diff worker sends back: the request it answers (see
+/// `App::diff_seq`) and the files, `None` when git couldn't compute a diff.
+type DiffMsg = (u64, Option<Vec<kommand0_core::FileDiff>>);
 
 /// A scan, routed against the repo's workspaces: the plan, core's notes (a
 /// failed refresh of the default branch, squash detection off) and the base
@@ -822,8 +827,9 @@ pub(crate) struct App {
     pub(crate) show_diff: bool,
     pub(crate) diff_title: String,
     /// What the left pane shows when there are no file rows — distinguishes a
-    /// fallback workspace (no branch), a non-repo/uncomputable diff, and a
-    /// genuinely-empty diff. Set in `open_diff`; empty when rows render.
+    /// fallback workspace (no branch), a diff still loading, a non-repo/uncomputable
+    /// diff, and a genuinely-empty diff. Set in `open_diff` and `finish_diff`;
+    /// empty when rows render.
     pub(crate) diff_note: String,
     /// The per-file diff sections (from `diff_files_vs_default_branch`).
     pub(crate) diff_files: Vec<kommand0_core::FileDiff>,
@@ -841,6 +847,11 @@ pub(crate) struct App {
     /// Rendered pane rects, set at render time for mouse hit-testing.
     pub(crate) diff_list_area: ratatui::layout::Rect,
     pub(crate) diff_body_area: ratatui::layout::Rect,
+    /// Bumped by every `open_diff`: a worker reply for an earlier request is
+    /// dropped.
+    diff_seq: u64,
+    /// Diff worker → event-loop channel. `None` when not wired (unit tests).
+    diff_tx: Option<tokio::sync::mpsc::UnboundedSender<DiffMsg>>,
     /// True when a `g` was pressed and we're waiting for a second `g` (vim `gg`).
     pub(crate) pending_g: bool,
     /// Tree filter query (case-insensitive; empty = no filter). Matches a
@@ -1078,6 +1089,8 @@ impl App {
             diff_focus: DiffFocus::Files,
             diff_list_area: ratatui::layout::Rect::default(),
             diff_body_area: ratatui::layout::Rect::default(),
+            diff_seq: 0,
+            diff_tx: None,
             pending_g: false,
             filter_query: String::new(),
             filter_input: false,
@@ -3542,17 +3555,22 @@ impl App {
         }
     }
 
-    /// Populate and open the review-diff dialog for a workspace: the PR-style
+    /// Open the review-diff dialog for a workspace: the PR-style
     /// `git diff <default>...HEAD` of its worktree (committed changes only), as a
-    /// collapsible file tree + per-file diff. Computed synchronously — a local git
-    /// diff is fast; move off-loop if a huge worktree ever hitches the render loop.
+    /// collapsible file tree + per-file diff. git runs on a worker; the dialog
+    /// says "Loading diff…" until [`Self::finish_diff`] fills it.
     fn open_diff(&mut self, ws_id: &str) {
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
             return;
         };
+        // First, so a reply for an earlier open can't land in this one.
+        self.diff_seq += 1;
         self.show_diff = true;
         self.diff_focus = DiffFocus::Files;
         self.diff_files.clear();
+        // Rows index into `diff_files`: stale ones would render against the
+        // cleared files.
+        self.diff_rows.clear();
         self.diff_expanded.clear();
         self.diff_selected = 0;
         self.diff_list_scroll = 0;
@@ -3566,7 +3584,6 @@ impl App {
         // gates on `worktree_path`).
         let Some(worktree) = ws.worktree_path.clone() else {
             self.diff_title = ws.name.clone();
-            self.diff_rows.clear();
             self.diff_note = "This workspace has no branch to review.".to_string();
             return;
         };
@@ -3574,21 +3591,36 @@ impl App {
             Some(b) => format!("{} ({b})", ws.name),
             None => ws.name.clone(),
         };
+        self.diff_note = "Loading diff…".to_string();
+        let Some(tx) = self.diff_tx.clone() else {
+            return; // not wired (unit tests)
+        };
+        let seq = self.diff_seq;
+        std::thread::spawn(move || {
+            let mut guard = SendOnDrop { tx, payload: Some((seq, None)) };
+            guard.payload = Some((seq, kommand0_core::diff_files_vs_default_branch(&worktree)));
+        });
+    }
+
+    /// A diff worker replied: fill the dialog if it is still open on that
+    /// request, else drop the reply.
+    fn finish_diff(&mut self, req: u64, files: Option<Vec<kommand0_core::FileDiff>>) {
+        if !self.show_diff || req != self.diff_seq {
+            return;
+        }
         // Distinguish "couldn't compute" (not a repo / base unresolved → None)
         // from a genuinely-empty diff (Some(empty)); both leave no rows, but the
         // note the left pane shows differs.
-        self.diff_files = match kommand0_core::diff_files_vs_default_branch(&worktree) {
-            Some(files) => files,
-            None => {
-                self.diff_rows.clear();
-                self.diff_note = "Couldn't compute a diff — not a git repo.".to_string();
-                return;
-            }
+        let Some(files) = files else {
+            self.diff_note = "Couldn't compute a diff: not a git repo.".to_string();
+            return;
         };
-        if self.diff_files.is_empty() {
-            self.diff_note =
-                "No committed changes on this branch vs the default branch.".to_string();
-        }
+        self.diff_files = files;
+        self.diff_note = if self.diff_files.is_empty() {
+            "No committed changes on this branch vs the default branch.".to_string()
+        } else {
+            String::new()
+        };
         // Default to every folder expanded, then flatten to the visible rows and
         // land the selection on the first File row (so the right pane shows a diff).
         for path in self.diff_files.iter().map(|f| f.path.clone()).collect::<Vec<_>>() {
@@ -5727,6 +5759,10 @@ async fn run(
     let (issue_tx, mut issue_rx) = tokio::sync::mpsc::unbounded_channel::<IssueMsg>();
     app.issue_tx = Some(issue_tx);
 
+    // Review-diff worker → event loop, carrying `(request id, files)`.
+    let (diff_tx, mut diff_rx) = tokio::sync::mpsc::unbounded_channel::<DiffMsg>();
+    app.diff_tx = Some(diff_tx);
+
     // Codex early-capture pollers → event loop, carrying the captured entry
     // as `(workspace_id, tab_id, "codex:<uuid>", spawn generation)`.
     let (codex_capture_tx, mut codex_capture_rx) =
@@ -5798,6 +5834,9 @@ async fn run(
             }
             Some((req, result)) = issue_rx.recv() => {
                 app.finish_issue_resolve(req, result);
+            }
+            Some((req, files)) = diff_rx.recv() => {
+                app.finish_diff(req, files);
             }
             Some((ws_id, result)) = cleanup_rx.recv() => {
                 app.on_cleanup_done(ws_id, result);
@@ -8820,6 +8859,77 @@ mod key_tests {
         assert_eq!(app.diff_title, "ws-one");
         assert!(app.diff_rows.is_empty());
         assert!(app.diff_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reopening_the_diff_shows_loading_not_the_old_rows() {
+        let mut app = test_app();
+        let repo = add_real_repo(&mut app, "feat");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wt = tmp.path().join("wt");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(repo.path(), &["worktree", "add", wt.to_str().unwrap(), "feat"]);
+        std::fs::write(wt.join("work.txt"), "work").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-m", "work"]);
+        route_w1_to_real(&mut app, &wt, "feat");
+        app.expanded.insert("real".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.diff_tx = Some(tx);
+
+        press(&mut app, KeyCode::Char('v')).await;
+        let (req, files) = recv(&mut rx).await;
+        app.finish_diff(req, files);
+        assert_eq!(row_labels(&app), ["F:work.txt"], "the first open lists the branch's file");
+
+        // Reopened, its reply not in yet: the old rows must not render
+        // against the cleared files.
+        press(&mut app, KeyCode::Esc).await;
+        press(&mut app, KeyCode::Char('v')).await;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Loading diff"), "{text}");
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Char('l')).await;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Loading diff"), "{text}");
+    }
+
+    #[test]
+    fn a_diff_reply_for_a_closed_or_newer_request_is_dropped() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/nonexistent/wt".into());
+        let files = || Some(vec![file_diff("a.txt", "@@ -0,0 +1 @@\n+x\n")]);
+
+        app.open_diff("w1");
+        let first = app.diff_seq;
+        app.show_diff = false;
+        app.finish_diff(first, files());
+        assert!(app.diff_rows.is_empty(), "a closed dialog takes no reply");
+
+        app.open_diff("w1");
+        app.finish_diff(first, files());
+        assert!(app.diff_rows.is_empty(), "the earlier request's reply is dropped");
+        assert_eq!(app.diff_note, "Loading diff…");
+
+        app.finish_diff(app.diff_seq, files());
+        assert_eq!(row_labels(&app), ["F:a.txt"], "the newest request's reply lands");
+    }
+
+    #[test]
+    fn a_failed_diff_says_so() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/nonexistent/wt".into());
+        app.open_diff("w1");
+        app.finish_diff(app.diff_seq, None);
+        assert!(app.diff_rows.is_empty());
+        assert_eq!(app.diff_note, "Couldn't compute a diff: not a git repo.");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Couldn't compute"), "{text}");
     }
 
     #[tokio::test]
