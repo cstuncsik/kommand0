@@ -183,10 +183,25 @@ pub fn create_worktree(
     let branch = unique_branch_name(repo_path, &strip_accents(workspace_name));
 
     // Create the worktree on a fresh branch.
-    let output = Command::new("git")
-        .args(["-C", repo_path, "worktree", "add", &worktree_path, "-b", &branch])
+    let output = git_no_prompt(repo_path)
+        .args(["worktree", "add", &worktree_path, "-b", &branch])
         .output();
     finish_worktree_add(repo_path, output, worktree_path, branch)
+}
+
+/// `git -C <repo_path>` for a `worktree add` that can't prompt: a hook or an
+/// LFS smudge reaching the network would otherwise ask on the terminal, reading
+/// keys meant for the TUI. The rest of [`crate::git::fetch_origin_branch`]'s
+/// recipe is left out: its 20 s `wait_bounded` cap would abandon a big healthy
+/// checkout, and its gc flags only matter for a fetch.
+fn git_no_prompt(repo_path: &str) -> Command {
+    let mut git = Command::new("git");
+    git.args(["-C", repo_path])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("GIT_SSH_COMMAND", crate::git::batch_ssh_command(repo_path))
+        .envs(crate::git::http_stall(repo_path));
+    git
 }
 
 /// Map the `git worktree add` result to a [`WorktreeResult`], copying the repo's
@@ -435,7 +450,7 @@ pub fn create_worktree_from_branch(
             return WorktreeResult::Fallback { reason: format!("branch not found: {branch_ref}") };
         };
 
-    let output = Command::new("git").args(["-C", repo_path]).args(&args).output();
+    let output = git_no_prompt(repo_path).args(&args).output();
     finish_worktree_add(repo_path, output, worktree_path, branch_name)
 }
 
@@ -921,6 +936,44 @@ mod tests {
                 assert_eq!(String::from_utf8_lossy(&up.stdout).trim(), "origin/feat", "tracks the remote");
             }
             WorktreeResult::Fallback { reason } => panic!("expected Created (tracking), got: {reason}"),
+        }
+    }
+
+    #[test]
+    fn worktree_add_runs_git_non_interactively() {
+        // A checkout that reaches the network (a hook, an LFS smudge) must not
+        // prompt on the terminal the TUI owns.
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        let hooks = repo.path().join("hooks");
+        let log = repo.path().join("env.log");
+        let hook = format!(
+            "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
+             \"${{GIT_ASKPASS-UNSET}}\" \"${{GIT_SSH_COMMAND-UNSET}}\" \
+             \"${{GIT_HTTP_LOW_SPEED_TIME-UNSET}}\" >> {}\n",
+            crate::git::shell_quote(log.to_str().unwrap())
+        );
+        write_file(&hooks, "post-checkout", &hook);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hooks.join("post-checkout"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        // Local, so it beats a hooksPath in the global config the tests inherit.
+        Command::new("git").args(["-C", rp, "config", "core.hooksPath", hooks.to_str().unwrap()]).output().unwrap();
+        Command::new("git").args(["-C", rp, "branch", "feat"]).output().unwrap();
+
+        assert!(matches!(create_worktree(rp, "r1", "a", base.path()), WorktreeResult::Created { .. }));
+        let from_branch = create_worktree_from_branch(rp, "r1", "b", base.path(), "feat");
+        assert!(matches!(from_branch, WorktreeResult::Created { .. }));
+
+        let env = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(env.lines().count(), 2, "one line per worktree add: {env}");
+        for line in env.lines() {
+            assert!(line.starts_with("0||"), "no terminal prompt and no askpass helper: {line}");
+            let fields: Vec<&str> = line.split('|').collect();
+            assert!(fields[2].contains("BatchMode=yes"), "ssh can't prompt: {line}");
+            assert_ne!(fields[3], "UNSET", "a stalled https transfer gives up: {line}");
         }
     }
 

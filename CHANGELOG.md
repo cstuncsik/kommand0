@@ -45,6 +45,9 @@ All notable changes to kommand0 are documented here. The format is based on
   macOS default), where both names share one directory: the create is refused.
   Deleting a workspace whose directory is another workspace's worktree (a case
   variant, a symlink) keeps that worktree. Applies to `kmd` too.
+- **Creating a workspace can no longer stop on a git, ssh or LFS prompt** that
+  reads keystrokes meant for the TUI: `git worktree add` runs
+  non-interactively, like kommand0's fetches. Applies to `kmd` too.
 
 ## [0.32.1] - 2026-10-23
 

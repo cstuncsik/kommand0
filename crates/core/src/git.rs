@@ -320,7 +320,7 @@ const SSH_OPTS: &str = "-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatch
 /// variable only when the user set neither it nor its `http.lowSpeed*` key
 /// (for any URL), which the variable would override; git needs both for a
 /// limit, so one they set still gets the other.
-fn http_stall(repo_dir: &str) -> Vec<(&'static str, &'static str)> {
+pub(crate) fn http_stall(repo_dir: &str) -> Vec<(&'static str, &'static str)> {
     let configured = Command::new("git")
         .args(["-C", repo_dir, "config", "--get-regexp", r"^http\..*lowspeed(limit|time)$"])
         .env_remove("GIT_CONFIG")
@@ -363,7 +363,7 @@ fn stall_env(limit_set: bool, time_set: bool) -> Vec<(&'static str, &'static str
 /// ssh takes the FIRST value of a repeated option, so someone who has already
 /// put an explicit `-oBatchMode=no` in their own command keeps it, and their
 /// choice to be prompted stands.
-fn batch_ssh_command(repo_dir: &str) -> String {
+pub(crate) fn batch_ssh_command(repo_dir: &str) -> String {
     let env = std::env::var("GIT_SSH_COMMAND").ok();
     // Only read the config when the environment doesn't already decide it.
     let cfg = env
