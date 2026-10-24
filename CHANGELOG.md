@@ -5,6 +5,13 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **The background git status and `kmd workspace status` no longer take git's
+  optional index lock** (`git --no-optional-locks status`): a status check never
+  rewrites a worktree's index, so a git command running there at the same
+  moment can't trip over its `index.lock`.
+
 ## [0.32.1] - 2026-10-23
 
 ### Changed
