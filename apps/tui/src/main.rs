@@ -5372,7 +5372,8 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-#[tokio::main]
+// One event loop task and no spawned tasks: worker threads would only idle.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     // Answer `--version`/`--help` before entering the alt-screen, where stdout
     // would be swallowed. (Kept first so `kommand0 --profile --help` prints

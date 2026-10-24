@@ -26,7 +26,8 @@ All notable changes to kommand0 are documented here. The format is based on
   output are paced (about 66 a second), and a deferred one waits on its own
   timer instead of pausing the event loop. Frames a session marks as
   synchronized (DEC mode 2026) are shown whole, not half painted; a frame left
-  open still shows after 100 ms.
+  open still shows after 100 ms. The event loop runs on one thread instead of
+  starting an idle worker per CPU core.
 
 ## [0.32.1] - 2026-10-23
 
