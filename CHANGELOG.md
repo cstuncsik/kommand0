@@ -40,6 +40,11 @@ All notable changes to kommand0 are documented here. The format is based on
   session id.
 - **Opening the review diff (`v`) no longer freezes the UI on a big branch**:
   git computes it in the background while the dialog says "Loading diff…".
+- **Creating a workspace whose name differs from another's only in case no
+  longer deletes that workspace's worktree** on a case-insensitive volume (the
+  macOS default), where both names share one directory: the create is refused.
+  Deleting a workspace whose directory is another workspace's worktree (a case
+  variant, a symlink) keeps that worktree. Applies to `kmd` too.
 
 ## [0.32.1] - 2026-10-23
 

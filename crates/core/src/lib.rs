@@ -179,6 +179,52 @@ enum TargetState {
     Corrupt(anyhow::Error),
 }
 
+/// What a guarded worktree removal left on disk ([`AppState::remove_worktree_of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeftWorktree {
+    /// Another live workspace's worktree (case variant, symlink, any alias): kept on purpose.
+    Alias { path: String, owner: String },
+    /// Ownership couldn't be checked (state.json unreadable): kept, fail closed.
+    Unverified { path: String },
+    /// git failed on the row's own directory; it is still there.
+    Failed { path: String },
+}
+
+/// The name of the workspace whose live worktree `dir` is, if any: same device
+/// and inode as the worktree of a row in `rows` (the caller's) or in `base`'s
+/// state.json (a `kmd` write since the caller loaded), skipping rows whose id
+/// is in `skip` (the ones being removed). A case variant on a case-insensitive
+/// volume, a symlink, any alias counts. `Ok(None)` when `dir` doesn't exist;
+/// `Err` when state.json can't be read while it does, so callers fail closed.
+fn live_alias(
+    dir: &Path,
+    base: &Path,
+    rows: &[Workspace],
+    skip: &[String],
+) -> Result<Option<String>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(target) = fs::metadata(dir) else {
+        return Ok(None);
+    };
+    let owner = |among: &[Workspace]| {
+        among
+            .iter()
+            .filter(|w| !skip.contains(&w.id))
+            .find(|w| {
+                let meta = w.worktree_path.as_ref().and_then(|p| fs::metadata(p).ok());
+                meta.is_some_and(|m| (m.dev(), m.ino()) == (target.dev(), target.ino()))
+            })
+            .map(|w| w.name.clone())
+    };
+    if let Some(name) = owner(rows) {
+        return Ok(Some(name));
+    }
+    let disk = AppState::load_from(base).map_err(|e| {
+        format!("couldn't check whether another workspace uses {}: {e:#}", dir.display())
+    })?;
+    Ok(owner(&disk.workspaces))
+}
+
 impl AppState {
     /// The profile-independent dev-build data root (also the release fallback
     /// when the platform data dir can't be resolved).
@@ -1478,7 +1524,7 @@ impl AppState {
         base: &Path,
     ) -> anyhow::Result<RepoEntry> {
         let id = self.resolve_repo(repo_ref)?.id.clone();
-        let repo = self.remove_repo(&id).ok_or_else(|| anyhow::anyhow!("repo not found: {id}"))?;
+        let repo = self.remove_repo_in(&id, base).ok_or_else(|| anyhow::anyhow!("repo not found: {id}"))?;
         self.save_to(base)?;
         Ok(repo)
     }
@@ -1495,6 +1541,12 @@ impl AppState {
     /// [`Self::remove_workspace`]: the caller persists. `None` when no repo
     /// has that id, a no-op. User-facing refs stay on [`Self::delete_repo`].
     pub fn remove_repo(&mut self, id: &str) -> Option<RepoEntry> {
+        self.remove_repo_in(id, &Self::state_dir())
+    }
+
+    /// [`Self::remove_repo`], each worktree guarded against `base`'s rows
+    /// ([`Self::remove_worktree_of`]).
+    fn remove_repo_in(&mut self, id: &str, base: &Path) -> Option<RepoEntry> {
         let repo = self.repos.iter().find(|r| r.id == id)?.clone();
 
         // Collect workspace IDs for this repo
@@ -1518,17 +1570,14 @@ impl AppState {
             }
         });
 
-        // Remove workspaces and their worktrees
-        self.workspaces.retain(|w| {
-            if w.repo_id == repo.id {
-                if let Some(wt_path) = &w.worktree_path {
-                    let _ = worktree::remove_worktree(&repo.path, wt_path);
-                }
-                false
-            } else {
-                true
-            }
-        });
+        // Remove workspaces, then their worktrees: the repo's rows all go, so
+        // only the rows that stay can claim a dir.
+        let (rows, kept): (Vec<Workspace>, Vec<Workspace>) =
+            std::mem::take(&mut self.workspaces).into_iter().partition(|w| w.repo_id == repo.id);
+        self.workspaces = kept;
+        for w in &rows {
+            let _ = Self::remove_worktree_of(&repo.path, w, base, &self.workspaces, &ws_ids);
+        }
 
         // Forget any embedded Claude session ids (and titles) for the removed
         // workspaces.
@@ -1676,6 +1725,21 @@ impl AppState {
 
         self.validate_new_workspace_name(&ws_name, &repo.id)?;
 
+        // The worktree create force-removes whatever is at its dir, so refuse a
+        // dir that is another workspace's worktree. A dir that can't be built
+        // gets the fallback row below, as before.
+        if use_worktree && let Ok(dir) = worktree::worktree_dir(&repo.id, &ws_name, base) {
+            match live_alias(&dir, base, &self.workspaces, &[]) {
+                Ok(None) => {}
+                Ok(Some(owner)) => bail!(
+                    "{} is already workspace {owner}'s worktree (on a case-insensitive volume, \
+                     names that differ only in case share a directory)",
+                    dir.display()
+                ),
+                Err(e) => bail!(e),
+            }
+        }
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time went backwards")
@@ -1809,18 +1873,48 @@ impl AppState {
         Ok(&self.workspaces[self.workspace_index(ws_ref)?])
     }
 
+    /// Remove `ws`'s worktree from repo `repo_path`, unless it is another live
+    /// workspace's too (`live_alias` over `rows`, `base`'s state.json and
+    /// `skip`). `Ok(())` when nothing is left: removed, already gone (the
+    /// empty-parent rmdir still runs), or a fallback row with no worktree. A
+    /// kept dir is logged, as git's own failures are.
+    fn remove_worktree_of(
+        repo_path: &str,
+        ws: &Workspace,
+        base: &Path,
+        rows: &[Workspace],
+        skip: &[String],
+    ) -> Result<(), LeftWorktree> {
+        let Some(wt) = ws.worktree_path.as_deref() else {
+            return Ok(());
+        };
+        let path = wt.to_string();
+        match live_alias(Path::new(wt), base, rows, skip) {
+            Ok(None) => {}
+            Ok(Some(owner)) => {
+                tracing::warn!(worktree = wt, "kept: it is {owner}'s worktree");
+                return Err(LeftWorktree::Alias { path, owner });
+            }
+            Err(e) => {
+                tracing::warn!(worktree = wt, "kept: {e}");
+                return Err(LeftWorktree::Unverified { path });
+            }
+        }
+        let _ = worktree::remove_worktree(repo_path, wt);
+        if Path::new(wt).exists() { Err(LeftWorktree::Failed { path }) } else { Ok(()) }
+    }
+
     /// Shared removal body once an entry point has resolved the row index: drop
-    /// the row, its embedded-session bookkeeping and its git worktree. No save.
-    fn remove_workspace_at(&mut self, idx: usize) -> Workspace {
+    /// the row, its embedded-session bookkeeping and its git worktree, guarded
+    /// against `base`'s rows ([`Self::remove_worktree_of`]). No save.
+    fn remove_workspace_at(&mut self, idx: usize, base: &Path) -> Workspace {
         let removed = self.workspaces.remove(idx);
         self.embedded_sessions.remove(&removed.id);
         self.embedded_titles.remove(&removed.id);
 
-        // Clean up worktree if present
-        if let Some(wt_path) = &removed.worktree_path
-            && let Some(repo) = self.repos.iter().find(|r| r.id == removed.repo_id)
-        {
-            let _ = worktree::remove_worktree(&repo.path, wt_path);
+        if let Some(repo) = self.repos.iter().find(|r| r.id == removed.repo_id) {
+            let skip = [removed.id.clone()];
+            let _ = Self::remove_worktree_of(&repo.path, &removed, base, &self.workspaces, &skip);
         }
         removed
     }
@@ -1833,7 +1927,7 @@ impl AppState {
         base: &Path,
     ) -> anyhow::Result<Workspace> {
         let idx = self.workspace_index(ws_ref)?;
-        let removed = self.remove_workspace_at(idx);
+        let removed = self.remove_workspace_at(idx, base);
         self.save_to(base)?;
         Ok(removed)
     }
@@ -1845,10 +1939,11 @@ impl AppState {
 
     /// Remove the workspace with EXACTLY this id (never a name match) from the
     /// in-memory state: the row, its `embedded_sessions`/`embedded_titles`
-    /// entries and its git worktree ([`worktree::remove_worktree`], idempotent:
-    /// a dir already gone still clears an empty `worktrees/<repo-id>/`). No
-    /// save: the caller persists (`save_to`, or the TUI's merge-aware
-    /// `save_state`), so a concurrent `kmd` write is merged, not clobbered.
+    /// entries and its git worktree ([`Self::remove_worktree_of`] against
+    /// [`Self::state_dir`]; idempotent: a dir already gone still clears an
+    /// empty `worktrees/<repo-id>/`). No save: the caller persists (`save_to`,
+    /// or the TUI's merge-aware `save_state`), so a concurrent `kmd` write is
+    /// merged, not clobbered.
     /// `None` when no row has that id, a no-op: immune to name shadowing AND to
     /// the race where the row was deleted meanwhile and a new workspace is NAMED
     /// that id string, which a ws_ref lookup would mis-target. For callers
@@ -1856,7 +1951,7 @@ impl AppState {
     /// user-facing refs stay on [`Self::delete_workspace`].
     pub fn remove_workspace(&mut self, id: &str) -> Option<Workspace> {
         let idx = self.workspaces.iter().position(|w| w.id == id)?;
-        Some(self.remove_workspace_at(idx))
+        Some(self.remove_workspace_at(idx, &Self::state_dir()))
     }
 
     /// Record `branch` as workspace `id`'s branch (a cleanup followed its
@@ -2577,6 +2672,187 @@ mod tests {
         assert_eq!(removed.id, wa.id);
         assert!(!Path::new(&pa).exists(), "the addressed worktree is removed");
         assert!(Path::new(&pb).exists(), "the other repo's worktree survives");
+    }
+
+    /// A state saved under `tmp/state` holding `tmp/repo`, a real repo.
+    fn state_with_repo(tmp: &TempDir) -> (AppState, PathBuf, RepoEntry) {
+        let base = tmp.path().join("state");
+        let repo = init_git_repo(tmp, "repo");
+        let mut state = AppState::default();
+        let r = state.add_repo_with_base(repo.to_str().unwrap(), &base).unwrap();
+        (state, base, r)
+    }
+
+    /// Create workspace `name` and leave an unsaved file in its worktree.
+    fn live_worktree(state: &mut AppState, repo_id: &str, name: &str, base: &Path) -> PathBuf {
+        let ws = state.create_workspace_with_base(Some(name), repo_id, base).unwrap();
+        let dir = PathBuf::from(ws.worktree_path.expect("a real worktree"));
+        std::fs::write(dir.join("work.txt"), "unsaved").unwrap();
+        dir
+    }
+
+    /// Whether [`live_worktree`]'s unsaved file is still there.
+    fn intact(dir: &Path) -> bool {
+        std::fs::read_to_string(dir.join("work.txt")).is_ok_and(|s| s == "unsaved")
+    }
+
+    /// Whether `tmp` is on a volume that folds case (the macOS default).
+    fn folds_case(tmp: &TempDir) -> bool {
+        std::fs::write(tmp.path().join("probe"), "").unwrap();
+        tmp.path().join("PROBE").exists()
+    }
+
+    /// A row whose worktree is `dir`, as a stale or hand-edited state holds it.
+    fn row_at(repo_id: &str, name: &str, dir: &Path) -> Workspace {
+        let dir = dir.to_string_lossy().into_owned();
+        Workspace {
+            repo_id: repo_id.into(),
+            working_dir: dir.clone(),
+            worktree_path: Some(dir),
+            ..ws(name, name)
+        }
+    }
+
+    /// `git -C <repo> <args>`, which must succeed.
+    fn git_in(repo: &str, args: &[&str]) {
+        let out = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn a_case_variant_create_refuses_and_keeps_the_files() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let upper = live_worktree(&mut state, &r.id, "Foo", &base);
+
+        let lower = state.create_workspace_with_base(Some("foo"), &r.id, &base);
+        assert!(intact(&upper), "Foo's worktree keeps its files");
+        if folds_case(&tmp) {
+            let err = lower.unwrap_err().to_string();
+            assert!(err.contains("Foo's worktree"), "{err}");
+        } else {
+            let lower = lower.unwrap().worktree_path.expect("a real worktree");
+            assert!(Path::new(&lower).exists(), "foo gets its own dir beside Foo");
+        }
+    }
+
+    #[test]
+    fn a_create_onto_an_alias_of_a_live_worktree_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let a = live_worktree(&mut state, &r.id, "a", &base);
+        std::os::unix::fs::symlink(&a, a.with_file_name("b")).unwrap();
+
+        let created = state.create_workspace_with_base(Some("b"), &r.id, &base);
+        assert!(intact(&a), "a's worktree keeps its files");
+        let err = created.unwrap_err().to_string();
+        assert!(err.contains("a's worktree"), "{err}");
+    }
+
+    #[test]
+    fn a_create_reclaims_a_dir_no_row_owns() {
+        // A worktree no row records (a crash between git and the save) is still
+        // reclaimed: the guard is not a plain "exists, so refuse".
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let orphan = base.join("worktrees").join(&r.id).join("orphan");
+        git_in(&r.path, &["worktree", "add", "--detach", orphan.to_str().unwrap()]);
+
+        let ws = state.create_workspace_with_base(Some("orphan"), &r.id, &base).unwrap();
+        assert_eq!(ws.worktree_path.as_deref(), orphan.to_str(), "a real worktree, not a fallback row");
+    }
+
+    #[test]
+    fn a_stale_instance_sees_a_row_kmd_saved() {
+        let tmp = TempDir::new().unwrap();
+        let (_, base, r) = state_with_repo(&tmp);
+        let mut stale = AppState::load_from(&base).unwrap();
+        let mut kmd = AppState::load_from(&base).unwrap();
+        let a = live_worktree(&mut kmd, &r.id, "a", &base);
+        std::os::unix::fs::symlink(&a, a.with_file_name("b")).unwrap();
+
+        let created = stale.create_workspace_with_base(Some("b"), &r.id, &base);
+        assert!(intact(&a), "a's worktree keeps its files");
+        assert!(created.is_err());
+    }
+
+    #[test]
+    fn re_deleting_a_stale_row_spares_its_case_variant() {
+        // An abandoned delete left foo's row without its worktree; Foo then took
+        // the dir, which is foo's too on a case-insensitive volume.
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let foo = state.create_workspace_with_base(Some("foo"), &r.id, &base).unwrap();
+        git_in(&r.path, &["worktree", "remove", "--force", foo.worktree_path.as_deref().unwrap()]);
+        let upper = live_worktree(&mut state, &r.id, "Foo", &base);
+
+        state.delete_workspace_with_base(&foo.id, &base).unwrap();
+        assert!(intact(&upper), "Foo's worktree keeps its files");
+        assert!(state.workspaces.iter().all(|w| w.id != foo.id), "the stale row goes");
+    }
+
+    #[test]
+    fn deleting_a_row_aliasing_a_live_worktree_keeps_it() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let a = live_worktree(&mut state, &r.id, "a", &base);
+        let b = a.with_file_name("b");
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        state.workspaces.push(row_at(&r.id, "b", &b));
+
+        state.delete_workspace_with_base("b", &base).unwrap();
+        assert!(intact(&a), "a's worktree keeps its files");
+        assert!(state.workspaces.iter().all(|w| w.id != "b"), "the aliasing row goes");
+    }
+
+    #[test]
+    fn remove_worktree_of_keeps_an_alias_and_says_whose() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let a = live_worktree(&mut state, &r.id, "a", &base);
+        let b = a.with_file_name("b");
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let row = row_at(&r.id, "b", &b);
+
+        let skip = std::slice::from_ref(&row.id);
+        let left = AppState::remove_worktree_of(&r.path, &row, &base, &state.workspaces, skip);
+        assert!(intact(&a), "a's worktree keeps its files");
+        let path = b.to_string_lossy().into_owned();
+        assert_eq!(left, Err(LeftWorktree::Alias { path, owner: "a".into() }));
+    }
+
+    #[test]
+    fn a_garbage_state_file_keeps_an_alias() {
+        // A stale instance can't see a's row in a state.json it can't parse, so
+        // it must not take the dir for unowned.
+        let tmp = TempDir::new().unwrap();
+        let (_, base, r) = state_with_repo(&tmp);
+        let mut stale = AppState::load_from(&base).unwrap();
+        let mut kmd = AppState::load_from(&base).unwrap();
+        let a = live_worktree(&mut kmd, &r.id, "a", &base);
+        let b = a.with_file_name("b");
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        std::fs::write(base.join(AppState::STATE_FILE), "{ not json").unwrap();
+
+        let created = stale.create_workspace_with_base(Some("b"), &r.id, &base);
+        assert!(intact(&a), "a create keeps a's files");
+        assert!(created.unwrap_err().to_string().contains("couldn't check"));
+        let row = row_at(&r.id, "b", &b);
+        let skip = std::slice::from_ref(&row.id);
+        let left = AppState::remove_worktree_of(&r.path, &row, &base, &stale.workspaces, skip);
+        assert!(intact(&a), "a delete keeps a's files");
+        assert_eq!(left, Err(LeftWorktree::Unverified { path: b.to_string_lossy().into_owned() }));
+    }
+
+    #[test]
+    fn a_create_with_an_unusable_worktree_dir_still_falls_back() {
+        // A hand-edited repo id that is not one path segment has no dir to check:
+        // the create still gets the repo-root row it always got.
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, _) = state_with_repo(&tmp);
+        state.repos[0].id = "a/b".into();
+        let ws = state.create_workspace_with_base(Some("w"), "a/b", &base).unwrap();
+        assert_eq!(ws.worktree_path, None);
     }
 
     #[test]

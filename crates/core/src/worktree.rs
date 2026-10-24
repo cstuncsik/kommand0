@@ -1,4 +1,4 @@
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Result;
@@ -55,19 +55,18 @@ pub fn branch_exists_bare(repo_path: &str, name: &str) -> bool {
         || verify_ref(repo_path, &format!("refs/remotes/origin/{name}"))
 }
 
-/// Resolve `<base_dir>/worktrees/<repo_id>/<workspace_name>` to an absolute
-/// path string, clearing a stale worktree already there. `Err(reason)` if the
-/// repo id is unsafe as a path segment or a dir still blocks the path.
+/// `<base_dir>/worktrees/<repo_id>/<workspace_name>` as an absolute path.
+/// `Err(reason)` if the repo id is unsafe as a path segment or the parent is a
+/// checked-out worktree.
 ///
 /// Coexistence invariant: `worktrees/` may contain legacy flat `<name>` dirs
 /// (pre-nesting layout) alongside `<repo-id>/` dirs. Paths are read from
 /// state, never re-derived from names; never sweep `worktrees/` by pattern.
-fn prepare_worktree_dir(
-    repo_path: &str,
+pub(crate) fn worktree_dir(
     repo_id: &str,
     workspace_name: &str,
     base_dir: &Path,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<PathBuf, String> {
     // state.json is hand-editable: the id must be exactly one normal path
     // segment (rejects `.`/`..`, separators, and a Windows drive prefix like
     // `C:x`, any of which would make `join` escape `worktrees/`). A leading
@@ -91,11 +90,22 @@ fn prepare_worktree_dir(
     }
     let worktree_dir = parent.join(workspace_name);
     // The worktree dir doesn't exist yet; make the path absolute so git is happy.
-    let worktree_dir = if worktree_dir.is_relative() {
+    Ok(if worktree_dir.is_relative() {
         std::env::current_dir().unwrap_or_default().join(&worktree_dir)
     } else {
         worktree_dir
-    };
+    })
+}
+
+/// [`worktree_dir`] as a string, clearing a stale worktree already there.
+/// `Err(reason)` if the dir can't be built or a dir still blocks the path.
+fn prepare_worktree_dir(
+    repo_path: &str,
+    repo_id: &str,
+    workspace_name: &str,
+    base_dir: &Path,
+) -> std::result::Result<String, String> {
+    let worktree_dir = worktree_dir(repo_id, workspace_name, base_dir)?;
     let worktree_path = worktree_dir.to_string_lossy().to_string();
 
     if worktree_dir.exists() {
