@@ -1717,6 +1717,22 @@ impl AppState {
         use_worktree: bool,
         from_branch: Option<&str>,
     ) -> anyhow::Result<Workspace> {
+        let (repo, ws_name, taken) = self.resolve_new_workspace(name, repo_ref, from_branch)?;
+        let ws = Self::make_workspace(&repo, &ws_name, base, from_branch, use_worktree, &taken)?;
+        self.insert_workspace(ws.clone())?;
+        self.save_to(base)?;
+        Ok(ws)
+    }
+
+    /// A create's first step: the repo, the workspace name (defaulted and
+    /// validated) and `taken`, the rows [`Self::make_workspace`] checks the
+    /// new worktree dir against.
+    pub fn resolve_new_workspace(
+        &self,
+        name: Option<&str>,
+        repo_ref: &str,
+        from_branch: Option<&str>,
+    ) -> anyhow::Result<(RepoEntry, String, Vec<Workspace>)> {
         let repo = self.resolve_repo(repo_ref)?.clone();
 
         let ws_name = match name {
@@ -1730,12 +1746,27 @@ impl AppState {
         };
 
         self.validate_new_workspace_name(&ws_name, &repo.id)?;
+        let taken = self.worktree_rows_except(&[]);
+        Ok((repo, ws_name, taken))
+    }
 
+    /// Make the workspace [`Self::resolve_new_workspace`] resolved: its git
+    /// worktree, or a row on the repo root when none is wanted or git can't
+    /// make one. Touches no state, so it can run off the UI thread;
+    /// [`Self::insert_workspace`] adds the result.
+    pub fn make_workspace(
+        repo: &RepoEntry,
+        ws_name: &str,
+        base: &Path,
+        from_branch: Option<&str>,
+        use_worktree: bool,
+        taken: &[Workspace],
+    ) -> anyhow::Result<Workspace> {
         // The worktree create force-removes whatever is at its dir, so refuse a
         // dir that is another workspace's worktree. A dir that can't be built
         // gets the fallback row below, as before.
-        if use_worktree && let Ok(dir) = worktree::worktree_dir(&repo.id, &ws_name, base) {
-            match live_alias(&dir, base, &self.workspaces, &[]) {
+        if use_worktree && let Ok(dir) = worktree::worktree_dir(&repo.id, ws_name, base) {
+            match live_alias(&dir, base, taken, &[]) {
                 Ok(None) => {}
                 Ok(Some(owner)) => bail!(
                     "{} is already workspace {owner}'s worktree (on a case-insensitive volume, \
@@ -1756,7 +1787,7 @@ impl AppState {
         let (working_dir, worktree_path, branch_name) = if !use_worktree {
             (repo.path.clone(), None, None)
         } else if let Some(branch_ref) = from_branch {
-            match worktree::create_worktree_from_branch(&repo.path, &repo.id, &ws_name, base, branch_ref) {
+            match worktree::create_worktree_from_branch(&repo.path, &repo.id, ws_name, base, branch_ref) {
                 worktree::WorktreeResult::Created { worktree_path, branch_name } => {
                     (worktree_path.clone(), Some(worktree_path), Some(branch_name))
                 }
@@ -1767,7 +1798,7 @@ impl AppState {
                 }
             }
         } else {
-            match worktree::create_worktree(&repo.path, &repo.id, &ws_name, base) {
+            match worktree::create_worktree(&repo.path, &repo.id, ws_name, base) {
                 worktree::WorktreeResult::Created { worktree_path, branch_name } => {
                     (worktree_path.clone(), Some(worktree_path), Some(branch_name))
                 }
@@ -1775,20 +1806,27 @@ impl AppState {
             }
         };
 
-        let ws = Workspace {
+        Ok(Workspace {
             id: generate_id(),
-            name: ws_name,
+            name: ws_name.to_string(),
             repo_id: repo.id.clone(),
             working_dir,
             active: true,
             created_at: now,
             worktree_path,
             branch_name,
-        };
+        })
+    }
 
-        self.workspaces.push(ws.clone());
-        self.save_to(base)?;
-        Ok(ws)
+    /// Add a made workspace ([`Self::make_workspace`]), unless its repo is
+    /// gone or its name was taken meanwhile. No save.
+    pub fn insert_workspace(&mut self, ws: Workspace) -> anyhow::Result<()> {
+        if !self.repos.iter().any(|r| r.id == ws.repo_id) {
+            bail!("its repo is no longer tracked");
+        }
+        self.validate_new_workspace_name(&ws.name, &ws.repo_id)?;
+        self.workspaces.push(ws);
+        Ok(())
     }
 
     /// Create a workspace, saving state to the default state directory.
@@ -2947,6 +2985,53 @@ mod tests {
         state.repos[0].id = "a/b".into();
         let ws = state.create_workspace_with_base(Some("w"), "a/b", &base).unwrap();
         assert_eq!(ws.worktree_path, None);
+    }
+
+    #[test]
+    fn resolve_new_workspace_defaults_and_validates_the_name() {
+        let mut state = under_r(vec![]);
+        state.repos[0].name = "repo".into();
+        state.workspaces.push(row_at("r", "a", Path::new("/tmp/kommand0-a")));
+
+        let name = |s: &AppState, n, b| s.resolve_new_workspace(n, "r", b).map(|(_, n, _)| n);
+        assert_eq!(name(&state, None, None).unwrap(), "repo", "from the repo");
+        assert_eq!(name(&state, None, Some("origin/feat/x")).unwrap(), "feat-x", "from the branch");
+        assert_eq!(name(&state, Some("mine"), Some("feat")).unwrap(), "mine", "as typed");
+        let err = name(&state, Some("a/b"), None).unwrap_err().to_string();
+        assert!(err.contains("invalid workspace name"), "{err}");
+        let err = name(&state, Some("a"), None).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(state.resolve_new_workspace(None, "ghost", None).is_err(), "an unknown repo");
+
+        let (repo, _, taken) = state.resolve_new_workspace(Some("b"), "r", None).unwrap();
+        assert_eq!(repo.id, "r");
+        assert_eq!(taken.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[test]
+    fn make_workspace_creates_the_worktree_and_writes_no_state() {
+        let tmp = TempDir::new().unwrap();
+        let (state, base, r) = state_with_repo(&tmp);
+        let (repo, name, taken) = state.resolve_new_workspace(Some("a"), &r.id, None).unwrap();
+
+        let ws = AppState::make_workspace(&repo, &name, &base, None, true, &taken).unwrap();
+        assert_eq!((ws.name.as_str(), ws.repo_id.as_str()), ("a", r.id.as_str()));
+        assert_eq!(ws.branch_name.as_deref(), Some("a"), "on a fresh branch");
+        assert!(Path::new(ws.worktree_path.as_deref().unwrap()).exists(), "the worktree is on disk");
+        assert!(state.workspaces.is_empty(), "the state holds no row");
+        assert!(AppState::load_from(&base).unwrap().workspaces.is_empty(), "nothing was saved");
+    }
+
+    #[test]
+    fn insert_workspace_refuses_a_gone_repo_or_a_taken_name() {
+        let mut state = under_r(vec![]);
+        state.insert_workspace(ws("w1", "a")).unwrap();
+
+        let err = state.insert_workspace(ws("w2", "a")).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        let gone = Workspace { repo_id: "gone".into(), ..ws("w3", "b") };
+        assert!(state.insert_workspace(gone).is_err(), "its repo is gone");
+        assert_eq!(state.workspaces.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["w1"]);
     }
 
     #[test]
