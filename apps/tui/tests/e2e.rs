@@ -577,6 +577,31 @@ fn an_idle_screen_writes_nothing() {
 }
 
 #[test]
+fn synchronized_frames_render_and_an_unclosed_one_still_shows() {
+    // embed-stub-sync echoes each key inside a synchronized-output frame;
+    // `!` opens one it never closes, which still shows once it has stalled.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub-sync")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+
+    tui.send("zq7");
+    tui.wait_for("zq7");
+    tui.send("!");
+    tui.wait_for("SYNCSTALL");
+
+    tui.send("\x1d");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn palette_jumps_to_and_opens_a_collapsed_repo_workspace() {
     // `:` opens the command palette; typing fuzzy-matches a workspace hidden
     // under a collapsed repo, and Enter jumps to + opens it.

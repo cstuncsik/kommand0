@@ -2042,6 +2042,13 @@ impl App {
         Some(self.embedded.get(ws_id)?.active_tab()?.pane.output_seq())
     }
 
+    /// Whether the visible pane is inside a synchronized-output frame.
+    fn visible_pane_mid_frame(&self) -> bool {
+        self.selected_workspace()
+            .and_then(|w| self.embedded.get(&w.id)?.active_tab())
+            .is_some_and(|t| t.pane.mid_frame())
+    }
+
     /// Focus the embedded pane from a mouse gesture. Clearing the Ctrl+A
     /// prefix is part of the invariant — a half-typed prefix carried across a
     /// click would mis-fire on the next keystroke. Both mouse routes
@@ -5490,6 +5497,82 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+/// The shortest gap between two redraws that visible pane output causes
+/// (~66fps).
+const WAKE_REDRAW_CAP: Duration = Duration::from_millis(15);
+/// How long a synchronized-output frame may hold visible output back before
+/// the tick draws it anyway (a child that never closes its frame).
+const SYNC_STALL_REDRAW: Duration = Duration::from_millis(100);
+
+/// The event loop's redraw decisions, pulled out of `run` so they are
+/// unit-tested: `seq` is the visible pane's output seq, `mid` whether it is
+/// inside a synchronized-output frame.
+#[derive(Default)]
+struct Pacer {
+    last_drawn_seq: Option<u64>,
+    /// The last draw a wake caused: paces visible output. Input draws never
+    /// count, so a key's echo is not held back.
+    last_wake_draw: Option<Instant>,
+    /// A deferred visible-output draw (the deadline arm).
+    wake_draw_at: Option<Instant>,
+    /// Since when visible output has been withheld for a frame in progress.
+    withheld_since: Option<Instant>,
+}
+
+impl Pacer {
+    /// After every draw, with the seq sampled before it.
+    fn drew(&mut self, seq: Option<u64>) {
+        self.last_drawn_seq = seq;
+        self.withheld_since = None;
+    }
+
+    /// A pane produced output: draw now, at `wake_draw_at`, or not at all.
+    fn on_wake(&mut self, now: Instant, seq: Option<u64>, mid: bool) -> bool {
+        // Background-only output: the visible frame would be unchanged (a
+        // resume storm in other workspaces must not peg the UI thread). Checked
+        // first, so it never starts the stall timer.
+        if seq == self.last_drawn_seq {
+            return false;
+        }
+        if mid {
+            self.withheld_since.get_or_insert(now);
+            return false;
+        }
+        match self.last_wake_draw {
+            // Defer rather than drop, so the burst's tail still shows.
+            Some(t) if now < t + WAKE_REDRAW_CAP => {
+                self.wake_draw_at.get_or_insert(t + WAKE_REDRAW_CAP);
+                false
+            }
+            _ => {
+                self.last_wake_draw = Some(now);
+                self.wake_draw_at = None;
+                true
+            }
+        }
+    }
+
+    /// The deferred draw is due. A mid-frame one is dropped: the frame's
+    /// closing wake comes after the cap, so it draws at once.
+    fn on_deadline(&mut self, now: Instant, seq: Option<u64>, mid: bool) -> bool {
+        self.wake_draw_at = None;
+        if mid || seq == self.last_drawn_seq {
+            return false;
+        }
+        self.last_wake_draw = Some(now);
+        true
+    }
+
+    /// The tick draws what it `changed`, and visible output still undrawn:
+    /// outside a frame, or held back by one for `SYNC_STALL_REDRAW`.
+    fn on_tick(&self, now: Instant, seq: Option<u64>, mid: bool, changed: bool) -> bool {
+        let stalled = self
+            .withheld_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= SYNC_STALL_REDRAW);
+        changed || (seq != self.last_drawn_seq && (!mid || stalled))
+    }
+}
+
 async fn run(
     terminal: &mut DefaultTerminal,
     profile: String,
@@ -5612,11 +5695,9 @@ async fn run(
         tokio::sync::mpsc::unbounded_channel::<(String, String, String, Instant)>();
     app.codex_capture_tx = Some(codex_capture_tx);
 
-    // Redraw coalescing for the wake arm: the visible pane's `output_seq` as of
-    // the last draw, when that draw happened, and whether the wake arm proved
-    // the next frame would be identical (background-only output: skip it).
-    let mut last_drawn_seq: Option<u64> = None;
-    let mut last_draw_at = Instant::now();
+    // When the visible pane's output is drawn (see Pacer), and whether the arm
+    // that just ran proved the next frame would be identical.
+    let mut pacer = Pacer::default();
     let mut skip_draw = false;
 
     loop {
@@ -5632,8 +5713,7 @@ async fn run(
             // is not in the frame just drawn, silently skipping that output.
             let seq = app.visible_pane_seq();
             terminal.draw(|frame| render::ui(frame, &mut app))?;
-            last_drawn_seq = seq;
-            last_draw_at = Instant::now();
+            pacer.drew(seq);
         }
         skip_draw = false;
 
@@ -5642,31 +5722,20 @@ async fn run(
                 // Drain any backlog so we coalesce into a single redraw.
                 while wake_rx.try_recv().is_ok() {}
                 // Invariant: this arm stays mutation-free beyond draining and
-                // pacing. The seq-only comparison below relies on every
+                // pacing. The seq-only comparison in the pacer relies on every
                 // visible-pane identity change (tab/workspace switches, opens,
                 // reaps) repainting: input always does, and the tick does
                 // whenever its TickView changed.
-                if app.visible_pane_seq() == last_drawn_seq {
-                    // Background-only output: the visible pane's frame would be
-                    // unchanged, so skip the repaint (a resume storm in other
-                    // workspaces must not peg the UI thread).
-                    skip_draw = true;
-                } else {
-                    // Visible-pane output storm: pace repaints to ~66fps. Defer
-                    // rather than drop: dropping would regress keystroke echo to
-                    // the 50ms tick (the input-arm draw resets the clock and the
-                    // echo lands within the cap). Read elapsed() ONCE and subtract
-                    // from that value; a guard and subtraction on two separate
-                    // reads can underflow, and Duration subtraction panics.
-                    const WAKE_REDRAW_CAP: Duration = Duration::from_millis(15);
-                    let e = last_draw_at.elapsed();
-                    if e < WAKE_REDRAW_CAP {
-                        tokio::time::sleep(WAKE_REDRAW_CAP - e).await;
-                        // Pick up chunks that arrived during the pause so they
-                        // land in this draw, not a queued extra wake iteration.
-                        while wake_rx.try_recv().is_ok() {}
-                    }
-                }
+                let (seq, mid) = (app.visible_pane_seq(), app.visible_pane_mid_frame());
+                skip_draw = !pacer.on_wake(Instant::now(), seq, mid);
+            }
+            // A visible-output draw the wake arm deferred (a disabled branch's
+            // sleep is built but never polled).
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                pacer.wake_draw_at.unwrap_or_else(Instant::now),
+            )), if pacer.wake_draw_at.is_some() => {
+                let (seq, mid) = (app.visible_pane_seq(), app.visible_pane_mid_frame());
+                skip_draw = !pacer.on_deadline(Instant::now(), seq, mid);
             }
             Some(results) = status_rx.recv() => {
                 // A status pass finished: merge it (an unchanged cache needs no
@@ -5890,7 +5959,10 @@ async fn run(
                 }
             }
             _ = tick_interval.tick() => {
-                skip_draw = !app.tick(Instant::now());
+                let now = Instant::now();
+                let changed = app.tick(now);
+                let (seq, mid) = (app.visible_pane_seq(), app.visible_pane_mid_frame());
+                skip_draw = !pacer.on_tick(now, seq, mid, changed);
             }
         }
     }
@@ -10342,6 +10414,99 @@ mod key_tests {
         app.mouse_pos = Some((area.right() + 2, area.y));
         assert_eq!(app.hovered_region(), None);
         assert!(draw(&mut app) != hovered, "leaving the button drops its hover style");
+    }
+
+    #[test]
+    fn a_wake_right_after_an_input_draw_draws_at_once() {
+        let t0 = Instant::now();
+        let mut p = Pacer::default();
+        assert!(p.on_wake(t0, Some(1), false));
+        p.drew(Some(1));
+        // A key draws at 30 ms and its echo lands 1 ms later: only draws a
+        // wake caused pace the next one.
+        p.drew(Some(1));
+        assert!(p.on_wake(t0 + Duration::from_millis(31), Some(2), false));
+    }
+
+    #[test]
+    fn a_wake_with_nothing_new_does_nothing() {
+        let mut p = Pacer::default();
+        p.drew(Some(3));
+        assert!(!p.on_wake(Instant::now(), Some(3), false));
+        assert_eq!((p.wake_draw_at, p.withheld_since), (None, None));
+    }
+
+    #[test]
+    fn background_output_during_an_open_frame_does_not_start_the_stall_timer() {
+        let mut p = Pacer::default();
+        p.drew(Some(3));
+        // The visible pane is mid-frame; the output came from another pane.
+        assert!(!p.on_wake(Instant::now(), Some(3), true));
+        assert_eq!(p.withheld_since, None);
+    }
+
+    #[test]
+    fn a_mid_frame_wake_waits_for_the_closing_wake() {
+        let t0 = Instant::now();
+        let mut p = Pacer::default();
+        p.drew(Some(1));
+        assert!(!p.on_wake(t0, Some(2), true), "the frame is still open");
+        assert!(p.on_wake(t0 + Duration::from_millis(5), Some(3), false), "its close draws");
+    }
+
+    #[test]
+    fn a_deferred_wake_draws_at_its_deadline() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut p = Pacer::default();
+        assert!(p.on_wake(t0, Some(1), false));
+        p.drew(Some(1));
+        assert!(!p.on_wake(ms(5), Some(2), false), "inside the cap");
+        assert_eq!(p.wake_draw_at, Some(ms(15)));
+        assert!(p.on_deadline(ms(15), Some(3), false));
+    }
+
+    #[test]
+    fn a_withheld_frame_redraws_on_the_tick_only_after_100_ms() {
+        let base = Instant::now();
+        let mut p = Pacer::default();
+        assert!(p.on_wake(base, Some(1), false));
+        p.drew(Some(1));
+        let t0 = base + Duration::from_secs(1);
+        let ms = |n| t0 + Duration::from_millis(n);
+        assert!(!p.on_wake(t0, Some(2), true));
+        assert!(!p.on_tick(ms(10), Some(2), true, false));
+        assert!(!p.on_tick(ms(50), Some(2), true, false));
+        assert!(p.on_tick(ms(100), Some(2), true, false), "a frame that never closes still shows");
+    }
+
+    #[test]
+    fn undrawn_output_outside_a_frame_is_drawn_by_the_next_tick() {
+        let t0 = Instant::now();
+        let mut p = Pacer::default();
+        assert!(p.on_wake(t0, Some(1), false));
+        p.drew(Some(1));
+        // Deferred inside the cap, and the tick comes before the deadline.
+        assert!(!p.on_wake(t0 + Duration::from_millis(5), Some(2), false));
+        assert!(p.on_tick(t0 + Duration::from_millis(6), Some(2), false, false));
+        p.drew(Some(2));
+        assert!(!p.on_tick(t0 + Duration::from_millis(56), Some(2), false, false), "all drawn");
+    }
+
+    #[test]
+    fn back_to_back_frames_cannot_starve() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut p = Pacer::default();
+        assert!(p.on_wake(t0, Some(1), false));
+        p.drew(Some(1));
+        assert!(!p.on_wake(ms(10), Some(2), true), "a frame opens");
+        assert!(!p.on_wake(ms(11), Some(3), false), "it closes inside the cap");
+        assert_eq!(p.wake_draw_at, Some(ms(15)));
+        assert!(!p.on_wake(ms(14), Some(4), true), "the next frame opens");
+        assert!(!p.on_deadline(ms(15), Some(4), true), "the deadline lands mid-frame");
+        let close = ms(15) + Duration::from_micros(500);
+        assert!(p.on_wake(close, Some(5), false), "the next close draws at once");
     }
 
     #[test]

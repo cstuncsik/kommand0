@@ -21,6 +21,12 @@ All notable changes to kommand0 are documented here. The format is based on
   redraws only when it changed something on screen (a tab gone, focus, a
   spinner frame, a "needs you" dot), and a pointer move only when it changes a
   button's hover.
+- **Keystroke echo in a session no longer waits on the previous frame, and a
+  session's output no longer stalls key handling**: only redraws caused by
+  output are paced (about 66 a second), and a deferred one waits on its own
+  timer instead of pausing the event loop. Frames a session marks as
+  synchronized (DEC mode 2026) are shown whole, not half painted; a frame left
+  open still shows after 100 ms.
 
 ## [0.32.1] - 2026-10-23
 
