@@ -193,7 +193,7 @@ cargo run -p kommand0-tui   # from a checkout
 | `c` | Tree | Clean up merged workspace / repo: on a workspace row, its merged worktree + branch; on a repo row (or click `[Clean up branches]` in its detail pane), every local branch already merged into the default branch, which is fetched first (preview, then `y`); branches of kommand0 workspaces are routed to the workspace cleanup, other checkouts and `protected_branches` are skipped |
 | `a` | Tree | Add repository (modal) |
 | `w` | Tree | Add workspace to selected repo (modal; a `123` / `#123` / issue URL name creates the branch GitHub links to that issue) |
-| `d` / `D` | Tree | Delete / force-delete selected |
+| `d` / `D` | Tree | Delete / force-delete selected; the row shows "Deleting…" until its worktree is gone |
 | _typing_ | Embedded | Goes straight to the embedded Claude |
 | `Alt+Enter` | Embedded | Insert a newline (works everywhere, no config; see the Shift+Enter note below) |
 | `Ctrl+A` then `c` | Embedded | New Claude Code session tab |

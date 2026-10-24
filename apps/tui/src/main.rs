@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyEvent, KeyEventKind};
 use kommand0_core::{
-    AppState, Cleaned, Config, DEFAULT_PROFILE, RepoCleanupItem, RepoEntry, SessionStatus,
-    Workspace,
+    AppState, Cleaned, Config, DEFAULT_PROFILE, LeftWorktree, RepoCleanupItem, RepoEntry,
+    SessionStatus, Workspace,
 };
 use ratatui::{
     DefaultTerminal,
@@ -104,6 +104,39 @@ type StatusMsg = Vec<(String, Option<kommand0_core::BranchStatus>)>;
 /// What the review-diff worker sends back: the request it answers (see
 /// `App::diff_seq`) and the files, `None` when git couldn't compute a diff.
 type DiffMsg = (u64, Option<Vec<kommand0_core::FileDiff>>);
+
+/// What a delete targets: one workspace row, or a repo with all its rows.
+#[derive(Debug, Clone, PartialEq)]
+enum Deleted {
+    Workspace(String),
+    Repo(String),
+}
+
+/// How a delete's worktree removal ended: everything gone, gone except what
+/// a removal kept or left on disk, or unknown (the worker died first).
+#[derive(Debug, PartialEq)]
+enum DeleteOutcome {
+    Done,
+    Notes(Vec<LeftWorktree>),
+    Interrupted,
+}
+
+/// What the delete worker sends back.
+type DeleteMsg = (Deleted, DeleteOutcome);
+
+/// One notice line for a worktree a delete left on disk. Only a failed
+/// removal asks for a hand delete: a kept dir is, or may be, another
+/// workspace's.
+fn left_worktree_note(left: &LeftWorktree) -> String {
+    use LeftWorktree::*;
+    match left {
+        Alias { path, owner } => format!("kept {path}: it is {owner}'s worktree"),
+        Unverified { path } => {
+            format!("kept {path}: couldn't check whether another workspace uses it")
+        }
+        Failed { path } => format!("couldn't remove {path}; delete it by hand"),
+    }
+}
 
 /// A scan, routed against the repo's workspaces: the plan, core's notes (a
 /// failed refresh of the default branch, squash detection off) and the base
@@ -980,6 +1013,12 @@ pub(crate) struct App {
     /// Cleanup worker → event-loop channel carrying `(workspace_id, result)`.
     cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<Cleaned, String>)>>,
 
+    /// Workspace and repo ids whose delete is running (ids are random, so one
+    /// set holds both). The rows stay listed until the worker reports.
+    pub(crate) delete_inflight: HashSet<String>,
+    /// Delete worker → event-loop channel. `None` when not wired (unit tests).
+    delete_tx: Option<tokio::sync::mpsc::UnboundedSender<DeleteMsg>>,
+
     /// The repo whose merged-branch scan or delete is running (at most one).
     pub(crate) repo_cleanup_inflight: Option<String>,
     /// Repo-cleanup outcome `(message, is_error)` per repo id, shown in that
@@ -1137,6 +1176,8 @@ impl App {
             cleanup_inflight: HashSet::new(),
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
+            delete_inflight: HashSet::new(),
+            delete_tx: None,
             repo_cleanup_inflight: None,
             repo_cleanup_result: HashMap::new(),
             repo_cleanup_pending: None,
@@ -1628,6 +1669,9 @@ impl App {
         let Some(ws) = self.selected_workspace() else {
             return;
         };
+        if self.refuse_busy(&ws.id, "open") {
+            return;
+        }
         let ws_id = ws.id.clone();
         let ws_name = ws.name.clone();
         let ws_dir = ws.working_dir.clone();
@@ -2396,6 +2440,9 @@ impl App {
     /// action and the palette share this). Keeps the row selected across the
     /// rebuild.
     fn archive_toggle(&mut self, ws_id: &str) {
+        if self.refuse_busy(ws_id, "archive") {
+            return;
+        }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
             return;
         };
@@ -2584,6 +2631,9 @@ impl App {
     /// Open an additional tab of `kind` for a workspace (up to the shared cap)
     /// and focus it.
     fn new_tab(&mut self, kind: TabKind, ws_id: &str) {
+        if self.refuse_busy(ws_id, "new tab") {
+            return;
+        }
         self.select_workspace_row(ws_id);
         let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
         if count >= MAX_SESSION_TABS {
@@ -2791,6 +2841,7 @@ impl App {
         !self.waiting_response.is_empty()
             || !self.cleanup_inflight.is_empty()
             || self.repo_cleanup_inflight.is_some()
+            || !self.delete_inflight.is_empty()
     }
 
     /// The hit region under the pointer, by the last render: a pointer move
@@ -3278,7 +3329,7 @@ impl App {
         pane::terminate_all(&mut panes);
     }
 
-    /// Kill `tabs` on a background thread, then run `then` (a cleanup's
+    /// Kill `tabs` on a background thread, then run `then` (a worktree
     /// removal) on a thread of its own. A teardown first waits for earlier ones
     /// sharing a workspace id, so a detach's panes are dead before a cleanup
     /// removes their cwd. Kill threads are joined at quit, `then` is not. A
@@ -3351,7 +3402,12 @@ impl App {
         let mut due: Vec<(u8, Option<Instant>, String, String)> = Vec::new();
         // Only workspaces with their own worktree/branch: a fallback workspace's
         // working_dir is the shared repo root, whose status the UI never shows.
-        for w in self.workspaces.iter().filter(|w| w.worktree_path.is_some()) {
+        // A row being deleted is skipped: its worktree is on its way out.
+        for w in self
+            .workspaces
+            .iter()
+            .filter(|w| w.worktree_path.is_some() && !self.delete_inflight.contains(&w.id))
+        {
             let checked = self.status_checked.get(&w.id).copied();
             let active = self.embedded.get(&w.id).is_some_and(|s| {
                 s.tabs.iter().any(|t| {
@@ -3560,6 +3616,9 @@ impl App {
     /// collapsible file tree + per-file diff. git runs on a worker; the dialog
     /// says "Loading diff…" until [`Self::finish_diff`] fills it.
     fn open_diff(&mut self, ws_id: &str) {
+        if self.refuse_busy(ws_id, "review diff") {
+            return;
+        }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
             return;
         };
@@ -3825,7 +3884,7 @@ impl App {
     /// Open the cleanup confirmation modal for a workspace (own-branch only),
     /// pre-filling the branch and any cached uncommitted/unpushed warnings.
     fn cleanup_workspace_prompt(&mut self, ws_id: &str) {
-        if self.cleanup_inflight.contains(ws_id) {
+        if self.refuse_busy(ws_id, "cleanup") {
             return;
         }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
@@ -3858,15 +3917,15 @@ impl App {
     }
 
     /// [`Self::start_cleanup`] for a set: the workspaces that can start one
-    /// (own-branch, repo known, not already in flight) get ONE shared pane-capture
-    /// grace, then each is torn down and handed to its own worker.
+    /// (own-branch, repo known, not busy) get ONE shared pane-capture grace,
+    /// then each is torn down and handed to its own worker.
     fn start_cleanups(&mut self, ids: &[&str]) {
         let Some(tx) = self.cleanup_tx.clone() else {
             return; // not wired (unit tests)
         };
         let targets: Vec<(String, String, String, String)> = ids
             .iter()
-            .filter(|id| !self.cleanup_inflight.contains(**id))
+            .filter(|id| !self.row_busy(id))
             .filter_map(|id| {
                 let ws = self.workspaces.iter().find(|w| w.id == *id)?;
                 let repo = self.repos.iter().find(|r| r.id == ws.repo_id)?;
@@ -3933,8 +3992,9 @@ impl App {
 
     /// `c` on a repo row: review this repo's parked plan, else start a scan.
     /// One scan/delete at a time; a parked plan for another repo is dropped.
+    /// Nothing while the repo is being deleted.
     fn repo_cleanup_requested(&mut self, repo_id: &str) {
-        if self.repo_cleanup_inflight.is_some() {
+        if self.repo_cleanup_inflight.is_some() || self.delete_inflight.contains(repo_id) {
             return;
         }
         match self.repo_cleanup_pending.take() {
@@ -4184,32 +4244,183 @@ impl App {
         self.repo_cleanup_result.insert(repo_id, (line, !failed.is_empty() || skipped > 0));
     }
 
-    /// `d`/`D`/`[Delete]` on a row whose cleanup is running would force-remove
-    /// the worktree under core's probes: refused, silently (the pane already
-    /// shows the spinner and hides `[Clean up]`; a `cleanup_result` line would
-    /// render as "Cleanup blocked:"). Logs the refusal.
-    fn workspace_delete_blocked_by_cleanup(&self, ws_id: &str) -> bool {
-        let blocked = self.cleanup_inflight.contains(ws_id);
+    /// Whether a cleanup or a delete owns workspace `ws_id`'s row: its
+    /// worktree may be on its way out, so nothing opens, cleans up or deletes
+    /// it until that worker reports.
+    fn row_busy(&self, ws_id: &str) -> bool {
+        self.cleanup_inflight.contains(ws_id) || self.delete_inflight.contains(ws_id)
+    }
+
+    /// [`Self::row_busy`], logging the refused `action` (the pane already
+    /// shows the spinner, so the refusal is silent on screen).
+    fn refuse_busy(&self, ws_id: &str, action: &str) -> bool {
+        let busy = self.row_busy(ws_id);
+        if busy {
+            tracing::info!("{action}: workspace {ws_id} is being cleaned up or deleted; ignored");
+        }
+        busy
+    }
+
+    /// `d`/`D`/`[Delete]` on a busy row ([`Self::row_busy`]) would race the
+    /// worker that owns its worktree: refused, silently. Logs the refusal.
+    fn workspace_delete_blocked(&self, ws_id: &str) -> bool {
+        self.refuse_busy(ws_id, "delete")
+    }
+
+    /// Delete workspace `ws_id`: its panes die and its worktree is removed off
+    /// the loop ([`Self::spawn_delete`]); the row stays, marked in
+    /// `delete_inflight`, until the worker reports, so its name stays taken
+    /// meanwhile. The one path behind `d`+`y`, `D` and the `[Delete]` button.
+    /// Refused per [`Self::workspace_delete_blocked`]. A row already gone
+    /// only has its panes killed.
+    fn delete_workspace(&mut self, ws_id: &str) {
+        if self.workspace_delete_blocked(ws_id) {
+            return;
+        }
+        let tabs = self.embedded.remove(ws_id).map(|s| s.tabs).unwrap_or_default();
+        let Some(ws) = self.state.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
+            self.spawn_teardown(vec![ws_id.to_string()], tabs, None);
+            return;
+        };
+        self.delete_inflight.insert(ws_id.to_string());
+        self.spawn_delete(Deleted::Workspace(ws_id.to_string()), vec![ws], tabs);
+    }
+
+    /// The repo-level twin of [`Self::workspace_delete_blocked`]: refused
+    /// while the repo's own merged-branch scan or delete runs
+    /// (`repo_cleanup_inflight`), while the repo is being deleted, or while
+    /// any of its rows is busy. Logs the refusal.
+    fn repo_delete_blocked(&self, repo_id: &str) -> bool {
+        let blocked = self.repo_cleanup_inflight.as_deref() == Some(repo_id)
+            || self.delete_inflight.contains(repo_id)
+            || self.workspaces.iter().any(|w| w.repo_id == repo_id && self.row_busy(&w.id));
         if blocked {
-            tracing::info!("delete: workspace {ws_id} has a cleanup in flight; ignored");
+            tracing::info!("delete: repo {repo_id} has a cleanup or a delete in flight; ignored");
         }
         blocked
     }
 
-    /// Delete workspace `ws_id`: drop its live panes (at user-action time, so
-    /// reap_embedded never blocks the tick on the Drop), drop the row (exact id;
-    /// its worktree goes with it), flip its legacy Running session and persist
-    /// with ONE merge-aware save. The one path behind `d`+`y`, `D`, the
-    /// `[Delete]` button and a Removed cleanup. Refused while the row's cleanup
-    /// is in flight (the worker owns the worktree). Drops the pane entry first;
-    /// the rest is a no-op when the row is already gone, even when a new
-    /// workspace reused the id as a name.
-    fn delete_workspace(&mut self, ws_id: &str) {
-        if self.workspace_delete_blocked_by_cleanup(ws_id) {
+    /// Delete repo `repo_id` with every row under it, as
+    /// [`Self::delete_workspace`] does one row: the repo and its rows stay,
+    /// marked, until every worktree removal reports. The one path behind
+    /// `d`+`y`, `D` and `[Delete]` on a repo row. Refused per
+    /// [`Self::repo_delete_blocked`]; a repo already gone only has its rows'
+    /// panes killed.
+    fn delete_repo(&mut self, repo_id: &str) {
+        if self.repo_delete_blocked(repo_id) {
             return;
         }
-        self.embedded.remove(ws_id);
-        if self.state.remove_workspace(ws_id).is_none() {
+        let rows: Vec<Workspace> =
+            self.state.workspaces.iter().filter(|w| w.repo_id == repo_id).cloned().collect();
+        let ids: Vec<String> = rows.iter().map(|w| w.id.clone()).collect();
+        let tabs: Vec<SessionTab> =
+            ids.iter().filter_map(|id| self.embedded.remove(id)).flat_map(|s| s.tabs).collect();
+        if !self.state.repos.iter().any(|r| r.id == repo_id) {
+            self.spawn_teardown(ids, tabs, None);
+            return;
+        }
+        self.delete_inflight.insert(repo_id.to_string());
+        self.delete_inflight.extend(ids);
+        self.spawn_delete(Deleted::Repo(repo_id.to_string()), rows, tabs);
+    }
+
+    /// Kill `tabs`, then remove each row's worktree, guarded against every
+    /// other row ([`AppState::remove_worktree_of`]), and report `target`'s
+    /// outcome to [`Self::on_delete_done`]: over `delete_tx` (an interrupted
+    /// worker still reports), or inline when it isn't wired (unit tests).
+    fn spawn_delete(&mut self, target: Deleted, rows: Vec<Workspace>, tabs: Vec<SessionTab>) {
+        let ids: Vec<String> = rows.iter().map(|w| w.id.clone()).collect();
+        let held = self.state.worktree_rows_except(&ids);
+        let base = AppState::state_dir();
+        // The worker can't read state, so each row goes with its repo's path.
+        // A row whose repo is gone has no worktree git could remove (as core).
+        let jobs: Vec<(String, Workspace)> = rows
+            .into_iter()
+            .filter_map(|w| {
+                let repo = self.state.repos.iter().find(|r| r.id == w.repo_id)?;
+                Some((repo.path.clone(), w))
+            })
+            .collect();
+        let skip = ids.clone();
+        let remove = move || {
+            let left: Vec<LeftWorktree> = jobs
+                .iter()
+                .filter_map(|(repo, w)| {
+                    if let Some(wt) = &w.worktree_path {
+                        tracing::info!("delete: removing worktree {wt}");
+                    }
+                    AppState::remove_worktree_of(repo, w, &base, &held, &skip).err()
+                })
+                .collect();
+            if left.is_empty() { DeleteOutcome::Done } else { DeleteOutcome::Notes(left) }
+        };
+        let Some(tx) = self.delete_tx.clone() else {
+            kill_tabs(tabs);
+            let outcome = remove();
+            self.on_delete_done(target, outcome);
+            return;
+        };
+        let payload = Some((target.clone(), DeleteOutcome::Interrupted));
+        let guard = SendOnDrop { tx, payload };
+        let then = move || {
+            let mut guard = guard;
+            guard.payload = Some((target, remove()));
+        };
+        self.spawn_teardown(ids, tabs, Some(Box::new(then)));
+    }
+
+    /// A delete's worker reported. Interrupted: the rows stay listed (deleting
+    /// them again finishes the job). Otherwise they are forgotten, and what a
+    /// removal kept or left on disk is named in the notice.
+    fn on_delete_done(&mut self, target: Deleted, outcome: DeleteOutcome) {
+        // Read while the rows are still here; a row already gone shows its id.
+        let name = match &target {
+            Deleted::Workspace(id) => {
+                self.state.workspaces.iter().find(|w| w.id == *id).map_or(id, |w| &w.name)
+            }
+            Deleted::Repo(id) => {
+                self.state.repos.iter().find(|r| r.id == *id).map_or(id, |r| &r.name)
+            }
+        }
+        .clone();
+        let left = match outcome {
+            DeleteOutcome::Done => Vec::new(),
+            DeleteOutcome::Notes(left) => left,
+            DeleteOutcome::Interrupted => {
+                match &target {
+                    Deleted::Workspace(id) => {
+                        self.delete_inflight.remove(id);
+                    }
+                    Deleted::Repo(id) => self.unmark_repo(id),
+                }
+                let msg = format!(
+                    "Couldn't finish deleting {name}; it is still listed, delete it again"
+                );
+                self.profile_notice = Some((msg, true));
+                return;
+            }
+        };
+        match &target {
+            Deleted::Workspace(id) => self.forget_workspace(id),
+            Deleted::Repo(id) => self.forget_repo(id),
+        }
+        if !left.is_empty() {
+            // Only a failed removal is an error: a kept dir is kept on purpose.
+            let failed = left.iter().any(|l| matches!(l, LeftWorktree::Failed { .. }));
+            let notes: Vec<String> = left.iter().map(left_worktree_note).collect();
+            let msg = format!("Deleted {name}, but {}", notes.join("; "));
+            self.profile_notice = Some((msg, failed));
+        }
+    }
+
+    /// Drop the row `ws_id` whose worktree is gone (a finished delete or a
+    /// Removed cleanup), flip its legacy Running session and persist with ONE
+    /// merge-aware save. The cursor stays on its item: a report can land long
+    /// after the user moved on. No-op (beyond the mark) when the row is gone.
+    fn forget_workspace(&mut self, ws_id: &str) {
+        self.delete_inflight.remove(ws_id);
+        let was_selected = self.selected_workspace().is_some_and(|w| w.id == ws_id);
+        if self.state.take_workspace(ws_id).is_none() {
             return;
         }
         if let Some(sid) = self
@@ -4224,56 +4435,25 @@ impl App {
         self.workspaces = self.state.workspaces.clone();
         self.expanded_icon_rows.remove(ws_id);
         self.cleanup_result.remove(ws_id);
-        self.rebuild_tree();
-        // clamp_selection re-seats off any hint row AND re-syncs the active
-        // session (a raw clamp skipped both, stranding focus/selection).
-        self.clamp_selection();
-        // Rows shifted under selected_index, so a DIFFERENT workspace's pane can
-        // now be the visible one; a highlight (or live drag) must not carry over.
-        self.pane_selection = None;
+        self.rebuild_tree_keeping_selection();
+        // Only a highlight on the forgotten row's pane goes with it.
+        if was_selected {
+            self.pane_selection = None;
+        }
     }
 
-    /// The repo-level twin of `workspace_delete_blocked_by_cleanup`: a repo
-    /// delete removes every row's worktree and the repo's branches, so it is
-    /// refused while any of the repo's rows has a cleanup in flight or while
-    /// the repo's own merged-branch scan or delete runs
-    /// (`repo_cleanup_inflight`). Logs the refusal.
-    fn repo_delete_blocked_by_cleanup(&self, repo_id: &str) -> bool {
-        let blocked = self.repo_cleanup_inflight.as_deref() == Some(repo_id)
-            || self
-                .workspaces
-                .iter()
-                .any(|w| w.repo_id == repo_id && self.cleanup_inflight.contains(&w.id));
-        if blocked {
-            tracing::info!("delete: repo {repo_id} has a cleanup in flight; ignored");
-        }
-        blocked
-    }
-
-    /// Delete repo `repo_id` with every row under it: drop the rows' panes,
-    /// per-row UI entries and the repo's own cleanup outcome, remove the repo
-    /// and everything under it (exact id: rows, worktrees, sessions) and
-    /// persist with ONE merge-aware save. The one path behind `d`+`y`, `D`
-    /// and `[Delete]` on a repo row. Refused per
-    /// `repo_delete_blocked_by_cleanup`; a no-op when the repo is already gone.
-    fn delete_repo(&mut self, repo_id: &str) {
-        if self.repo_delete_blocked_by_cleanup(repo_id) {
+    /// Drop repo `repo_id` and its rows once their worktrees are gone, with
+    /// their UI leftovers, persisting with ONE merge-aware save. The cursor
+    /// stays on its item; only a highlight on one of the repo's rows goes.
+    fn forget_repo(&mut self, repo_id: &str) {
+        let was_in_repo = self.selected_workspace().is_some_and(|w| w.repo_id == repo_id);
+        self.unmark_repo(repo_id);
+        let Some((_, rows)) = self.state.take_repo(repo_id) else {
             return;
-        }
-        let ws_ids: Vec<String> = self
-            .state
-            .workspaces
-            .iter()
-            .filter(|w| w.repo_id == repo_id)
-            .map(|w| w.id.clone())
-            .collect();
-        for ws_id in &ws_ids {
-            self.embedded.remove(ws_id);
-            self.expanded_icon_rows.remove(ws_id);
-            self.cleanup_result.remove(ws_id);
-        }
-        if self.state.remove_repo(repo_id).is_none() {
-            return;
+        };
+        for w in &rows {
+            self.expanded_icon_rows.remove(&w.id);
+            self.cleanup_result.remove(&w.id);
         }
         self.repo_cleanup_result.remove(repo_id);
         if self.repo_cleanup_pending.as_ref().is_some_and(|(id, _)| id == repo_id) {
@@ -4283,9 +4463,18 @@ impl App {
         self.expanded.remove(repo_id);
         self.repos = self.state.repos.clone();
         self.workspaces = self.state.workspaces.clone();
-        self.rebuild_tree();
-        self.clamp_selection();
-        self.pane_selection = None;
+        self.rebuild_tree_keeping_selection();
+        if was_in_repo {
+            self.pane_selection = None;
+        }
+    }
+
+    /// Clear a repo delete's marks: the repo's and its rows'.
+    fn unmark_repo(&mut self, repo_id: &str) {
+        self.delete_inflight.remove(repo_id);
+        for w in self.state.workspaces.iter().filter(|w| w.repo_id == repo_id) {
+            self.delete_inflight.remove(&w.id);
+        }
     }
 
     /// A workspace cleanup landed: a removal drops the row, a followed worktree
@@ -4295,20 +4484,37 @@ impl App {
         self.status_checked.remove(&ws_id);
         match result {
             Ok(Cleaned::Removed) => {
-                // The worktree + branch are gone; drop the workspace too.
-                self.delete_workspace(&ws_id);
+                // The worktree + branch are gone; drop the workspace too. No
+                // git here: a late reply must not touch a dir another create
+                // reused meanwhile. Only the emptied `worktrees/<repo-id>/`
+                // goes, and `remove_dir` leaves a non-empty one alone.
+                if let Some(parent) = self
+                    .state
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id == ws_id)
+                    .and_then(|w| w.worktree_path.as_deref())
+                    .and_then(|p| std::path::Path::new(p).parent())
+                {
+                    let _ = std::fs::remove_dir(parent);
+                }
+                self.forget_workspace(&ws_id);
             }
             Ok(Cleaned::Followed { branch }) => {
                 // The dir is `branch`'s checkout and stays; the row tracks it
                 // from now on.
+                let was_selected = self.selected_workspace().is_some_and(|w| w.id == ws_id);
                 if let Some(ws) = self.state.workspaces.iter_mut().find(|w| w.id == ws_id) {
                     let was = ws.branch_name.replace(branch.clone()).unwrap_or_default();
                     self.workspaces = self.state.workspaces.clone();
-                    self.rebuild_tree();
-                    self.clamp_selection(); // a branch filter may have hidden the row
-                    // Rows may have shifted under the selection, as after a
-                    // removal: a highlight (or live drag) must not carry over.
-                    self.pane_selection = None;
+                    // The cursor stays on its item, unless a branch filter now
+                    // hides the row.
+                    self.rebuild_tree_keeping_selection();
+                    // That row's pane may no longer be the one shown: a
+                    // highlight (or live drag) on it must not carry over.
+                    if was_selected {
+                        self.pane_selection = None;
+                    }
                     self.save_state();
                     // The old branch's PR must not linger on the row; a refresh
                     // already in flight may still land it, so run one more.
@@ -5254,7 +5460,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Action::AddWorkspace => app.open_add_workspace_modal_for_selection(),
                 Action::Delete => match app.tree_items.get(app.selected_index).cloned() {
                     Some(TreeNode::Workspace { ws, repo_name })
-                        if !app.workspace_delete_blocked_by_cleanup(&ws.id) =>
+                        if !app.workspace_delete_blocked(&ws.id) =>
                     {
                         app.modal = modal::ModalState::ConfirmDelete {
                             target: modal::DeleteTarget::Workspace {
@@ -5265,7 +5471,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         };
                     }
                     Some(TreeNode::Repo { id, name, .. })
-                        if !app.repo_delete_blocked_by_cleanup(&id) =>
+                        if !app.repo_delete_blocked(&id) =>
                     {
                         let ws_count =
                             app.workspaces.iter().filter(|w| w.repo_id == id).count();
@@ -5763,6 +5969,10 @@ async fn run(
     let (diff_tx, mut diff_rx) = tokio::sync::mpsc::unbounded_channel::<DiffMsg>();
     app.diff_tx = Some(diff_tx);
 
+    // Delete worker → event loop, carrying `(what was deleted, outcome)`.
+    let (delete_tx, mut delete_rx) = tokio::sync::mpsc::unbounded_channel::<DeleteMsg>();
+    app.delete_tx = Some(delete_tx);
+
     // Codex early-capture pollers → event loop, carrying the captured entry
     // as `(workspace_id, tab_id, "codex:<uuid>", spawn generation)`.
     let (codex_capture_tx, mut codex_capture_rx) =
@@ -5840,6 +6050,9 @@ async fn run(
             }
             Some((ws_id, result)) = cleanup_rx.recv() => {
                 app.on_cleanup_done(ws_id, result);
+            }
+            Some((target, outcome)) = delete_rx.recv() => {
+                app.on_delete_done(target, outcome);
             }
             Some(msg) = repo_cleanup_rx.recv() => {
                 app.repo_cleanup_inflight = None;
@@ -6090,11 +6303,15 @@ async fn run(
     // Closed tabs and detaches may still be in their grace: a child that
     // ignores SIGHUP would outlive us.
     app.join_teardowns();
-    // Cleanup replies already in get saved; one still running is abandoned
-    // (its row stays in state). A follow must not start `gh` now.
+    // Cleanup and delete replies already in get saved; one still running is
+    // abandoned (its row stays in state, and deleting it again finishes the
+    // job). A follow must not start `gh` now.
     app.pr_status_tx = None;
     while let Ok((ws_id, result)) = cleanup_rx.try_recv() {
         app.on_cleanup_done(ws_id, result);
+    }
+    while let Ok((target, outcome)) = delete_rx.try_recv() {
+        app.on_delete_done(target, outcome);
     }
     // The teardown window: shutdown_panes itself takes up to ~1.75s (the
     // SIGTERM capture grace plus the SIGHUP grace), and a poller event or a
@@ -10536,6 +10753,9 @@ mod key_tests {
         let mut app = test_app();
         app.repo_cleanup_inflight = Some("r1".into());
         assert_eq!(redraws(&mut app), 2, "a repo cleanup spinner");
+        let mut app = test_app();
+        app.delete_inflight.insert("w1".into());
+        assert_eq!(redraws(&mut app), 2, "a delete spinner");
     }
 
     #[test]
@@ -11888,6 +12108,10 @@ mod key_tests {
         app.state.workspaces = app.workspaces.clone();
         app.cleanup_result.insert("w1".to_string(), ("stale refusal".to_string(), true));
         app.expanded_icon_rows.insert("w1".to_string());
+        // Selected, so the highlight on its pane goes with the row.
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
         app.pane_selection =
             Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
         // In flight, as when the worker's message lands: the arm must clear it
@@ -12084,56 +12308,482 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn repo_delete_is_ignored_while_one_of_its_rows_cleans_up() {
+    async fn repo_delete_waits_while_a_row_is_busy() {
+        for deleting in [false, true] {
+            let busy = if deleting { "delete" } else { "cleanup" };
+            let mark = |app: &mut App, on: bool| {
+                let set =
+                    if deleting { &mut app.delete_inflight } else { &mut app.cleanup_inflight };
+                if on {
+                    set.insert("w1".to_string());
+                } else {
+                    set.remove("w1");
+                }
+            };
+            let mut app = test_app();
+            mark(&mut app, true);
+            app.select_repo_row("r1");
+
+            // Refused while a row's cleanup or delete owns its worktree: `d`
+            // opens nothing, `D` and a confirmed modal change nothing.
+            press(&mut app, KeyCode::Char('d')).await;
+            assert!(matches!(app.modal, modal::ModalState::None), "{busy}: d opens no modal");
+            press(&mut app, KeyCode::Char('D')).await;
+            assert_eq!(app.repos.len(), 2, "{busy}: D is ignored");
+            assert_eq!(app.workspaces.len(), 1);
+            app.modal = modal::ModalState::ConfirmDelete {
+                target: modal::DeleteTarget::Repo {
+                    id: "r1".into(),
+                    name: "alpha".into(),
+                    workspace_count: 1,
+                },
+            };
+            press(&mut app, KeyCode::Char('y')).await;
+            assert_eq!(app.repos.len(), 2, "{busy}: a confirmed delete is ignored");
+            assert!(app.workspaces.iter().any(|w| w.id == "w1"));
+
+            // Per repo: another repo still deletes.
+            app.select_repo_row("r2");
+            press(&mut app, KeyCode::Char('D')).await;
+            assert!(app.repos.iter().all(|r| r.id != "r2"), "{busy}: r2 is gone");
+            assert!(app.repos.iter().any(|r| r.id == "r1"), "{busy}: r1 stays");
+            assert!(app.workspaces.iter().any(|w| w.id == "w1"), "{busy}: w1 stays");
+
+            // The repo's own branch-delete phase owns its branches: refused too.
+            mark(&mut app, false);
+            app.repo_cleanup_inflight = Some("r1".into());
+            app.select_repo_row("r1");
+            press(&mut app, KeyCode::Char('D')).await;
+            assert_eq!(app.repos.len(), 1, "{busy}: D is ignored while the branch delete runs");
+            app.repo_cleanup_inflight = None;
+
+            // And a delete of the repo already running.
+            app.delete_inflight.insert("r1".into());
+            press(&mut app, KeyCode::Char('D')).await;
+            assert_eq!(app.repos.len(), 1, "{busy}: D is ignored while the repo's delete runs");
+            app.delete_inflight.remove("r1");
+
+            // Once the cleanups are done the same keys delete.
+            app.select_repo_row("r1");
+            press(&mut app, KeyCode::Char('d')).await;
+            assert!(matches!(
+                &app.modal,
+                modal::ModalState::ConfirmDelete {
+                    target: modal::DeleteTarget::Repo { id, workspace_count: 1, .. }
+                } if id == "r1"
+            ));
+            press(&mut app, KeyCode::Char('y')).await;
+            assert!(app.repos.is_empty());
+            assert!(app.workspaces.is_empty());
+        }
+    }
+
+    /// Run git in `dir`, failing the test on an error.
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// w1 on a real worktree (`feat`) of the real repo, selected, in the
+    /// state and its baseline. Returns the app, the repo and worktree-parent
+    /// guards, and the worktree.
+    fn app_with_a_real_worktree(
+    ) -> (App, tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
         let mut app = test_app();
-        app.cleanup_inflight.insert("w1".into());
-        app.select_repo_row("r1");
+        let repo = add_real_repo(&mut app, "feat");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wt = tmp.path().join("wt");
+        git_ok(repo.path(), &["worktree", "add", wt.to_str().unwrap(), "feat"]);
+        route_w1_to_real(&mut app, &wt, "feat");
+        app.state.workspaces = app.workspaces.clone();
+        app.state_baseline = app.state.clone();
+        app.expanded.insert("real".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        (app, repo, tmp, wt)
+    }
 
-        // Refused while a row's cleanup owns its worktree: `d` opens nothing,
-        // `D` and a confirmed modal change nothing.
-        press(&mut app, KeyCode::Char('d')).await;
-        assert!(matches!(app.modal, modal::ModalState::None), "d opens no modal");
+    /// Keeps recreating a dir under its cwd until it dies, and appends to
+    /// `mark` whenever it finds that cwd gone (it outlived a removal).
+    fn cwd_keeper(mark: &std::path::Path) -> String {
+        format!(
+            "trap '' HUP; echo UP $$ OK; while :; do [ -d \"$PWD\" ] || echo gone >> '{}'; \
+             mkdir -p \"$PWD/x\"; sleep 0.02; done",
+            mark.display()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_delete_keeps_the_row_until_its_worktree_is_gone() {
+        let (mut app, _repo, _tmp, wt) = app_with_a_real_worktree();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+
         press(&mut app, KeyCode::Char('D')).await;
-        assert_eq!(app.repos.len(), 2, "D is ignored");
-        assert_eq!(app.workspaces.len(), 1);
-        app.modal = modal::ModalState::ConfirmDelete {
-            target: modal::DeleteTarget::Repo {
-                id: "r1".into(),
-                name: "alpha".into(),
-                workspace_count: 1,
+        assert!(app.workspaces.iter().any(|w| w.id == "w1"), "still listed");
+        assert!(app.state.workspaces.iter().any(|w| w.id == "w1"), "still in state");
+        assert!(app.delete_inflight.contains("w1"), "in flight");
+
+        let (target, outcome) = recv(&mut rx).await;
+        assert_eq!(outcome, DeleteOutcome::Done);
+        assert!(!wt.exists(), "the worktree is gone");
+        app.on_delete_done(target, outcome);
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "the row is gone");
+        assert!(app.state.workspaces.iter().all(|w| w.id != "w1"), "from the state too");
+        assert!(
+            app.state_baseline.workspaces.iter().all(|w| w.id != "w1"),
+            "persisted: the baseline moves only after a successful save"
+        );
+        assert!(app.profile_notice.is_none(), "a clean delete needs no notice");
+    }
+
+    #[tokio::test]
+    async fn a_late_delete_report_keeps_the_cursor_and_focus() {
+        let mut app = test_app();
+        // w2 sits under w1 and above beta's row: a cursor kept by index would
+        // slide off it when w1 goes.
+        app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+
+        app.delete_workspace("w1"); // the row's ✕
+        app.select_workspace_row("w2");
+        app.embedded.insert(
+            "w2".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
             },
-        };
-        press(&mut app, KeyCode::Char('y')).await;
-        assert_eq!(app.repos.len(), 2, "a confirmed delete is ignored");
-        assert!(app.workspaces.iter().any(|w| w.id == "w1"));
+        );
+        app.focus = Focus::Embedded;
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+        let (target, outcome) = recv(&mut rx).await;
+        app.on_delete_done(target, outcome);
 
-        // Per repo: another repo still deletes.
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "w1 is gone");
+        let selected = app.selected_workspace().map(|w| w.id.as_str());
+        assert_eq!(selected, Some("w2"), "the cursor stays");
+        assert_eq!(app.focus, Focus::Embedded, "so does the focus");
+        assert!(app.pane_selection.is_some(), "and w2's highlight");
+    }
+
+    #[tokio::test]
+    async fn a_removed_cleanup_keeps_the_cursor_on_its_row() {
+        let mut app = test_app();
+        let wt = tempfile::TempDir::new().unwrap();
+        app.workspaces[0].worktree_path =
+            Some(wt.path().join("gone").to_string_lossy().into_owned());
+        app.workspaces[0].branch_name = Some("ws-one".into());
+        // As in the late delete report: w2 under w1, above beta's row.
+        app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w2");
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+        app.cleanup_inflight.insert("w1".into());
+
+        app.on_cleanup_done("w1".into(), Ok(Cleaned::Removed));
+
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "w1 is gone");
+        let selected = app.selected_workspace().map(|w| w.id.as_str());
+        assert_eq!(selected, Some("w2"), "the cursor stays");
+        assert!(app.pane_selection.is_some(), "and w2's highlight");
+    }
+
+    #[tokio::test]
+    async fn a_followed_cleanup_keeps_another_rows_highlight() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/nonexistent/kommand0-w1".into());
+        app.workspaces[0].branch_name = Some("feat".into());
+        app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w2");
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+        app.cleanup_inflight.insert("w1".into());
+
+        app.on_cleanup_done("w1".into(), Ok(Cleaned::Followed { branch: "elsewhere".into() }));
+
+        assert_eq!(app.workspaces[0].branch_name.as_deref(), Some("elsewhere"), "w1 follows");
+        let selected = app.selected_workspace().map(|w| w.id.as_str());
+        assert_eq!(selected, Some("w2"), "the cursor stays");
+        assert!(app.pane_selection.is_some(), "and w2's highlight");
+    }
+
+    #[tokio::test]
+    async fn a_busy_row_ignores_delete_open_new_tab_diff_archive_and_cleanup() {
+        for deleting in [false, true] {
+            let busy = if deleting { "delete" } else { "cleanup" };
+            let mut app = test_app();
+            app.config.claude_bin = Some("sh".to_string());
+            // Openable and own-branch, so each refusal below is the guard's.
+            app.workspaces[0].working_dir = "/tmp".into();
+            app.workspaces[0].worktree_path = Some("/nonexistent/kommand0-w1".into());
+            app.workspaces[0].branch_name = Some("feat".into());
+            app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+            app.state.workspaces = app.workspaces.clone();
+            app.expanded.insert("r1".to_string());
+            app.rebuild_tree();
+            app.select_workspace_row("w1");
+            if deleting {
+                app.delete_inflight.insert("w1".into());
+            } else {
+                app.cleanup_inflight.insert("w1".into());
+            }
+
+            press(&mut app, KeyCode::Char('d')).await;
+            assert!(matches!(app.modal, modal::ModalState::None), "{busy}: d opens no modal");
+            press(&mut app, KeyCode::Char('D')).await;
+            assert!(app.workspaces.iter().any(|w| w.id == "w1"), "{busy}: D leaves the row");
+            press(&mut app, KeyCode::Enter).await;
+            assert!(!app.embedded.contains_key("w1"), "{busy}: Enter spawns nothing");
+            app.new_tab(TabKind::Claude, "w1");
+            assert!(!app.embedded.contains_key("w1"), "{busy}: no new tab");
+            press(&mut app, KeyCode::Char('v')).await;
+            assert!(!app.show_diff, "{busy}: v opens no diff");
+            press(&mut app, KeyCode::Char('A')).await;
+            let active = app.workspaces.iter().any(|w| w.id == "w1" && w.active);
+            assert!(active, "{busy}: A doesn't archive it");
+            press(&mut app, KeyCode::Char('c')).await;
+            assert!(matches!(app.modal, modal::ModalState::None), "{busy}: c opens nothing");
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.cleanup_tx = Some(tx);
+            let before = app.cleanup_inflight.clone();
+            app.start_cleanups(&["w1"]);
+            assert_eq!(app.cleanup_inflight, before, "{busy}: no cleanup starts");
+
+            app.select_workspace_row("w2");
+            press(&mut app, KeyCode::Enter).await;
+            assert!(app.embedded.contains_key("w2"), "{busy}: the sibling still opens");
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_delete_keeps_its_rows_until_every_worktree_is_gone() {
+        let (mut app, repo, tmp, wt1) = app_with_a_real_worktree();
+        let wt2 = tmp.path().join("wt2");
+        git_ok(repo.path(), &["branch", "feat2"]);
+        git_ok(repo.path(), &["worktree", "add", wt2.to_str().unwrap(), "feat2"]);
+        app.workspaces.push(Workspace {
+            working_dir: wt2.to_string_lossy().into_owned(),
+            worktree_path: Some(wt2.to_string_lossy().into_owned()),
+            ..mk_ws("w2", "ws-two", "real", Some("feat2"))
+        });
+        app.state.workspaces = app.workspaces.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+        app.select_repo_row("real");
+
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.repos.iter().any(|r| r.id == "real"), "the repo stays listed");
+        let rows = app.workspaces.iter().filter(|w| w.repo_id == "real").count();
+        assert_eq!(rows, 2, "with its rows");
+        let mut marked: Vec<&str> = app.delete_inflight.iter().map(String::as_str).collect();
+        marked.sort();
+        assert_eq!(marked, ["real", "w1", "w2"]);
+
+        let (target, outcome) = recv(&mut rx).await;
+        assert_eq!((&target, &outcome), (&Deleted::Repo("real".into()), &DeleteOutcome::Done));
+        app.on_delete_done(target, outcome);
+        assert!(app.repos.iter().all(|r| r.id != "real"), "the repo is gone");
+        assert!(app.workspaces.iter().all(|w| w.repo_id != "real"), "with its rows");
+        assert!(app.delete_inflight.is_empty(), "nothing left in flight");
+        assert!(!app.spinner_visible(), "no spinner left behind");
+        assert!(!wt1.exists() && !wt2.exists(), "both worktrees are gone");
+    }
+
+    #[tokio::test]
+    async fn a_live_pane_dies_before_its_worktree_goes() {
+        let (mut app, _repo, _tmp, wt) = app_with_a_real_worktree();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+        // Outside the worktree's parent, which the removal may rmdir.
+        let marks = tempfile::TempDir::new().unwrap();
+        let mark = marks.path().join("outlived");
+        let t = tab_in("a", &wt, &["-c", &cwd_keeper(&mark)]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![t], active: 0, last_active: None },
+        );
+
+        press(&mut app, KeyCode::Char('D')).await;
+        let left = !app.embedded.contains_key("w1");
+        let queued = queued_teardowns(&app);
+        let alive_after_delete = alive(pid);
+        let (_, outcome) = recv(&mut rx).await;
+        app.join_teardowns();
+        let removed = !wt.exists();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        pane::tests::kill_leftovers(pid);
+
+        assert!(left, "the tab left at once");
+        assert_eq!(queued, [vec!["w1".to_string()]], "its kill runs in the background");
+        assert!(alive_after_delete, "the delete returned before the process died");
+        assert_eq!(outcome, DeleteOutcome::Done);
+        assert!(!mark.exists(), "the process was dead before its cwd went");
+        assert!(removed, "nothing recreated the worktree after its removal");
+        assert!(died, "the join waited for the kill");
+    }
+
+    #[tokio::test]
+    async fn a_detach_then_delete_waits_for_the_detach_kill() {
+        let (mut app, _repo, _tmp, wt) = app_with_a_real_worktree();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+        let marks = tempfile::TempDir::new().unwrap();
+        let mark = marks.path().join("outlived");
+        let t = tab_in("a", &wt, &["-c", &cwd_keeper(&mark)]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![t], active: 0, last_active: None },
+        );
+
+        app.detach_selected_workspace();
+        press(&mut app, KeyCode::Char('D')).await;
+        let alive_after_delete = alive(pid);
+        let (_, outcome) = recv(&mut rx).await;
+        app.join_teardowns();
+        let removed = !wt.exists();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        pane::tests::kill_leftovers(pid);
+
+        assert!(alive_after_delete, "the delete returned before the detach's kill ended");
+        assert_eq!(outcome, DeleteOutcome::Done);
+        assert!(!mark.exists(), "the removal waited for the detach's kill");
+        assert!(removed, "nothing recreated the worktree after its removal");
+        assert!(died, "the join waited for the kill");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_delete_keeps_the_row() {
+        for target in [Deleted::Workspace("w1".into()), Deleted::Repo("r1".into())] {
+            let mut app = test_app();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.delete_tx = Some(tx);
+            match &target {
+                Deleted::Workspace(id) => app.delete_workspace(id),
+                Deleted::Repo(id) => app.delete_repo(id),
+            }
+            assert!(app.delete_inflight.contains("w1"), "{target:?}: marked");
+
+            app.on_delete_done(target.clone(), DeleteOutcome::Interrupted);
+
+            assert!(app.workspaces.iter().any(|w| w.id == "w1"), "{target:?}: the row stays");
+            assert!(app.repos.iter().any(|r| r.id == "r1"), "{target:?}: under its repo");
+            assert!(app.delete_inflight.is_empty(), "{target:?}: no longer in flight");
+            assert!(!app.spinner_visible(), "{target:?}: no spinner left behind");
+            let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+            assert!(msg.contains("still listed"), "{target:?}: {msg}");
+            assert!(is_error, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn a_delete_leaving_files_names_them() {
+        let mut app = test_app();
+        app.delete_inflight.insert("w1".into());
+        let left = vec![LeftWorktree::Failed { path: "/x/y".into() }];
+
+        app.on_delete_done(Deleted::Workspace("w1".into()), DeleteOutcome::Notes(left));
+
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "the row is gone");
+        assert!(app.delete_inflight.is_empty(), "no longer in flight");
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert!(msg.contains("/x/y") && msg.contains("by hand"), "{msg}");
+        assert!(is_error, "a failed removal is an error");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_row_aliasing_a_live_worktree_names_the_owner() {
+        let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
+        std::fs::write(wt.join("keep.txt"), "mine").unwrap();
+        // w2's dir is a symlink to w1's live worktree.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&wt, &alias).unwrap();
+        app.workspaces.push(Workspace {
+            working_dir: alias.to_string_lossy().into_owned(),
+            worktree_path: Some(alias.to_string_lossy().into_owned()),
+            ..mk_ws("w2", "ws-two", "real", Some("feat2"))
+        });
+        app.state.workspaces = app.workspaces.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+
+        app.delete_workspace("w2");
+        let (target, outcome) = recv(&mut rx).await;
+        app.on_delete_done(target, outcome);
+
+        assert!(app.workspaces.iter().all(|w| w.id != "w2"), "the row is gone");
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert!(msg.contains("ws-one"), "names the owner: {msg}");
+        assert!(!msg.contains("by hand"), "never asks to delete a live worktree: {msg}");
+        assert!(!is_error, "kept on purpose, not a failure");
+        let kept = std::fs::read_to_string(wt.join("keep.txt")).unwrap();
+        assert_eq!(kept, "mine", "w1's worktree is intact");
+    }
+
+    #[tokio::test]
+    async fn a_deleting_row_shows_deleting_in_its_detail_pane() {
+        let mut app = test_app();
+        app.workspaces.push(Workspace {
+            worktree_path: Some("/nonexistent/kommand0-w2".into()),
+            ..mk_ws("w2", "ws-two", "r1", Some("feat"))
+        });
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.delete_inflight.extend(["w1".to_string(), "w2".to_string(), "r2".to_string()]);
+
+        // w1 is a fallback row: no branch, still says so.
+        app.select_workspace_row("w1");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Deleting…"), "a fallback row:\n{text}");
+        app.select_workspace_row("w2");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Deleting…"), "an own-branch row:\n{text}");
+        assert!(!text.contains("[Clean up]"), "the button yields to it:\n{text}");
         app.select_repo_row("r2");
-        press(&mut app, KeyCode::Char('D')).await;
-        assert!(app.repos.iter().all(|r| r.id != "r2"), "r2 is gone");
-        assert!(app.repos.iter().any(|r| r.id == "r1"), "r1 stays");
-        assert!(app.workspaces.iter().any(|w| w.id == "w1"), "w1 stays");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Deleting…"), "a repo:\n{text}");
+        assert!(!text.contains("[Clean up branches]"), "the button yields to it:\n{text}");
+    }
 
-        // The repo's own branch-delete phase owns its branches: refused too.
-        app.cleanup_inflight.remove("w1");
-        app.repo_cleanup_inflight = Some("r1".into());
-        app.select_repo_row("r1");
-        press(&mut app, KeyCode::Char('D')).await;
-        assert_eq!(app.repos.len(), 1, "D is ignored while the branch delete runs");
-        app.repo_cleanup_inflight = None;
+    #[test]
+    fn a_deleting_row_gets_no_status_check() {
+        let mut app = worktree_rows_app(2);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        app.delete_inflight.insert("w1".into());
 
-        // Once the cleanups are done the same keys delete.
+        app.dispatch_branch_status(Instant::now());
+
+        assert!(!app.status_checked.contains_key("w1"), "its worktree is going");
+        assert!(app.status_checked.contains_key("w2"), "the other row is checked");
+    }
+
+    #[tokio::test]
+    async fn a_repo_being_deleted_starts_no_branch_cleanup() {
+        let mut app = test_app();
+        let tmp = tempfile::TempDir::new().unwrap();
+        app.repos[0].path = tmp.path().join("missing").to_string_lossy().into_owned();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(tx);
+        app.delete_inflight.insert("r1".into());
         app.select_repo_row("r1");
-        press(&mut app, KeyCode::Char('d')).await;
-        assert!(matches!(
-            &app.modal,
-            modal::ModalState::ConfirmDelete {
-                target: modal::DeleteTarget::Repo { id, workspace_count: 1, .. }
-            } if id == "r1"
-        ));
-        press(&mut app, KeyCode::Char('y')).await;
-        assert!(app.repos.is_empty());
-        assert!(app.workspaces.is_empty());
+
+        press(&mut app, KeyCode::Char('c')).await;
+
+        assert!(app.repo_cleanup_inflight.is_none(), "no scan of a repo being deleted");
     }
 
     #[tokio::test]

@@ -1022,15 +1022,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 ]),
             ];
 
-            // Repo cleanup: the button (a spinner while the scan/delete runs),
-            // then its last outcome.
+            // Repo cleanup: the button (a spinner while the scan/delete runs,
+            // or while the repo itself is being deleted), then its last outcome.
             lines.push(Line::raw(""));
-            if app.repo_cleanup_inflight.as_deref() == Some(id.as_str()) {
+            let cleaning = app.repo_cleanup_inflight.as_deref() == Some(id.as_str());
+            if cleaning || app.delete_inflight.contains(id) {
                 // ponytail: one spinner for the whole scan; a per-branch
                 // counter needs the worker to report progress.
                 let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+                let what = if cleaning { "Cleaning up" } else { "Deleting" };
                 lines.push(Line::styled(
-                    format!("{spin} Cleaning up…"),
+                    format!("{spin} {what}…"),
                     Style::default().fg(th.dirty),
                 ));
             } else {
@@ -1196,14 +1198,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 }
             }
 
-            // Clean-up affordance + last outcome (own-branch workspaces).
+            // Clean-up affordance + last outcome (own-branch workspaces); a
+            // delete in flight shows here too, fallback rows included.
             let cleanup_inflight = app.cleanup_inflight.contains(&ws.id);
-            if has_branch || cleanup_inflight || app.cleanup_result.contains_key(&ws.id) {
+            let busy = cleanup_inflight || app.delete_inflight.contains(&ws.id);
+            if has_branch || busy || app.cleanup_result.contains_key(&ws.id) {
                 lines.push(Line::raw(""));
-                if cleanup_inflight {
+                if busy {
                     let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+                    let what = if cleanup_inflight { "Cleaning up" } else { "Deleting" };
                     lines.push(Line::styled(
-                        format!("{spin} Cleaning up…"),
+                        format!("{spin} {what}…"),
                         Style::default().fg(th.dirty),
                     ));
                 } else if has_branch {
