@@ -17,6 +17,10 @@ All notable changes to kommand0 are documented here. The format is based on
   a create, close, detach, stop or cleanup. The background git load drops from
   continuous (every worktree, back to back) to occasional.
   `status_refresh_secs` now sets the interval for a workspace you work in.
+- **An idle screen no longer repaints 20 times a second**: the 50 ms tick
+  redraws only when it changed something on screen (a tab gone, focus, a
+  spinner frame, a "needs you" dot), and a pointer move only when it changes a
+  button's hover.
 
 ## [0.32.1] - 2026-10-23
 

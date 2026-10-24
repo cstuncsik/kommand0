@@ -7,6 +7,7 @@
 //! `KOMMAND0_CLAUDE_BIN` env var (see the embedded-pane tests).
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,8 @@ struct Tui {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     master: Box<dyn portable_pty::MasterPty + Send>, // kept for resize()
+    /// Bytes the app has written to its terminal so far.
+    written: Arc<AtomicUsize>,
     /// The isolated state dir, doubling as the child's cwd (in the
     /// legacy-layout variant it's the cwd root CONTAINING `.kommand0-dev`,
     /// not the state dir itself). Kept alive for the duration of the test.
@@ -155,6 +158,8 @@ impl Tui {
             HostCallbacks::default(),
         )));
         let parser_clone = parser.clone();
+        let written = Arc::new(AtomicUsize::new(0));
+        let written_clone = written.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
@@ -162,6 +167,7 @@ impl Tui {
                     break;
                 }
                 parser_clone.lock().unwrap().process(&buf[..n]);
+                written_clone.fetch_add(n, Ordering::Relaxed);
             }
         });
 
@@ -171,6 +177,7 @@ impl Tui {
             child,
             killer,
             master,
+            written,
             state_dir,
         }
     }
@@ -268,6 +275,27 @@ impl Tui {
                 );
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Wait until the app has written nothing to its terminal for 1 s,
+    /// panicking after 10 s.
+    fn wait_for_quiet(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = self.written.load(Ordering::Relaxed);
+        let mut quiet_since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let now = self.written.load(Ordering::Relaxed);
+            if now != last {
+                last = now;
+                quiet_since = Instant::now();
+            } else if quiet_since.elapsed() >= Duration::from_secs(1) {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!("the app kept writing to its terminal; screen:\n{}", self.screen());
+            }
         }
     }
 
@@ -413,7 +441,8 @@ fn survives_a_resize_drag_without_wedging_input() {
         std::thread::sleep(Duration::from_millis(10));
     }
     // Re-rendered at the final size (a panic on any resize would have killed the
-    // process and timed this out instead).
+    // process and timed this out instead): the status bar sits on its last row.
+    tui.wait_for_row(39, "q quit");
     tui.wait_for("demo");
     // Input still flows after the drag — the wedge symptom was `q` being ignored.
     tui.send("q");
@@ -523,6 +552,27 @@ fn embedded_pane_renders_real_terminal_and_forwards_keys() {
 
     tui.send("\x1d"); // Ctrl+] leaves the embedded pane (back to the tree)
     tui.send("q"); // quit (kills the embedded child on teardown)
+    tui.wait_exit();
+}
+
+#[test]
+fn an_idle_screen_writes_nothing() {
+    // A session that went quiet, no spinner, no input: nothing on screen
+    // changes, so nothing is written (it used to repaint every 50 ms tick).
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for_quiet();
+
+    tui.send("\x1d");
+    tui.send("q");
     tui.wait_exit();
 }
 

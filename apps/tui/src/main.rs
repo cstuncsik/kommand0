@@ -25,7 +25,7 @@ use kommand0_core::{
 };
 use ratatui::{
     DefaultTerminal,
-    crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent},
+    crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind},
 };
 
 /// Height of the session tab strip at the top of the right pane.
@@ -1020,6 +1020,20 @@ pub(crate) struct App {
     /// How to alert when a backgrounded session needs you (defaults to `Off`
     /// until `run` applies config).
     pub(crate) notify_mode: notify::NotifyMode,
+}
+
+/// What a tick can change that the screen shows; `App::tick` compares it
+/// before and after, so a tick that changed nothing draws nothing.
+#[derive(PartialEq)]
+struct TickView {
+    focus: Focus,
+    waiting: HashSet<String>,
+    attention: HashSet<String>,
+    /// Per workspace with live tabs, sorted: its tab ids and the active index.
+    tabs: Vec<(String, Vec<String>, usize)>,
+    embed_error: Option<(String, String)>,
+    /// `pane_selection.is_some()`.
+    selection: bool,
 }
 
 impl App {
@@ -2702,6 +2716,70 @@ impl App {
         }
         self.state.replace_embedded_session(ws_id, tab_id, captured);
         true
+    }
+
+    /// The event loop's 50 ms tick. Returns whether the screen changed, so an
+    /// idle tick draws nothing.
+    fn tick(&mut self, now: Instant) -> bool {
+        let before = self.tick_view();
+        // Reap embedded panes whose claude exited (leaves Embedded focus).
+        self.reap_embedded(now);
+        // Refresh per-pane activity so the tree spinner reflects which
+        // sessions are currently producing output.
+        self.update_pane_activity(now);
+        // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
+        self.tick_counter = self.tick_counter.wrapping_add(1);
+        let spun = self.tick_counter.is_multiple_of(5);
+        if spun {
+            self.spinner_tick = (self.spinner_tick + 1) % 10;
+        }
+        // Frames no longer come every tick, so focus is synced here too.
+        self.sync_focus_states();
+        // Git status (off-loop) for the workspaces that are due.
+        self.dispatch_branch_status(now);
+        // Periodic PR/CI-status refresh (off-loop, slow interval: it's a
+        // network call per repo).
+        if self
+            .last_pr_status_refresh
+            .is_none_or(|t| now.duration_since(t) >= PR_STATUS_REFRESH_INTERVAL)
+        {
+            self.last_pr_status_refresh = Some(now);
+            self.request_pr_status_refresh();
+        }
+        before != self.tick_view() || (spun && self.spinner_visible())
+    }
+
+    fn tick_view(&self) -> TickView {
+        let mut tabs: Vec<(String, Vec<String>, usize)> = self
+            .embedded
+            .iter()
+            .map(|(ws_id, s)| {
+                (ws_id.clone(), s.tabs.iter().map(|t| t.id.clone()).collect(), s.active)
+            })
+            .collect();
+        tabs.sort();
+        TickView {
+            focus: self.focus,
+            waiting: self.waiting_response.clone(),
+            attention: self.attention.clone(),
+            tabs,
+            embed_error: self.embed_error.clone(),
+            selection: self.pane_selection.is_some(),
+        }
+    }
+
+    /// Whether a spinner is on screen, so its advance needs a redraw. A new
+    /// spinner must be added here, or it freezes while nothing else changes.
+    fn spinner_visible(&self) -> bool {
+        !self.waiting_response.is_empty()
+            || !self.cleanup_inflight.is_empty()
+            || self.repo_cleanup_inflight.is_some()
+    }
+
+    /// The hit region under the pointer, by the last render: a pointer move
+    /// only changes the screen when this changes (hover styling).
+    fn hovered_region(&self) -> Option<usize> {
+        self.hit_regions.iter().position(|r| buttons::is_hovered(self.mouse_pos, r.area))
     }
 
     /// Drop session tabs whose child has exited, and whole workspaces that were
@@ -5564,10 +5642,10 @@ async fn run(
                 // Drain any backlog so we coalesce into a single redraw.
                 while wake_rx.try_recv().is_ok() {}
                 // Invariant: this arm stays mutation-free beyond draining and
-                // pacing. Any state change belongs in an always-draw arm; the
-                // seq-only comparison below relies on visible-pane identity
-                // changes (tab/workspace switches, opens, reaps) flowing
-                // through arms that always repaint.
+                // pacing. The seq-only comparison below relies on every
+                // visible-pane identity change (tab/workspace switches, opens,
+                // reaps) repainting: input always does, and the tick does
+                // whenever its TickView changed.
                 if app.visible_pane_seq() == last_drawn_seq {
                     // Background-only output: the visible pane's frame would be
                     // unchanged, so skip the repaint (a resume storm in other
@@ -5701,6 +5779,9 @@ async fn run(
                         }
                     }
                     Event::Mouse(mouse_event) => {
+                        // A pointer move changes the screen only through the
+                        // hover, or by dropping a selection under an overlay.
+                        let before = (app.hovered_region(), app.pane_selection.is_some());
                         if app.show_diff {
                             mouse::handle_diff_mouse(&mut app, mouse_event);
                         } else if app.overlay_active() {
@@ -5729,6 +5810,8 @@ async fn run(
                         } else {
                             mouse::handle_mouse(&mut app, mouse_event);
                         }
+                        skip_draw = matches!(mouse_event.kind, MouseEventKind::Moved)
+                            && (app.hovered_region(), app.pane_selection.is_some()) == before;
                     }
                     _ => {}
                 }
@@ -5807,28 +5890,7 @@ async fn run(
                 }
             }
             _ = tick_interval.tick() => {
-                let now = Instant::now();
-                // Reap embedded panes whose claude exited (leaves Embedded focus).
-                app.reap_embedded(now);
-                // Refresh per-pane activity so the tree spinner reflects which
-                // sessions are currently producing output.
-                app.update_pane_activity(now);
-                // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
-                app.tick_counter = app.tick_counter.wrapping_add(1);
-                if app.tick_counter.is_multiple_of(5) {
-                    app.spinner_tick = (app.spinner_tick + 1) % 10;
-                }
-                // Git status (off-loop) for the workspaces that are due.
-                app.dispatch_branch_status(now);
-                // Periodic PR/CI-status refresh (off-loop, slow interval — it's a
-                // network call per repo).
-                if app
-                    .last_pr_status_refresh
-                    .is_none_or(|t| now.duration_since(t) >= PR_STATUS_REFRESH_INTERVAL)
-                {
-                    app.last_pr_status_refresh = Some(now);
-                    app.request_pr_status_refresh();
-                }
+                skip_draw = !app.tick(Instant::now());
             }
         }
     }
@@ -10145,6 +10207,141 @@ mod key_tests {
         // A tab switch retargets to the newly active (silent) tab.
         app.embedded.get_mut("w1").unwrap().active = 1;
         assert_eq!(app.visible_pane_seq(), Some(0), "tracks the tab switch");
+    }
+
+    #[test]
+    fn an_idle_tick_asks_for_no_redraw() {
+        let mut app = test_app();
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        let t0 = Instant::now();
+        // Six ticks cover a spinner advance (every fifth) with nothing spinning.
+        for i in 1..=6 {
+            assert!(!app.tick(t0 + Duration::from_millis(50 * i)), "tick {i}");
+        }
+    }
+
+    #[test]
+    fn a_visible_spinner_redraws_once_per_frame() {
+        let t0 = Instant::now();
+        let redraws = |app: &mut App| {
+            (1..=10).filter(|&i| app.tick(t0 + Duration::from_millis(50 * i))).count()
+        };
+        let mut app = test_app();
+        app.cleanup_inflight.insert("w1".into());
+        assert_eq!(redraws(&mut app), 2, "a workspace cleanup spinner");
+        let mut app = test_app();
+        app.repo_cleanup_inflight = Some("r1".into());
+        assert_eq!(redraws(&mut app), 2, "a repo cleanup spinner");
+    }
+
+    #[test]
+    fn a_reaped_tab_asks_for_a_redraw() {
+        let mut app = test_app();
+        let mut s = WorkspaceSessions {
+            tabs: vec![tab("a", &["-c", "exit 0"])],
+            active: 0,
+            last_active: None,
+        };
+        wait_exit(&mut s.tabs[0].pane);
+        app.embedded.insert("w1".to_string(), s);
+        let t0 = Instant::now();
+        assert!(app.tick(t0), "the reap drops the tab");
+        assert!(!app.embedded.contains_key("w1"));
+        assert!(!app.tick(t0 + Duration::from_millis(50)), "nothing left to change");
+    }
+
+    #[test]
+    fn a_reap_that_only_moves_focus_asks_for_a_redraw() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.focus = Focus::Embedded; // w1 has no live pane
+        assert!(app.tick(Instant::now()));
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn activity_changes_ask_for_a_redraw() {
+        let mut app = test_app();
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "while :; do echo x; sleep 0.02; done"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+            let redraw = app.tick(Instant::now());
+            if app.waiting_response.contains("a") {
+                assert!(redraw, "the tick that starts the spinner redraws");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the pane never armed the spinner");
+        }
+    }
+
+    #[test]
+    fn a_quiet_session_raises_attention_on_the_tick() {
+        let mut app = test_app(); // focus Tree: nobody is viewing the session
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "echo hi; sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.embedded["w1"].tabs[0].pane.output_seq() == 0 {
+            assert!(Instant::now() < deadline, "pane never produced output");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let t0 = Instant::now();
+        app.tick(t0);
+        assert!(app.tick(t0 + Duration::from_millis(3100)), "the attention dot redraws");
+        assert!(app.attention.contains("a"));
+    }
+
+    #[test]
+    fn a_pointer_move_repaints_only_on_a_hover_change() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut draw = |app: &mut App| {
+            terminal.draw(|frame| render::ui(frame, app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        draw(&mut app);
+        let i = app
+            .hit_regions
+            .iter()
+            .position(|r| r.action == buttons::HitAction::StartSession)
+            .expect("[Open Claude] is drawn");
+        let area = app.hit_regions[i].area;
+
+        app.mouse_pos = Some((area.x, area.y));
+        assert_eq!(app.hovered_region(), Some(i));
+        let hovered = draw(&mut app);
+        app.mouse_pos = Some((area.right() - 1, area.y));
+        assert_eq!(app.hovered_region(), Some(i));
+        assert!(draw(&mut app) == hovered, "a move inside the button changes nothing");
+
+        app.mouse_pos = Some((area.right() + 2, area.y));
+        assert_eq!(app.hovered_region(), None);
+        assert!(draw(&mut app) != hovered, "leaving the button drops its hover style");
     }
 
     #[test]
