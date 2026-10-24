@@ -47,7 +47,9 @@ pub struct Config {
     /// Override the `pi` binary. Lower precedence than the
     /// `KOMMAND0_PI_BIN` env var; falls back to `pi`.
     pub pi_bin: Option<String>,
-    /// Seconds between background git-status refreshes (default 2).
+    /// Seconds between git-status checks of a workspace you work in (one of its
+    /// sessions busy or typed into); default 2. The TUI checks the selected
+    /// workspace every 10 s and the rest at least every 5 minutes.
     pub status_refresh_secs: Option<u64>,
     /// Tree-pane key rebindings: action name (e.g. `"quit"`) → key specs (e.g.
     /// `["ctrl+q"]`). Parsed/validated by the TUI; an action's configured keys

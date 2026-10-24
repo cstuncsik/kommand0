@@ -35,10 +35,38 @@ const TAB_BAR_HEIGHT: u16 = 1;
 /// single-column tab labels).
 pub(crate) const MAX_SESSION_TABS: usize = 9;
 
-/// How often the periodic git-status refresh runs (off the render loop). Git
-/// status is cheap but can stall on large/cold worktrees, so it never runs on
-/// the 50ms tick; on-demand triggers (workspace create/close) keep it snappy.
+/// How often git status is checked (off the render loop) for a workspace you
+/// work in: one of its sessions is busy or was typed into since the last
+/// check. The default for `status_refresh_secs`.
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the selected workspace's git status is checked.
+const SELECTED_STATUS_EVERY: Duration = Duration::from_secs(10);
+
+/// The longest any worktree goes without a git-status check.
+const IDLE_STATUS_EVERY: Duration = Duration::from_secs(300);
+
+/// Background checks per pass, so the startup and 5-minute sweeps over many
+/// worktrees spread across passes instead of becoming one long one.
+const STATUS_BACKGROUND_PER_PASS: usize = 4;
+
+/// `Some(0)` urgent, `Some(1)` background, `None` not due. `age`: since the
+/// last check, `None` = never (or an explicit refresh dropped the stamp).
+fn status_due(
+    age: Option<Duration>,
+    interval: Duration,
+    active: bool,
+    selected: bool,
+) -> Option<u8> {
+    let past = |d: Duration| age.is_none_or(|a| a >= d);
+    if (active && past(interval)) || (selected && past(SELECTED_STATUS_EVERY)) {
+        Some(0)
+    } else if past(IDLE_STATUS_EVERY) {
+        Some(1)
+    } else {
+        None
+    }
+}
 
 /// How often the periodic PR/CI-status refresh runs (off the render loop). A `gh
 /// pr list` per repo is a network call, so it runs far less often than the local
@@ -67,6 +95,10 @@ impl<T> Drop for SendOnDrop<T> {
 /// core's result, stringly on the error side (it crosses a thread).
 type ProfileDeleteMsg =
     (String, Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>);
+
+/// What a git-status pass sends back: each checked row's status, `None` when
+/// git couldn't read it.
+type StatusMsg = Vec<(String, Option<kommand0_core::BranchStatus>)>;
 
 /// A scan, routed against the repo's workspaces: the plan, core's notes (a
 /// failed refresh of the default branch, squash detection off) and the base
@@ -895,11 +927,11 @@ pub(crate) struct App {
     /// A status-refresh worker is running; gates re-spawning (cleared when its
     /// result arrives — and it always sends, even on a partial/empty result).
     status_inflight: bool,
-    /// Worker → event-loop channel carrying a fresh status map (set in `run`).
-    status_tx: Option<tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::BranchStatus>>>,
-    /// When the periodic status refresh last fired (time-based, so it doesn't
-    /// depend on the wrapping tick counter).
-    last_status_refresh: Option<Instant>,
+    /// Worker → event-loop channel carrying each checked row's status (set in `run`).
+    status_tx: Option<tokio::sync::mpsc::UnboundedSender<StatusMsg>>,
+    /// When each worktree row's status check was last dispatched. A row with
+    /// no stamp is due; an explicit refresh drops the row's stamp.
+    status_checked: HashMap<String, Instant>,
 
     /// Per-workspace PR/CI status, refreshed off the render loop via one
     /// `gh pr list` per repo. Keyed by workspace id; absent until a PR exists on
@@ -1056,7 +1088,7 @@ impl App {
             branch_status: HashMap::new(),
             status_inflight: false,
             status_tx: None,
-            last_status_refresh: None,
+            status_checked: HashMap::new(),
             pr_status: HashMap::new(),
             pr_status_inflight: false,
             pr_status_rerun: false,
@@ -1826,7 +1858,7 @@ impl App {
     /// generation stamp, echoed back so [`Self::apply_codex_capture`] can
     /// drop this poller's event once the same sentinel has been respawned
     /// by a newer process (detach then fast reopen). Tx-gated like
-    /// `request_branch_status_refresh`: unit tests never wire
+    /// `dispatch_branch_status`: unit tests never wire
     /// `codex_capture_tx`, so they spawn no threads and never touch a
     /// developer's real `~/.codex/sessions`. No inflight guard on purpose:
     /// one shot per spawned tab, at most one send, and a stale/duplicate
@@ -2427,7 +2459,7 @@ impl App {
             self.focus = Focus::Tree;
         }
         // The session likely committed; refresh this workspace's branch status.
-        self.request_branch_status_refresh();
+        self.status_checked.remove(&ws_id);
     }
 
     /// Detach the selected workspace's embedded panes (tmux prefix-d, and the
@@ -2477,7 +2509,7 @@ impl App {
         }
         self.focus = Focus::Tree;
         // The sessions likely committed; refresh this workspace's branch status.
-        self.request_branch_status_refresh();
+        self.status_checked.remove(&ws_id);
     }
 
     /// Open the Rename Session modal for the selected workspace's active tab,
@@ -3162,28 +3194,50 @@ impl App {
         }
     }
 
-    /// Kick off an off-loop git-status refresh for every workspace (no-op if one
-    /// is already running or the channel isn't wired). The worker computes each
-    /// workspace's [`kommand0_core::branch_status`] and sends the whole map back;
-    /// the event loop replaces the cache wholesale, so deleted workspaces drop
-    /// out on the next refresh (no manual pruning).
-    fn request_branch_status_refresh(&mut self) {
+    /// Kick off an off-loop git-status pass over the worktree rows that are due
+    /// (see [`status_due`]): every urgent row plus the
+    /// [`STATUS_BACKGROUND_PER_PASS`] longest-unchecked background ones. A no-op
+    /// while a pass runs or when the channel isn't wired. Rows are stamped here,
+    /// at dispatch, so an explicit refresh during a pass still gets its check.
+    fn dispatch_branch_status(&mut self, now: Instant) {
         if self.status_inflight {
             return;
         }
         let Some(tx) = self.status_tx.clone() else {
             return; // not wired (e.g. unit tests drive the cache directly)
         };
-        // Only workspaces with their own worktree/branch — a fallback workspace's
+        let interval = self
+            .config
+            .status_refresh_secs
+            // Floor at 1s so a mis-set 0 can't thrash a git subprocess every tick.
+            .map(|s| Duration::from_secs(s.max(1)))
+            .unwrap_or(STATUS_REFRESH_INTERVAL);
+        let selected = self.selected_workspace().map(|w| w.id.as_str());
+        let mut due: Vec<(u8, Option<Instant>, String, String)> = Vec::new();
+        // Only workspaces with their own worktree/branch: a fallback workspace's
         // working_dir is the shared repo root, whose status the UI never shows.
-        let targets: Vec<(String, String)> = self
-            .workspaces
-            .iter()
-            .filter(|w| w.worktree_path.is_some())
-            .map(|w| (w.id.clone(), w.working_dir.clone()))
-            .collect();
-        if targets.is_empty() {
+        for w in self.workspaces.iter().filter(|w| w.worktree_path.is_some()) {
+            let checked = self.status_checked.get(&w.id).copied();
+            let active = self.embedded.get(&w.id).is_some_and(|s| {
+                s.tabs.iter().any(|t| {
+                    self.waiting_response.contains(&t.id)
+                        || t.pane.last_input_at().is_some_and(|i| checked.is_none_or(|c| i > c))
+                })
+            });
+            let age = checked.map(|c| now.saturating_duration_since(c));
+            if let Some(prio) = status_due(age, interval, active, selected == Some(w.id.as_str())) {
+                due.push((prio, checked, w.id.clone(), w.working_dir.clone()));
+            }
+        }
+        // Urgent first, then the longest unchecked (never-checked first).
+        due.sort_by_key(|&(prio, checked, ..)| (prio, checked));
+        let urgent = due.iter().filter(|d| d.0 == 0).count();
+        due.truncate(urgent + STATUS_BACKGROUND_PER_PASS);
+        if due.is_empty() {
             return;
+        }
+        for (_, _, id, _) in &due {
+            self.status_checked.insert(id.clone(), now);
         }
         self.status_inflight = true;
         std::thread::spawn(move || {
@@ -3191,15 +3245,36 @@ impl App {
             // event loop always clears `status_inflight`.
             let mut guard = SendOnDrop {
                 tx,
-                payload: Some(HashMap::new()),
+                payload: Some(Vec::new()),
             };
-            let map = guard.payload.as_mut().expect("payload present until drop");
-            for (id, dir) in targets {
-                if let Some(status) = kommand0_core::branch_status(&dir) {
-                    map.insert(id, status);
-                }
+            let results = guard.payload.as_mut().expect("payload present until drop");
+            for (_, _, id, dir) in due {
+                results.push((id, kommand0_core::branch_status(&dir)));
             }
         });
+    }
+
+    /// Merge a finished pass into the cache (`Some` inserts, `None` removes),
+    /// then prune the cache and the stamps to the live worktree rows, so a row
+    /// deleted mid-pass doesn't come back. Returns whether the cache changed.
+    fn apply_branch_status(&mut self, results: StatusMsg) -> bool {
+        let before = self.branch_status.clone();
+        for (id, status) in results {
+            if let Some(s) = status {
+                self.branch_status.insert(id, s);
+            } else {
+                self.branch_status.remove(&id);
+            }
+        }
+        let live: HashSet<&str> = self
+            .workspaces
+            .iter()
+            .filter(|w| w.worktree_path.is_some())
+            .map(|w| w.id.as_str())
+            .collect();
+        self.branch_status.retain(|id, _| live.contains(id.as_str()));
+        self.status_checked.retain(|id, _| live.contains(id.as_str()));
+        self.branch_status != before
     }
 
     /// Kick off an off-loop PR/CI-status refresh (no-op if one is running or the
@@ -3260,7 +3335,8 @@ impl App {
     }
 
     /// Post-process a workspace-create attempt from the add-workspace flow. On
-    /// success: sync workspaces, expand the repo, rebuild, refresh branch status.
+    /// success: sync workspaces, expand the repo, rebuild (the new row was never
+    /// checked, so its branch status is due at once).
     /// On failure: reopen the Add-Workspace modal with the typed `name`, the given
     /// `branch` (the explicit-branch path passes the user's typed branch so it
     /// isn't wiped on error; the fork/blank paths pass an empty string), and the
@@ -3286,7 +3362,6 @@ impl App {
                 // the new workspace can land above it, and from the embedded
                 // pane the cursor is the shown session.
                 self.rebuild_tree_keeping_selection();
-                self.request_branch_status_refresh();
             }
             Err(e) => {
                 self.modal = modal::ModalState::AddWorkspace {
@@ -4063,6 +4138,7 @@ impl App {
     /// re-points it, a refusal shows in its pane.
     fn on_cleanup_done(&mut self, ws_id: String, result: Result<Cleaned, String>) {
         self.cleanup_inflight.remove(&ws_id);
+        self.status_checked.remove(&ws_id);
         match result {
             Ok(Cleaned::Removed) => {
                 // The worktree + branch are gone; drop the workspace too.
@@ -4098,7 +4174,6 @@ impl App {
                 self.cleanup_result.insert(ws_id, (msg, true));
             }
         }
-        self.request_branch_status_refresh();
     }
 
     /// Resolve an issue reference to its linked branch off the render loop (up
@@ -5420,14 +5495,11 @@ async fn run(
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     app.embedded_wake = Some(wake_tx);
 
-    // Off-loop git-status worker → event loop. Seed one refresh up front, then
-    // refresh periodically (and on demand) so branch/diff status stays current
-    // without ever blocking the render loop on a git call.
-    let (status_tx, mut status_rx) =
-        tokio::sync::mpsc::unbounded_channel::<HashMap<String, kommand0_core::BranchStatus>>();
+    // Off-loop git-status worker → event loop. The tick dispatches the rows
+    // that are due (every row starts unchecked), so branch/diff status stays
+    // current without ever blocking the render loop on a git call.
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<StatusMsg>();
     app.status_tx = Some(status_tx);
-    app.request_branch_status_refresh();
-    app.last_status_refresh = Some(Instant::now());
 
     // Off-loop PR/CI-status worker → event loop. Seeded once, then refreshed on a
     // slow interval (one `gh pr list` per repo is a network call).
@@ -5518,10 +5590,10 @@ async fn run(
                     }
                 }
             }
-            Some(status) = status_rx.recv() => {
-                // A status refresh finished: replace the cache wholesale (drops
-                // entries for deleted workspaces) and allow the next refresh.
-                app.branch_status = status;
+            Some(results) = status_rx.recv() => {
+                // A status pass finished: merge it (an unchanged cache needs no
+                // redraw) and allow the next pass.
+                skip_draw = !app.apply_branch_status(results);
                 app.status_inflight = false;
             }
             Some(pr_status) = pr_status_rx.recv() => {
@@ -5699,6 +5771,7 @@ async fn run(
                                 let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                 app.update_active_session();
                             }
+                            app.status_checked.remove(&workspace_id);
                         }
                         buttons::HitAction::FocusComposerFor { workspace_id } => {
                             // Focus the embedded claude for the given workspace.
@@ -5745,22 +5818,8 @@ async fn run(
                 if app.tick_counter.is_multiple_of(5) {
                     app.spinner_tick = (app.spinner_tick + 1) % 10;
                 }
-                // Periodic git-status refresh (off-loop). Time-based so it doesn't
-                // depend on the wrapping tick counter; interval is configurable.
-                let status_interval = app
-                    .config
-                    .status_refresh_secs
-                    // Floor at 1s so a mis-set 0 can't thrash a git subprocess
-                    // every tick.
-                    .map(|s| Duration::from_secs(s.max(1)))
-                    .unwrap_or(STATUS_REFRESH_INTERVAL);
-                if app
-                    .last_status_refresh
-                    .is_none_or(|t| now.duration_since(t) >= status_interval)
-                {
-                    app.last_status_refresh = Some(now);
-                    app.request_branch_status_refresh();
-                }
+                // Git status (off-loop) for the workspaces that are due.
+                app.dispatch_branch_status(now);
                 // Periodic PR/CI-status refresh (off-loop, slow interval — it's a
                 // network call per repo).
                 if app
@@ -10201,6 +10260,158 @@ mod key_tests {
                 "a render sizes background tabs to the pane, not just the active one"
             );
         }
+    }
+
+    #[test]
+    fn status_due_schedules_by_activity_selection_and_age() {
+        let s = Duration::from_secs;
+        // (age since the last check, active, selected) -> due
+        let cases = [
+            (None, false, false, Some(1)),
+            (None, false, true, Some(0)),
+            (Some(s(2)), true, false, Some(0)),
+            (Some(s(1)), true, false, None),
+            (Some(s(9)), false, true, None),
+            (Some(s(10)), false, true, Some(0)),
+            (Some(s(240)), false, false, None),
+            (Some(s(300)), false, false, Some(1)),
+        ];
+        for (age, active, selected, want) in cases {
+            assert_eq!(
+                status_due(age, s(2), active, selected),
+                want,
+                "age {age:?}, active {active}, selected {selected}"
+            );
+        }
+    }
+
+    /// `test_app` with worktree rows `w1`..`wn` under an expanded r1. Their
+    /// dirs don't exist, so a check finds no status.
+    fn worktree_rows_app(n: usize) -> App {
+        let mut app = test_app();
+        app.workspaces = (1..=n)
+            .map(|i| {
+                let dir = format!("/nonexistent/kommand0-w{i}");
+                Workspace {
+                    worktree_path: Some(dir.clone()),
+                    working_dir: dir,
+                    ..mk_ws(&format!("w{i}"), &format!("ws-{i}"), "r1", None)
+                }
+            })
+            .collect();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app
+    }
+
+    #[test]
+    fn apply_branch_status_merges_and_prunes() {
+        let mut app = worktree_rows_app(1);
+        let on = |branch: &str| kommand0_core::BranchStatus {
+            branch: Some(branch.into()),
+            ..Default::default()
+        };
+        assert!(app.apply_branch_status(vec![("w1".into(), Some(on("a")))]), "a new status");
+        assert_eq!(app.branch_status["w1"], on("a"));
+
+        // "gone" was deleted while its check ran.
+        app.status_checked.insert("gone".into(), Instant::now());
+        let changed = app.apply_branch_status(vec![
+            ("w1".into(), Some(on("a"))),
+            ("gone".into(), Some(on("b"))),
+        ]);
+        assert!(!changed, "the same status plus a deleted row is no change");
+        assert!(!app.branch_status.contains_key("gone"), "a deleted row is not re-inserted");
+        assert!(!app.status_checked.contains_key("gone"), "nor is its stamp kept");
+
+        assert!(app.apply_branch_status(vec![("w1".into(), None)]), "a failed check clears w1");
+        assert!(app.branch_status.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pass_takes_every_urgent_row_and_at_most_four_background_ones() {
+        let mut app = worktree_rows_app(10);
+        app.select_workspace_row("w9");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+
+        let now = Instant::now();
+        app.dispatch_branch_status(now);
+        let mut stamped: Vec<&str> = app.status_checked.keys().map(String::as_str).collect();
+        stamped.sort();
+        assert_eq!(stamped, ["w1", "w2", "w3", "w4", "w9"]);
+        app.dispatch_branch_status(now);
+        assert_eq!(app.status_checked.len(), 5, "a pass in flight blocks the next");
+
+        let results = recv(&mut rx).await;
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["w9", "w1", "w2", "w3", "w4"]);
+        assert!(results.iter().all(|(_, s)| s.is_none()), "no status for a missing dir");
+    }
+
+    #[tokio::test]
+    async fn back_to_back_passes_only_take_what_is_due() {
+        let mut app = worktree_rows_app(3);
+        app.select_workspace_row("w3");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+
+        let now = Instant::now();
+        app.dispatch_branch_status(now);
+        let first = recv(&mut rx).await;
+        assert_eq!(first.len(), 3, "every row starts unchecked");
+        app.apply_branch_status(first);
+        app.status_inflight = false;
+
+        app.status_checked.remove("w2");
+        app.dispatch_branch_status(now + Duration::from_secs(30));
+        let ids: Vec<String> = recv(&mut rx).await.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["w3", "w2"]);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_refresh_survives_a_pass_in_flight() {
+        let mut app = worktree_rows_app(1);
+        app.select_workspace_row("w1");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        app.dispatch_branch_status(Instant::now());
+
+        app.detach_selected_workspace();
+        let results = recv(&mut rx).await;
+        app.apply_branch_status(results);
+        app.status_inflight = false;
+        assert!(!app.status_checked.contains_key("w1"), "the landed pass doesn't re-stamp w1");
+
+        app.dispatch_branch_status(Instant::now());
+        assert!(app.status_inflight, "w1 is due at once");
+        assert_eq!(recv(&mut rx).await[0].0, "w1");
+    }
+
+    #[tokio::test]
+    async fn typing_into_a_pane_makes_its_workspace_due() {
+        let mut app = worktree_rows_app(1);
+        app.select_repo_row("r1");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        let now = Instant::now();
+        app.status_checked.insert("w1".into(), now - Duration::from_secs(3));
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+
+        app.dispatch_branch_status(now);
+        assert!(!app.status_inflight, "an idle row checked 3s ago isn't due");
+
+        app.embedded.get_mut("w1").unwrap().tabs[0].pane.send(b"x").unwrap();
+        app.dispatch_branch_status(now);
+        assert!(app.status_inflight, "typed into since the check: due");
+        assert_eq!(recv(&mut rx).await[0].0, "w1");
     }
 
     #[tokio::test]

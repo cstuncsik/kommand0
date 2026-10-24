@@ -11,6 +11,12 @@ All notable changes to kommand0 are documented here. The format is based on
   optional index lock** (`git --no-optional-locks status`): a status check never
   rewrites a worktree's index, so a git command running there at the same
   moment can't trip over its `index.lock`.
+- **Git status is checked per workspace, only when it can have changed**: about
+  every 2 s while you work in one (a session busy or typed into), about every
+  10 s for the selected one, at least every 5 minutes otherwise, and right after
+  a create, close, detach, stop or cleanup. The background git load drops from
+  continuous (every worktree, back to back) to occasional.
+  `status_refresh_secs` now sets the interval for a workspace you work in.
 
 ## [0.32.1] - 2026-10-23
 
