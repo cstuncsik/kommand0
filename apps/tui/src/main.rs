@@ -709,19 +709,27 @@ impl WorkspaceSessions {
             self.switch_to(idx);
         }
     }
-    /// Remove the tab at `idx` (order-preserving), re-clamping `active`. Returns
-    /// whether the workspace is now empty (the caller removes the entry).
-    fn remove_tab(&mut self, idx: usize) -> bool {
+    /// Remove the tab at `idx` (order-preserving), re-clamping `active`, and
+    /// hand it back for the caller to kill (and to remove an emptied entry).
+    fn remove_tab(&mut self, idx: usize) -> Option<SessionTab> {
         if idx >= self.tabs.len() {
-            return self.tabs.is_empty();
+            return None;
         }
-        self.tabs.remove(idx);
+        let tab = self.tabs.remove(idx);
         if idx < self.active {
             self.active -= 1;
         }
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
-        self.tabs.is_empty()
+        Some(tab)
     }
+}
+
+/// Kill the tabs' processes with one shared grace (see
+/// [`pane::terminate_all`]), then drop them. Blocks up to ~250ms, so it runs
+/// on a teardown thread (see [`App::spawn_teardown`]).
+fn kill_tabs(mut tabs: Vec<SessionTab>) {
+    let mut panes: Vec<&mut pane::Pane> = tabs.iter_mut().map(|t| &mut t.pane).collect();
+    pane::terminate_all(&mut panes);
 }
 
 /// Tree-pane width bounds and step (percent of the terminal). The live width is
@@ -903,6 +911,10 @@ pub(crate) struct App {
     // Embedded interactive `claude` sessions, as tabs per workspace, composited
     // into the right pane.
     pub(crate) embedded: HashMap<String, WorkspaceSessions>,
+    /// Kill threads still tearing down session panes (see
+    /// [`Self::spawn_teardown`]), each with the workspace ids whose panes it
+    /// kills. Joined at quit.
+    teardowns: Vec<(Vec<String>, std::thread::JoinHandle<()>)>,
     /// Reader-thread → event-loop repaint signal (set in `main` before the loop).
     pub(crate) embedded_wake: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     /// Last-rendered right-pane rect, so a new embedded pane spawns at its final
@@ -1094,6 +1106,7 @@ impl App {
             tree_width_pct: TREE_WIDTH_DEFAULT,
             tick_counter: 0,
             embedded: HashMap::new(),
+            teardowns: Vec::new(),
             embedded_wake: None,
             right_pane_area: ratatui::layout::Rect::default(),
             embedded_prefix: false,
@@ -1826,15 +1839,21 @@ impl App {
                 if let Some(sessions) = self.embedded.get_mut(ws_id)
                     && let Some(slot) = sessions.tabs.iter().position(|t| t.id == gone_id)
                 {
-                    sessions.tabs[slot] = SessionTab {
-                        id: new_id,
-                        pane,
-                        was_resume,
-                        spawned: now,
-                        capture_since: (kind == TabKind::Codex).then_some(since),
-                        exit_seen: None,
-                        kind,
-                    };
+                    // A missed resume can still be alive (claude stays up on
+                    // the miss), so the old tab dies off the loop.
+                    let old = std::mem::replace(
+                        &mut sessions.tabs[slot],
+                        SessionTab {
+                            id: new_id,
+                            pane,
+                            was_resume,
+                            spawned: now,
+                            capture_since: (kind == TabKind::Codex).then_some(since),
+                            exit_seen: None,
+                            kind,
+                        },
+                    );
+                    self.spawn_teardown(vec![ws_id.to_string()], vec![old], None);
                 }
                 let mut msg = format!(
                     "session {} not found in {}'s store for this directory: started fresh",
@@ -2454,31 +2473,29 @@ impl App {
         true
     }
 
-    /// Close the active session tab of the selected workspace: drop its pane,
-    /// forget its persisted id, and re-focus the previous tab (or the tree when
-    /// the last tab is gone).
+    /// Close the active session tab of the selected workspace: kill its pane
+    /// off the loop, forget its persisted id, and re-focus the previous tab (or
+    /// the tree when the last tab is gone).
     fn close_active_session(&mut self) {
         let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
             return;
         };
-        let (tab_id, now_empty) = {
-            let Some(sessions) = self.embedded.get_mut(&ws_id) else {
-                return;
-            };
-            let active = sessions.active;
-            let Some(tab_id) = sessions.tabs.get(active).map(|t| t.id.clone()) else {
-                return;
-            };
-            (tab_id, sessions.remove_tab(active))
+        let Some(sessions) = self.embedded.get_mut(&ws_id) else {
+            return;
         };
+        let Some(tab) = sessions.remove_tab(sessions.active) else {
+            return;
+        };
+        let now_empty = sessions.tabs.is_empty();
         // Closing a tab forgets its persisted entry, whatever its kind: a Claude
         // id won't resume next time, a shell sentinel won't respawn.
-        self.state.remove_embedded_session(&ws_id, &tab_id);
+        self.state.remove_embedded_session(&ws_id, &tab.id);
         self.save_state();
         if now_empty {
             self.embedded.remove(&ws_id);
             self.focus = Focus::Tree;
         }
+        self.spawn_teardown(vec![ws_id.clone()], vec![tab], None);
         // The session likely committed; refresh this workspace's branch status.
         self.status_checked.remove(&ws_id);
     }
@@ -2496,27 +2513,7 @@ impl App {
             return;
         };
         self.capture_panes_on_teardown(Some(&ws_id));
-        // The workspace-scoped twin of [`Self::shutdown_panes`]: dropping the
-        // panes one by one costs a full SIGHUP→250ms→SIGKILL each (a Node
-        // `claude` ignores SIGHUP), so a 9-tab detach would freeze the UI
-        // ~2.25s. Broadcast the hangup, wait one shared grace, SIGKILL+reap
-        // stragglers — the per-pane `Drop` then sees an exited child and
-        // returns instantly.
-        if let Some(sessions) = self.embedded.get_mut(&ws_id) {
-            for tab in sessions.tabs.iter_mut() {
-                tab.pane.signal_hangup();
-            }
-            for _ in 0..5 {
-                if sessions.tabs.iter_mut().all(|t| t.pane.has_exited()) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            for tab in sessions.tabs.iter_mut() {
-                tab.pane.force_kill_and_reap();
-            }
-        }
-        self.embedded.remove(&ws_id);
+        self.drop_panes(&ws_id);
         // Also flip a legacy `Running` stream session to Stopped: those are
         // never resurrected, so one left `Running` keeps a phantom "running"
         // tree icon until the next startup normalization.
@@ -2792,7 +2789,7 @@ impl App {
     /// Drop session tabs whose child has exited, and whole workspaces that were
     /// deleted. Applies the per-tab resume-failure net, keeps the active tab
     /// stable by identity, and leaves Embedded focus if the selected workspace
-    /// emptied. Pane's `Drop` terminates the child.
+    /// emptied. The dropped tabs are killed off the loop.
     fn reap_embedded(&mut self, now: Instant) {
         // One pass: collect exited tabs (with the signal-vs-exit distinction in
         // `code`) and live resumed tabs that are showing claude's resume-miss
@@ -2965,17 +2962,25 @@ impl App {
             .chain(resume_missed)
             .collect();
         let mut remove_ws: Vec<String> = Vec::new();
+        // Killed off the loop: a resume-miss tab (a failed heal's too) is alive.
+        let mut doomed: Vec<(String, Vec<SessionTab>)> = Vec::new();
         for (ws_id, sessions) in self.embedded.iter_mut() {
             if !live_ws.contains(ws_id) {
                 remove_ws.push(ws_id.clone()); // workspace was deleted
+                doomed.push((ws_id.clone(), std::mem::take(&mut sessions.tabs)));
                 continue;
             }
             // Drop dead tabs, then rebase `active` to the same tab by identity (a
             // saturating clamp would silently focus a different session).
             let active_id = sessions.tabs.get(sessions.active).map(|t| t.id.clone());
-            sessions
-                .tabs
-                .retain(|t| !dead.contains(&(ws_id.clone(), t.id.clone())));
+            let (dead_tabs, live): (Vec<SessionTab>, Vec<SessionTab>) =
+                std::mem::take(&mut sessions.tabs)
+                    .into_iter()
+                    .partition(|t| dead.contains(&(ws_id.clone(), t.id.clone())));
+            sessions.tabs = live;
+            if !dead_tabs.is_empty() {
+                doomed.push((ws_id.clone(), dead_tabs));
+            }
             if sessions.tabs.is_empty() {
                 remove_ws.push(ws_id.clone());
             } else {
@@ -2986,6 +2991,9 @@ impl App {
         }
         for ws_id in &remove_ws {
             self.embedded.remove(ws_id);
+        }
+        for (ws_id, tabs) in doomed {
+            self.spawn_teardown(vec![ws_id], tabs, None);
         }
         // Dropped tabs/workspaces shift what renders where — a stale highlight
         // must not land on the neighbor tab.
@@ -3178,6 +3186,9 @@ impl App {
 
     /// [`Self::capture_panes_on_teardown`] over an arbitrary workspace set (the
     /// routed repo cleanup pays the grace once for all of them).
+    // ponytail: runs on the loop, up to TEARDOWN_CAPTURE_GRACE (1.5s), only when
+    // codex or opencode tabs are in scope. Upgrade: SIGTERM and drain in the
+    // teardown job, then send each hint back to adopt_captured_hint.
     fn capture_panes_on_teardown_for(&mut self, in_scope: impl Fn(&str) -> bool) {
         let mut targets = 0usize;
         for (ws_id, sessions) in self.embedded.iter_mut() {
@@ -3239,43 +3250,69 @@ impl App {
         }
     }
 
-    /// Tear down every embedded pane in ONE shared grace period at quit. Dropping
-    /// the panes one by one runs a full SIGHUP→250ms→SIGKILL per pane, so quitting
-    /// with N sessions that ignore SIGHUP (a Node `claude` does) froze the UI
-    /// ~N×250ms. Instead: broadcast SIGHUP to every child, wait once, then
-    /// SIGKILL+reap any straggler — the per-pane `Drop` then sees an exited child
-    /// and returns instantly. Capture-kind panes get the SIGTERM exit-hint
+    /// Tear down every embedded pane at quit, in ONE shared grace (see
+    /// [`pane::terminate_all`]). Capture-kind panes get the SIGTERM exit-hint
     /// capture first (see [`Self::capture_panes_on_teardown`]), which also
-    /// persists state: nothing else saves after the event loop breaks.
+    /// persists state: nothing else saves after the event loop breaks. The
+    /// tabs stay in `embedded` for the quit-time codex sweep.
     fn shutdown_panes(&mut self) {
         self.capture_panes_on_teardown(None);
-        let mut any = false;
-        for sessions in self.embedded.values_mut() {
-            for tab in sessions.tabs.iter_mut() {
-                tab.pane.signal_hangup();
-                any = true;
-            }
-        }
-        if !any {
+        let mut panes: Vec<&mut pane::Pane> = self
+            .embedded
+            .values_mut()
+            .flat_map(|s| s.tabs.iter_mut().map(|t| &mut t.pane))
+            .collect();
+        pane::terminate_all(&mut panes);
+    }
+
+    /// Kill `tabs` on a background thread, then run `then` (a cleanup's
+    /// removal) on a thread of its own. A teardown first waits for earlier ones
+    /// sharing a workspace id, so a detach's panes are dead before a cleanup
+    /// removes their cwd. Kill threads are joined at quit, `then` is not. A
+    /// [`SendOnDrop`] guard moved into `then` still reports if the kill panics.
+    fn spawn_teardown(
+        &mut self,
+        ws_ids: Vec<String>,
+        tabs: Vec<SessionTab>,
+        then: Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        if tabs.is_empty() && then.is_none() {
             return;
         }
-        // One shared grace window: poll up to ~250ms, breaking early once every
-        // child has exited (so SIGHUP-respecting children don't cost the full
-        // wait). Then SIGKILL+reap any straggler that ignored the hangup.
-        for _ in 0..5 {
-            let all_done = self
-                .embedded
-                .values_mut()
-                .all(|s| s.tabs.iter_mut().all(|t| t.pane.has_exited()));
-            if all_done {
-                break;
+        let (earlier, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.teardowns)
+            .into_iter()
+            .filter(|(_, h)| !h.is_finished())
+            .partition(|(ids, _)| ids.iter().any(|id| ws_ids.contains(id)));
+        self.teardowns = rest;
+        if tabs.is_empty() && earlier.is_empty() {
+            if let Some(then) = then {
+                std::thread::spawn(then);
             }
-            std::thread::sleep(Duration::from_millis(50));
+            return;
         }
-        for sessions in self.embedded.values_mut() {
-            for tab in sessions.tabs.iter_mut() {
-                tab.pane.force_kill_and_reap();
+        let handle = std::thread::spawn(move || {
+            for (_, h) in earlier {
+                let _ = h.join();
             }
+            kill_tabs(tabs);
+            if let Some(then) = then {
+                std::thread::spawn(then);
+            }
+        });
+        self.teardowns.push((ws_ids, handle));
+    }
+
+    /// Take a workspace's tabs out of `embedded` and kill them off the loop.
+    fn drop_panes(&mut self, ws_id: &str) {
+        if let Some(sessions) = self.embedded.remove(ws_id) {
+            self.spawn_teardown(vec![ws_id.to_string()], sessions.tabs, None);
+        }
+    }
+
+    /// Wait for every kill thread [`Self::spawn_teardown`] started.
+    fn join_teardowns(&mut self) {
+        for (_, handle) in self.teardowns.drain(..) {
+            let _ = handle.join();
         }
     }
 
@@ -3817,32 +3854,32 @@ impl App {
         if targets.is_empty() {
             return; // never SIGTERM panes for a cleanup that will not start
         }
-        // Tear down the embedded panes synchronously (Drop terminates the child),
-        // so a worktree dir isn't removed while a claude is running inside it.
+        // The panes die before the cleanup runs (see spawn_teardown), so a
+        // worktree dir isn't removed while a claude is running inside it.
         // Capture first: on a cleanup FAILURE the workspace and its entries
         // survive, and a live codex/opencode session would otherwise be lost
         // while its entry persisted.
         self.capture_panes_on_teardown_for(|ws| targets.iter().any(|(id, ..)| id == ws));
         for (id, worktree, branch, repo) in targets {
-            // ponytail: panes are dropped on the loop like the single cleanup; move
-            // teardown to the worker if a batch of SIGHUP-ignoring panes makes this visible.
-            self.embedded.remove(&id);
+            let tabs = self.embedded.remove(&id).map(|s| s.tabs).unwrap_or_default();
             self.cleanup_inflight.insert(id.clone());
             self.cleanup_result.remove(&id);
-            let tx = tx.clone();
+            let guard = SendOnDrop {
+                tx: tx.clone(),
+                payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
+            };
             let config_path = self.config_path.clone();
-            std::thread::spawn(move || {
-                let mut guard = SendOnDrop {
-                    tx,
-                    payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
-                };
+            let ws_id = id.clone();
+            let cleanup = move || {
+                let mut guard = guard;
                 // The file, not the startup snapshot: an edit applies to the next
                 // cleanup, and an unparseable file blocks it rather than degrading.
                 let result = Config::protected_branches_at(&config_path).and_then(|protected| {
                     kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch, &protected)
                 });
-                guard.payload = Some((id, result));
-            });
+                guard.payload = Some((ws_id, result));
+            };
+            self.spawn_teardown(vec![id], tabs, Some(Box::new(cleanup)));
         }
     }
 
@@ -5700,6 +5737,9 @@ async fn run(
     // that just ran proved the next frame would be identical.
     let mut pacer = Pacer::default();
     let mut skip_draw = false;
+    // A draw or key error ends the loop like a quit, so the teardown below
+    // still runs; `run` returns the error after it.
+    let mut loop_error: Option<anyhow::Error> = None;
 
     loop {
         if !skip_draw {
@@ -5713,7 +5753,10 @@ async fn run(
             // Sample BEFORE drawing: a read after could record a seq whose chunk
             // is not in the frame just drawn, silently skipping that output.
             let seq = app.visible_pane_seq();
-            terminal.draw(|frame| render::ui(frame, &mut app))?;
+            if let Err(e) = terminal.draw(|frame| render::ui(frame, &mut app)) {
+                loop_error = Some(e.into());
+                break;
+            }
             pacer.drew(seq);
         }
         skip_draw = false;
@@ -5790,8 +5833,13 @@ async fn run(
                 let Some(event) = maybe_event else { break; }; // reader thread ended
                 match event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if handle_key(&mut app, key).await? == KeyOutcome::Quit {
-                            break;
+                        match handle_key(&mut app, key).await {
+                            Ok(KeyOutcome::Quit) => break,
+                            Ok(KeyOutcome::Continue) => {}
+                            Err(e) => {
+                                loop_error = Some(e);
+                                break;
+                            }
                         }
                     }
                     Event::Resize(_, _) => {
@@ -5916,7 +5964,7 @@ async fn run(
                             // The mouse twin of detach: entries survive, so give
                             // the capture-kind panes their exit-hint capture too.
                             app.capture_panes_on_teardown(Some(&workspace_id));
-                            app.embedded.remove(&workspace_id);
+                            app.drop_panes(&workspace_id);
                             if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
                                 .filter(|s| s.status == SessionStatus::Running)
                                 .map(|s| s.id.clone())
@@ -5968,6 +6016,16 @@ async fn run(
         }
     }
 
+    // Every loop exit lands here. Quitting may wait below (live panes, kill
+    // threads, a profile delete): say so on screen first.
+    let waits = !app.embedded.is_empty()
+        || app.teardowns.iter().any(|(_, h)| !h.is_finished())
+        || app.profile_delete_join.as_ref().is_some_and(|h| !h.is_finished());
+    if waits {
+        app.profile_notice = Some(("Finishing background work…".to_string(), false));
+        let _ = terminal.draw(|frame| render::ui(frame, &mut app));
+    }
+
     // A profile delete still in flight (the quit guard covers key-driven
     // quits, but the input channel can close under it) must finish before
     // any teardown: exiting mid-remove_dir_all would leave half a profile.
@@ -5990,6 +6048,15 @@ async fn run(
     }
     // Tear down all embedded panes in one shared grace period (not N×250ms).
     app.shutdown_panes();
+    // Closed tabs and detaches may still be in their grace: a child that
+    // ignores SIGHUP would outlive us.
+    app.join_teardowns();
+    // Cleanup replies already in get saved; one still running is abandoned
+    // (its row stays in state). A follow must not start `gh` now.
+    app.pr_status_tx = None;
+    while let Ok((ws_id, result)) = cleanup_rx.try_recv() {
+        app.on_cleanup_done(ws_id, result);
+    }
     // The teardown window: shutdown_panes itself takes up to ~1.75s (the
     // SIGTERM capture grace plus the SIGHUP grace), and a poller event or a
     // rollout landing DURING it would be lost with the sentinel kept
@@ -6002,7 +6069,7 @@ async fn run(
     if let Some(store) = kommand0_core::codex_sessions_dir() {
         app.sweep_codex_captures(&store);
     }
-    Ok(())
+    loop_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -8474,6 +8541,53 @@ mod key_tests {
             "detach keeps every persisted entry (unlike close_active_session)"
         );
         assert_eq!(app.focus, Focus::Tree, "detach lands back on the tree");
+    }
+
+    #[test]
+    fn closing_a_hup_ignoring_tab_does_not_wait_for_it() {
+        let mut app = app_with_pane(HUP_IGNORING);
+        let pid = pane::tests::wait_for_pid(&app.embedded["w1"].tabs[0].pane);
+        app.focus = Focus::Embedded;
+
+        app.close_active_session();
+        let left = !app.embedded.contains_key("w1");
+        let queued = queued_teardowns(&app);
+        let alive_after_close = alive(pid);
+        app.join_teardowns();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        pane::tests::kill_leftovers(pid);
+
+        assert!(left, "the tab left at once");
+        assert_eq!(queued, [vec!["w1".to_string()]], "its kill runs in the background");
+        assert!(alive_after_close, "close returned before the process died");
+        assert!(died, "the join waited for the kill");
+    }
+
+    #[tokio::test]
+    async fn detaching_returns_before_its_panes_die() {
+        let mut app = app_with_pane(HUP_IGNORING);
+        app.embedded.get_mut("w1").unwrap().tabs.push(tab("b", &["-c", HUP_IGNORING]));
+        let pids: Vec<i32> =
+            app.embedded["w1"].tabs.iter().map(|t| pane::tests::wait_for_pid(&t.pane)).collect();
+        app.focus = Focus::Embedded;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        press(&mut app, KeyCode::Char('d')).await;
+        let left = !app.embedded.contains_key("w1");
+        let queued = queued_teardowns(&app);
+        let alive_after_detach = pids.iter().all(|&p| alive(p));
+        app.join_teardowns();
+        let died = pids.iter().all(|&p| pane::tests::wait_for_death(p, Duration::from_secs(5)));
+        for &p in &pids {
+            pane::tests::kill_leftovers(p);
+        }
+
+        assert!(left, "the tabs left at once");
+        assert_eq!(queued, [vec!["w1".to_string()]], "one background kill for the workspace");
+        assert!(alive_after_detach, "detach returned before the processes died");
+        assert!(died, "the join waited for the kill");
     }
 
     #[tokio::test]
@@ -11580,6 +11694,78 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn a_cleanup_kills_the_panes_before_it_removes_their_worktree() {
+        let mut app = test_app();
+        let repo = add_real_repo(&mut app, "feat");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wt = tmp.path().join("wt");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(repo.path(), &["worktree", "add", wt.to_str().unwrap(), "feat"]);
+        std::fs::write(wt.join("work.txt"), "work").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-m", "work"]);
+        git(repo.path(), &["merge", "--squash", "--ff", "feat"]);
+        git(repo.path(), &["commit", "-m", "squash feat"]);
+        route_w1_to_real(&mut app, &wt, "feat");
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cleanup_tx = Some(cleanup_tx);
+        // Until it dies the child keeps recreating a dir under its cwd, so a
+        // removal that ran first would be undone.
+        let script = "trap '' HUP; echo UP $$ OK; while :; do mkdir -p \"$PWD/x\"; sleep 0.02; done";
+        let t = tab_in("a", &wt, &["-c", script]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![t], active: 0, last_active: None },
+        );
+
+        app.start_cleanup("w1");
+        let left = !app.embedded.contains_key("w1");
+        let queued = queued_teardowns(&app);
+        let alive_after_start = alive(pid);
+        let (ws_id, result) = recv(&mut cleanup_rx).await;
+        app.join_teardowns();
+        let removed = !wt.exists();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        pane::tests::kill_leftovers(pid);
+
+        assert!(left, "the tab left at once");
+        assert_eq!(queued, [vec!["w1".to_string()]], "its kill runs in the background");
+        assert!(alive_after_start, "the cleanup started before the process died");
+        assert_eq!((ws_id.as_str(), result), ("w1", Ok(Cleaned::Removed)));
+        assert!(removed, "nothing recreated the worktree after its removal");
+        assert!(died, "the join waited for the kill");
+    }
+
+    #[test]
+    fn the_follow_up_runs_once_the_workspaces_panes_are_dead() {
+        // A real cleanup's git checks outlast the kill's grace, which hides a
+        // wrong order; this follow-up looks at once. The panes are its own, or
+        // an earlier teardown's (a detach, then a cleanup with no tabs left).
+        for earlier in [false, true] {
+            let mut app = test_app();
+            let t = tab("a", &["-c", HUP_IGNORING]);
+            let pid = pane::tests::wait_for_pid(&t.pane);
+            let mut tabs = vec![t];
+            if earlier {
+                app.spawn_teardown(vec!["w1".to_string()], std::mem::take(&mut tabs), None);
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let follow_up = move || {
+                let _ = tx.send(alive(pid));
+            };
+            app.spawn_teardown(vec!["w1".to_string()], tabs, Some(Box::new(follow_up)));
+            let seen_alive = rx.recv_timeout(Duration::from_secs(5));
+            app.join_teardowns();
+            pane::tests::kill_leftovers(pid);
+            assert_eq!(seen_alive, Ok(false), "earlier teardown: {earlier}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_removed_cleanup_drops_the_row_and_its_leftovers() {
         let mut app = test_app();
         // Under a TempDir: the delete's `remove_worktree` clears an absent
@@ -11884,6 +12070,7 @@ mod key_tests {
         assert!(elapsed < 2 * TEARDOWN_CAPTURE_GRACE, "paid once, not per workspace ({elapsed:?})");
         assert!(app.cleanup_inflight.contains("w1") && app.cleanup_inflight.contains("w2"));
         assert!(!app.repo_cleanup_result.contains_key("real"), "nothing skipped, no line");
+        app.join_teardowns();
     }
 
     #[tokio::test]
@@ -12423,15 +12610,32 @@ mod key_tests {
     }
 
     fn tab(id: &str, args: &[&str]) -> SessionTab {
+        tab_in(id, std::path::Path::new("/tmp"), args)
+    }
+
+    fn tab_in(id: &str, dir: &std::path::Path, args: &[&str]) -> SessionTab {
         SessionTab {
             id: id.to_string(),
-            pane: pane::Pane::spawn("sh", args, std::path::Path::new("/tmp"), 24, 80).unwrap(),
+            pane: pane::Pane::spawn("sh", args, dir, 24, 80).unwrap(),
             was_resume: false,
             spawned: Instant::now(),
             capture_since: None,
             exit_seen: None,
             kind: TabKind::Claude,
         }
+    }
+
+    /// Ignores SIGHUP like a Node `claude`, so only the SIGKILL after the grace
+    /// ends it; prints its pid for `pane::tests::wait_for_pid`.
+    const HUP_IGNORING: &str = "trap '' HUP; echo UP $$ OK; sleep 300";
+
+    fn alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    /// The workspace ids of each queued teardown.
+    fn queued_teardowns(app: &App) -> Vec<Vec<String>> {
+        app.teardowns.iter().map(|(ids, _)| ids.clone()).collect()
     }
 
     fn ids(s: &WorkspaceSessions) -> Vec<&str> {
@@ -12497,16 +12701,18 @@ mod key_tests {
 
         // Close a tab BELOW the active one: the active tab stays the same one.
         // [a,b,c] active=1(b); remove 0(a) -> [b,c] active=0(b).
-        assert!(!s.remove_tab(0));
+        assert_eq!(s.remove_tab(0).map(|t| t.id), Some("a".to_string()));
         assert_eq!(ids(&s), vec!["b", "c"]);
         assert_eq!(s.active, 0);
         // Close the active (last) tab: clamp back onto the remaining one.
         s.active = 1;
-        assert!(!s.remove_tab(1));
+        assert_eq!(s.remove_tab(1).map(|t| t.id), Some("c".to_string()));
         assert_eq!(ids(&s), vec!["b"]);
         assert_eq!(s.active, 0);
         // Close the final tab -> empty.
-        assert!(s.remove_tab(0));
+        assert_eq!(s.remove_tab(0).map(|t| t.id), Some("b".to_string()));
+        assert!(s.tabs.is_empty());
+        assert!(s.remove_tab(0).is_none(), "nothing left to remove");
     }
 
     #[test]
@@ -12571,7 +12777,7 @@ mod key_tests {
         // Close the remembered tab: the dangling id degrades to a no-op.
         s.select(2); // now on c; last_active = b
         let b_idx = s.tabs.iter().position(|t| t.id == "b").unwrap();
-        assert!(!s.remove_tab(b_idx));
+        assert_eq!(s.remove_tab(b_idx).map(|t| t.id), Some("b".to_string()));
         s.select_last_active();
         assert_eq!(s.tabs[s.active].id, "c", "closed last-active tab: no-op");
     }
@@ -13066,24 +13272,27 @@ mod key_tests {
 
     #[test]
     fn reap_drops_exited_tab_and_keeps_active_by_identity() {
-        let mut app = test_app(); // has workspace "w1"
-        let mut s = WorkspaceSessions {
-            tabs: vec![
-                tab("a", &["-c", "sleep 30"]),
-                tab("b", &["-c", "sleep 30"]),
-                tab("c", &["-c", "sleep 30"]),
-            ],
-            active: 2, // active on "c"
-            last_active: None,
-        };
-        s.tabs[0].pane.kill(); // a non-active tab exits
-        wait_exit(&mut s.tabs[0].pane);
-        app.embedded.insert("w1".to_string(), s);
+        // On "b" the index alone would slide onto "c" once "a" is gone.
+        for (active, active_id) in [(2, "c"), (1, "b")] {
+            let mut app = test_app(); // has workspace "w1"
+            let mut s = WorkspaceSessions {
+                tabs: vec![
+                    tab("a", &["-c", "sleep 30"]),
+                    tab("b", &["-c", "sleep 30"]),
+                    tab("c", &["-c", "sleep 30"]),
+                ],
+                active,
+                last_active: None,
+            };
+            s.tabs[0].pane.kill(); // a non-active tab exits
+            wait_exit(&mut s.tabs[0].pane);
+            app.embedded.insert("w1".to_string(), s);
 
-        app.reap_embedded(Instant::now());
-        let s = &app.embedded["w1"];
-        assert_eq!(ids(s), vec!["b", "c"], "exited tab a dropped");
-        assert_eq!(s.tabs[s.active].id, "c", "active stays on c by identity");
+            app.reap_embedded(Instant::now());
+            let s = &app.embedded["w1"];
+            assert_eq!(ids(s), vec!["b", "c"], "exited tab a dropped");
+            assert_eq!(s.tabs[s.active].id, active_id, "active stays on {active_id} by identity");
+        }
     }
 
     #[tokio::test]
@@ -13193,6 +13402,11 @@ mod key_tests {
         assert!(
             app.heal_resume(TabKind::Claude, "w1", "b", "/tmp", Instant::now()),
             "fresh spawn succeeded"
+        );
+        assert_eq!(
+            queued_teardowns(&app),
+            [vec!["w1".to_string()]],
+            "the replaced tab dies off the loop"
         );
 
         let persisted = app.state.embedded_session_ids("w1").to_vec();
@@ -13350,6 +13564,11 @@ mod key_tests {
         app.reap_embedded(t + RESUME_MISS_SCAN_EVERY);
         let gone = app.embedded.get("w1").map(|s| !ids(s).contains(&"a")).unwrap_or(true);
         assert!(gone, "past the stride the scan heals/drops the missed resume");
+        assert_eq!(
+            queued_teardowns(&app),
+            [vec!["w1".to_string()]],
+            "the live missed tab dies off the loop"
+        );
     }
 
     #[tokio::test]

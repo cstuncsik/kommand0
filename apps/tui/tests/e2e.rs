@@ -1321,6 +1321,51 @@ fn closing_the_last_tab_returns_to_tree_and_reopens_fresh() {
 }
 
 #[test]
+fn quitting_right_after_closing_a_tab_kills_its_process() {
+    // A closed tab's process dies on a background thread; quitting must wait
+    // for it, or a child that ignores SIGHUP outlives kommand0.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub-hup")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid = loop {
+        let screen = tui.screen();
+        let pid = screen.split("UP ").skip(1).find_map(|rest| {
+            let (pid, tail) = rest.split_once(' ')?;
+            tail.starts_with("OK").then(|| pid.parse::<i32>().ok()).flatten()
+        });
+        if let Some(pid) = pid {
+            break nix::unistd::Pid::from_raw(pid);
+        }
+        assert!(Instant::now() < deadline, "the stub never printed its pid; screen:\n{screen}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    tui.send("\x01");
+    tui.send("x");
+    tui.send("q");
+    tui.wait_exit();
+
+    // Polled: a dead child can linger a moment as a zombie.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut alive = nix::sys::signal::kill(pid, None).is_ok();
+    while alive && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        alive = nix::sys::signal::kill(pid, None).is_ok();
+    }
+    if alive {
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    }
+    assert!(!alive, "the closed tab's process outlived kommand0");
+}
+
+#[test]
 fn stale_resume_auto_heals_to_a_fresh_session() {
     // The real bug: `claude --resume <gone-id>` prints "No conversation found"
     // and STAYS ALIVE, so the exit-code net never fires and the dead id is never

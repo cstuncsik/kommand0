@@ -792,6 +792,25 @@ impl Pane {
     }
 }
 
+/// [`Pane::terminate`] for many panes with ONE shared grace: SIGHUP every
+/// child, wait at most ~250ms for all of them (less once every child has
+/// exited), then SIGKILL and reap the stragglers. Each pane's `Drop` then
+/// finds an exited child and returns at once.
+pub fn terminate_all(panes: &mut [&mut Pane]) {
+    for p in panes.iter_mut() {
+        p.signal_hangup();
+    }
+    for _ in 0..5 {
+        if panes.iter_mut().all(|p| p.has_exited()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for p in panes.iter_mut() {
+        p.force_kill_and_reap();
+    }
+}
+
 impl Drop for Pane {
     fn drop(&mut self) {
         // Guarantee the child dies (terminate escalates to SIGKILL). We do NOT
@@ -1002,7 +1021,7 @@ fn caps_lock(c: char, caps: bool) -> char {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -1128,7 +1147,31 @@ mod tests {
         assert!(died, "server survived terminate() after the capture exit");
     }
 
-    fn wait_for_pid(pane: &Pane) -> i32 {
+    // A Node `claude` ignores SIGHUP, so each pane waits out the whole grace
+    // before its SIGKILL: torn down together, the panes pay it once.
+    #[test]
+    fn terminate_all_pays_one_grace_for_many_hup_ignoring_children() {
+        let mut panes: Vec<Pane> = (0..6)
+            .map(|_| {
+                Pane::spawn("sh", &["-c", "trap '' HUP; echo UP $$ OK; sleep 300"], &tmp(), 24, 80)
+                    .unwrap()
+            })
+            .collect();
+        let pids: Vec<i32> = panes.iter().map(wait_for_pid).collect();
+        let start = Instant::now();
+        terminate_all(&mut panes.iter_mut().collect::<Vec<_>>());
+        let elapsed = start.elapsed();
+        drop(panes);
+        let died = pids.iter().all(|&pid| wait_for_death(pid, Duration::from_secs(5)));
+        for &pid in &pids {
+            kill_leftovers(pid);
+        }
+        assert!(died, "a HUP-ignoring child survived terminate_all");
+        assert!(elapsed >= Duration::from_millis(250), "the grace was paid ({elapsed:?})");
+        assert!(elapsed < Duration::from_secs(1), "once, not per pane ({elapsed:?})");
+    }
+
+    pub(crate) fn wait_for_pid(pane: &Pane) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let s = pane.screen_contents();
@@ -1148,7 +1191,7 @@ mod tests {
         }
     }
 
-    fn wait_for_death(pid: i32, timeout: Duration) -> bool {
+    pub(crate) fn wait_for_death(pid: i32, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
@@ -1161,7 +1204,7 @@ mod tests {
 
     // Failure-path cleanup: SIGKILL the leaked job's whole group first (a
     // shell may fork `sleep` rather than exec it), then the pid itself.
-    fn kill_leftovers(pid: i32) {
+    pub(crate) fn kill_leftovers(pid: i32) {
         let p = nix::unistd::Pid::from_raw(pid);
         if let Ok(pgid) = nix::unistd::getpgid(Some(p)) {
             let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);

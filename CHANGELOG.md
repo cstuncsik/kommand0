@@ -29,6 +29,16 @@ All notable changes to kommand0 are documented here. The format is based on
   open still shows after 100 ms. The event loop runs on one thread instead of
   starting an idle worker per CPU core.
 
+### Fixed
+
+- **Closing a tab, detaching, the Stop button, starting a cleanup and healing a
+  resume no longer freeze the UI while session processes exit**: a Node
+  `claude` ignores the hangup and only dies at the kill 250 ms later, which
+  used to be waited out on the event loop. The processes now die in the
+  background, and quitting waits for them. Detaching, stopping or starting a
+  cleanup with codex or opencode tabs still waits up to 1.5 s to capture their
+  session id.
+
 ## [0.32.1] - 2026-10-23
 
 ### Changed

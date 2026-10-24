@@ -48,7 +48,9 @@ git worktree. A `kmd` CLI mirrors the core actions.
   (see `dispatch_branch_status` / `request_pr_status_refresh`). Branch status is
   checked per workspace: ~2s while you work in one, ~10s for the selected one, at
   least every 5 min otherwise (an explicit refresh drops the row's `status_checked`
-  stamp); PR/CI status ~60s (network).
+  stamp); PR/CI status ~60s (network). Session panes die off the loop too, through
+  `spawn_teardown`: its kill threads are ordered per workspace and joined at quit;
+  their follow-ups (a cleanup's removal) are not.
 - **All `gh` calls go through `git::run_gh`** — non-interactive (prompts/pager off,
   stdin null), ETXTBSY-retry, 20s timeout. Never invoke `gh` directly.
 - **Network git follows `git::fetch_origin_branch`'s recipe**: `GIT_TERMINAL_PROMPT=0`,
