@@ -73,6 +73,16 @@ fn status_due(
 /// git status.
 const PR_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long an issue-resolve worker counts as running (see
+/// `App::issue_worker_started`). It expires so a worker that never replies
+/// can't wedge the feature for the session: every bounded call on the path
+/// has landed well inside this.
+const ISSUE_WORKER_MAX: Duration = Duration::from_secs(180);
+
+/// How long quitting waits for a workspace create still making its worktree
+/// (about 10 s on a big repo such as n8n) before abandoning it.
+const CREATE_QUIT_WAIT: Duration = Duration::from_secs(15);
+
 /// Carries a background worker's result to the event loop, sending on drop
 /// so the loop always gets a message (and clears the matching `*_inflight`
 /// flag) even if the worker thread panics before finishing. Shared by the
@@ -172,6 +182,23 @@ fn repo_cleanup_counts(items: &[RepoCleanupItem]) -> (usize, usize, usize) {
 /// What the issue-resolve worker sends back: the request id (the newest one
 /// wins) and the branch GitHub links to the issue.
 type IssueMsg = (u64, Result<kommand0_core::IssueBranch, String>);
+
+/// What the create worker sends back: the workspace it made, or why not.
+type CreateMsg = Result<Workspace, String>;
+
+/// The one workspace create running; cleared only by its reply, which
+/// SendOnDrop guarantees even on a panic. No expiry: a hung create blocks
+/// further creates and issue resolves until restart.
+struct Creating {
+    /// What was typed, restored with the error while the modal still waits.
+    repo_id: String,
+    repo_name: String,
+    input: String,
+    branch: String,
+    /// Shown once the workspace lands, modal or not (the issue flow's record
+    /// of a remote write).
+    notice: Option<String>,
+}
 
 /// The `(message, is_error)` notice for a finished profile delete: clean,
 /// with warnings (their full texts go to the log), or failed. Each names the
@@ -1065,6 +1092,11 @@ pub(crate) struct App {
     /// Issue-resolve worker → event-loop channel. `None` when not wired (unit tests).
     issue_tx: Option<tokio::sync::mpsc::UnboundedSender<IssueMsg>>,
 
+    /// The workspace create making its worktree, if any (one at a time).
+    create: Option<Creating>,
+    /// Create worker → event-loop channel. `None` when not wired (unit tests).
+    create_tx: Option<tokio::sync::mpsc::UnboundedSender<CreateMsg>>,
+
     /// User config (claude passthrough + tunables), loaded once at startup.
     pub(crate) config: Config,
     /// Where the settings page writes config fields back to. Resolved once at
@@ -1191,6 +1223,8 @@ impl App {
             issue_req: None,
             issue_worker_started: None,
             issue_tx: None,
+            create: None,
+            create_tx: None,
             config: Config::default(),
             config_path: Config::effective_path(),
             settings: None,
@@ -3525,46 +3559,142 @@ impl App {
         });
     }
 
-    /// Post-process a workspace-create attempt from the add-workspace flow. On
-    /// success: sync workspaces, expand the repo, rebuild (the new row was never
-    /// checked, so its branch status is due at once).
-    /// On failure: reopen the Add-Workspace modal with the typed `name`, the given
-    /// `branch` (the explicit-branch path passes the user's typed branch so it
-    /// isn't wiped on error; the fork/blank paths pass an empty string), and the
-    /// error.
-    fn finish_add_workspace(
+    /// Reopen the Add Workspace modal with what was typed and why no
+    /// workspace was made. `branch` is the typed Branch field (the
+    /// explicit-branch path keeps it; the others pass it blank).
+    fn reopen_add_workspace(
         &mut self,
-        result: anyhow::Result<Workspace>,
         repo_id: String,
         repo_name: String,
-        name: String,
+        input: String,
         branch: String,
+        error: String,
     ) {
-        match result {
-            Ok(_) => {
-                // The create plain-saved the whole state, so disk is exactly
-                // `state` now: re-baseline, or a later merge-save reads the new
-                // row as a concurrent add and keeps it after a delete (goes
-                // away with the merge-save-everywhere follow-up).
-                self.state_baseline = self.state.clone();
+        self.modal = modal::ModalState::AddWorkspace {
+            repo_id,
+            repo_name,
+            input,
+            cursor: 0,
+            branch,
+            branch_cursor: 0,
+            field: modal::AddWorkspaceField::Name,
+            error: Some(error),
+        };
+    }
+
+    /// Whether an issue-resolve worker may still be running.
+    fn issue_resolve_running(&self) -> bool {
+        self.issue_worker_started.is_some_and(|t| t.elapsed() < ISSUE_WORKER_MAX)
+    }
+
+    /// Why a create, or an issue lookup (which ends in one), into `repo_id`
+    /// must wait: one create at a time, none during a lookup, none into a
+    /// repo being deleted.
+    fn create_refusal(&self, repo_id: &str) -> Option<&'static str> {
+        if self.create.is_some() {
+            Some("a workspace is still being created; wait for it to finish")
+        } else if self.issue_resolve_running() {
+            Some("an issue lookup is still running; wait for it to finish")
+        } else if self.delete_inflight.contains(repo_id) {
+            Some("this repo is being deleted")
+        } else {
+            None
+        }
+    }
+
+    /// Create a workspace from the Add Workspace flow: resolve and validate
+    /// here, make the git worktree on a worker behind the Creating note, adopt
+    /// it in [`Self::finish_create`]. `input` and `branch` are what was typed,
+    /// restored with the reason when the create is refused or fails while
+    /// the note is up. Inline when the channel isn't wired (unit tests).
+    #[allow(clippy::too_many_arguments)]
+    fn start_create(
+        &mut self,
+        repo_id: String,
+        repo_name: String,
+        input: String,
+        branch: String,
+        name: Option<String>,
+        from_branch: Option<String>,
+        notice: Option<String>,
+    ) {
+        if let Some(reason) = self.create_refusal(&repo_id) {
+            self.reopen_add_workspace(repo_id, repo_name, input, branch, reason.to_string());
+            return;
+        }
+        let resolved =
+            self.state.resolve_new_workspace(name.as_deref(), &repo_id, from_branch.as_deref());
+        let (repo, ws_name, taken) = match resolved {
+            Ok(r) => r,
+            Err(e) => {
+                self.reopen_add_workspace(repo_id, repo_name, input, branch, e.to_string());
+                return;
+            }
+        };
+        self.modal = modal::ModalState::CreatingWorkspace { repo_name: repo_name.clone() };
+        self.create = Some(Creating { repo_id, repo_name, input, branch, notice });
+        let base = AppState::state_dir();
+        let make = move || {
+            AppState::make_workspace(&repo, &ws_name, &base, from_branch.as_deref(), true, &taken)
+                .map_err(|e| e.to_string())
+        };
+        let Some(tx) = self.create_tx.clone() else {
+            self.finish_create(make());
+            return;
+        };
+        std::thread::spawn(move || {
+            let mut guard = SendOnDrop {
+                tx,
+                payload: Some(Err("the workspace create was interrupted".to_string())),
+            };
+            guard.payload = Some(make());
+        });
+    }
+
+    /// The create's worker reported. A made workspace is adopted and saved
+    /// whether or not the Creating note still waits, and its notice shown. A
+    /// failure reopens Add Workspace while the note waits; after Esc it is an
+    /// error notice, and whatever modal is up now stays.
+    fn finish_create(&mut self, result: CreateMsg) {
+        let Some(c) = self.create.take() else {
+            tracing::warn!("a workspace create reported, but none was running; ignored");
+            return;
+        };
+        let waiting = matches!(self.modal, modal::ModalState::CreatingWorkspace { .. });
+        if waiting {
+            self.modal = modal::ModalState::None;
+        }
+        let adopted = result.and_then(|ws| {
+            let made_at = ws.worktree_path.clone();
+            self.state.insert_workspace(ws).map_err(|e| match made_at {
+                Some(p) => format!(
+                    "the worktree was made at {p}, but the workspace couldn't be added: {e}; \
+                     the worktree was left there"
+                ),
+                None => format!("the workspace couldn't be added: {e}"),
+            })
+        });
+        match adopted {
+            Ok(()) => {
+                self.save_state();
                 self.workspaces = self.state.workspaces.clone();
-                self.expanded.insert(repo_id);
+                self.expanded.insert(c.repo_id);
                 // Keep the cursor on its row: under a name or newest-first sort
                 // the new workspace can land above it, and from the embedded
-                // pane the cursor is the shown session.
+                // pane the cursor is the shown session. The new row was never
+                // checked, so its branch status is due at once.
                 self.rebuild_tree_keeping_selection();
+                if let Some(notice) = c.notice {
+                    self.profile_notice = Some((notice, false));
+                }
+            }
+            Err(e) if waiting => {
+                self.reopen_add_workspace(c.repo_id, c.repo_name, c.input, c.branch, e);
             }
             Err(e) => {
-                self.modal = modal::ModalState::AddWorkspace {
-                    repo_id,
-                    repo_name,
-                    input: name,
-                    cursor: 0,
-                    branch,
-                    branch_cursor: 0,
-                    field: modal::AddWorkspaceField::Name,
-                    error: Some(e.to_string()),
-                };
+                tracing::warn!("creating a workspace in {}: {e}", c.repo_name);
+                let msg = format!("Couldn't create the workspace in {}: {e}", c.repo_name);
+                self.profile_notice = Some((msg, true));
             }
         }
     }
@@ -4262,9 +4392,20 @@ impl App {
     }
 
     /// `d`/`D`/`[Delete]` on a busy row ([`Self::row_busy`]) would race the
-    /// worker that owns its worktree: refused, silently. Logs the refusal.
+    /// worker that owns its worktree, and in a repo a create is making a
+    /// worktree in, it could remove that one as its own (a case variant not
+    /// adopted yet): refused, silently. Logs the refusal.
     fn workspace_delete_blocked(&self, ws_id: &str) -> bool {
-        self.refuse_busy(ws_id, "delete")
+        if self.refuse_busy(ws_id, "delete") {
+            return true;
+        }
+        let creating = self.workspaces.iter().any(|w| {
+            w.id == ws_id && self.create.as_ref().is_some_and(|c| c.repo_id == w.repo_id)
+        });
+        if creating {
+            tracing::info!("delete: a workspace is being created in {ws_id}'s repo; ignored");
+        }
+        creating
     }
 
     /// Delete workspace `ws_id`: its panes die and its worktree is removed off
@@ -4288,14 +4429,17 @@ impl App {
 
     /// The repo-level twin of [`Self::workspace_delete_blocked`]: refused
     /// while the repo's own merged-branch scan or delete runs
-    /// (`repo_cleanup_inflight`), while the repo is being deleted, or while
-    /// any of its rows is busy. Logs the refusal.
+    /// (`repo_cleanup_inflight`), while the repo is being deleted, while any
+    /// of its rows is busy, or while a create targets it. Logs the refusal.
     fn repo_delete_blocked(&self, repo_id: &str) -> bool {
         let blocked = self.repo_cleanup_inflight.as_deref() == Some(repo_id)
             || self.delete_inflight.contains(repo_id)
-            || self.workspaces.iter().any(|w| w.repo_id == repo_id && self.row_busy(&w.id));
+            || self.workspaces.iter().any(|w| w.repo_id == repo_id && self.row_busy(&w.id))
+            || self.create.as_ref().is_some_and(|c| c.repo_id == repo_id);
         if blocked {
-            tracing::info!("delete: repo {repo_id} has a cleanup or a delete in flight; ignored");
+            tracing::info!(
+                "delete: repo {repo_id} has a cleanup, a delete or a create in flight; ignored"
+            );
         }
         blocked
     }
@@ -4547,22 +4691,10 @@ impl App {
         // "has 2 linked branches", with no way back from inside kommand0.
         // `start_cleanup` and `start_profile_delete` guard the same way.
         // The latch is global, not per-repo, so the message must not claim
-        // otherwise. It expires so a worker that never replies can't wedge the
-        // feature for the session: every bounded call on the path has landed
-        // well inside this.
-        const ISSUE_WORKER_MAX: Duration = Duration::from_secs(180);
-        if self.issue_worker_started.is_some_and(|t| t.elapsed() < ISSUE_WORKER_MAX) {
+        // otherwise. The lookup ends in a create, so it waits as one would.
+        if let Some(reason) = self.create_refusal(&repo.id) {
             let (repo_id, repo_name) = (repo.id.clone(), repo.name.clone());
-            self.finish_add_workspace(
-                Err(anyhow::anyhow!(
-                    "an issue lookup is still running; \
-                     wait for it to finish before starting another"
-                )),
-                repo_id,
-                repo_name,
-                issue,
-                String::new(),
-            );
+            self.reopen_add_workspace(repo_id, repo_name, issue, String::new(), reason.to_string());
             return;
         }
         self.issue_seq += 1;
@@ -4631,30 +4763,24 @@ impl App {
                 return;
             }
         };
-        // The workspace name comes from the branch; `finish_add_workspace`
-        // reopens Add Workspace with the typed ref + the error on failure, so
-        // gh's own message is what the user sees.
-        let created = result.as_ref().ok().map(|b| (b.branch.clone(), b.reused));
-        let result = result
-            .map_err(anyhow::Error::msg)
-            .and_then(|b| self.state.create_workspace_from_branch(None, &repo_id, &b.branch));
-        let ok = result.is_ok();
-        self.finish_add_workspace(result, repo_id, repo_name, issue, String::new());
-        // The resolving modal is gone by now, and its "may create a new linked
-        // branch" warning with it. On the create path this notice is the user's
-        // only record that kommand0 just wrote to their remote (the CLI prints
-        // the same thing on stderr).
-        if let Some((branch, reused)) = created
-            && ok
-        {
-            self.profile_notice = Some((
-                if reused {
-                    format!("Using existing linked branch {branch}")
+        // The workspace name comes from the branch. A failure reopens Add
+        // Workspace with the typed ref and the error, so gh's own message is
+        // what the user sees.
+        match result {
+            Ok(b) => {
+                // The resolving modal is gone by now, and its "may create a new
+                // linked branch" warning with it. Once the workspace lands this
+                // notice is the user's only record that kommand0 just wrote to
+                // their remote (the CLI prints the same thing on stderr).
+                let notice = Some(if b.reused {
+                    format!("Using existing linked branch {}", b.branch)
                 } else {
-                    format!("Created linked branch {branch} on origin")
-                },
-                false,
-            ));
+                    format!("Created linked branch {} on origin", b.branch)
+                });
+                let from = Some(b.branch);
+                self.start_create(repo_id, repo_name, issue, String::new(), None, from, notice);
+            }
+            Err(e) => self.reopen_add_workspace(repo_id, repo_name, issue, String::new(), e),
         }
     }
 
@@ -5147,8 +5273,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             }
             modal::ModalResult::SubmitRepo(path) => match app.state.add_repo(&path) {
                 Ok(repo) => {
-                    // The add plain-saved the whole state: re-baseline, as
-                    // `finish_add_workspace` does.
+                    // The add plain-saved the whole state: re-baseline.
                     app.state_baseline = app.state.clone();
                     // Expand the just-added repo so its "(no workspaces — press w)"
                     // hint shows immediately, pointing the user at the next step.
@@ -5192,12 +5317,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // today — the detect-and-offer flow is only for a blank one.
                     // A blank name means derive a path-safe one from the branch.
                     let repo_name = repo.map(|r| r.name).unwrap_or_default();
-                    let result = app.state.create_workspace_from_branch(
-                        (!name.is_empty()).then_some(name.as_str()),
-                        &repo_id,
-                        &branch,
-                    );
-                    app.finish_add_workspace(result, repo_id, repo_name, name, branch);
+                    let ws_name = (!name.is_empty()).then(|| name.clone());
+                    let from = Some(branch.clone());
+                    app.start_create(repo_id, repo_name, name, branch, ws_name, from, None);
                 } else if let Some(repo) = repo {
                     // An issue reference (123, #123, or an issue URL) in the Name
                     // field means "the branch GitHub links to that issue".
@@ -5213,9 +5335,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // workspace name derived by core. A missing branch surfaces
                     // core's error, with the typed name preserved for a retry.
                     else if name.contains('/') {
-                        let result =
-                            app.state.create_workspace_from_branch(None, &repo_id, &name);
-                        app.finish_add_workspace(result, repo_id, repo.name, name, String::new());
+                        let from = Some(name.clone());
+                        app.start_create(repo_id, repo.name, name, String::new(), None, from, None);
                     }
                     // Blank branch: offer the checkout only for a valid, unused
                     // name whose bare branch already exists — otherwise fall
@@ -5230,14 +5351,14 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             name,
                         };
                     } else {
-                        let result = app.state.create_workspace(Some(&name), &repo_id);
-                        app.finish_add_workspace(result, repo_id, repo.name, name, String::new());
+                        let ws_name = Some(name.clone());
+                        app.start_create(repo_id, repo.name, name, String::new(), ws_name, None, None);
                     }
                 } else {
                     // Repo not found: fall through to create so its resolve error
                     // surfaces (don't call the detector with an empty path).
-                    let result = app.state.create_workspace(Some(&name), &repo_id);
-                    app.finish_add_workspace(result, repo_id, String::new(), name, String::new());
+                    let ws_name = Some(name.clone());
+                    app.start_create(repo_id, String::new(), name, String::new(), ws_name, None, None);
                 }
             }
             modal::ModalResult::BranchCheckoutChoice { repo_id, name, checkout } => {
@@ -5250,12 +5371,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     .find(|r| r.id == repo_id)
                     .map(|r| r.name.clone())
                     .unwrap_or_default();
-                let result = if checkout {
-                    app.state.create_workspace_from_branch(Some(&name), &repo_id, &name)
-                } else {
-                    app.state.create_workspace(Some(&name), &repo_id)
-                };
-                app.finish_add_workspace(result, repo_id, repo_name, name, String::new());
+                let (ws_name, from) = (Some(name.clone()), checkout.then(|| name.clone()));
+                app.start_create(repo_id, repo_name, name, String::new(), ws_name, from, None);
             }
             modal::ModalResult::SubmitRename(ws_id, session_id, title) => {
                 // Only title a session that's still live — reap can heal/drop the
@@ -5973,6 +6090,10 @@ async fn run(
     let (delete_tx, mut delete_rx) = tokio::sync::mpsc::unbounded_channel::<DeleteMsg>();
     app.delete_tx = Some(delete_tx);
 
+    // Create worker → event loop, carrying the made workspace or why not.
+    let (create_tx, mut create_rx) = tokio::sync::mpsc::unbounded_channel::<CreateMsg>();
+    app.create_tx = Some(create_tx);
+
     // Codex early-capture pollers → event loop, carrying the captured entry
     // as `(workspace_id, tab_id, "codex:<uuid>", spawn generation)`.
     let (codex_capture_tx, mut codex_capture_rx) =
@@ -6053,6 +6174,9 @@ async fn run(
             }
             Some((target, outcome)) = delete_rx.recv() => {
                 app.on_delete_done(target, outcome);
+            }
+            Some(result) = create_rx.recv() => {
+                app.finish_create(result);
             }
             Some(msg) = repo_cleanup_rx.recv() => {
                 app.repo_cleanup_inflight = None;
@@ -6269,10 +6393,11 @@ async fn run(
     }
 
     // Every loop exit lands here. Quitting may wait below (live panes, kill
-    // threads, a profile delete): say so on screen first.
+    // threads, a profile delete, a create): say so on screen first.
     let waits = !app.embedded.is_empty()
         || app.teardowns.iter().any(|(_, h)| !h.is_finished())
-        || app.profile_delete_join.as_ref().is_some_and(|h| !h.is_finished());
+        || app.profile_delete_join.as_ref().is_some_and(|h| !h.is_finished())
+        || app.create.is_some();
     if waits {
         app.profile_notice = Some(("Finishing background work…".to_string(), false));
         let _ = terminal.draw(|frame| render::ui(frame, &mut app));
@@ -6303,10 +6428,20 @@ async fn run(
     // Closed tabs and detaches may still be in their grace: a child that
     // ignores SIGHUP would outlive us.
     app.join_teardowns();
+    // A follow must not start `gh` now.
+    app.pr_status_tx = None;
+    // A create still making its worktree gets a bounded wait, then is adopted
+    // and saved; past it, its dir and branch are left behind unregistered.
+    if let Some(c) = &app.create {
+        let what = format!("{:?} (branch {:?}) in {}", c.input, c.branch, c.repo_name);
+        match tokio::time::timeout(CREATE_QUIT_WAIT, create_rx.recv()).await {
+            Ok(Some(result)) => app.finish_create(result),
+            _ => tracing::warn!("quit: abandoned creating workspace {what}"),
+        }
+    }
     // Cleanup and delete replies already in get saved; one still running is
     // abandoned (its row stays in state, and deleting it again finishes the
-    // job). A follow must not start `gh` now.
-    app.pr_status_tx = None;
+    // job).
     while let Ok((ws_id, result)) = cleanup_rx.try_recv() {
         app.on_cleanup_done(ws_id, result);
     }
@@ -7496,6 +7631,181 @@ mod key_tests {
             }
             _ => panic!("expected AddWorkspace reopened with an error"),
         }
+    }
+
+    /// A create into `repo_id` in flight, as `start_create` leaves it.
+    fn creating(repo_id: &str) -> Creating {
+        Creating {
+            repo_id: repo_id.into(),
+            repo_name: "real".into(),
+            input: "busy".into(),
+            branch: String::new(),
+            notice: None,
+        }
+    }
+
+    /// The error Add Workspace was reopened with, and what it kept typed.
+    fn reopened(app: &App) -> (String, String) {
+        match &app.modal {
+            modal::ModalState::AddWorkspace { error: Some(e), input, .. } => (e.clone(), input.clone()),
+            _ => panic!("expected AddWorkspace reopened with an error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_submit_shows_creating_and_the_worker_reply_adopts() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "adoptme");
+        press(&mut app, KeyCode::Enter).await;
+        assert!(matches!(app.modal, modal::ModalState::CreatingWorkspace { .. }), "the note is up");
+        assert!(!app.workspaces.iter().any(|w| w.name == "adoptme"), "not listed yet");
+
+        let result = recv(&mut rx).await;
+        app.finish_create(result);
+
+        assert!(!app.modal.is_active(), "the note closes");
+        assert!(app.create.is_none(), "no create is running");
+        let ws = app.workspaces.iter().find(|w| w.name == "adoptme").expect("adopted");
+        assert_eq!(ws.branch_name.as_deref(), Some("adoptme"), "on its own worktree");
+        assert!(
+            app.state_baseline.workspaces.iter().any(|w| w.name == "adoptme"),
+            "persisted: the baseline moves only after a successful save"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_while_creating_still_adopts_and_keeps_the_notice() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "escissue");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        let req = app.issue_req.unwrap();
+        app.finish_issue_resolve(
+            req,
+            Ok(kommand0_core::IssueBranch { branch: "escissue".into(), reused: true }),
+        );
+        press(&mut app, KeyCode::Esc).await;
+        assert!(!app.modal.is_active(), "Esc hides the note");
+        app.open_add_repo_modal();
+
+        let result = recv(&mut rx).await;
+        app.finish_create(result);
+
+        assert!(matches!(app.modal, modal::ModalState::AddRepo { .. }), "the other modal stays up");
+        assert!(app.workspaces.iter().any(|w| w.name == "escissue"), "still adopted");
+        let (msg, is_error) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("Using existing linked branch escissue"), "{msg}");
+        assert!(!is_error);
+    }
+
+    #[tokio::test]
+    async fn a_create_failing_after_esc_leaves_an_error_notice() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            input: "failme".into(),
+            cursor: 6,
+            branch: "ghost".into(),
+            branch_cursor: 5,
+            field: modal::AddWorkspaceField::Name,
+            error: None,
+        };
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Esc).await;
+        app.open_add_repo_modal();
+
+        let result = recv(&mut rx).await;
+        app.finish_create(result);
+
+        assert!(matches!(app.modal, modal::ModalState::AddRepo { .. }), "the other modal stays up");
+        let (msg, is_error) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("couldn't check out branch"), "{msg}");
+        assert!(is_error);
+        assert!(!app.workspaces.iter().any(|w| w.name == "failme"), "nothing created");
+    }
+
+    #[tokio::test]
+    async fn a_second_create_while_one_runs_is_refused() {
+        let mut app = test_app();
+        app.create = Some(creating("r1"));
+        app.modal = add_workspace_modal_for("r1", "second");
+        press(&mut app, KeyCode::Enter).await;
+
+        let (e, input) = reopened(&app);
+        assert!(e.contains("still being created"), "{e}");
+        assert_eq!(input, "second", "the typed name is kept");
+        assert_eq!(app.create.as_ref().map(|c| c.input.as_str()), Some("busy"), "the first runs on");
+    }
+
+    #[tokio::test]
+    async fn an_issue_resolve_while_a_create_runs_is_refused() {
+        let mut app = test_app();
+        app.create = Some(creating("r1"));
+        app.modal = add_workspace_modal_for("r1", "123");
+        press(&mut app, KeyCode::Enter).await;
+
+        let (e, input) = reopened(&app);
+        assert!(e.contains("still being created"), "{e}");
+        assert_eq!(input, "123");
+        assert!(app.issue_req.is_none(), "no lookup started");
+    }
+
+    #[tokio::test]
+    async fn a_create_while_an_issue_resolve_runs_is_refused() {
+        let mut app = test_app();
+        app.issue_worker_started = Some(Instant::now());
+        app.modal = add_workspace_modal_for("r1", "plain");
+        press(&mut app, KeyCode::Enter).await;
+
+        let (e, input) = reopened(&app);
+        assert!(e.contains("issue lookup is still running"), "{e}");
+        assert_eq!(input, "plain");
+        assert!(app.create.is_none(), "no create started");
+    }
+
+    #[tokio::test]
+    async fn a_create_into_a_repo_being_deleted_is_refused() {
+        // A plain name and an issue ref: both end in a create.
+        for name in ["late", "123"] {
+            let mut app = test_app();
+            app.delete_inflight.insert("r1".into());
+            app.modal = add_workspace_modal_for("r1", name);
+            press(&mut app, KeyCode::Enter).await;
+
+            let (e, _) = reopened(&app);
+            assert!(e.contains("being deleted"), "{name}: {e}");
+            assert!(app.create.is_none() && app.issue_req.is_none(), "{name}: nothing started");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_adopt_names_the_leftover_path() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "dupe");
+        press(&mut app, KeyCode::Enter).await;
+        // The name is taken by the time the worker reports.
+        app.state.workspaces.push(mk_ws("other", "dupe", "real", None));
+
+        let result = recv(&mut rx).await;
+        let path = result.as_ref().unwrap().worktree_path.clone().unwrap();
+        app.finish_create(result);
+
+        let (e, input) = reopened(&app);
+        assert!(e.contains(&path) && e.contains("already exists"), "{e}");
+        assert_eq!(input, "dupe");
+        assert!(std::path::Path::new(&path).exists(), "the worktree is left there");
     }
 
     #[tokio::test]
@@ -10267,6 +10577,37 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn the_creating_modal_keeps_its_footer_and_never_names_the_branch() {
+        // The issue e2e waits for the branch name to appear in the tree, so
+        // the note must not show it first.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "linked-77");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            input: String::new(),
+            cursor: 0,
+            branch: "linked-77".into(),
+            branch_cursor: 9,
+            field: modal::AddWorkspaceField::Branch,
+            error: None,
+        };
+        press(&mut app, KeyCode::Enter).await;
+
+        for (w, h) in [(80u16, 30u16), (80, 24), (100, 30)] {
+            let text = render_to_string(&mut app, w, h);
+            let at = format!("at {w}x{h}");
+            assert!(text.contains("Add Workspace to real"), "{at}: names the repo:\n{text}");
+            assert!(text.contains("Making the git worktree"), "{at}: says what runs:\n{text}");
+            assert!(text.contains("Esc hide; it still gets created"), "{at}: footer survives:\n{text}");
+            assert!(!text.contains("linked-77"), "{at}: never names the branch:\n{text}");
+        }
+        let _ = recv(&mut rx).await;
+    }
+
+    #[tokio::test]
     async fn add_workspace_label_fits_80_columns() {
         // The modal is 55% wide, so 80 columns is the floor: the label has no
         // wrap and would clip.
@@ -12134,16 +12475,15 @@ mod key_tests {
 
     #[test]
     fn deleting_a_workspace_created_this_session_drops_it_from_disk() {
-        // The create plain-saves without moving the baseline, so a later
-        // merge-save would read the new row as a concurrent add and keep it.
+        // A baseline without the new row would make a later merge-save read
+        // it as a concurrent add and keep it.
         let mut app = test_app();
-        let row = mk_ws("w9", "ws-nine", "r1", None);
-        app.state.workspaces.push(row.clone()); // what the create does in memory
+        app.create = Some(creating("r1"));
 
-        app.finish_add_workspace(Ok(row), "r1".into(), "alpha".into(), "ws-nine".into(), String::new());
+        app.finish_create(Ok(mk_ws("w9", "ws-nine", "r1", None)));
         assert!(
             app.state_baseline.workspaces.iter().any(|w| w.id == "w9"),
-            "the baseline tracks the plain-saved row"
+            "the baseline tracks the saved row"
         );
 
         // The merge the delete's save performs: disk holds what the create
@@ -12784,6 +13124,46 @@ mod key_tests {
         press(&mut app, KeyCode::Char('c')).await;
 
         assert!(app.repo_cleanup_inflight.is_none(), "no scan of a repo being deleted");
+    }
+
+    #[tokio::test]
+    async fn a_delete_waits_for_a_create_into_its_repo() {
+        let mut app = test_app();
+        app.workspaces.push(mk_ws("w2", "ws-two", "r2", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.expanded.extend(["r1".to_string(), "r2".to_string()]);
+        app.rebuild_tree();
+        app.create = Some(creating("r1"));
+        app.select_workspace_row("w1");
+
+        press(&mut app, KeyCode::Char('d')).await;
+        assert!(!app.modal.is_active(), "d opens no modal");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.workspaces.iter().any(|w| w.id == "w1"), "D leaves the row");
+        assert!(app.delete_inflight.is_empty(), "nothing is being deleted");
+
+        // Per repo: a row in another repo still deletes.
+        app.select_workspace_row("w2");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.workspaces.iter().all(|w| w.id != "w2"), "w2 is gone");
+    }
+
+    #[tokio::test]
+    async fn a_repo_delete_waits_for_a_create_into_it() {
+        let mut app = test_app();
+        app.create = Some(creating("r1"));
+        app.select_repo_row("r1");
+
+        press(&mut app, KeyCode::Char('d')).await;
+        assert!(!app.modal.is_active(), "d opens no modal");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.repos.iter().any(|r| r.id == "r1"), "D leaves the repo");
+        assert!(app.delete_inflight.is_empty(), "nothing is being deleted");
+
+        // Per repo: another repo still deletes.
+        app.select_repo_row("r2");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.repos.iter().all(|r| r.id != "r2"), "r2 is gone");
     }
 
     #[tokio::test]

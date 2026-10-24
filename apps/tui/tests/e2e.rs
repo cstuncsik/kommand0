@@ -1700,6 +1700,60 @@ fn w_with_an_issue_ref_resolves_it_and_creates_the_workspace() {
 }
 
 #[test]
+fn quitting_during_a_create_still_adds_the_workspace() {
+    // The checkout hook holds `git worktree add` until the test opens a gate,
+    // which it does only once the quit says it is finishing up: the workspace
+    // can only land in state.json if the quit waited for the create.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let hooks = dir.path().join("hooks");
+    let gate = dir.path().join("gate");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&hooks).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "user.name", "t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+    // Bounded, so a gate never opened can't hang git past the quit wait.
+    let hook = format!(
+        "#!/bin/sh\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n",
+        gate.display()
+    );
+    let hook_path = hooks.join("post-checkout");
+    std::fs::write(&hook_path, hook).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Local, so it beats a hooksPath in the global config the tests inherit.
+    run_git(&repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
+        "workspaces": [],
+        "sessions": []
+    })
+    .to_string();
+
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "false")]);
+    tui.wait_for("demo");
+    tui.send("w");
+    tui.wait_for("Add Workspace");
+    tui.send("slowws");
+    tui.send("\r");
+    tui.wait_for("Making the git worktree");
+    tui.send_esc();
+    tui.send("q");
+    tui.wait_for("Finishing background work");
+    std::fs::write(&gate, "").unwrap();
+    tui.wait_exit();
+
+    let st = tui.read_state();
+    assert_eq!(st["workspaces"][0]["name"], "slowws", "state: {st}");
+    // A failed worktree add silently yields a row on the repo root.
+    assert!(st["workspaces"][0]["worktree_path"].is_string(), "a real worktree: {st}");
+}
+
+#[test]
 fn slash_filters_the_tree_and_capital_a_archives() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().to_str().unwrap();
