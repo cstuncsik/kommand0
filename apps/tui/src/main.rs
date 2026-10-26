@@ -3409,6 +3409,12 @@ impl App {
             }
             return;
         }
+        // The joined handles leave `teardowns`, so this one stands in for
+        // their workspaces too.
+        let mut ids = ws_ids;
+        ids.extend(earlier.iter().flat_map(|(e, _)| e.iter().cloned()));
+        ids.sort();
+        ids.dedup();
         let handle = std::thread::spawn(move || {
             for (_, h) in earlier {
                 let _ = h.join();
@@ -3418,7 +3424,7 @@ impl App {
                 std::thread::spawn(then);
             }
         });
-        self.teardowns.push((ws_ids, handle));
+        self.teardowns.push((ids, handle));
     }
 
     /// Take a workspace's tabs out of `embedded` and kill them off the loop.
@@ -12561,6 +12567,26 @@ mod key_tests {
             pane::tests::kill_leftovers(pid);
             assert_eq!(seen_alive, Ok(false), "earlier teardown: {earlier}");
         }
+    }
+
+    #[test]
+    fn a_teardown_waits_for_the_kills_an_earlier_one_joined() {
+        // A repo delete kills w1's and w2's panes; a w2 teardown joins that
+        // kill, and a w1 follow-up after it must still wait for it.
+        let mut app = test_app();
+        let t = tab("a", &["-c", HUP_IGNORING]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.spawn_teardown(vec!["w1".to_string(), "w2".to_string()], vec![t], None);
+        app.spawn_teardown(vec!["w2".to_string()], Vec::new(), Some(Box::new(|| {})));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follow_up = move || {
+            let _ = tx.send(alive(pid));
+        };
+        app.spawn_teardown(vec!["w1".to_string()], Vec::new(), Some(Box::new(follow_up)));
+        let seen_alive = rx.recv_timeout(Duration::from_secs(5));
+        app.join_teardowns();
+        pane::tests::kill_leftovers(pid);
+        assert_eq!(seen_alive, Ok(false), "w1's pane was dead first");
     }
 
     #[tokio::test]
