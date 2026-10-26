@@ -4517,7 +4517,9 @@ impl App {
     /// worker still reports), or inline when it isn't wired (unit tests).
     fn spawn_delete(&mut self, target: Deleted, rows: Vec<Workspace>, tabs: Vec<SessionTab>) {
         let ids: Vec<String> = rows.iter().map(|w| w.id.clone()).collect();
-        let held = self.state.worktree_rows_except(&ids);
+        // A row another running delete is removing can't claim a dir either.
+        let skip: Vec<String> = ids.iter().chain(&self.delete_inflight).cloned().collect();
+        let held = self.state.worktree_rows_except(&skip);
         let base = AppState::state_dir();
         // The worker can't read state, so each row goes with its repo's path.
         // A row whose repo is gone has no worktree git could remove (as core).
@@ -4528,7 +4530,6 @@ impl App {
                 Some((repo.path.clone(), w))
             })
             .collect();
-        let skip = ids.clone();
         let remove = move || {
             let left: Vec<LeftWorktree> = jobs
                 .iter()
@@ -13197,6 +13198,32 @@ mod key_tests {
         assert!(!is_error, "kept on purpose, not a failure");
         let kept = std::fs::read_to_string(wt.join("keep.txt")).unwrap();
         assert_eq!(kept, "mine", "w1's worktree is intact");
+    }
+
+    #[tokio::test]
+    async fn a_row_being_deleted_does_not_keep_another_deletes_worktree() {
+        let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
+        // w2's dir is a symlink to w1's worktree, and both rows go.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&wt, &alias).unwrap();
+        app.workspaces.push(Workspace {
+            working_dir: alias.to_string_lossy().into_owned(),
+            worktree_path: Some(alias.to_string_lossy().into_owned()),
+            ..mk_ws("w2", "ws-two", "real", Some("feat2"))
+        });
+        app.state.workspaces = app.workspaces.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+
+        app.delete_workspace("w2");
+        app.delete_workspace("w1");
+        for _ in 0..2 {
+            let (target, outcome) = recv(&mut rx).await;
+            app.on_delete_done(target, outcome);
+            let notice = app.profile_notice.take().map(|(msg, _)| msg).unwrap_or_default();
+            assert!(!notice.contains("ws-two's worktree"), "{notice}");
+        }
+        assert!(!wt.exists(), "w1's worktree is gone");
     }
 
     #[tokio::test]
