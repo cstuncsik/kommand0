@@ -54,8 +54,8 @@ All notable changes to kommand0 are documented here. The format is based on
   error). The failure is logged, as is the reason for any fallback to the
   shared checkout. Applies to `kmd` too.
 - **Deleting a workspace or repo no longer freezes the UI while git removes
-  worktrees** (#129): the row shows "Deleting…" until its directory is gone,
-  and anything kept or left behind is named.
+  worktrees** (#129): the detail pane shows "Deleting…" until its directory is
+  gone, and anything kept or left behind is named.
 - **Creating a workspace no longer freezes the UI while git makes its
   worktree** (about 10 s on a big repo): the worktree is made in the
   background behind a "Making the git worktree" note. Esc hides the note and
