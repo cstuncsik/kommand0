@@ -1802,7 +1802,10 @@ impl AppState {
                 worktree::WorktreeResult::Created { worktree_path, branch_name } => {
                     (worktree_path.clone(), Some(worktree_path), Some(branch_name))
                 }
-                worktree::WorktreeResult::Fallback { reason: _ } => (repo.path.clone(), None, None),
+                worktree::WorktreeResult::Fallback { reason } => {
+                    tracing::warn!("no worktree for {ws_name}, using the repo root: {reason}");
+                    (repo.path.clone(), None, None)
+                }
             }
         };
 
@@ -2832,6 +2835,26 @@ mod tests {
 
         let ws = state.create_workspace_with_base(Some("orphan"), &r.id, &base).unwrap();
         assert_eq!(ws.worktree_path.as_deref(), orphan.to_str(), "a real worktree, not a fallback row");
+    }
+
+    #[test]
+    fn a_worktree_whose_post_checkout_hook_failed_is_still_used() {
+        // git fails the add but keeps the worktree.
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let hook = tmp.path().join("hooks").join("post-checkout");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Local, so it beats a hooksPath in the global config the tests inherit.
+        let hooks = hook.parent().unwrap().to_str().unwrap();
+        crate::git::tests::git(Path::new(&r.path), &["config", "core.hooksPath", hooks]);
+
+        let ws = state.create_workspace_with_base(Some("hooked"), &r.id, &base).unwrap();
+        let dir = base.join("worktrees").join(&r.id).join("hooked");
+        assert_eq!(ws.worktree_path.as_deref(), dir.to_str(), "its own worktree, not the repo root");
+        assert_eq!(ws.branch_name.as_deref(), Some("hooked"));
     }
 
     #[test]

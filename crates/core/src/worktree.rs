@@ -205,7 +205,8 @@ fn git_no_prompt(repo_path: &str) -> Command {
 }
 
 /// Map the `git worktree add` result to a [`WorktreeResult`], copying the repo's
-/// `.worktree-copy` files into a freshly-created worktree.
+/// `.worktree-copy` files into a freshly-created worktree. A failed add that
+/// left its worktree (a failed post-checkout hook) counts as created.
 ///
 /// `repo_path` is the source repo root (where `.worktree-copy` lives). The copy
 /// runs only on the success arm — a `Fallback` worktree never exists to copy
@@ -219,6 +220,18 @@ fn finish_worktree_add(
 ) -> WorktreeResult {
     match output {
         Ok(result) if result.status.success() => {
+            copy_worktree_files(repo_path, &worktree_path);
+            WorktreeResult::Created { worktree_path, branch_name }
+        }
+        // git keeps a worktree whose post-checkout hook failed, and removes
+        // one it gave up on; the dir didn't exist before the add.
+        Ok(result) if Path::new(&worktree_path).join(".git").exists() => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!(
+                worktree = worktree_path,
+                "git worktree add failed but kept the worktree: {}",
+                stderr.trim()
+            );
             copy_worktree_files(repo_path, &worktree_path);
             WorktreeResult::Created { worktree_path, branch_name }
         }

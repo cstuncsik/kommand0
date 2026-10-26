@@ -48,6 +48,11 @@ All notable changes to kommand0 are documented here. The format is based on
 - **Creating a workspace can no longer stop on a git, ssh or LFS prompt** that
   reads keystrokes meant for the TUI: `git worktree add` runs
   non-interactively, like kommand0's fetches. Applies to `kmd` too.
+- **A workspace whose post-checkout hook fails still gets its worktree**: git
+  reports the hook's failure but keeps the worktree, which kommand0 used to
+  leave behind for a row on the shared checkout (or, checking out a branch, an
+  error). The failure is logged, as is the reason for any fallback to the
+  shared checkout. Applies to `kmd` too.
 - **Deleting a workspace or repo no longer freezes the UI while git removes
   worktrees** (#129): the row shows "Deleting…" until its directory is gone,
   and anything kept or left behind is named.
