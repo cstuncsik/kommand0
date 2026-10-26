@@ -866,6 +866,10 @@ pub(crate) struct App {
     /// in-memory state over the current on-disk file relative to this, so a `kmd`
     /// command that wrote `state.json` while we were open isn't clobbered.
     pub(crate) state_baseline: AppState,
+    /// Fails every save, as an unwritable state dir would: the unit harness's
+    /// state dir is shared by every test in the process.
+    #[cfg(test)]
+    fail_saves: bool,
     pub(crate) expanded: HashSet<String>,
     pub(crate) tree_items: Vec<TreeNode>,
     pub(crate) selected_index: usize,
@@ -1145,6 +1149,8 @@ impl App {
             workspaces,
             state,
             state_baseline,
+            #[cfg(test)]
+            fail_saves: false,
             expanded: HashSet::new(),
             tree_items: Vec::new(),
             selected_index: 0,
@@ -1652,6 +1658,10 @@ impl App {
     /// but not in `self.state`, and baselining it would flip it into "our
     /// deletion" on the next save.
     fn persist_state(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.fail_saves {
+            anyhow::bail!("the state dir is read-only");
+        }
         // Merge over the current on-disk state (a `kmd` command may have written
         // it while we were open) rather than blindly overwriting it.
         self.state.merge_save(&self.state_baseline)?;
@@ -3694,7 +3704,8 @@ impl App {
         }
         let adopted = result.and_then(|ws| {
             let made_at = ws.worktree_path.clone();
-            self.state.insert_workspace(ws).map_err(|e| match made_at {
+            let made = made_at.clone().unwrap_or_else(|| ws.name.clone());
+            self.state.insert_workspace(ws).map(|()| made).map_err(|e| match made_at {
                 Some(p) => format!(
                     "the worktree was made at {p}, but the workspace couldn't be added: {e}; \
                      the worktree was left there"
@@ -3703,8 +3714,8 @@ impl App {
             })
         });
         match adopted {
-            Ok(()) => {
-                self.save_state();
+            Ok(made) => {
+                let saved = self.persist_state();
                 self.workspaces = self.state.workspaces.clone();
                 self.expanded.insert(c.repo_id);
                 // Keep the cursor on its row: under a name or newest-first sort
@@ -3712,7 +3723,11 @@ impl App {
                 // pane the cursor is the shown session. The new row was never
                 // checked, so its branch status is due at once.
                 self.rebuild_tree_keeping_selection();
-                if let Some(notice) = c.notice {
+                if let Err(e) = saved {
+                    tracing::warn!("failed to persist state: {e:#}");
+                    let msg = format!("created {made} but couldn't save it: {e:#}");
+                    self.profile_notice = Some((msg, true));
+                } else if let Some(notice) = c.notice {
                     self.profile_notice = Some((notice, false));
                 }
             }
@@ -7834,6 +7849,26 @@ mod key_tests {
         assert!(e.contains(&path) && e.contains("already exists"), "{e}");
         assert_eq!(input, "dupe");
         assert!(std::path::Path::new(&path).exists(), "the worktree is left there");
+    }
+
+    #[tokio::test]
+    async fn a_create_whose_save_fails_says_so() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "unsaved");
+        press(&mut app, KeyCode::Enter).await;
+        app.fail_saves = true;
+
+        let result = recv(&mut rx).await;
+        let path = result.as_ref().unwrap().worktree_path.clone().unwrap();
+        app.finish_create(result);
+
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert!(msg.contains(&path) && msg.contains("couldn't save"), "{msg}");
+        assert!(is_error);
+        assert!(app.workspaces.iter().any(|w| w.name == "unsaved"), "the row stays listed");
     }
 
     #[tokio::test]
