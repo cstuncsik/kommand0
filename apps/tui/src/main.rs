@@ -36,8 +36,8 @@ const TAB_BAR_HEIGHT: u16 = 1;
 pub(crate) const MAX_SESSION_TABS: usize = 9;
 
 /// How often git status is checked (off the render loop) for a workspace you
-/// work in: one of its sessions is busy or was typed into since the last
-/// check. The default for `status_refresh_secs`.
+/// work in: one of its sessions was busy or typed into since the last check.
+/// The default for `status_refresh_secs`.
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often the selected workspace's git status is checked.
@@ -1015,6 +1015,10 @@ pub(crate) struct App {
     /// When each worktree row's status check was last dispatched. A row with
     /// no stamp is due; an explicit refresh drops the row's stamp.
     status_checked: HashMap<String, Instant>,
+    /// Rows whose session was busy at some tick since their last check. The
+    /// spinner can go before a slow pass lands; this stays until a pass takes
+    /// the row.
+    status_active: HashSet<String>,
 
     /// Per-workspace PR/CI status, refreshed off the render loop via one
     /// `gh pr list` per repo. Keyed by workspace id; absent until a PR exists on
@@ -1200,6 +1204,7 @@ impl App {
             status_inflight: false,
             status_tx: None,
             status_checked: HashMap::new(),
+            status_active: HashSet::new(),
             pr_status: HashMap::new(),
             pr_status_inflight: false,
             pr_status_rerun: false,
@@ -2828,6 +2833,11 @@ impl App {
         // Refresh per-pane activity so the tree spinner reflects which
         // sessions are currently producing output.
         self.update_pane_activity(now);
+        for (ws_id, s) in &self.embedded {
+            if s.tabs.iter().any(|t| self.waiting_response.contains(&t.id)) {
+                self.status_active.insert(ws_id.clone());
+            }
+        }
         // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
         self.tick_counter = self.tick_counter.wrapping_add(1);
         let spun = self.tick_counter.is_multiple_of(5);
@@ -2837,6 +2847,7 @@ impl App {
         // Frames no longer come every tick, so focus is synced here too.
         self.sync_focus_states();
         // Git status (off-loop) for the workspaces that are due.
+        self.reap_teardowns();
         self.dispatch_branch_status(now);
         // Periodic PR/CI-status refresh (off-loop, slow interval: it's a
         // network call per repo).
@@ -3377,9 +3388,9 @@ impl App {
         if tabs.is_empty() && then.is_none() {
             return;
         }
+        self.reap_teardowns();
         let (earlier, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.teardowns)
             .into_iter()
-            .filter(|(_, h)| !h.is_finished())
             .partition(|(ids, _)| ids.iter().any(|id| ws_ids.contains(id)));
         self.teardowns = rest;
         if tabs.is_empty() && earlier.is_empty() {
@@ -3414,6 +3425,21 @@ impl App {
         }
     }
 
+    /// Drop the finished kill threads. Their workspaces' git status is due
+    /// again: a dying session's last writes can land after the status check
+    /// its close or detach asked for.
+    fn reap_teardowns(&mut self) {
+        self.teardowns.retain(|(ids, h)| {
+            let done = h.is_finished();
+            if done {
+                for id in ids {
+                    self.status_checked.remove(id);
+                }
+            }
+            !done
+        });
+    }
+
     /// Kick off an off-loop git-status pass over the worktree rows that are due
     /// (see [`status_due`]): every urgent row plus the
     /// [`STATUS_BACKGROUND_PER_PASS`] longest-unchecked background ones. A no-op
@@ -3443,12 +3469,12 @@ impl App {
             .filter(|w| w.worktree_path.is_some() && !self.delete_inflight.contains(&w.id))
         {
             let checked = self.status_checked.get(&w.id).copied();
-            let active = self.embedded.get(&w.id).is_some_and(|s| {
-                s.tabs.iter().any(|t| {
-                    self.waiting_response.contains(&t.id)
-                        || t.pane.last_input_at().is_some_and(|i| checked.is_none_or(|c| i > c))
-                })
-            });
+            let active = self.status_active.contains(&w.id)
+                || self.embedded.get(&w.id).is_some_and(|s| {
+                    s.tabs.iter().any(|t| {
+                        t.pane.last_input_at().is_some_and(|i| checked.is_none_or(|c| i > c))
+                    })
+                });
             let age = checked.map(|c| now.saturating_duration_since(c));
             if let Some(prio) = status_due(age, interval, active, selected == Some(w.id.as_str())) {
                 due.push((prio, checked, w.id.clone(), w.working_dir.clone()));
@@ -3463,6 +3489,7 @@ impl App {
         }
         for (_, _, id, _) in &due {
             self.status_checked.insert(id.clone(), now);
+            self.status_active.remove(id);
         }
         self.status_inflight = true;
         std::thread::spawn(move || {
@@ -3499,6 +3526,7 @@ impl App {
             .collect();
         self.branch_status.retain(|id, _| live.contains(id.as_str()));
         self.status_checked.retain(|id, _| live.contains(id.as_str()));
+        self.status_active.retain(|id| live.contains(id.as_str()));
         self.branch_status != before
     }
 
@@ -11560,6 +11588,69 @@ mod key_tests {
         app.dispatch_branch_status(now);
         assert!(app.status_inflight, "typed into since the check: due");
         assert_eq!(recv(&mut rx).await[0].0, "w1");
+    }
+
+    #[tokio::test]
+    async fn a_session_busy_during_a_pass_is_checked_after_it_goes_quiet() {
+        let mut app = worktree_rows_app(1);
+        app.select_repo_row("r1");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        // A pass checked w1 at t0 and is still running while the session works.
+        let t0 = Instant::now();
+        app.status_checked.insert("w1".into(), t0);
+        app.status_inflight = true;
+        app.pane_active_until.insert("a".into(), t0 + Duration::from_secs(1));
+        app.tick(t0);
+        assert!(app.waiting_response.contains("a"), "the session is busy");
+
+        // The pass lands after the spinner is gone.
+        app.status_inflight = false;
+        app.tick(t0 + Duration::from_secs(3));
+        assert!(app.waiting_response.is_empty(), "the session went quiet");
+        assert!(app.status_inflight, "w1 was busy since its check: due");
+        assert_eq!(recv(&mut rx).await[0].0, "w1");
+
+        // Quiet since that check, it waits for its idle interval again.
+        app.status_inflight = false;
+        app.tick(t0 + Duration::from_secs(6));
+        assert!(!app.status_inflight, "taken once");
+    }
+
+    #[test]
+    fn a_finished_teardown_makes_its_workspace_due_again() {
+        let mut app = worktree_rows_app(1);
+        app.select_workspace_row("w1");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+
+        app.close_active_session();
+        // A pass checks w1 while its session is still dying, and runs on.
+        app.dispatch_branch_status(Instant::now());
+        assert!(app.status_checked.contains_key("w1"), "checked during the kill");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.teardowns.iter().all(|(_, h)| h.is_finished()) {
+            assert!(Instant::now() < deadline, "the kill never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.tick(Instant::now());
+        assert!(!app.status_checked.contains_key("w1"), "due again once the session is gone");
     }
 
     #[tokio::test]
