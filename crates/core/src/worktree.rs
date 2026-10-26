@@ -980,13 +980,22 @@ mod tests {
         let from_branch = create_worktree_from_branch(rp, "r1", "b", base.path(), "feat");
         assert!(matches!(from_branch, WorktreeResult::Created { .. }));
 
+        // A low-speed limit the user configured wins over kommand0's.
+        let user_limit = Command::new("git")
+            .args(["-C", rp, "config", "--get-regexp", r"^http\..*lowspeed"])
+            .output()
+            .unwrap()
+            .status
+            .success();
         let env = std::fs::read_to_string(&log).unwrap();
         assert_eq!(env.lines().count(), 2, "one line per worktree add: {env}");
         for line in env.lines() {
             assert!(line.starts_with("0||"), "no terminal prompt and no askpass helper: {line}");
             let fields: Vec<&str> = line.split('|').collect();
             assert!(fields[2].contains("BatchMode=yes"), "ssh can't prompt: {line}");
-            assert_ne!(fields[3], "UNSET", "a stalled https transfer gives up: {line}");
+            if !user_limit {
+                assert_ne!(fields[3], "UNSET", "a stalled https transfer gives up: {line}");
+            }
         }
     }
 

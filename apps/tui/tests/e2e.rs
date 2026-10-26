@@ -1387,6 +1387,16 @@ fn quitting_right_after_closing_a_tab_kills_its_process() {
         assert!(Instant::now() < deadline, "the stub never printed its pid; screen:\n{screen}");
         std::thread::sleep(Duration::from_millis(50));
     };
+    // Whatever fails from here on, the stub's `sleep 1000` must not outlive the test.
+    struct KillOnDrop(Option<nix::unistd::Pid>);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+    }
+    let mut stub = KillOnDrop(Some(pid));
 
     tui.send("\x01");
     tui.send("x");
@@ -1400,8 +1410,8 @@ fn quitting_right_after_closing_a_tab_kills_its_process() {
         std::thread::sleep(Duration::from_millis(50));
         alive = nix::sys::signal::kill(pid, None).is_ok();
     }
-    if alive {
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    if !alive {
+        stub.0 = None; // dead: its pid may be reused
     }
     assert!(!alive, "the closed tab's process outlived kommand0");
 }

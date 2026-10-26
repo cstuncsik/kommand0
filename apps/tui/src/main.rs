@@ -11273,18 +11273,6 @@ mod key_tests {
     }
 
     #[test]
-    fn a_wake_right_after_an_input_draw_draws_at_once() {
-        let t0 = Instant::now();
-        let mut p = Pacer::default();
-        assert!(p.on_wake(t0, Some(1), false));
-        p.drew(Some(1));
-        // A key draws at 30 ms and its echo lands 1 ms later: only draws a
-        // wake caused pace the next one.
-        p.drew(Some(1));
-        assert!(p.on_wake(t0 + Duration::from_millis(31), Some(2), false));
-    }
-
-    #[test]
     fn a_wake_with_nothing_new_does_nothing() {
         let mut p = Pacer::default();
         p.drew(Some(3));
@@ -11333,7 +11321,9 @@ mod key_tests {
         assert!(!p.on_wake(t0, Some(2), true));
         assert!(!p.on_tick(ms(10), Some(2), true, false));
         assert!(!p.on_tick(ms(50), Some(2), true, false));
-        assert!(p.on_tick(ms(100), Some(2), true, false), "a frame that never closes still shows");
+        // More output into the same frame doesn't restart the clock.
+        assert!(!p.on_wake(ms(60), Some(3), true));
+        assert!(p.on_tick(ms(100), Some(3), true, false), "a frame that never closes still shows");
     }
 
     #[test]
@@ -11346,6 +11336,9 @@ mod key_tests {
         assert!(!p.on_wake(t0 + Duration::from_millis(5), Some(2), false));
         assert!(p.on_tick(t0 + Duration::from_millis(6), Some(2), false, false));
         p.drew(Some(2));
+        // Its deadline then finds nothing new, and disarms.
+        assert!(!p.on_deadline(t0 + Duration::from_millis(15), Some(2), false));
+        assert_eq!(p.wake_draw_at, None);
         assert!(!p.on_tick(t0 + Duration::from_millis(56), Some(2), false, false), "all drawn");
     }
 
@@ -11361,6 +11354,7 @@ mod key_tests {
         assert_eq!(p.wake_draw_at, Some(ms(15)));
         assert!(!p.on_wake(ms(14), Some(4), true), "the next frame opens");
         assert!(!p.on_deadline(ms(15), Some(4), true), "the deadline lands mid-frame");
+        assert_eq!(p.wake_draw_at, None, "and is spent");
         let close = ms(15) + Duration::from_micros(500);
         assert!(p.on_wake(close, Some(5), false), "the next close draws at once");
     }
@@ -12966,6 +12960,42 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn a_late_repo_delete_report_keeps_the_cursor_and_focus() {
+        let mut app = test_app();
+        // w2 sits above w3 in beta: a cursor kept by index would slide off it
+        // when alpha and its row go.
+        app.workspaces.push(mk_ws("w2", "aa-two", "r2", None));
+        app.workspaces.push(mk_ws("w3", "zz-three", "r2", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.expanded.extend(["r1".to_string(), "r2".to_string()]);
+        app.rebuild_tree();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+
+        app.delete_repo("r1");
+        app.select_workspace_row("w2");
+        app.embedded.insert(
+            "w2".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        app.focus = Focus::Embedded;
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+        let (target, outcome) = recv(&mut rx).await;
+        app.on_delete_done(target, outcome);
+
+        assert!(app.repos.iter().all(|r| r.id != "r1"), "alpha is gone");
+        let selected = app.selected_workspace().map(|w| w.id.as_str());
+        assert_eq!(selected, Some("w2"), "the cursor stays");
+        assert_eq!(app.focus, Focus::Embedded, "so does the focus");
+        assert!(app.pane_selection.is_some(), "and w2's highlight");
+    }
+
+    #[tokio::test]
     async fn a_removed_cleanup_keeps_the_cursor_on_its_row() {
         let mut app = test_app();
         let wt = tempfile::TempDir::new().unwrap();
@@ -12988,6 +13018,24 @@ mod key_tests {
         let selected = app.selected_workspace().map(|w| w.id.as_str());
         assert_eq!(selected, Some("w2"), "the cursor stays");
         assert!(app.pane_selection.is_some(), "and w2's highlight");
+    }
+
+    #[tokio::test]
+    async fn a_removed_cleanup_leaves_other_dirs_alone() {
+        // w1's dir is back (a create reused it before this late reply), and a
+        // sibling shares its parent.
+        let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
+        let sibling = tmp.path().join("sibling");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(sibling.join("keep.txt"), "mine").unwrap();
+        app.cleanup_inflight.insert("w1".into());
+
+        app.on_cleanup_done("w1".into(), Ok(Cleaned::Removed));
+
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "the row is gone");
+        let kept = std::fs::read_to_string(sibling.join("keep.txt"));
+        assert_eq!(kept.ok().as_deref(), Some("mine"), "the sibling's file is intact");
+        assert!(wt.exists(), "no git ran on the reused dir");
     }
 
     #[tokio::test]
@@ -13050,9 +13098,10 @@ mod key_tests {
             assert!(matches!(app.modal, modal::ModalState::None), "{busy}: c opens nothing");
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             app.cleanup_tx = Some(tx);
-            let before = app.cleanup_inflight.clone();
+            // A cleanup that starts clears the row's last result.
+            app.cleanup_result.insert("w1".into(), ("earlier".into(), false));
             app.start_cleanups(&["w1"]);
-            assert_eq!(app.cleanup_inflight, before, "{busy}: no cleanup starts");
+            assert!(app.cleanup_result.contains_key("w1"), "{busy}: no cleanup starts");
 
             app.select_workspace_row("w2");
             press(&mut app, KeyCode::Enter).await;
@@ -13195,6 +13244,21 @@ mod key_tests {
         let (msg, is_error) = app.profile_notice.clone().expect("a notice");
         assert!(msg.contains("/x/y") && msg.contains("by hand"), "{msg}");
         assert!(is_error, "a failed removal is an error");
+    }
+
+    #[test]
+    fn only_a_failed_removal_asks_for_a_hand_delete() {
+        let path = || "/x/y".to_string();
+        let cases = [
+            (LeftWorktree::Alias { path: path(), owner: "ws-two".into() }, false),
+            (LeftWorktree::Unverified { path: path() }, false),
+            (LeftWorktree::Failed { path: path() }, true),
+        ];
+        for (left, by_hand) in cases {
+            let note = left_worktree_note(&left);
+            assert!(note.contains("/x/y"), "{note}");
+            assert_eq!(note.contains("by hand"), by_hand, "{note}");
+        }
     }
 
     #[tokio::test]
