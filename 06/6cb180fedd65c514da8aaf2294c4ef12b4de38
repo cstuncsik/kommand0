@@ -1,0 +1,41 @@
+apps/tui/src/main.rs
+  s_4488bcd771c902::t_bb03e76fbd5013 12756,13331,13353
+  s_4488bcd771c902::t_bac4e9fdd7dd14 4436-4439
+  s_4488bcd771c902::t_0dff79806cf6f4 5358
+  s_4488bcd771c902::t_32819d05dae002 83-84
+  s_4488bcd771c902::t_6db2a6c10b88c4 4676-4680
+  s_4488bcd771c902::t_4f2f28ed8a534c 3627-3630,3633
+  s_4488bcd771c902::t_3661ae2180336c 4818
+  s_4488bcd771c902::t_e47f26c5ff7c10 5391,5397
+  s_4488bcd771c902::t_b49b0366af56b9 2887
+  s_4488bcd771c902::t_c3e428e09c4c1b 9442,9444-9445
+  s_4488bcd771c902::t_d454c84dfab8f6 12462-12463,12465-12468
+  s_4488bcd771c902::t_829da375f7bf28 5402,5404
+  s_4488bcd771c902::t_b64c9bf98dbbfc 3656-3657
+  s_4488bcd771c902::t_5e8e94b014dd9f 5375
+  s_4488bcd771c902::t_64df5eb4d8d587 185
+crates/core/src/worktree.rs
+  s_4488bcd771c902::t_d3176f7799365d 475
+crates/core/src/lib.rs
+  s_4488bcd771c902::t_e533b411fbae42 2009-2010,2014-2015
+  s_4488bcd771c902::t_763e6a2b1f0c73 28
+  s_4488bcd771c902::t_42c453f8a3d921 1872-1873
+  s_4488bcd771c902::t_0d276bb319b330 3084,3086,3092
+  s_4488bcd771c902::t_9a73164d624f76 2287,2819,2837,2866,2966-2967
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "066cb180fedd65c514da8aaf2294c4ef12b4de38",
+  "prompts": {},
+  "sessions": {
+    "s_4488bcd771c902": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "30ca474e-9d38-471d-a1a8-32843766b0eb",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
