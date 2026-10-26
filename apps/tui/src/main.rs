@@ -73,12 +73,6 @@ fn status_due(
 /// git status.
 const PR_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long an issue-resolve worker counts as running (see
-/// `App::issue_worker_started`). It expires so a worker that never replies
-/// can't wedge the feature for the session: every bounded call on the path
-/// has landed well inside this.
-const ISSUE_WORKER_MAX: Duration = Duration::from_secs(180);
-
 /// How long quitting waits for a workspace create still making its worktree
 /// (about 10 s on a big repo such as n8n) before abandoning it.
 const CREATE_QUIT_WAIT: Duration = Duration::from_secs(15);
@@ -86,8 +80,8 @@ const CREATE_QUIT_WAIT: Duration = Duration::from_secs(15);
 /// Carries a background worker's result to the event loop, sending on drop
 /// so the loop always gets a message (and clears the matching `*_inflight`
 /// flag) even if the worker thread panics before finishing. Shared by the
-/// status/PR refreshes, cleanup, the issue resolve, the review diff, and
-/// profile delete.
+/// status/PR refreshes, cleanup, the issue resolve, the review diff, the
+/// workspace create and delete, and profile delete.
 struct SendOnDrop<T> {
     tx: tokio::sync::mpsc::UnboundedSender<T>,
     payload: Option<T>,
@@ -188,7 +182,7 @@ type CreateMsg = Result<Workspace, String>;
 
 /// The one workspace create running; cleared only by its reply, which
 /// SendOnDrop guarantees even on a panic. No expiry: a hung create blocks
-/// further creates and issue resolves until restart.
+/// further creates, issue resolves, and deletes in its repo until restart.
 struct Creating {
     /// What was typed, restored with the error while the modal still waits.
     repo_id: String,
@@ -2890,7 +2884,7 @@ impl App {
         }
     }
 
-    /// Whether a spinner is on screen, so its advance needs a redraw. A new
+    /// Whether a spinner may be on screen, so its advance needs a redraw. A new
     /// spinner must be added here, or it freezes while nothing else changes.
     fn spinner_visible(&self) -> bool {
         !self.waiting_response.is_empty()
@@ -3626,18 +3620,17 @@ impl App {
         };
     }
 
-    /// Whether an issue-resolve worker may still be running.
-    fn issue_resolve_running(&self) -> bool {
-        self.issue_worker_started.is_some_and(|t| t.elapsed() < ISSUE_WORKER_MAX)
-    }
-
     /// Why a create, or an issue lookup (which ends in one), into `repo_id`
     /// must wait: one create at a time, none during a lookup, none into a
     /// repo being deleted.
     fn create_refusal(&self, repo_id: &str) -> Option<&'static str> {
+        // How long an issue-resolve worker counts as running. It expires so a
+        // worker that never replies can't wedge the feature for the session:
+        // every bounded call on the path has landed well inside this.
+        const ISSUE_WORKER_MAX: Duration = Duration::from_secs(180);
         if self.create.is_some() {
             Some("a workspace is still being created; wait for it to finish")
-        } else if self.issue_resolve_running() {
+        } else if self.issue_worker_started.is_some_and(|t| t.elapsed() < ISSUE_WORKER_MAX) {
             Some("an issue lookup is still running; wait for it to finish")
         } else if self.delete_inflight.contains(repo_id) {
             Some("this repo is being deleted")
@@ -3651,17 +3644,17 @@ impl App {
     /// it in [`Self::finish_create`]. `input` and `branch` are what was typed,
     /// restored with the reason when the create is refused or fails while
     /// the note is up. Inline when the channel isn't wired (unit tests).
-    #[allow(clippy::too_many_arguments)]
     fn start_create(
         &mut self,
         repo_id: String,
-        repo_name: String,
         input: String,
         branch: String,
         name: Option<String>,
         from_branch: Option<String>,
         notice: Option<String>,
     ) {
+        let repo_name =
+            self.repos.iter().find(|r| r.id == repo_id).map(|r| r.name.clone()).unwrap_or_default();
         if let Some(reason) = self.create_refusal(&repo_id) {
             self.reopen_add_workspace(repo_id, repo_name, input, branch, reason.to_string());
             return;
@@ -4440,10 +4433,10 @@ impl App {
         busy
     }
 
-    /// `d`/`D`/`[Delete]` on a busy row ([`Self::row_busy`]) would race the
-    /// worker that owns its worktree, and in a repo a create is making a
-    /// worktree in, it could remove that one as its own (a case variant not
-    /// adopted yet): refused, silently. Logs the refusal.
+    /// Whether `d`/`D`/`[Delete]` on `ws_id` is refused (silently, with a log
+    /// line): its row is busy ([`Self::row_busy`]), or a create is making a
+    /// worktree in its repo, which the delete could take for its own (a case
+    /// variant not adopted yet).
     fn workspace_delete_blocked(&self, ws_id: &str) -> bool {
         if self.refuse_busy(ws_id, "delete") {
             return true;
@@ -4680,17 +4673,11 @@ impl App {
             Ok(Cleaned::Removed) => {
                 // The worktree + branch are gone; drop the workspace too. No
                 // git here: a late reply must not touch a dir another create
-                // reused meanwhile. Only the emptied `worktrees/<repo-id>/`
-                // goes, and `remove_dir` leaves a non-empty one alone.
-                if let Some(parent) = self
-                    .state
-                    .workspaces
-                    .iter()
-                    .find(|w| w.id == ws_id)
-                    .and_then(|w| w.worktree_path.as_deref())
-                    .and_then(|p| std::path::Path::new(p).parent())
-                {
-                    let _ = std::fs::remove_dir(parent);
+                // reused meanwhile. Only an empty parent goes:
+                // `worktrees/<repo-id>/`, or `worktrees/` for a legacy flat row.
+                let ws = self.state.workspaces.iter().find(|w| w.id == ws_id);
+                if let Some(wt) = ws.and_then(|w| w.worktree_path.as_deref()) {
+                    kommand0_core::remove_empty_parent(wt);
                 }
                 self.forget_workspace(&ws_id);
             }
@@ -4828,7 +4815,7 @@ impl App {
                     format!("Created linked branch {} on origin", b.branch)
                 });
                 let from = Some(b.branch);
-                self.start_create(repo_id, repo_name, issue, String::new(), None, from, notice);
+                self.start_create(repo_id, issue, String::new(), None, from, notice);
             }
             Err(e) => self.reopen_add_workspace(repo_id, repo_name, issue, String::new(), e),
         }
@@ -5366,10 +5353,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // An explicitly-filled Branch field checks out that branch as
                     // today — the detect-and-offer flow is only for a blank one.
                     // A blank name means derive a path-safe one from the branch.
-                    let repo_name = repo.map(|r| r.name).unwrap_or_default();
                     let ws_name = (!name.is_empty()).then(|| name.clone());
                     let from = Some(branch.clone());
-                    app.start_create(repo_id, repo_name, name, branch, ws_name, from, None);
+                    app.start_create(repo_id, name, branch, ws_name, from, None);
                 } else if let Some(repo) = repo {
                     // An issue reference (123, #123, or an issue URL) in the Name
                     // field means "the branch GitHub links to that issue".
@@ -5386,7 +5372,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // core's error, with the typed name preserved for a retry.
                     else if name.contains('/') {
                         let from = Some(name.clone());
-                        app.start_create(repo_id, repo.name, name, String::new(), None, from, None);
+                        app.start_create(repo_id, name, String::new(), None, from, None);
                     }
                     // Blank branch: offer the checkout only for a valid, unused
                     // name whose bare branch already exists — otherwise fall
@@ -5402,27 +5388,20 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         };
                     } else {
                         let ws_name = Some(name.clone());
-                        app.start_create(repo_id, repo.name, name, String::new(), ws_name, None, None);
+                        app.start_create(repo_id, name, String::new(), ws_name, None, None);
                     }
                 } else {
                     // Repo not found: fall through to create so its resolve error
                     // surfaces (don't call the detector with an empty path).
                     let ws_name = Some(name.clone());
-                    app.start_create(repo_id, String::new(), name, String::new(), ws_name, None, None);
+                    app.start_create(repo_id, name, String::new(), ws_name, None, None);
                 }
             }
             modal::ModalResult::BranchCheckoutChoice { repo_id, name, checkout } => {
                 // Route directly — never back through SubmitWorkspace, or a fork
-                // would re-trigger detection and loop. repo_name is only needed
-                // for the Err-reopen text.
-                let repo_name = app
-                    .repos
-                    .iter()
-                    .find(|r| r.id == repo_id)
-                    .map(|r| r.name.clone())
-                    .unwrap_or_default();
+                // would re-trigger detection and loop.
                 let (ws_name, from) = (Some(name.clone()), checkout.then(|| name.clone()));
-                app.start_create(repo_id, repo_name, name, String::new(), ws_name, from, None);
+                app.start_create(repo_id, name, String::new(), ws_name, from, None);
             }
             modal::ModalResult::SubmitRename(ws_id, session_id, title) => {
                 // Only title a session that's still live — reap can heal/drop the
@@ -9460,22 +9439,10 @@ mod key_tests {
 
     #[tokio::test]
     async fn reopening_the_diff_shows_loading_not_the_old_rows() {
-        let mut app = test_app();
-        let repo = add_real_repo(&mut app, "feat");
-        let tmp = tempfile::TempDir::new().unwrap();
-        let wt = tmp.path().join("wt");
-        let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        };
-        git(repo.path(), &["worktree", "add", wt.to_str().unwrap(), "feat"]);
+        let (mut app, _repo, _tmp, wt) = app_with_a_real_worktree();
         std::fs::write(wt.join("work.txt"), "work").unwrap();
-        git(&wt, &["add", "."]);
-        git(&wt, &["commit", "-m", "work"]);
-        route_w1_to_real(&mut app, &wt, "feat");
-        app.expanded.insert("real".to_string());
-        app.rebuild_tree();
-        app.select_workspace_row("w1");
+        git_ok(&wt, &["add", "."]);
+        git_ok(&wt, &["commit", "-m", "work"]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         app.diff_tx = Some(tx);
 
@@ -12492,22 +12459,13 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn a_cleanup_kills_the_panes_before_it_removes_their_worktree() {
-        let mut app = test_app();
-        let repo = add_real_repo(&mut app, "feat");
-        let tmp = tempfile::TempDir::new().unwrap();
-        let wt = tmp.path().join("wt");
-        let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        };
-        git(repo.path(), &["worktree", "add", wt.to_str().unwrap(), "feat"]);
+    async fn a_cleanup_kills_its_panes_off_the_loop() {
+        let (mut app, repo, _tmp, wt) = app_with_a_real_worktree();
         std::fs::write(wt.join("work.txt"), "work").unwrap();
-        git(&wt, &["add", "."]);
-        git(&wt, &["commit", "-m", "work"]);
-        git(repo.path(), &["merge", "--squash", "--ff", "feat"]);
-        git(repo.path(), &["commit", "-m", "squash feat"]);
-        route_w1_to_real(&mut app, &wt, "feat");
+        git_ok(&wt, &["add", "."]);
+        git_ok(&wt, &["commit", "-m", "work"]);
+        git_ok(repo.path(), &["merge", "--squash", "--ff", "feat"]);
+        git_ok(repo.path(), &["commit", "-m", "squash feat"]);
         let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
         app.cleanup_tx = Some(cleanup_tx);
         // Until it dies the child keeps recreating a dir under its cwd, so a
@@ -12795,7 +12753,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn repo_delete_waits_while_a_row_is_busy() {
+    async fn repo_delete_is_ignored_while_a_row_is_busy() {
         for deleting in [false, true] {
             let busy = if deleting { "delete" } else { "cleanup" };
             let mark = |app: &mut App, on: bool| {
@@ -13370,7 +13328,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn a_delete_waits_for_a_create_into_its_repo() {
+    async fn a_delete_is_ignored_while_a_create_runs_in_its_repo() {
         let mut app = test_app();
         app.workspaces.push(mk_ws("w2", "ws-two", "r2", None));
         app.state.workspaces = app.workspaces.clone();
@@ -13392,7 +13350,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn a_repo_delete_waits_for_a_create_into_it() {
+    async fn a_repo_delete_is_ignored_while_a_create_runs_in_it() {
         let mut app = test_app();
         app.create = Some(creating("r1"));
         app.select_repo_row("r1");

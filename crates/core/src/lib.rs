@@ -25,6 +25,7 @@ pub use repo::{RepoEntry, run_git_status};
 pub use session::{Session, SessionStatus};
 pub use sort::{SortMode, sort_repos, sort_workspaces};
 pub use workspace::Workspace;
+pub use worktree::remove_empty_parent;
 
 use std::collections::HashMap;
 use std::fs;
@@ -1534,16 +1535,6 @@ impl AppState {
         self.delete_repo_with_base(repo_ref, Self::state_dir().as_path())
     }
 
-    /// Remove the repo with EXACTLY this id (never a name match) and everything
-    /// under it from the in-memory state: its sessions (and their log files),
-    /// its workspaces (and their worktrees) with their `embedded_sessions`/
-    /// `embedded_titles` entries, then the repo. No save, like
-    /// [`Self::remove_workspace`]: the caller persists. `None` when no repo
-    /// has that id, a no-op. User-facing refs stay on [`Self::delete_repo`].
-    pub fn remove_repo(&mut self, id: &str) -> Option<RepoEntry> {
-        self.remove_repo_in(id, &Self::state_dir())
-    }
-
     /// [`Self::take_repo`], then each row's worktree, guarded against `base`'s
     /// rows ([`Self::remove_worktree_of`]): the repo's own rows all go, so
     /// only the rows that stay can claim a dir.
@@ -1878,8 +1869,8 @@ impl AppState {
     /// workspace is named with another workspace's id-shaped string).
     /// Trade-off: in that shadow state the TUI's by-id archive/activate
     /// calls hit the error and silently no-op until the shadowing row is
-    /// deleted by its own id; destructive deletes are immune, they use the
-    /// exact-id [`Self::remove_workspace`] path instead.
+    /// deleted by its own id; destructive deletes are immune, they take the
+    /// row by exact id ([`Self::take_workspace`]) instead.
     fn workspace_index(&self, ws_ref: &str) -> anyhow::Result<usize> {
         let matches: Vec<usize> = self
             .workspaces
@@ -2015,14 +2006,13 @@ impl AppState {
     /// in-memory state: the row, its `embedded_sessions`/`embedded_titles`
     /// entries and its git worktree ([`Self::remove_worktree_of`] against
     /// [`Self::state_dir`]; idempotent: a dir already gone still clears an
-    /// empty `worktrees/<repo-id>/`). No save: the caller persists (`save_to`,
-    /// or the TUI's merge-aware `save_state`), so a concurrent `kmd` write is
-    /// merged, not clobbered.
+    /// empty `worktrees/<repo-id>/`). No save: the caller persists (`kmd`
+    /// merge-saves), so a concurrent write is merged, not clobbered.
     /// `None` when no row has that id, a no-op: immune to name shadowing AND to
     /// the race where the row was deleted meanwhile and a new workspace is NAMED
     /// that id string, which a ws_ref lookup would mis-target. For callers
-    /// holding a state-held id (the TUI's tree actions, the cleanups);
-    /// user-facing refs stay on [`Self::delete_workspace`].
+    /// holding a state-held id (`kmd`'s cleanups); user-facing refs stay on
+    /// [`Self::delete_workspace`].
     pub fn remove_workspace(&mut self, id: &str) -> Option<Workspace> {
         let removed = self.take_workspace(id)?;
         self.remove_taken_worktree(&removed, &Self::state_dir());
@@ -2294,6 +2284,7 @@ pub fn plan_repo_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::tests::git;
     use tempfile::TempDir;
 
     fn ws(id: &str, name: &str) -> Workspace {
@@ -2788,12 +2779,6 @@ mod tests {
         }
     }
 
-    /// `git -C <repo> <args>`, which must succeed.
-    fn git_in(repo: &str, args: &[&str]) {
-        let out = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    }
-
     #[test]
     fn a_case_variant_create_refuses_and_keeps_the_files() {
         let tmp = TempDir::new().unwrap();
@@ -2831,7 +2816,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (mut state, base, r) = state_with_repo(&tmp);
         let orphan = base.join("worktrees").join(&r.id).join("orphan");
-        git_in(&r.path, &["worktree", "add", "--detach", orphan.to_str().unwrap()]);
+        git(Path::new(&r.path), &["worktree", "add", "--detach", orphan.to_str().unwrap()]);
 
         let ws = state.create_workspace_with_base(Some("orphan"), &r.id, &base).unwrap();
         assert_eq!(ws.worktree_path.as_deref(), orphan.to_str(), "a real worktree, not a fallback row");
@@ -2849,7 +2834,7 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Local, so it beats a hooksPath in the global config the tests inherit.
         let hooks = hook.parent().unwrap().to_str().unwrap();
-        crate::git::tests::git(Path::new(&r.path), &["config", "core.hooksPath", hooks]);
+        git(Path::new(&r.path), &["config", "core.hooksPath", hooks]);
 
         let ws = state.create_workspace_with_base(Some("hooked"), &r.id, &base).unwrap();
         let dir = base.join("worktrees").join(&r.id).join("hooked");
@@ -2878,7 +2863,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (mut state, base, r) = state_with_repo(&tmp);
         let foo = state.create_workspace_with_base(Some("foo"), &r.id, &base).unwrap();
-        git_in(&r.path, &["worktree", "remove", "--force", foo.worktree_path.as_deref().unwrap()]);
+        git(Path::new(&r.path), &["worktree", "remove", "--force", foo.worktree_path.as_deref().unwrap()]);
         let upper = live_worktree(&mut state, &r.id, "Foo", &base);
 
         state.delete_workspace_with_base(&foo.id, &base).unwrap();
@@ -2978,8 +2963,8 @@ mod tests {
         let [removed, gone, locked] = ["removed", "gone", "locked"]
             .map(|n| state.create_workspace_with_base(Some(n), &r.id, &base).unwrap());
         let dir = |w: &Workspace| w.worktree_path.clone().unwrap();
-        git_in(&r.path, &["worktree", "remove", "--force", &dir(&gone)]);
-        git_in(&r.path, &["worktree", "lock", &dir(&locked)]);
+        git(Path::new(&r.path), &["worktree", "remove", "--force", &dir(&gone)]);
+        git(Path::new(&r.path), &["worktree", "lock", &dir(&locked)]);
         let fallback = Workspace { repo_id: r.id.clone(), working_dir: r.path.clone(), ..ws("fb", "fb") };
 
         let cases = [
@@ -3096,15 +3081,15 @@ mod tests {
     }
 
     #[test]
-    fn remove_repo_ignores_name_shadowing() {
+    fn take_repo_ignores_name_shadowing() {
         let mut state = shadowed_repos();
-        let removed = state.remove_repo("a-id").unwrap();
+        let (removed, _) = state.take_repo("a-id").unwrap();
         assert_eq!(removed.id, "a-id", "the id match wins over the shadowing name");
         assert_eq!(state.repos.len(), 1);
         assert_eq!(state.repos[0].id, "b-id", "the shadowing repo is untouched");
         assert_eq!(state.workspaces.len(), 1, "A's row went with it");
         assert_eq!(state.workspaces[0].id, "wb");
-        assert!(state.remove_repo("a-id").is_none(), "no name-match fallback");
+        assert!(state.take_repo("a-id").is_none(), "no name-match fallback");
         assert_eq!(state.repos.len(), 1);
     }
 

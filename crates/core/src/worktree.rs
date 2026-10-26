@@ -472,7 +472,7 @@ pub fn create_worktree_from_branch(
 /// EMPTY dir, so a sibling worktree keeps it alive; for a legacy flat
 /// worktree the parent is `worktrees/` itself, removed only when empty and
 /// recreated on demand, a harmless no-op.
-fn remove_empty_parent(worktree_path: &str) {
+pub fn remove_empty_parent(worktree_path: &str) {
     if let Some(parent) = Path::new(worktree_path).parent() {
         let _ = std::fs::remove_dir(parent);
     }
