@@ -177,8 +177,9 @@ fn repo_cleanup_counts(items: &[RepoCleanupItem]) -> (usize, usize, usize) {
 /// wins) and the branch GitHub links to the issue.
 type IssueMsg = (u64, Result<kommand0_core::IssueBranch, String>);
 
-/// What the create worker sends back: the workspace it made, or why not.
-type CreateMsg = Result<Workspace, String>;
+/// What the create worker sends back: the workspace it made, with git's last
+/// line when its post-checkout hook failed, or why not.
+type CreateMsg = Result<(Workspace, Option<String>), String>;
 
 /// The one workspace create running; cleared only by its reply, which
 /// SendOnDrop guarantees even on a panic. No expiry: a hung create blocks
@@ -3690,9 +3691,10 @@ impl App {
     }
 
     /// The create's worker reported. A made workspace is adopted and saved
-    /// whether or not the Creating note still waits, and its notice shown. A
-    /// failure reopens Add Workspace while the note waits; after Esc it is an
-    /// error notice, and whatever modal is up now stays.
+    /// whether or not the Creating note still waits, and its notice shown,
+    /// naming a post-checkout hook that failed. A failure reopens Add
+    /// Workspace while the note waits; after Esc it is an error notice, and
+    /// whatever modal is up now stays.
     fn finish_create(&mut self, result: CreateMsg) {
         let Some(c) = self.create.take() else {
             tracing::warn!("a workspace create reported, but none was running; ignored");
@@ -3702,10 +3704,13 @@ impl App {
         if waiting {
             self.modal = modal::ModalState::None;
         }
-        let adopted = result.and_then(|ws| {
+        let adopted = result.and_then(|(ws, hook_error)| {
             let made_at = ws.worktree_path.clone();
             let made = made_at.clone().unwrap_or_else(|| ws.name.clone());
-            self.state.insert_workspace(ws).map(|()| made).map_err(|e| match made_at {
+            let hook_note = hook_error.map(|line| {
+                format!("created {}, but its post-checkout hook failed: {line}", ws.name)
+            });
+            self.state.insert_workspace(ws).map(|()| (made, hook_note)).map_err(|e| match made_at {
                 Some(p) => format!(
                     "the worktree was made at {p}, but the workspace couldn't be added: {e}; \
                      the worktree was left there"
@@ -3714,7 +3719,7 @@ impl App {
             })
         });
         match adopted {
-            Ok(made) => {
+            Ok((made, hook_note)) => {
                 let saved = self.persist_state();
                 self.workspaces = self.state.workspaces.clone();
                 self.expanded.insert(c.repo_id);
@@ -3727,8 +3732,11 @@ impl App {
                     tracing::warn!("failed to persist state: {e:#}");
                     let msg = format!("created {made} but couldn't save it: {e:#}");
                     self.profile_notice = Some((msg, true));
-                } else if let Some(notice) = c.notice {
-                    self.profile_notice = Some((notice, false));
+                } else {
+                    let notes: Vec<String> = c.notice.into_iter().chain(hook_note).collect();
+                    if !notes.is_empty() {
+                        self.profile_notice = Some((notes.join("; "), false));
+                    }
                 }
             }
             Err(e) if waiting => {
@@ -7831,7 +7839,7 @@ mod key_tests {
         app.state.workspaces.push(mk_ws("other", "dupe", "real", None));
 
         let result = recv(&mut rx).await;
-        let path = result.as_ref().unwrap().worktree_path.clone().unwrap();
+        let path = result.as_ref().unwrap().0.worktree_path.clone().unwrap();
         app.finish_create(result);
 
         let (e, input) = reopened(&app);
@@ -7851,13 +7859,31 @@ mod key_tests {
         app.fail_saves = true;
 
         let result = recv(&mut rx).await;
-        let path = result.as_ref().unwrap().worktree_path.clone().unwrap();
+        let path = result.as_ref().unwrap().0.worktree_path.clone().unwrap();
         app.finish_create(result);
 
         let (msg, is_error) = app.profile_notice.clone().expect("a notice");
         assert!(msg.contains(&path) && msg.contains("couldn't save"), "{msg}");
         assert!(is_error);
         assert!(app.workspaces.iter().any(|w| w.name == "unsaved"), "the row stays listed");
+    }
+
+    #[test]
+    fn a_failed_post_checkout_hook_is_named_in_the_create_notice() {
+        let mut app = test_app();
+        let notice = Some("Created linked branch ws-nine on origin".to_string());
+        app.create = Some(Creating { notice, ..creating("r1") });
+
+        app.finish_create(Ok((mk_ws("w9", "ws-nine", "r1", None), Some("hook says no".into()))));
+
+        assert!(app.workspaces.iter().any(|w| w.id == "w9"), "the workspace is adopted");
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert_eq!(
+            msg,
+            "Created linked branch ws-nine on origin; \
+             created ws-nine, but its post-checkout hook failed: hook says no"
+        );
+        assert!(!is_error, "the workspace is usable");
     }
 
     #[tokio::test]
@@ -12588,7 +12614,7 @@ mod key_tests {
         let mut app = test_app();
         app.create = Some(creating("r1"));
 
-        app.finish_create(Ok(mk_ws("w9", "ws-nine", "r1", None)));
+        app.finish_create(Ok((mk_ws("w9", "ws-nine", "r1", None), None)));
         assert!(
             app.state_baseline.workspaces.iter().any(|w| w.id == "w9"),
             "the baseline tracks the saved row"

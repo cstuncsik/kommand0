@@ -11,6 +11,9 @@ pub enum WorktreeResult {
     Created {
         worktree_path: String,
         branch_name: String,
+        /// git's last stderr line when the post-checkout hook failed (the
+        /// worktree is still made).
+        hook_error: Option<String>,
     },
     /// Worktree creation failed; caller should fall back to repo root.
     Fallback {
@@ -221,7 +224,7 @@ fn finish_worktree_add(
     match output {
         Ok(result) if result.status.success() => {
             copy_worktree_files(repo_path, &worktree_path);
-            WorktreeResult::Created { worktree_path, branch_name }
+            WorktreeResult::Created { worktree_path, branch_name, hook_error: None }
         }
         // git keeps a worktree whose post-checkout hook failed, and removes
         // one it gave up on; the dir didn't exist before the add.
@@ -233,7 +236,8 @@ fn finish_worktree_add(
                 stderr.trim()
             );
             copy_worktree_files(repo_path, &worktree_path);
-            WorktreeResult::Created { worktree_path, branch_name }
+            let hook_error = Some(crate::git::last_line(&result.stderr));
+            WorktreeResult::Created { worktree_path, branch_name, hook_error }
         }
         Ok(result) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -613,6 +617,7 @@ mod tests {
             WorktreeResult::Created {
                 worktree_path,
                 branch_name,
+                ..
             } => {
                 assert!(Path::new(&worktree_path).exists());
                 assert_eq!(branch_name, "my-feature", "branch is named after the workspace");
@@ -801,7 +806,7 @@ mod tests {
         let base = TempDir::new().unwrap();
         init_git_repo(repo.path());
         match create_worktree(repo.path().to_str().unwrap(), "r1", "ajándék-tálcás-ő-ű", base.path()) {
-            WorktreeResult::Created { worktree_path, branch_name } => {
+            WorktreeResult::Created { worktree_path, branch_name, .. } => {
                 assert_eq!(branch_name, "ajandek-talcas-o-u");
                 assert!(
                     worktree_path.ends_with("ajándék-tálcás-ő-ű"),
@@ -824,7 +829,7 @@ mod tests {
         Command::new("git").args(["-C", rp, "branch", "feat"]).output().unwrap();
 
         match create_worktree_from_branch(rp, "r1", "ws", base.path(), "feat") {
-            WorktreeResult::Created { worktree_path, branch_name } => {
+            WorktreeResult::Created { worktree_path, branch_name, .. } => {
                 assert!(Path::new(&worktree_path).exists());
                 assert_eq!(branch_name, "feat", "existing branch checked out as-is (no fork)");
                 let head = Command::new("git")
@@ -995,7 +1000,7 @@ mod tests {
         let base = TempDir::new().unwrap();
 
         match create_worktree_from_branch(clone.to_str().unwrap(), "r1", "ws", base.path(), "feat") {
-            WorktreeResult::Created { worktree_path, branch_name } => {
+            WorktreeResult::Created { worktree_path, branch_name, .. } => {
                 assert_eq!(branch_name, "feat", "a local branch is created for the remote ref");
                 let up = Command::new("git")
                     .args(["-C", &worktree_path, "rev-parse", "--abbrev-ref", "feat@{upstream}"])

@@ -1709,7 +1709,8 @@ impl AppState {
         from_branch: Option<&str>,
     ) -> anyhow::Result<Workspace> {
         let (repo, ws_name, taken) = self.resolve_new_workspace(name, repo_ref, from_branch)?;
-        let ws = Self::make_workspace(&repo, &ws_name, base, from_branch, use_worktree, &taken)?;
+        // A failed post-checkout hook is already logged (on stderr under kmd).
+        let (ws, _) = Self::make_workspace(&repo, &ws_name, base, from_branch, use_worktree, &taken)?;
         self.insert_workspace(ws.clone())?;
         self.save_to(base)?;
         Ok(ws)
@@ -1743,7 +1744,8 @@ impl AppState {
 
     /// Make the workspace [`Self::resolve_new_workspace`] resolved: its git
     /// worktree, or a row on the repo root when none is wanted or git can't
-    /// make one. Touches no state, so it can run off the UI thread;
+    /// make one, with git's last line when the worktree's post-checkout hook
+    /// failed. Touches no state, so it can run off the UI thread;
     /// [`Self::insert_workspace`] adds the result.
     pub fn make_workspace(
         repo: &RepoEntry,
@@ -1752,7 +1754,7 @@ impl AppState {
         from_branch: Option<&str>,
         use_worktree: bool,
         taken: &[Workspace],
-    ) -> anyhow::Result<Workspace> {
+    ) -> anyhow::Result<(Workspace, Option<String>)> {
         // The worktree create force-removes whatever is at its dir, so refuse a
         // dir that is another workspace's worktree. A dir that can't be built
         // gets the fallback row below, as before.
@@ -1775,12 +1777,12 @@ impl AppState {
 
         // Create a git worktree: on an existing branch if one was requested, else
         // on a fresh branch named after the workspace.
-        let (working_dir, worktree_path, branch_name) = if !use_worktree {
-            (repo.path.clone(), None, None)
+        let (working_dir, worktree_path, branch_name, hook_error) = if !use_worktree {
+            (repo.path.clone(), None, None, None)
         } else if let Some(branch_ref) = from_branch {
             match worktree::create_worktree_from_branch(&repo.path, &repo.id, ws_name, base, branch_ref) {
-                worktree::WorktreeResult::Created { worktree_path, branch_name } => {
-                    (worktree_path.clone(), Some(worktree_path), Some(branch_name))
+                worktree::WorktreeResult::Created { worktree_path, branch_name, hook_error } => {
+                    (worktree_path.clone(), Some(worktree_path), Some(branch_name), hook_error)
                 }
                 // An explicit branch request that can't be satisfied is an error,
                 // not a silent fall back to the repo root.
@@ -1790,17 +1792,17 @@ impl AppState {
             }
         } else {
             match worktree::create_worktree(&repo.path, &repo.id, ws_name, base) {
-                worktree::WorktreeResult::Created { worktree_path, branch_name } => {
-                    (worktree_path.clone(), Some(worktree_path), Some(branch_name))
+                worktree::WorktreeResult::Created { worktree_path, branch_name, hook_error } => {
+                    (worktree_path.clone(), Some(worktree_path), Some(branch_name), hook_error)
                 }
                 worktree::WorktreeResult::Fallback { reason } => {
                     tracing::warn!("no worktree for {ws_name}, using the repo root: {reason}");
-                    (repo.path.clone(), None, None)
+                    (repo.path.clone(), None, None, None)
                 }
             }
         };
 
-        Ok(Workspace {
+        let ws = Workspace {
             id: generate_id(),
             name: ws_name.to_string(),
             repo_id: repo.id.clone(),
@@ -1809,7 +1811,8 @@ impl AppState {
             created_at: now,
             worktree_path,
             branch_name,
-        })
+        };
+        Ok((ws, hook_error))
     }
 
     /// Add a made workspace ([`Self::make_workspace`]), unless its repo is
@@ -2826,10 +2829,10 @@ mod tests {
     fn a_worktree_whose_post_checkout_hook_failed_is_still_used() {
         // git fails the add but keeps the worktree.
         let tmp = TempDir::new().unwrap();
-        let (mut state, base, r) = state_with_repo(&tmp);
+        let (state, base, r) = state_with_repo(&tmp);
         let hook = tmp.path().join("hooks").join("post-checkout");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(&hook, "#!/bin/sh\necho 'hook says no' >&2\nexit 1\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Local, so it beats a hooksPath in the global config the tests inherit.
@@ -2838,12 +2841,14 @@ mod tests {
         std::fs::write(Path::new(&r.path).join(".worktree-copy"), "notes.txt\n").unwrap();
         std::fs::write(Path::new(&r.path).join("notes.txt"), "local").unwrap();
 
-        let ws = state.create_workspace_with_base(Some("hooked"), &r.id, &base).unwrap();
+        let (repo, name, taken) = state.resolve_new_workspace(Some("hooked"), &r.id, None).unwrap();
+        let (ws, hook_error) = AppState::make_workspace(&repo, &name, &base, None, true, &taken).unwrap();
         let dir = base.join("worktrees").join(&r.id).join("hooked");
         assert_eq!(ws.worktree_path.as_deref(), dir.to_str(), "its own worktree, not the repo root");
         assert_eq!(ws.branch_name.as_deref(), Some("hooked"));
         let copied = std::fs::read_to_string(dir.join("notes.txt")).ok();
         assert_eq!(copied.as_deref(), Some("local"), "the .worktree-copy files are copied");
+        assert_eq!(hook_error.as_deref(), Some("hook says no"), "the caller hears why");
     }
 
     #[test]
@@ -3026,7 +3031,7 @@ mod tests {
         let (state, base, r) = state_with_repo(&tmp);
         let (repo, name, taken) = state.resolve_new_workspace(Some("a"), &r.id, None).unwrap();
 
-        let ws = AppState::make_workspace(&repo, &name, &base, None, true, &taken).unwrap();
+        let (ws, _) = AppState::make_workspace(&repo, &name, &base, None, true, &taken).unwrap();
         assert_eq!((ws.name.as_str(), ws.repo_id.as_str()), ("a", r.id.as_str()));
         assert_eq!(ws.branch_name.as_deref(), Some("a"), "on a fresh branch");
         assert!(Path::new(ws.worktree_path.as_deref().unwrap()).exists(), "the worktree is on disk");
