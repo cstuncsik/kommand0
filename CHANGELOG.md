@@ -5,6 +5,69 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **The background git status and `kmd workspace status` no longer take git's
+  optional index lock** (`git --no-optional-locks status`): a status check never
+  rewrites a worktree's index, so a git command running there at the same
+  moment can't trip over its `index.lock`.
+- **Git status is checked per workspace, only when it can have changed**: about
+  every 2 s while you work in one (a session busy or typed into), about every
+  10 s for the selected one, at least every 5 minutes otherwise, and right after
+  a create, close, detach, stop or cleanup. The background git load drops from
+  continuous (every worktree, back to back) to occasional.
+  `status_refresh_secs` now sets the interval for a workspace you work in.
+- **An idle screen no longer repaints 20 times a second**: the 50 ms tick
+  redraws only when it changed something on screen (a tab gone, focus, a
+  spinner frame, a "needs you" dot), and a pointer move only when it changes a
+  button's hover.
+- **Keystroke echo in a session no longer waits on the previous frame, and a
+  session's output no longer stalls key handling**: only redraws caused by
+  output are paced (about 66 a second), and a deferred one waits on its own
+  timer instead of pausing the event loop. Frames a session marks as
+  synchronized (DEC mode 2026) are shown whole, not half painted; a frame left
+  open still shows after 100 ms. The event loop runs on one thread instead of
+  starting an idle worker per CPU core.
+
+### Fixed
+
+- **Closing a tab, detaching, the Stop button, starting a cleanup and healing a
+  resume no longer freeze the UI while session processes exit**: a Node
+  `claude` ignores the hangup and only dies at the kill 250 ms later, which
+  used to be waited out on the event loop. The processes now die in the
+  background, and quitting waits for them. Detaching, stopping or starting a
+  cleanup with codex or opencode tabs still waits up to 1.5 s to capture their
+  session id.
+- **Opening the review diff (`v`) no longer freezes the UI on a big branch**:
+  git computes it in the background while the dialog says "Loading diff…".
+- **Creating a workspace whose name differs from another's only in case no
+  longer deletes that workspace's worktree** on a case-insensitive volume (the
+  macOS default), where both names share one directory: the create is refused.
+  Deleting a workspace whose directory is another workspace's worktree (a case
+  variant, a symlink) keeps that worktree. Applies to `kmd` too.
+- **Creating a workspace can no longer stop on a git, ssh or LFS prompt** that
+  reads keystrokes meant for the TUI: `git worktree add` runs
+  non-interactively, like kommand0's fetches. Applies to `kmd` too.
+- **A workspace whose post-checkout hook fails still gets its worktree**: git
+  reports the hook's failure but keeps the worktree, which kommand0 used to
+  leave behind for a row on the shared checkout (or, checking out a branch, an
+  error). The failure is now reported: the TUI's notice quotes the hook's last
+  line of output (or says it printed nothing), and `kmd` prints git's output as
+  a warning. The reason for any fallback to the shared checkout is logged.
+  Applies to `kmd` too.
+- **Deleting a workspace or repo no longer freezes the UI while git removes
+  worktrees** (#129): the detail pane shows "Deleting…" until its directory is
+  gone, and anything kept or left behind is named.
+- **Creating a workspace no longer freezes the UI while git makes its
+  worktree** (about 10 s on a big repo): the worktree is made in the
+  background behind a "Making the git worktree" note. Esc hides the note and
+  the workspace still appears; quitting waits up to 15 s for it.
+- **A create no longer adds a second workspace of the same name** when another
+  kommand0 or `kmd` saved that name in the repo while the worktree was being
+  made: the create is refused, and the TUI names the worktree it left. Two
+  workspaces of one name left `kmd` refusing that name as ambiguous. Applies to
+  `kmd` too.
+
 ## [0.32.1] - 2026-10-23
 
 ### Changed

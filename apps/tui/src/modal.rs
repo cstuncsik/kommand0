@@ -149,6 +149,12 @@ pub(crate) enum ModalState {
         repo_name: String,
         issue: String,
     },
+    /// A workspace create is making its git worktree in the background.
+    /// Display-only: Esc hides the note (the workspace still gets created),
+    /// every other key is swallowed.
+    CreatingWorkspace {
+        repo_name: String,
+    },
 }
 
 impl ModalState {
@@ -508,7 +514,7 @@ pub(crate) fn handle_modal_key(modal: &mut ModalState, key: KeyEvent) -> ModalRe
                 _ => ModalResult::Consumed,
             }
         }
-        ModalState::ResolvingIssue { .. } => match key.code {
+        ModalState::ResolvingIssue { .. } | ModalState::CreatingWorkspace { .. } => match key.code {
             KeyCode::Esc => {
                 *modal = ModalState::None;
                 ModalResult::Cancelled
@@ -590,7 +596,8 @@ pub(crate) fn handle_modal_paste(modal: &mut ModalState, text: &str) {
         | ModalState::ConfirmCleanup { .. }
         | ModalState::ConfirmRepoCleanup { .. }
         | ModalState::ConfirmBranchCheckout { .. }
-        | ModalState::ResolvingIssue { .. } => {
+        | ModalState::ResolvingIssue { .. }
+        | ModalState::CreatingWorkspace { .. } => {
             return;
         }
     };
@@ -1252,7 +1259,32 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 inner[2],
             );
         }
-        ModalState::ResolvingIssue { repo_name, issue, .. } => {
+        ModalState::ResolvingIssue { repo_name, .. } | ModalState::CreatingWorkspace { repo_name } => {
+            // Esc cancels neither the lookup nor the create, so neither footer
+            // may imply it does.
+            let (message, footer) = match modal {
+                // Name the target: this can perform a remote write.
+                ModalState::ResolvingIssue { issue, .. } => (
+                    vec![
+                        Line::styled(
+                            format!("Resolving issue {issue} on {repo_name}'s origin."),
+                            Style::default().fg(th.text),
+                        ),
+                        Line::styled(
+                            "GitHub may create a new linked branch.",
+                            Style::default().fg(th.muted),
+                        ),
+                    ],
+                    " stop waiting",
+                ),
+                _ => (
+                    vec![Line::styled(
+                        "Making the git worktree. This can take a while on a big repo.",
+                        Style::default().fg(th.text),
+                    )],
+                    " hide; it still gets created",
+                ),
+            };
             let area = centered_rect(55, 20, frame.area());
             frame.render_widget(Clear, area);
 
@@ -1278,29 +1310,11 @@ pub(crate) fn render_modal(frame: &mut ratatui::Frame, modal: &ModalState, theme
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(th.accent));
             frame.render_widget(block, area);
-
-            // Name the target: this can perform a remote write.
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::styled(
-                        format!("Resolving issue {issue} on {repo_name}'s origin."),
-                        Style::default().fg(th.text),
-                    ),
-                    Line::styled(
-                        "GitHub may create a new linked branch.",
-                        Style::default().fg(th.muted),
-                    ),
-                ])
-                .wrap(Wrap { trim: true }),
-                inner[0],
-            );
-
-            // Esc does NOT cancel the remote operation, so the footer must not
-            // imply it does.
+            frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: true }), inner[0]);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("Esc", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-                    Span::raw(" stop waiting"),
+                    Span::raw(footer),
                 ])),
                 inner[2],
             );
@@ -1474,6 +1488,10 @@ mod tests {
         };
         handle_modal_paste(&mut modal, "ignored");
         assert!(matches!(modal, ModalState::ConfirmRepoCleanup { .. }));
+
+        let mut modal = ModalState::CreatingWorkspace { repo_name: "demo".into() };
+        handle_modal_paste(&mut modal, "ignored");
+        assert!(matches!(modal, ModalState::CreatingWorkspace { .. }));
     }
 
     #[test]
@@ -1684,6 +1702,28 @@ mod tests {
                 "{code:?} is swallowed"
             );
             assert!(matches!(modal, ModalState::ResolvingIssue { .. }), "{code:?} leaves it open");
+        }
+    }
+
+    #[test]
+    fn creating_workspace_esc_cancels_and_other_keys_are_consumed() {
+        let creating = || ModalState::CreatingWorkspace { repo_name: "demo".into() };
+        let mut modal = creating();
+        assert!(matches!(handle_modal_key(&mut modal, key(KeyCode::Esc)), ModalResult::Cancelled));
+        assert!(matches!(modal, ModalState::None), "Esc hides the note");
+
+        let mut modal = creating();
+        let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(handle_modal_key(&mut modal, ev), ModalResult::Cancelled));
+        assert!(matches!(modal, ModalState::None), "Ctrl+C hides the note");
+
+        for code in [KeyCode::Char('q'), KeyCode::Enter, KeyCode::Tab, KeyCode::Backspace] {
+            let mut modal = creating();
+            assert!(
+                matches!(handle_modal_key(&mut modal, key(code)), ModalResult::Consumed),
+                "{code:?} is swallowed"
+            );
+            assert!(matches!(modal, ModalState::CreatingWorkspace { .. }), "{code:?} leaves it open");
         }
     }
 

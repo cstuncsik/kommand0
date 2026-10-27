@@ -40,10 +40,11 @@ pub struct BranchStatus {
 ///
 /// Returns `None` if the directory isn't a git repo or git fails to run. The
 /// porcelain v2 format is stable and locale-independent; this parser tolerates
-/// missing fields (a degraded field, never a panic).
+/// missing fields (a degraded field, never a panic). A background poll must
+/// never take `index.lock`, so this runs with `--no-optional-locks`.
 pub fn branch_status(working_dir: &str) -> Option<BranchStatus> {
     let out = Command::new("git")
-        .args(["-C", working_dir, "status", "--porcelain=v2", "--branch"])
+        .args(["--no-optional-locks", "-C", working_dir, "status", "--porcelain=v2", "--branch"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -319,7 +320,7 @@ const SSH_OPTS: &str = "-oServerAliveInterval=10 -oServerAliveCountMax=3 -oBatch
 /// variable only when the user set neither it nor its `http.lowSpeed*` key
 /// (for any URL), which the variable would override; git needs both for a
 /// limit, so one they set still gets the other.
-fn http_stall(repo_dir: &str) -> Vec<(&'static str, &'static str)> {
+pub(crate) fn http_stall(repo_dir: &str) -> Vec<(&'static str, &'static str)> {
     let configured = Command::new("git")
         .args(["-C", repo_dir, "config", "--get-regexp", r"^http\..*lowspeed(limit|time)$"])
         .env_remove("GIT_CONFIG")
@@ -362,7 +363,7 @@ fn stall_env(limit_set: bool, time_set: bool) -> Vec<(&'static str, &'static str
 /// ssh takes the FIRST value of a repeated option, so someone who has already
 /// put an explicit `-oBatchMode=no` in their own command keeps it, and their
 /// choice to be prompted stands.
-fn batch_ssh_command(repo_dir: &str) -> String {
+pub(crate) fn batch_ssh_command(repo_dir: &str) -> String {
     let env = std::env::var("GIT_SSH_COMMAND").ok();
     // Only read the config when the environment doesn't already decide it.
     let cfg = env
@@ -1370,6 +1371,29 @@ pub(crate) mod tests {
         assert!(s.has_upstream, "tracking branch has an upstream");
         assert_eq!(s.ahead, 1, "one unpushed commit");
         assert_eq!(s.behind, 0);
+    }
+
+    #[test]
+    fn branch_status_leaves_the_index_alone() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        // Stale stat data on an unchanged file: a status that may take the
+        // optional lock refreshes it by rewriting the index.
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(tmp.path().join("a.txt"))
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+        let index = tmp.path().join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+
+        branch_status(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&index).unwrap(), before, "branch_status rewrote the index");
+
+        git(tmp.path(), &["status"]);
+        assert_ne!(std::fs::read(&index).unwrap(), before, "a plain status refreshes the index");
     }
 
     /// Write an executable shell stub at `path` with the given body.

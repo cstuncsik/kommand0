@@ -20,12 +20,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyEvent, KeyEventKind};
 use kommand0_core::{
-    AppState, Cleaned, Config, DEFAULT_PROFILE, RepoCleanupItem, RepoEntry, SessionStatus,
-    Workspace,
+    AppState, Cleaned, Config, DEFAULT_PROFILE, LeftWorktree, RepoCleanupItem, RepoEntry,
+    SessionStatus, Workspace,
 };
 use ratatui::{
     DefaultTerminal,
-    crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent},
+    crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind},
 };
 
 /// Height of the session tab strip at the top of the right pane.
@@ -35,20 +35,53 @@ const TAB_BAR_HEIGHT: u16 = 1;
 /// single-column tab labels).
 pub(crate) const MAX_SESSION_TABS: usize = 9;
 
-/// How often the periodic git-status refresh runs (off the render loop). Git
-/// status is cheap but can stall on large/cold worktrees, so it never runs on
-/// the 50ms tick; on-demand triggers (workspace create/close) keep it snappy.
+/// How often git status is checked (off the render loop) for a workspace you
+/// work in: one of its sessions was busy or typed into since the last check.
+/// The default for `status_refresh_secs`.
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the selected workspace's git status is checked.
+const SELECTED_STATUS_EVERY: Duration = Duration::from_secs(10);
+
+/// The longest any worktree goes without a git-status check.
+const IDLE_STATUS_EVERY: Duration = Duration::from_secs(300);
+
+/// Background checks per pass, so the startup and 5-minute sweeps over many
+/// worktrees spread across passes instead of becoming one long one.
+const STATUS_BACKGROUND_PER_PASS: usize = 4;
+
+/// `Some(0)` urgent, `Some(1)` background, `None` not due. `age`: since the
+/// last check, `None` = never (or an explicit refresh dropped the stamp).
+fn status_due(
+    age: Option<Duration>,
+    interval: Duration,
+    active: bool,
+    selected: bool,
+) -> Option<u8> {
+    let past = |d: Duration| age.is_none_or(|a| a >= d);
+    if (active && past(interval)) || (selected && past(SELECTED_STATUS_EVERY)) {
+        Some(0)
+    } else if past(IDLE_STATUS_EVERY) {
+        Some(1)
+    } else {
+        None
+    }
+}
 
 /// How often the periodic PR/CI-status refresh runs (off the render loop). A `gh
 /// pr list` per repo is a network call, so it runs far less often than the local
 /// git status.
 const PR_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long quitting waits for a workspace create still making its worktree
+/// (about 10 s on a big repo such as n8n) before abandoning it.
+const CREATE_QUIT_WAIT: Duration = Duration::from_secs(15);
+
 /// Carries a background worker's result to the event loop, sending on drop
 /// so the loop always gets a message (and clears the matching `*_inflight`
 /// flag) even if the worker thread panics before finishing. Shared by the
-/// status/PR refreshes, cleanup, the issue resolve, and profile delete.
+/// status/PR refreshes, cleanup, the issue resolve, the review diff, the
+/// workspace create and delete, and profile delete.
 struct SendOnDrop<T> {
     tx: tokio::sync::mpsc::UnboundedSender<T>,
     payload: Option<T>,
@@ -67,6 +100,47 @@ impl<T> Drop for SendOnDrop<T> {
 /// core's result, stringly on the error side (it crosses a thread).
 type ProfileDeleteMsg =
     (String, Result<(kommand0_core::ProfileDeleteSummary, Vec<String>), String>);
+
+/// What a git-status pass sends back: each checked row's status, `None` when
+/// git couldn't read it.
+type StatusMsg = Vec<(String, Option<kommand0_core::BranchStatus>)>;
+
+/// What the review-diff worker sends back: the request it answers (see
+/// `App::diff_seq`) and the files, `None` when git couldn't compute a diff.
+type DiffMsg = (u64, Option<Vec<kommand0_core::FileDiff>>);
+
+/// What a delete targets: one workspace row, or a repo with all its rows.
+#[derive(Debug, Clone, PartialEq)]
+enum Deleted {
+    Workspace(String),
+    Repo(String),
+}
+
+/// How a delete's worktree removal ended: everything gone, gone except what
+/// a removal kept or left on disk, or unknown (the worker died first).
+#[derive(Debug, PartialEq)]
+enum DeleteOutcome {
+    Done,
+    Notes(Vec<LeftWorktree>),
+    Interrupted,
+}
+
+/// What the delete worker sends back.
+type DeleteMsg = (Deleted, DeleteOutcome);
+
+/// One notice line for a worktree a delete left on disk. Only a failed
+/// removal asks for a hand delete: a kept dir is, or may be, another
+/// workspace's.
+fn left_worktree_note(left: &LeftWorktree) -> String {
+    use LeftWorktree::*;
+    match left {
+        Alias { path, owner } => format!("kept {path}: it is {owner}'s worktree"),
+        Unverified { path } => {
+            format!("kept {path}: couldn't check whether another workspace uses it")
+        }
+        Failed { path } => format!("couldn't remove {path}; delete it by hand"),
+    }
+}
 
 /// A scan, routed against the repo's workspaces: the plan, core's notes (a
 /// failed refresh of the default branch, squash detection off) and the base
@@ -102,6 +176,24 @@ fn repo_cleanup_counts(items: &[RepoCleanupItem]) -> (usize, usize, usize) {
 /// What the issue-resolve worker sends back: the request id (the newest one
 /// wins) and the branch GitHub links to the issue.
 type IssueMsg = (u64, Result<kommand0_core::IssueBranch, String>);
+
+/// What the create worker sends back: the workspace it made, with the hook's
+/// last line when its post-checkout hook failed, or why not.
+type CreateMsg = Result<(Workspace, Option<String>), String>;
+
+/// The one workspace create running; cleared only by its reply, which
+/// SendOnDrop guarantees even on a panic. No expiry: a hung create blocks
+/// further creates, issue resolves, and deletes in its repo until restart.
+struct Creating {
+    /// What was typed, restored with the error while the modal still waits.
+    repo_id: String,
+    repo_name: String,
+    input: String,
+    branch: String,
+    /// Shown once the workspace lands, modal or not (the issue flow's record
+    /// of a remote write).
+    notice: Option<String>,
+}
 
 /// The `(message, is_error)` notice for a finished profile delete: clean,
 /// with warnings (their full texts go to the log), or failed. Each names the
@@ -677,19 +769,27 @@ impl WorkspaceSessions {
             self.switch_to(idx);
         }
     }
-    /// Remove the tab at `idx` (order-preserving), re-clamping `active`. Returns
-    /// whether the workspace is now empty (the caller removes the entry).
-    fn remove_tab(&mut self, idx: usize) -> bool {
+    /// Remove the tab at `idx` (order-preserving), re-clamping `active`, and
+    /// hand it back for the caller to kill (and to remove an emptied entry).
+    fn remove_tab(&mut self, idx: usize) -> Option<SessionTab> {
         if idx >= self.tabs.len() {
-            return self.tabs.is_empty();
+            return None;
         }
-        self.tabs.remove(idx);
+        let tab = self.tabs.remove(idx);
         if idx < self.active {
             self.active -= 1;
         }
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
-        self.tabs.is_empty()
+        Some(tab)
     }
+}
+
+/// Kill the tabs' processes with one shared grace (see
+/// [`pane::terminate_all`]), then drop them. Blocks up to ~250ms, so it runs
+/// on a teardown thread (see [`App::spawn_teardown`]).
+fn kill_tabs(mut tabs: Vec<SessionTab>) {
+    let mut panes: Vec<&mut pane::Pane> = tabs.iter_mut().map(|t| &mut t.pane).collect();
+    pane::terminate_all(&mut panes);
 }
 
 /// Tree-pane width bounds and step (percent of the terminal). The live width is
@@ -761,6 +861,10 @@ pub(crate) struct App {
     /// in-memory state over the current on-disk file relative to this, so a `kmd`
     /// command that wrote `state.json` while we were open isn't clobbered.
     pub(crate) state_baseline: AppState,
+    /// Fails every save, as an unwritable state dir would: the unit harness's
+    /// state dir is shared by every test in the process.
+    #[cfg(test)]
+    fail_saves: bool,
     pub(crate) expanded: HashSet<String>,
     pub(crate) tree_items: Vec<TreeNode>,
     pub(crate) selected_index: usize,
@@ -782,8 +886,9 @@ pub(crate) struct App {
     pub(crate) show_diff: bool,
     pub(crate) diff_title: String,
     /// What the left pane shows when there are no file rows — distinguishes a
-    /// fallback workspace (no branch), a non-repo/uncomputable diff, and a
-    /// genuinely-empty diff. Set in `open_diff`; empty when rows render.
+    /// fallback workspace (no branch), a diff still loading, a non-repo/uncomputable
+    /// diff, and a genuinely-empty diff. Set in `open_diff` and `finish_diff`;
+    /// empty when rows render.
     pub(crate) diff_note: String,
     /// The per-file diff sections (from `diff_files_vs_default_branch`).
     pub(crate) diff_files: Vec<kommand0_core::FileDiff>,
@@ -801,6 +906,11 @@ pub(crate) struct App {
     /// Rendered pane rects, set at render time for mouse hit-testing.
     pub(crate) diff_list_area: ratatui::layout::Rect,
     pub(crate) diff_body_area: ratatui::layout::Rect,
+    /// Bumped by every `open_diff`: a worker reply for an earlier request is
+    /// dropped.
+    diff_seq: u64,
+    /// Diff worker → event-loop channel. `None` when not wired (unit tests).
+    diff_tx: Option<tokio::sync::mpsc::UnboundedSender<DiffMsg>>,
     /// True when a `g` was pressed and we're waiting for a second `g` (vim `gg`).
     pub(crate) pending_g: bool,
     /// Tree filter query (case-insensitive; empty = no filter). Matches a
@@ -871,6 +981,11 @@ pub(crate) struct App {
     // Embedded interactive `claude` sessions, as tabs per workspace, composited
     // into the right pane.
     pub(crate) embedded: HashMap<String, WorkspaceSessions>,
+    /// Kill threads still tearing down session panes (see
+    /// [`Self::spawn_teardown`]), each with the workspace ids whose panes are
+    /// dead once it ends: its own and those of the teardowns it joined.
+    /// Joined at quit.
+    teardowns: Vec<(Vec<String>, std::thread::JoinHandle<()>)>,
     /// Reader-thread → event-loop repaint signal (set in `main` before the loop).
     pub(crate) embedded_wake: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     /// Last-rendered right-pane rect, so a new embedded pane spawns at its final
@@ -895,11 +1010,15 @@ pub(crate) struct App {
     /// A status-refresh worker is running; gates re-spawning (cleared when its
     /// result arrives — and it always sends, even on a partial/empty result).
     status_inflight: bool,
-    /// Worker → event-loop channel carrying a fresh status map (set in `run`).
-    status_tx: Option<tokio::sync::mpsc::UnboundedSender<HashMap<String, kommand0_core::BranchStatus>>>,
-    /// When the periodic status refresh last fired (time-based, so it doesn't
-    /// depend on the wrapping tick counter).
-    last_status_refresh: Option<Instant>,
+    /// Worker → event-loop channel carrying each checked row's status (set in `run`).
+    status_tx: Option<tokio::sync::mpsc::UnboundedSender<StatusMsg>>,
+    /// When each worktree row's status check was last dispatched. A row with
+    /// no stamp is due; an explicit refresh drops the row's stamp.
+    status_checked: HashMap<String, Instant>,
+    /// Rows whose session was busy at some tick since their last check. The
+    /// spinner can go before a slow pass lands; this stays until a pass takes
+    /// the row.
+    status_active: HashSet<String>,
 
     /// Per-workspace PR/CI status, refreshed off the render loop via one
     /// `gh pr list` per repo. Keyed by workspace id; absent until a PR exists on
@@ -924,6 +1043,12 @@ pub(crate) struct App {
     pub(crate) cleanup_result: HashMap<String, (String, bool)>,
     /// Cleanup worker → event-loop channel carrying `(workspace_id, result)`.
     cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Result<Cleaned, String>)>>,
+
+    /// Workspace and repo ids whose delete is running (ids are random, so one
+    /// set holds both). The rows stay listed until the worker reports.
+    pub(crate) delete_inflight: HashSet<String>,
+    /// Delete worker → event-loop channel. `None` when not wired (unit tests).
+    delete_tx: Option<tokio::sync::mpsc::UnboundedSender<DeleteMsg>>,
 
     /// The repo whose merged-branch scan or delete is running (at most one).
     pub(crate) repo_cleanup_inflight: Option<String>,
@@ -971,6 +1096,11 @@ pub(crate) struct App {
     /// Issue-resolve worker → event-loop channel. `None` when not wired (unit tests).
     issue_tx: Option<tokio::sync::mpsc::UnboundedSender<IssueMsg>>,
 
+    /// The workspace create making its worktree, if any (one at a time).
+    create: Option<Creating>,
+    /// Create worker → event-loop channel. `None` when not wired (unit tests).
+    create_tx: Option<tokio::sync::mpsc::UnboundedSender<CreateMsg>>,
+
     /// User config (claude passthrough + tunables), loaded once at startup.
     pub(crate) config: Config,
     /// Where the settings page writes config fields back to. Resolved once at
@@ -990,6 +1120,20 @@ pub(crate) struct App {
     pub(crate) notify_mode: notify::NotifyMode,
 }
 
+/// What a tick can change that the screen shows; `App::tick` compares it
+/// before and after, so a tick that changed nothing draws nothing.
+#[derive(PartialEq)]
+struct TickView {
+    focus: Focus,
+    waiting: HashSet<String>,
+    attention: HashSet<String>,
+    /// Per workspace with live tabs, sorted: its tab ids and the active index.
+    tabs: Vec<(String, Vec<String>, usize)>,
+    embed_error: Option<(String, String)>,
+    /// `pane_selection.is_some()`.
+    selection: bool,
+}
+
 impl App {
     fn new(state: AppState) -> Self {
         let repos = state.repos.clone();
@@ -1001,6 +1145,8 @@ impl App {
             workspaces,
             state,
             state_baseline,
+            #[cfg(test)]
+            fail_saves: false,
             expanded: HashSet::new(),
             tree_items: Vec::new(),
             selected_index: 0,
@@ -1020,6 +1166,8 @@ impl App {
             diff_focus: DiffFocus::Files,
             diff_list_area: ratatui::layout::Rect::default(),
             diff_body_area: ratatui::layout::Rect::default(),
+            diff_seq: 0,
+            diff_tx: None,
             pending_g: false,
             filter_query: String::new(),
             filter_input: false,
@@ -1048,6 +1196,7 @@ impl App {
             tree_width_pct: TREE_WIDTH_DEFAULT,
             tick_counter: 0,
             embedded: HashMap::new(),
+            teardowns: Vec::new(),
             embedded_wake: None,
             right_pane_area: ratatui::layout::Rect::default(),
             embedded_prefix: false,
@@ -1056,7 +1205,8 @@ impl App {
             branch_status: HashMap::new(),
             status_inflight: false,
             status_tx: None,
-            last_status_refresh: None,
+            status_checked: HashMap::new(),
+            status_active: HashSet::new(),
             pr_status: HashMap::new(),
             pr_status_inflight: false,
             pr_status_rerun: false,
@@ -1065,6 +1215,8 @@ impl App {
             cleanup_inflight: HashSet::new(),
             cleanup_result: HashMap::new(),
             cleanup_tx: None,
+            delete_inflight: HashSet::new(),
+            delete_tx: None,
             repo_cleanup_inflight: None,
             repo_cleanup_result: HashMap::new(),
             repo_cleanup_pending: None,
@@ -1078,6 +1230,8 @@ impl App {
             issue_req: None,
             issue_worker_started: None,
             issue_tx: None,
+            create: None,
+            create_tx: None,
             config: Config::default(),
             config_path: Config::effective_path(),
             settings: None,
@@ -1500,6 +1654,10 @@ impl App {
     /// but not in `self.state`, and baselining it would flip it into "our
     /// deletion" on the next save.
     fn persist_state(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.fail_saves {
+            anyhow::bail!("the state dir is read-only");
+        }
         // Merge over the current on-disk state (a `kmd` command may have written
         // it while we were open) rather than blindly overwriting it.
         self.state.merge_save(&self.state_baseline)?;
@@ -1556,6 +1714,9 @@ impl App {
         let Some(ws) = self.selected_workspace() else {
             return;
         };
+        if self.refuse_busy(&ws.id, "open") {
+            return;
+        }
         let ws_id = ws.id.clone();
         let ws_name = ws.name.clone();
         let ws_dir = ws.working_dir.clone();
@@ -1780,15 +1941,21 @@ impl App {
                 if let Some(sessions) = self.embedded.get_mut(ws_id)
                     && let Some(slot) = sessions.tabs.iter().position(|t| t.id == gone_id)
                 {
-                    sessions.tabs[slot] = SessionTab {
-                        id: new_id,
-                        pane,
-                        was_resume,
-                        spawned: now,
-                        capture_since: (kind == TabKind::Codex).then_some(since),
-                        exit_seen: None,
-                        kind,
-                    };
+                    // A missed resume can still be alive (claude stays up on
+                    // the miss), so the old tab dies off the loop.
+                    let old = std::mem::replace(
+                        &mut sessions.tabs[slot],
+                        SessionTab {
+                            id: new_id,
+                            pane,
+                            was_resume,
+                            spawned: now,
+                            capture_since: (kind == TabKind::Codex).then_some(since),
+                            exit_seen: None,
+                            kind,
+                        },
+                    );
+                    self.spawn_teardown(vec![ws_id.to_string()], vec![old], None);
                 }
                 let mut msg = format!(
                     "session {} not found in {}'s store for this directory: started fresh",
@@ -1826,7 +1993,7 @@ impl App {
     /// generation stamp, echoed back so [`Self::apply_codex_capture`] can
     /// drop this poller's event once the same sentinel has been respawned
     /// by a newer process (detach then fast reopen). Tx-gated like
-    /// `request_branch_status_refresh`: unit tests never wire
+    /// `dispatch_branch_status`: unit tests never wire
     /// `codex_capture_tx`, so they spawn no threads and never touch a
     /// developer's real `~/.codex/sessions`. No inflight guard on purpose:
     /// one shot per spawned tab, at most one send, and a stale/duplicate
@@ -1994,6 +2161,13 @@ impl App {
     fn visible_pane_seq(&self) -> Option<u64> {
         let ws_id = &self.selected_workspace()?.id;
         Some(self.embedded.get(ws_id)?.active_tab()?.pane.output_seq())
+    }
+
+    /// Whether the visible pane is inside a synchronized-output frame.
+    fn visible_pane_mid_frame(&self) -> bool {
+        self.selected_workspace()
+            .and_then(|w| self.embedded.get(&w.id)?.active_tab())
+            .is_some_and(|t| t.pane.mid_frame())
     }
 
     /// Focus the embedded pane from a mouse gesture. Clearing the Ctrl+A
@@ -2311,6 +2485,9 @@ impl App {
     /// action and the palette share this). Keeps the row selected across the
     /// rebuild.
     fn archive_toggle(&mut self, ws_id: &str) {
+        if self.refuse_busy(ws_id, "archive") {
+            return;
+        }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
             return;
         };
@@ -2401,33 +2578,31 @@ impl App {
         true
     }
 
-    /// Close the active session tab of the selected workspace: drop its pane,
-    /// forget its persisted id, and re-focus the previous tab (or the tree when
-    /// the last tab is gone).
+    /// Close the active session tab of the selected workspace: kill its pane
+    /// off the loop, forget its persisted id, and re-focus the previous tab (or
+    /// the tree when the last tab is gone).
     fn close_active_session(&mut self) {
         let Some(ws_id) = self.selected_workspace().map(|w| w.id.clone()) else {
             return;
         };
-        let (tab_id, now_empty) = {
-            let Some(sessions) = self.embedded.get_mut(&ws_id) else {
-                return;
-            };
-            let active = sessions.active;
-            let Some(tab_id) = sessions.tabs.get(active).map(|t| t.id.clone()) else {
-                return;
-            };
-            (tab_id, sessions.remove_tab(active))
+        let Some(sessions) = self.embedded.get_mut(&ws_id) else {
+            return;
         };
+        let Some(tab) = sessions.remove_tab(sessions.active) else {
+            return;
+        };
+        let now_empty = sessions.tabs.is_empty();
         // Closing a tab forgets its persisted entry, whatever its kind: a Claude
         // id won't resume next time, a shell sentinel won't respawn.
-        self.state.remove_embedded_session(&ws_id, &tab_id);
+        self.state.remove_embedded_session(&ws_id, &tab.id);
         self.save_state();
         if now_empty {
             self.embedded.remove(&ws_id);
             self.focus = Focus::Tree;
         }
+        self.spawn_teardown(vec![ws_id.clone()], vec![tab], None);
         // The session likely committed; refresh this workspace's branch status.
-        self.request_branch_status_refresh();
+        self.status_checked.remove(&ws_id);
     }
 
     /// Detach the selected workspace's embedded panes (tmux prefix-d, and the
@@ -2443,27 +2618,7 @@ impl App {
             return;
         };
         self.capture_panes_on_teardown(Some(&ws_id));
-        // The workspace-scoped twin of [`Self::shutdown_panes`]: dropping the
-        // panes one by one costs a full SIGHUP→250ms→SIGKILL each (a Node
-        // `claude` ignores SIGHUP), so a 9-tab detach would freeze the UI
-        // ~2.25s. Broadcast the hangup, wait one shared grace, SIGKILL+reap
-        // stragglers — the per-pane `Drop` then sees an exited child and
-        // returns instantly.
-        if let Some(sessions) = self.embedded.get_mut(&ws_id) {
-            for tab in sessions.tabs.iter_mut() {
-                tab.pane.signal_hangup();
-            }
-            for _ in 0..5 {
-                if sessions.tabs.iter_mut().all(|t| t.pane.has_exited()) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            for tab in sessions.tabs.iter_mut() {
-                tab.pane.force_kill_and_reap();
-            }
-        }
-        self.embedded.remove(&ws_id);
+        self.drop_panes(&ws_id);
         // Also flip a legacy `Running` stream session to Stopped: those are
         // never resurrected, so one left `Running` keeps a phantom "running"
         // tree icon until the next startup normalization.
@@ -2477,7 +2632,7 @@ impl App {
         }
         self.focus = Focus::Tree;
         // The sessions likely committed; refresh this workspace's branch status.
-        self.request_branch_status_refresh();
+        self.status_checked.remove(&ws_id);
     }
 
     /// Open the Rename Session modal for the selected workspace's active tab,
@@ -2521,6 +2676,9 @@ impl App {
     /// Open an additional tab of `kind` for a workspace (up to the shared cap)
     /// and focus it.
     fn new_tab(&mut self, kind: TabKind, ws_id: &str) {
+        if self.refuse_busy(ws_id, "new tab") {
+            return;
+        }
         self.select_workspace_row(ws_id);
         let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
         if count >= MAX_SESSION_TABS {
@@ -2672,10 +2830,81 @@ impl App {
         true
     }
 
+    /// The event loop's 50 ms tick. Returns whether the screen changed, so an
+    /// idle tick draws nothing.
+    fn tick(&mut self, now: Instant) -> bool {
+        let before = self.tick_view();
+        // Reap embedded panes whose claude exited (leaves Embedded focus).
+        self.reap_embedded(now);
+        // Refresh per-pane activity so the tree spinner reflects which
+        // sessions are currently producing output.
+        self.update_pane_activity(now);
+        for (ws_id, s) in &self.embedded {
+            if s.tabs.iter().any(|t| self.waiting_response.contains(&t.id)) {
+                self.status_active.insert(ws_id.clone());
+            }
+        }
+        // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
+        self.tick_counter = self.tick_counter.wrapping_add(1);
+        let spun = self.tick_counter.is_multiple_of(5);
+        if spun {
+            self.spinner_tick = (self.spinner_tick + 1) % 10;
+        }
+        // Frames no longer come every tick, so focus is synced here too.
+        self.sync_focus_states();
+        // Git status (off-loop) for the workspaces that are due.
+        self.reap_teardowns();
+        self.dispatch_branch_status(now);
+        // Periodic PR/CI-status refresh (off-loop, slow interval: it's a
+        // network call per repo).
+        if self
+            .last_pr_status_refresh
+            .is_none_or(|t| now.duration_since(t) >= PR_STATUS_REFRESH_INTERVAL)
+        {
+            self.last_pr_status_refresh = Some(now);
+            self.request_pr_status_refresh();
+        }
+        before != self.tick_view() || (spun && self.spinner_visible())
+    }
+
+    fn tick_view(&self) -> TickView {
+        let mut tabs: Vec<(String, Vec<String>, usize)> = self
+            .embedded
+            .iter()
+            .map(|(ws_id, s)| {
+                (ws_id.clone(), s.tabs.iter().map(|t| t.id.clone()).collect(), s.active)
+            })
+            .collect();
+        tabs.sort();
+        TickView {
+            focus: self.focus,
+            waiting: self.waiting_response.clone(),
+            attention: self.attention.clone(),
+            tabs,
+            embed_error: self.embed_error.clone(),
+            selection: self.pane_selection.is_some(),
+        }
+    }
+
+    /// Whether a spinner may be on screen, so its advance needs a redraw. A new
+    /// spinner must be added here, or it freezes while nothing else changes.
+    fn spinner_visible(&self) -> bool {
+        !self.waiting_response.is_empty()
+            || !self.cleanup_inflight.is_empty()
+            || self.repo_cleanup_inflight.is_some()
+            || !self.delete_inflight.is_empty()
+    }
+
+    /// The hit region under the pointer, by the last render: a pointer move
+    /// only changes the screen when this changes (hover styling).
+    fn hovered_region(&self) -> Option<usize> {
+        self.hit_regions.iter().position(|r| buttons::is_hovered(self.mouse_pos, r.area))
+    }
+
     /// Drop session tabs whose child has exited, and whole workspaces that were
     /// deleted. Applies the per-tab resume-failure net, keeps the active tab
     /// stable by identity, and leaves Embedded focus if the selected workspace
-    /// emptied. Pane's `Drop` terminates the child.
+    /// emptied. The dropped tabs are killed off the loop.
     fn reap_embedded(&mut self, now: Instant) {
         // One pass: collect exited tabs (with the signal-vs-exit distinction in
         // `code`) and live resumed tabs that are showing claude's resume-miss
@@ -2848,17 +3077,25 @@ impl App {
             .chain(resume_missed)
             .collect();
         let mut remove_ws: Vec<String> = Vec::new();
+        // Killed off the loop: a resume-miss tab (a failed heal's too) is alive.
+        let mut doomed: Vec<(String, Vec<SessionTab>)> = Vec::new();
         for (ws_id, sessions) in self.embedded.iter_mut() {
             if !live_ws.contains(ws_id) {
                 remove_ws.push(ws_id.clone()); // workspace was deleted
+                doomed.push((ws_id.clone(), std::mem::take(&mut sessions.tabs)));
                 continue;
             }
             // Drop dead tabs, then rebase `active` to the same tab by identity (a
             // saturating clamp would silently focus a different session).
             let active_id = sessions.tabs.get(sessions.active).map(|t| t.id.clone());
-            sessions
-                .tabs
-                .retain(|t| !dead.contains(&(ws_id.clone(), t.id.clone())));
+            let (dead_tabs, live): (Vec<SessionTab>, Vec<SessionTab>) =
+                std::mem::take(&mut sessions.tabs)
+                    .into_iter()
+                    .partition(|t| dead.contains(&(ws_id.clone(), t.id.clone())));
+            sessions.tabs = live;
+            if !dead_tabs.is_empty() {
+                doomed.push((ws_id.clone(), dead_tabs));
+            }
             if sessions.tabs.is_empty() {
                 remove_ws.push(ws_id.clone());
             } else {
@@ -2869,6 +3106,9 @@ impl App {
         }
         for ws_id in &remove_ws {
             self.embedded.remove(ws_id);
+        }
+        for (ws_id, tabs) in doomed {
+            self.spawn_teardown(vec![ws_id], tabs, None);
         }
         // Dropped tabs/workspaces shift what renders where — a stale highlight
         // must not land on the neighbor tab.
@@ -3061,6 +3301,9 @@ impl App {
 
     /// [`Self::capture_panes_on_teardown`] over an arbitrary workspace set (the
     /// routed repo cleanup pays the grace once for all of them).
+    // ponytail: runs on the loop, up to TEARDOWN_CAPTURE_GRACE (1.5s), only when
+    // codex or opencode tabs are in scope. Upgrade: SIGTERM and drain in the
+    // teardown job, then send each hint back to adopt_captured_hint.
     fn capture_panes_on_teardown_for(&mut self, in_scope: impl Fn(&str) -> bool) {
         let mut targets = 0usize;
         for (ws_id, sessions) in self.embedded.iter_mut() {
@@ -3122,68 +3365,143 @@ impl App {
         }
     }
 
-    /// Tear down every embedded pane in ONE shared grace period at quit. Dropping
-    /// the panes one by one runs a full SIGHUP→250ms→SIGKILL per pane, so quitting
-    /// with N sessions that ignore SIGHUP (a Node `claude` does) froze the UI
-    /// ~N×250ms. Instead: broadcast SIGHUP to every child, wait once, then
-    /// SIGKILL+reap any straggler — the per-pane `Drop` then sees an exited child
-    /// and returns instantly. Capture-kind panes get the SIGTERM exit-hint
+    /// Tear down every embedded pane at quit, in ONE shared grace (see
+    /// [`pane::terminate_all`]). Capture-kind panes get the SIGTERM exit-hint
     /// capture first (see [`Self::capture_panes_on_teardown`]), which also
-    /// persists state: nothing else saves after the event loop breaks.
+    /// persists state: nothing else saves after the event loop breaks. The
+    /// tabs stay in `embedded` for the quit-time codex sweep.
     fn shutdown_panes(&mut self) {
         self.capture_panes_on_teardown(None);
-        let mut any = false;
-        for sessions in self.embedded.values_mut() {
-            for tab in sessions.tabs.iter_mut() {
-                tab.pane.signal_hangup();
-                any = true;
-            }
-        }
-        if !any {
+        let mut panes: Vec<&mut pane::Pane> = self
+            .embedded
+            .values_mut()
+            .flat_map(|s| s.tabs.iter_mut().map(|t| &mut t.pane))
+            .collect();
+        pane::terminate_all(&mut panes);
+    }
+
+    /// Kill `tabs` on a background thread, then run `then` (a worktree
+    /// removal) on a thread of its own. A teardown first waits for earlier ones
+    /// sharing a workspace id, so a detach's panes are dead before a cleanup
+    /// removes their cwd. Kill threads are joined at quit, `then` is not. A
+    /// [`SendOnDrop`] guard moved into `then` still reports if the kill panics.
+    fn spawn_teardown(
+        &mut self,
+        ws_ids: Vec<String>,
+        tabs: Vec<SessionTab>,
+        then: Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        if tabs.is_empty() && then.is_none() {
             return;
         }
-        // One shared grace window: poll up to ~250ms, breaking early once every
-        // child has exited (so SIGHUP-respecting children don't cost the full
-        // wait). Then SIGKILL+reap any straggler that ignored the hangup.
-        for _ in 0..5 {
-            let all_done = self
-                .embedded
-                .values_mut()
-                .all(|s| s.tabs.iter_mut().all(|t| t.pane.has_exited()));
-            if all_done {
-                break;
+        self.reap_teardowns();
+        let (earlier, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.teardowns)
+            .into_iter()
+            .partition(|(ids, _)| ids.iter().any(|id| ws_ids.contains(id)));
+        self.teardowns = rest;
+        if tabs.is_empty() && earlier.is_empty() {
+            if let Some(then) = then {
+                std::thread::spawn(then);
             }
-            std::thread::sleep(Duration::from_millis(50));
+            return;
         }
-        for sessions in self.embedded.values_mut() {
-            for tab in sessions.tabs.iter_mut() {
-                tab.pane.force_kill_and_reap();
+        // The joined handles leave `teardowns`, so this one stands in for
+        // their workspaces too.
+        let mut ids = ws_ids;
+        ids.extend(earlier.iter().flat_map(|(e, _)| e.iter().cloned()));
+        ids.sort();
+        ids.dedup();
+        let handle = std::thread::spawn(move || {
+            for (_, h) in earlier {
+                let _ = h.join();
             }
+            kill_tabs(tabs);
+            if let Some(then) = then {
+                std::thread::spawn(then);
+            }
+        });
+        self.teardowns.push((ids, handle));
+    }
+
+    /// Take a workspace's tabs out of `embedded` and kill them off the loop.
+    fn drop_panes(&mut self, ws_id: &str) {
+        if let Some(sessions) = self.embedded.remove(ws_id) {
+            self.spawn_teardown(vec![ws_id.to_string()], sessions.tabs, None);
         }
     }
 
-    /// Kick off an off-loop git-status refresh for every workspace (no-op if one
-    /// is already running or the channel isn't wired). The worker computes each
-    /// workspace's [`kommand0_core::branch_status`] and sends the whole map back;
-    /// the event loop replaces the cache wholesale, so deleted workspaces drop
-    /// out on the next refresh (no manual pruning).
-    fn request_branch_status_refresh(&mut self) {
+    /// Wait for every kill thread [`Self::spawn_teardown`] started.
+    fn join_teardowns(&mut self) {
+        for (_, handle) in self.teardowns.drain(..) {
+            let _ = handle.join();
+        }
+    }
+
+    /// Drop the finished kill threads. Their workspaces' git status is due
+    /// again: a dying session's last writes can land after the status check
+    /// its close or detach asked for.
+    fn reap_teardowns(&mut self) {
+        self.teardowns.retain(|(ids, h)| {
+            let done = h.is_finished();
+            if done {
+                for id in ids {
+                    self.status_checked.remove(id);
+                }
+            }
+            !done
+        });
+    }
+
+    /// Kick off an off-loop git-status pass over the worktree rows that are due
+    /// (see [`status_due`]): every urgent row plus the
+    /// [`STATUS_BACKGROUND_PER_PASS`] longest-unchecked background ones. A no-op
+    /// while a pass runs or when the channel isn't wired. Rows are stamped here,
+    /// at dispatch, so an explicit refresh during a pass still gets its check.
+    fn dispatch_branch_status(&mut self, now: Instant) {
         if self.status_inflight {
             return;
         }
         let Some(tx) = self.status_tx.clone() else {
             return; // not wired (e.g. unit tests drive the cache directly)
         };
-        // Only workspaces with their own worktree/branch — a fallback workspace's
+        let interval = self
+            .config
+            .status_refresh_secs
+            // Floor at 1s so a mis-set 0 can't thrash a git subprocess every tick.
+            .map(|s| Duration::from_secs(s.max(1)))
+            .unwrap_or(STATUS_REFRESH_INTERVAL);
+        let selected = self.selected_workspace().map(|w| w.id.as_str());
+        let mut due: Vec<(u8, Option<Instant>, String, String)> = Vec::new();
+        // Only workspaces with their own worktree/branch: a fallback workspace's
         // working_dir is the shared repo root, whose status the UI never shows.
-        let targets: Vec<(String, String)> = self
+        // A row being deleted is skipped: its worktree is on its way out.
+        for w in self
             .workspaces
             .iter()
-            .filter(|w| w.worktree_path.is_some())
-            .map(|w| (w.id.clone(), w.working_dir.clone()))
-            .collect();
-        if targets.is_empty() {
+            .filter(|w| w.worktree_path.is_some() && !self.delete_inflight.contains(&w.id))
+        {
+            let checked = self.status_checked.get(&w.id).copied();
+            let active = self.status_active.contains(&w.id)
+                || self.embedded.get(&w.id).is_some_and(|s| {
+                    s.tabs.iter().any(|t| {
+                        t.pane.last_input_at().is_some_and(|i| checked.is_none_or(|c| i > c))
+                    })
+                });
+            let age = checked.map(|c| now.saturating_duration_since(c));
+            if let Some(prio) = status_due(age, interval, active, selected == Some(w.id.as_str())) {
+                due.push((prio, checked, w.id.clone(), w.working_dir.clone()));
+            }
+        }
+        // Urgent first, then the longest unchecked (never-checked first).
+        due.sort_by_key(|&(prio, checked, ..)| (prio, checked));
+        let urgent = due.iter().filter(|d| d.0 == 0).count();
+        due.truncate(urgent + STATUS_BACKGROUND_PER_PASS);
+        if due.is_empty() {
             return;
+        }
+        for (_, _, id, _) in &due {
+            self.status_checked.insert(id.clone(), now);
+            self.status_active.remove(id);
         }
         self.status_inflight = true;
         std::thread::spawn(move || {
@@ -3191,15 +3509,37 @@ impl App {
             // event loop always clears `status_inflight`.
             let mut guard = SendOnDrop {
                 tx,
-                payload: Some(HashMap::new()),
+                payload: Some(Vec::new()),
             };
-            let map = guard.payload.as_mut().expect("payload present until drop");
-            for (id, dir) in targets {
-                if let Some(status) = kommand0_core::branch_status(&dir) {
-                    map.insert(id, status);
-                }
+            let results = guard.payload.as_mut().expect("payload present until drop");
+            for (_, _, id, dir) in due {
+                results.push((id, kommand0_core::branch_status(&dir)));
             }
         });
+    }
+
+    /// Merge a finished pass into the cache (`Some` inserts, `None` removes),
+    /// then prune the cache and the stamps to the live worktree rows, so a row
+    /// deleted mid-pass doesn't come back. Returns whether the cache changed.
+    fn apply_branch_status(&mut self, results: StatusMsg) -> bool {
+        let before = self.branch_status.clone();
+        for (id, status) in results {
+            if let Some(s) = status {
+                self.branch_status.insert(id, s);
+            } else {
+                self.branch_status.remove(&id);
+            }
+        }
+        let live: HashSet<&str> = self
+            .workspaces
+            .iter()
+            .filter(|w| w.worktree_path.is_some())
+            .map(|w| w.id.as_str())
+            .collect();
+        self.branch_status.retain(|id, _| live.contains(id.as_str()));
+        self.status_checked.retain(|id, _| live.contains(id.as_str()));
+        self.status_active.retain(|id| live.contains(id.as_str()));
+        self.branch_status != before
     }
 
     /// Kick off an off-loop PR/CI-status refresh (no-op if one is running or the
@@ -3259,46 +3599,154 @@ impl App {
         });
     }
 
-    /// Post-process a workspace-create attempt from the add-workspace flow. On
-    /// success: sync workspaces, expand the repo, rebuild, refresh branch status.
-    /// On failure: reopen the Add-Workspace modal with the typed `name`, the given
-    /// `branch` (the explicit-branch path passes the user's typed branch so it
-    /// isn't wiped on error; the fork/blank paths pass an empty string), and the
-    /// error.
-    fn finish_add_workspace(
+    /// Reopen the Add Workspace modal with what was typed and why no
+    /// workspace was made. `branch` is the typed Branch field (the
+    /// explicit-branch path keeps it; the others pass it blank).
+    fn reopen_add_workspace(
         &mut self,
-        result: anyhow::Result<Workspace>,
         repo_id: String,
         repo_name: String,
-        name: String,
+        input: String,
         branch: String,
+        error: String,
     ) {
-        match result {
-            Ok(_) => {
-                // The create plain-saved the whole state, so disk is exactly
-                // `state` now: re-baseline, or a later merge-save reads the new
-                // row as a concurrent add and keeps it after a delete (goes
-                // away with the merge-save-everywhere follow-up).
-                self.state_baseline = self.state.clone();
+        self.modal = modal::ModalState::AddWorkspace {
+            repo_id,
+            repo_name,
+            input,
+            cursor: 0,
+            branch,
+            branch_cursor: 0,
+            field: modal::AddWorkspaceField::Name,
+            error: Some(error),
+        };
+    }
+
+    /// Why a create, or an issue lookup (which ends in one), into `repo_id`
+    /// must wait: one create at a time, none during a lookup, none into a
+    /// repo being deleted.
+    fn create_refusal(&self, repo_id: &str) -> Option<&'static str> {
+        // How long an issue-resolve worker counts as running. It expires so a
+        // worker that never replies can't wedge the feature for the session:
+        // every bounded call on the path has landed well inside this.
+        const ISSUE_WORKER_MAX: Duration = Duration::from_secs(180);
+        if self.create.is_some() {
+            Some("a workspace is still being created; wait for it to finish")
+        } else if self.issue_worker_started.is_some_and(|t| t.elapsed() < ISSUE_WORKER_MAX) {
+            Some("an issue lookup is still running; wait for it to finish")
+        } else if self.delete_inflight.contains(repo_id) {
+            Some("this repo is being deleted")
+        } else {
+            None
+        }
+    }
+
+    /// Create a workspace from the Add Workspace flow: resolve and validate
+    /// here, make the git worktree on a worker behind the Creating note, adopt
+    /// it in [`Self::finish_create`]. `input` and `branch` are what was typed,
+    /// restored with the reason when the create is refused or fails while
+    /// the note is up. Inline when the channel isn't wired (unit tests).
+    fn start_create(
+        &mut self,
+        repo_id: String,
+        input: String,
+        branch: String,
+        name: Option<String>,
+        from_branch: Option<String>,
+        notice: Option<String>,
+    ) {
+        let repo_name =
+            self.repos.iter().find(|r| r.id == repo_id).map(|r| r.name.clone()).unwrap_or_default();
+        if let Some(reason) = self.create_refusal(&repo_id) {
+            self.reopen_add_workspace(repo_id, repo_name, input, branch, reason.to_string());
+            return;
+        }
+        let resolved =
+            self.state.resolve_new_workspace(name.as_deref(), &repo_id, from_branch.as_deref());
+        let (repo, ws_name, taken) = match resolved {
+            Ok(r) => r,
+            Err(e) => {
+                self.reopen_add_workspace(repo_id, repo_name, input, branch, e.to_string());
+                return;
+            }
+        };
+        self.modal = modal::ModalState::CreatingWorkspace { repo_name: repo_name.clone() };
+        self.create = Some(Creating { repo_id, repo_name, input, branch, notice });
+        let base = AppState::state_dir();
+        let make = move || {
+            AppState::make_workspace(&repo, &ws_name, &base, from_branch.as_deref(), true, &taken)
+                .map_err(|e| e.to_string())
+        };
+        let Some(tx) = self.create_tx.clone() else {
+            self.finish_create(make());
+            return;
+        };
+        std::thread::spawn(move || {
+            let mut guard = SendOnDrop {
+                tx,
+                payload: Some(Err("the workspace create was interrupted".to_string())),
+            };
+            guard.payload = Some(make());
+        });
+    }
+
+    /// The create's worker reported. A made workspace is adopted and saved
+    /// whether or not the Creating note still waits, and its notice shown,
+    /// naming a post-checkout hook that failed. A failure reopens Add
+    /// Workspace while the note waits; after Esc it is an error notice, and
+    /// whatever modal is up now stays.
+    fn finish_create(&mut self, result: CreateMsg) {
+        let Some(c) = self.create.take() else {
+            tracing::warn!("a workspace create reported, but none was running; ignored");
+            return;
+        };
+        let waiting = matches!(self.modal, modal::ModalState::CreatingWorkspace { .. });
+        if waiting {
+            self.modal = modal::ModalState::None;
+        }
+        let adopted = result.and_then(|(ws, hook_error)| {
+            let made_at = ws.worktree_path.clone();
+            let made = made_at.clone().unwrap_or_else(|| ws.name.clone());
+            let hook_note = hook_error.map(|line| {
+                format!("created {}, but its post-checkout hook failed: {line}", ws.name)
+            });
+            let base = AppState::state_dir();
+            self.state.insert_workspace(ws, &base).map(|()| (made, hook_note)).map_err(|e| match made_at {
+                Some(p) => format!(
+                    "the worktree was made at {p}, but the workspace couldn't be added: {e}; \
+                     the worktree was left there"
+                ),
+                None => format!("the workspace couldn't be added: {e}"),
+            })
+        });
+        match adopted {
+            Ok((made, hook_note)) => {
+                let saved = self.persist_state();
                 self.workspaces = self.state.workspaces.clone();
-                self.expanded.insert(repo_id);
+                self.expanded.insert(c.repo_id);
                 // Keep the cursor on its row: under a name or newest-first sort
                 // the new workspace can land above it, and from the embedded
-                // pane the cursor is the shown session.
+                // pane the cursor is the shown session. The new row was never
+                // checked, so its branch status is due at once.
                 self.rebuild_tree_keeping_selection();
-                self.request_branch_status_refresh();
+                if let Err(e) = saved {
+                    tracing::warn!("failed to persist state: {e:#}");
+                    let msg = format!("created {made} but couldn't save it: {e:#}");
+                    self.profile_notice = Some((msg, true));
+                } else {
+                    let notes: Vec<String> = c.notice.into_iter().chain(hook_note).collect();
+                    if !notes.is_empty() {
+                        self.profile_notice = Some((notes.join("; "), false));
+                    }
+                }
+            }
+            Err(e) if waiting => {
+                self.reopen_add_workspace(c.repo_id, c.repo_name, c.input, c.branch, e);
             }
             Err(e) => {
-                self.modal = modal::ModalState::AddWorkspace {
-                    repo_id,
-                    repo_name,
-                    input: name,
-                    cursor: 0,
-                    branch,
-                    branch_cursor: 0,
-                    field: modal::AddWorkspaceField::Name,
-                    error: Some(e.to_string()),
-                };
+                tracing::warn!("creating a workspace in {}: {e}", c.repo_name);
+                let msg = format!("Couldn't create the workspace in {}: {e}", c.repo_name);
+                self.profile_notice = Some((msg, true));
             }
         }
     }
@@ -3345,17 +3793,25 @@ impl App {
         }
     }
 
-    /// Populate and open the review-diff dialog for a workspace: the PR-style
+    /// Open the review-diff dialog for a workspace: the PR-style
     /// `git diff <default>...HEAD` of its worktree (committed changes only), as a
-    /// collapsible file tree + per-file diff. Computed synchronously — a local git
-    /// diff is fast; move off-loop if a huge worktree ever hitches the render loop.
+    /// collapsible file tree + per-file diff. git runs on a worker; the dialog
+    /// says "Loading diff…" until [`Self::finish_diff`] fills it.
     fn open_diff(&mut self, ws_id: &str) {
+        if self.refuse_busy(ws_id, "review diff") {
+            return;
+        }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
             return;
         };
+        // First, so a reply for an earlier open can't land in this one.
+        self.diff_seq += 1;
         self.show_diff = true;
         self.diff_focus = DiffFocus::Files;
         self.diff_files.clear();
+        // Rows index into `diff_files`: stale ones would render against the
+        // cleared files.
+        self.diff_rows.clear();
         self.diff_expanded.clear();
         self.diff_selected = 0;
         self.diff_list_scroll = 0;
@@ -3369,7 +3825,6 @@ impl App {
         // gates on `worktree_path`).
         let Some(worktree) = ws.worktree_path.clone() else {
             self.diff_title = ws.name.clone();
-            self.diff_rows.clear();
             self.diff_note = "This workspace has no branch to review.".to_string();
             return;
         };
@@ -3377,21 +3832,36 @@ impl App {
             Some(b) => format!("{} ({b})", ws.name),
             None => ws.name.clone(),
         };
+        self.diff_note = "Loading diff…".to_string();
+        let Some(tx) = self.diff_tx.clone() else {
+            return; // not wired (unit tests)
+        };
+        let seq = self.diff_seq;
+        std::thread::spawn(move || {
+            let mut guard = SendOnDrop { tx, payload: Some((seq, None)) };
+            guard.payload = Some((seq, kommand0_core::diff_files_vs_default_branch(&worktree)));
+        });
+    }
+
+    /// A diff worker replied: fill the dialog if it is still open on that
+    /// request, else drop the reply.
+    fn finish_diff(&mut self, req: u64, files: Option<Vec<kommand0_core::FileDiff>>) {
+        if !self.show_diff || req != self.diff_seq {
+            return;
+        }
         // Distinguish "couldn't compute" (not a repo / base unresolved → None)
         // from a genuinely-empty diff (Some(empty)); both leave no rows, but the
         // note the left pane shows differs.
-        self.diff_files = match kommand0_core::diff_files_vs_default_branch(&worktree) {
-            Some(files) => files,
-            None => {
-                self.diff_rows.clear();
-                self.diff_note = "Couldn't compute a diff — not a git repo.".to_string();
-                return;
-            }
+        let Some(files) = files else {
+            self.diff_note = "Couldn't compute a diff: not a git repo.".to_string();
+            return;
         };
-        if self.diff_files.is_empty() {
-            self.diff_note =
-                "No committed changes on this branch vs the default branch.".to_string();
-        }
+        self.diff_files = files;
+        self.diff_note = if self.diff_files.is_empty() {
+            "No committed changes on this branch vs the default branch.".to_string()
+        } else {
+            String::new()
+        };
         // Default to every folder expanded, then flatten to the visible rows and
         // land the selection on the first File row (so the right pane shows a diff).
         for path in self.diff_files.iter().map(|f| f.path.clone()).collect::<Vec<_>>() {
@@ -3596,7 +4066,7 @@ impl App {
     /// Open the cleanup confirmation modal for a workspace (own-branch only),
     /// pre-filling the branch and any cached uncommitted/unpushed warnings.
     fn cleanup_workspace_prompt(&mut self, ws_id: &str) {
-        if self.cleanup_inflight.contains(ws_id) {
+        if self.refuse_busy(ws_id, "cleanup") {
             return;
         }
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else {
@@ -3629,15 +4099,15 @@ impl App {
     }
 
     /// [`Self::start_cleanup`] for a set: the workspaces that can start one
-    /// (own-branch, repo known, not already in flight) get ONE shared pane-capture
-    /// grace, then each is torn down and handed to its own worker.
+    /// (own-branch, repo known, not busy) get ONE shared pane-capture grace,
+    /// then each is torn down and handed to its own worker.
     fn start_cleanups(&mut self, ids: &[&str]) {
         let Some(tx) = self.cleanup_tx.clone() else {
             return; // not wired (unit tests)
         };
         let targets: Vec<(String, String, String, String)> = ids
             .iter()
-            .filter(|id| !self.cleanup_inflight.contains(**id))
+            .filter(|id| !self.row_busy(id))
             .filter_map(|id| {
                 let ws = self.workspaces.iter().find(|w| w.id == *id)?;
                 let repo = self.repos.iter().find(|r| r.id == ws.repo_id)?;
@@ -3657,32 +4127,32 @@ impl App {
         if targets.is_empty() {
             return; // never SIGTERM panes for a cleanup that will not start
         }
-        // Tear down the embedded panes synchronously (Drop terminates the child),
-        // so a worktree dir isn't removed while a claude is running inside it.
+        // The panes die before the cleanup runs (see spawn_teardown), so a
+        // worktree dir isn't removed while a claude is running inside it.
         // Capture first: on a cleanup FAILURE the workspace and its entries
         // survive, and a live codex/opencode session would otherwise be lost
         // while its entry persisted.
         self.capture_panes_on_teardown_for(|ws| targets.iter().any(|(id, ..)| id == ws));
         for (id, worktree, branch, repo) in targets {
-            // ponytail: panes are dropped on the loop like the single cleanup; move
-            // teardown to the worker if a batch of SIGHUP-ignoring panes makes this visible.
-            self.embedded.remove(&id);
+            let tabs = self.embedded.remove(&id).map(|s| s.tabs).unwrap_or_default();
             self.cleanup_inflight.insert(id.clone());
             self.cleanup_result.remove(&id);
-            let tx = tx.clone();
+            let guard = SendOnDrop {
+                tx: tx.clone(),
+                payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
+            };
             let config_path = self.config_path.clone();
-            std::thread::spawn(move || {
-                let mut guard = SendOnDrop {
-                    tx,
-                    payload: Some((id.clone(), Err("the cleanup was interrupted".to_string()))),
-                };
+            let ws_id = id.clone();
+            let cleanup = move || {
+                let mut guard = guard;
                 // The file, not the startup snapshot: an edit applies to the next
                 // cleanup, and an unparseable file blocks it rather than degrading.
                 let result = Config::protected_branches_at(&config_path).and_then(|protected| {
                     kommand0_core::cleanup_merged_workspace(&repo, &worktree, &branch, &protected)
                 });
-                guard.payload = Some((id, result));
-            });
+                guard.payload = Some((ws_id, result));
+            };
+            self.spawn_teardown(vec![id], tabs, Some(Box::new(cleanup)));
         }
     }
 
@@ -3704,8 +4174,9 @@ impl App {
 
     /// `c` on a repo row: review this repo's parked plan, else start a scan.
     /// One scan/delete at a time; a parked plan for another repo is dropped.
+    /// Nothing while the repo is being deleted.
     fn repo_cleanup_requested(&mut self, repo_id: &str) {
-        if self.repo_cleanup_inflight.is_some() {
+        if self.repo_cleanup_inflight.is_some() || self.delete_inflight.contains(repo_id) {
             return;
         }
         match self.repo_cleanup_pending.take() {
@@ -3955,32 +4426,225 @@ impl App {
         self.repo_cleanup_result.insert(repo_id, (line, !failed.is_empty() || skipped > 0));
     }
 
-    /// `d`/`D`/`[Delete]` on a row whose cleanup is running would force-remove
-    /// the worktree under core's probes: refused, silently (the pane already
-    /// shows the spinner and hides `[Clean up]`; a `cleanup_result` line would
-    /// render as "Cleanup blocked:"). Logs the refusal.
-    fn workspace_delete_blocked_by_cleanup(&self, ws_id: &str) -> bool {
-        let blocked = self.cleanup_inflight.contains(ws_id);
+    /// Whether a cleanup or a delete owns workspace `ws_id`'s row: its
+    /// worktree may be on its way out, so nothing opens, cleans up or deletes
+    /// it until that worker reports.
+    fn row_busy(&self, ws_id: &str) -> bool {
+        self.cleanup_inflight.contains(ws_id) || self.delete_inflight.contains(ws_id)
+    }
+
+    /// [`Self::row_busy`], logging the refused `action` (the pane already
+    /// shows the spinner, so the refusal is silent on screen).
+    fn refuse_busy(&self, ws_id: &str, action: &str) -> bool {
+        let busy = self.row_busy(ws_id);
+        if busy {
+            tracing::info!("{action}: workspace {ws_id} is being cleaned up or deleted; ignored");
+        }
+        busy
+    }
+
+    /// Whether `d`/`D`/`[Delete]` on `ws_id` is refused (silently, with a log
+    /// line): its row is busy ([`Self::row_busy`]), or a create is making a
+    /// worktree in its repo, which the delete could take for its own (a case
+    /// variant not adopted yet).
+    fn workspace_delete_blocked(&self, ws_id: &str) -> bool {
+        if self.refuse_busy(ws_id, "delete") {
+            return true;
+        }
+        let creating = self.workspaces.iter().any(|w| {
+            w.id == ws_id && self.create.as_ref().is_some_and(|c| c.repo_id == w.repo_id)
+        });
+        if creating {
+            tracing::info!("delete: a workspace is being created in {ws_id}'s repo; ignored");
+        }
+        creating
+    }
+
+    /// Delete workspace `ws_id`: its panes die and its worktree is removed off
+    /// the loop ([`Self::spawn_delete`]); the row stays, marked in
+    /// `delete_inflight`, until the worker reports, so its name stays taken
+    /// meanwhile. The one path behind `d`+`y`, `D` and the `[Delete]` button.
+    /// Refused per [`Self::workspace_delete_blocked`]. A row already gone
+    /// only has its panes killed.
+    fn delete_workspace(&mut self, ws_id: &str) {
+        if self.workspace_delete_blocked(ws_id) {
+            return;
+        }
+        let tabs = self.embedded.remove(ws_id).map(|s| s.tabs).unwrap_or_default();
+        let Some(ws) = self.state.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
+            self.spawn_teardown(vec![ws_id.to_string()], tabs, None);
+            return;
+        };
+        self.delete_inflight.insert(ws_id.to_string());
+        self.spawn_delete(Deleted::Workspace(ws_id.to_string()), vec![ws], tabs);
+    }
+
+    /// The repo-level twin of [`Self::workspace_delete_blocked`]: refused
+    /// while the repo's own merged-branch scan or delete runs
+    /// (`repo_cleanup_inflight`), while the repo is being deleted, while any
+    /// of its rows is busy, or while a create targets it. Logs the refusal.
+    fn repo_delete_blocked(&self, repo_id: &str) -> bool {
+        let blocked = self.repo_cleanup_inflight.as_deref() == Some(repo_id)
+            || self.delete_inflight.contains(repo_id)
+            || self.workspaces.iter().any(|w| w.repo_id == repo_id && self.row_busy(&w.id))
+            || self.create.as_ref().is_some_and(|c| c.repo_id == repo_id);
         if blocked {
-            tracing::info!("delete: workspace {ws_id} has a cleanup in flight; ignored");
+            tracing::info!(
+                "delete: repo {repo_id} has a cleanup, a delete or a create in flight; ignored"
+            );
         }
         blocked
     }
 
-    /// Delete workspace `ws_id`: drop its live panes (at user-action time, so
-    /// reap_embedded never blocks the tick on the Drop), drop the row (exact id;
-    /// its worktree goes with it), flip its legacy Running session and persist
-    /// with ONE merge-aware save. The one path behind `d`+`y`, `D`, the
-    /// `[Delete]` button and a Removed cleanup. Refused while the row's cleanup
-    /// is in flight (the worker owns the worktree). Drops the pane entry first;
-    /// the rest is a no-op when the row is already gone, even when a new
-    /// workspace reused the id as a name.
-    fn delete_workspace(&mut self, ws_id: &str) {
-        if self.workspace_delete_blocked_by_cleanup(ws_id) {
+    /// Delete repo `repo_id` with every row under it, as
+    /// [`Self::delete_workspace`] does one row: the repo and its rows stay,
+    /// marked, until every worktree removal reports. The one path behind
+    /// `d`+`y`, `D` and `[Delete]` on a repo row. Refused per
+    /// [`Self::repo_delete_blocked`]; a repo already gone only has its rows'
+    /// panes killed.
+    fn delete_repo(&mut self, repo_id: &str) {
+        if self.repo_delete_blocked(repo_id) {
             return;
         }
-        self.embedded.remove(ws_id);
-        if self.state.remove_workspace(ws_id).is_none() {
+        let rows: Vec<Workspace> =
+            self.state.workspaces.iter().filter(|w| w.repo_id == repo_id).cloned().collect();
+        let ids: Vec<String> = rows.iter().map(|w| w.id.clone()).collect();
+        let tabs: Vec<SessionTab> =
+            ids.iter().filter_map(|id| self.embedded.remove(id)).flat_map(|s| s.tabs).collect();
+        if !self.state.repos.iter().any(|r| r.id == repo_id) {
+            self.spawn_teardown(ids, tabs, None);
+            return;
+        }
+        self.delete_inflight.insert(repo_id.to_string());
+        self.delete_inflight.extend(ids);
+        self.spawn_delete(Deleted::Repo(repo_id.to_string()), rows, tabs);
+    }
+
+    /// Kill `tabs`, then remove each row's worktree, guarded against every
+    /// other row ([`AppState::remove_worktree_of`]), and report `target`'s
+    /// outcome to [`Self::on_delete_done`]: over `delete_tx` (an interrupted
+    /// worker still reports), or inline when it isn't wired (unit tests).
+    fn spawn_delete(&mut self, target: Deleted, rows: Vec<Workspace>, tabs: Vec<SessionTab>) {
+        let ids: Vec<String> = rows.iter().map(|w| w.id.clone()).collect();
+        // A row another running delete is removing can't claim a dir either,
+        // and may share it: the removal waits for that delete's kill too.
+        let skip: Vec<String> = ids.iter().chain(&self.delete_inflight).cloned().collect();
+        let waits_for = skip.clone();
+        let held = self.state.worktree_rows_except(&skip);
+        let base = AppState::state_dir();
+        // The worker can't read state, so each row goes with its repo's path.
+        // A row whose repo is gone has no worktree git could remove (as core).
+        let jobs: Vec<(String, Workspace)> = rows
+            .into_iter()
+            .filter_map(|w| {
+                let repo = self.state.repos.iter().find(|r| r.id == w.repo_id)?;
+                Some((repo.path.clone(), w))
+            })
+            .collect();
+        let remove = move || {
+            let left: Vec<LeftWorktree> = jobs
+                .iter()
+                .filter_map(|(repo, w)| {
+                    if let Some(wt) = &w.worktree_path {
+                        tracing::info!("delete: removing worktree {wt}");
+                    }
+                    AppState::remove_worktree_of(repo, w, &base, &held, &skip).err()
+                })
+                .collect();
+            if left.is_empty() { DeleteOutcome::Done } else { DeleteOutcome::Notes(left) }
+        };
+        let Some(tx) = self.delete_tx.clone() else {
+            kill_tabs(tabs);
+            let outcome = remove();
+            self.on_delete_done(target, outcome);
+            return;
+        };
+        let payload = Some((target.clone(), DeleteOutcome::Interrupted));
+        let guard = SendOnDrop { tx, payload };
+        let then = move || {
+            let mut guard = guard;
+            guard.payload = Some((target, remove()));
+        };
+        self.spawn_teardown(waits_for, tabs, Some(Box::new(then)));
+    }
+
+    /// A delete's worker reported. Interrupted: the rows stay listed (deleting
+    /// them again finishes the job). Otherwise they are forgotten, and what a
+    /// removal kept or left on disk is named in the notice, unless a kept dir
+    /// is gone by now or its owner is being deleted too.
+    fn on_delete_done(&mut self, target: Deleted, outcome: DeleteOutcome) {
+        // Read while the rows are still here; a row already gone shows its id.
+        let name = match &target {
+            Deleted::Workspace(id) => {
+                self.state.workspaces.iter().find(|w| w.id == *id).map_or(id, |w| &w.name)
+            }
+            Deleted::Repo(id) => {
+                self.state.repos.iter().find(|r| r.id == *id).map_or(id, |r| &r.name)
+            }
+        }
+        .clone();
+        let mut left = match outcome {
+            DeleteOutcome::Done => Vec::new(),
+            DeleteOutcome::Notes(left) => left,
+            DeleteOutcome::Interrupted => {
+                match &target {
+                    Deleted::Workspace(id) => {
+                        self.delete_inflight.remove(id);
+                    }
+                    Deleted::Repo(id) => self.unmark_repo(id),
+                }
+                let msg = format!(
+                    "Couldn't finish deleting {name}; it is still listed, delete it again"
+                );
+                self.profile_notice = Some((msg, true));
+                return;
+            }
+        };
+        // Drop a kept-dir note only on evidence it is stale: the dir is gone
+        // (its owner's delete removed it), or the owner is a sibling row being
+        // deleted now. An owner this state doesn't hold may well be live.
+        let deleted = match &target {
+            Deleted::Workspace(id) => self.state.workspaces.iter().find(|w| w.id == *id),
+            Deleted::Repo(_) => None,
+        };
+        left.retain(|l| match l {
+            LeftWorktree::Alias { path, owner } => {
+                let owner_deleting = deleted.is_some_and(|d| {
+                    self.state.workspaces.iter().any(|w| {
+                        w.repo_id == d.repo_id
+                            && w.name == *owner
+                            && w.id != d.id
+                            && self.delete_inflight.contains(&w.id)
+                    })
+                });
+                std::path::Path::new(path).exists() && !owner_deleting
+            }
+            _ => true,
+        });
+        match &target {
+            Deleted::Workspace(id) => self.forget_workspace(id),
+            Deleted::Repo(id) => self.forget_repo(id),
+        }
+        if !left.is_empty() {
+            // Only a failed removal is an error: a kept dir is kept on purpose.
+            let failed = left.iter().any(|l| matches!(l, LeftWorktree::Failed { .. }));
+            let notes: Vec<String> = left.iter().map(left_worktree_note).collect();
+            let msg = format!("Deleted {name}, but {}", notes.join("; "));
+            // A note never hides an unread error, such as another delete's failure.
+            if failed || !self.profile_notice.as_ref().is_some_and(|(_, is_error)| *is_error) {
+                self.profile_notice = Some((msg, failed));
+            }
+        }
+    }
+
+    /// Drop the row `ws_id` whose worktree is gone (a finished delete or a
+    /// Removed cleanup), flip its legacy Running session and persist with ONE
+    /// merge-aware save. The cursor stays on its item: a report can land long
+    /// after the user moved on. No-op (beyond the mark) when the row is gone.
+    fn forget_workspace(&mut self, ws_id: &str) {
+        self.delete_inflight.remove(ws_id);
+        let was_selected = self.selected_workspace().is_some_and(|w| w.id == ws_id);
+        if self.state.take_workspace(ws_id).is_none() {
             return;
         }
         if let Some(sid) = self
@@ -3995,56 +4659,25 @@ impl App {
         self.workspaces = self.state.workspaces.clone();
         self.expanded_icon_rows.remove(ws_id);
         self.cleanup_result.remove(ws_id);
-        self.rebuild_tree();
-        // clamp_selection re-seats off any hint row AND re-syncs the active
-        // session (a raw clamp skipped both, stranding focus/selection).
-        self.clamp_selection();
-        // Rows shifted under selected_index, so a DIFFERENT workspace's pane can
-        // now be the visible one; a highlight (or live drag) must not carry over.
-        self.pane_selection = None;
+        self.rebuild_tree_keeping_selection();
+        // Only a highlight on the forgotten row's pane goes with it.
+        if was_selected {
+            self.pane_selection = None;
+        }
     }
 
-    /// The repo-level twin of `workspace_delete_blocked_by_cleanup`: a repo
-    /// delete removes every row's worktree and the repo's branches, so it is
-    /// refused while any of the repo's rows has a cleanup in flight or while
-    /// the repo's own merged-branch scan or delete runs
-    /// (`repo_cleanup_inflight`). Logs the refusal.
-    fn repo_delete_blocked_by_cleanup(&self, repo_id: &str) -> bool {
-        let blocked = self.repo_cleanup_inflight.as_deref() == Some(repo_id)
-            || self
-                .workspaces
-                .iter()
-                .any(|w| w.repo_id == repo_id && self.cleanup_inflight.contains(&w.id));
-        if blocked {
-            tracing::info!("delete: repo {repo_id} has a cleanup in flight; ignored");
-        }
-        blocked
-    }
-
-    /// Delete repo `repo_id` with every row under it: drop the rows' panes,
-    /// per-row UI entries and the repo's own cleanup outcome, remove the repo
-    /// and everything under it (exact id: rows, worktrees, sessions) and
-    /// persist with ONE merge-aware save. The one path behind `d`+`y`, `D`
-    /// and `[Delete]` on a repo row. Refused per
-    /// `repo_delete_blocked_by_cleanup`; a no-op when the repo is already gone.
-    fn delete_repo(&mut self, repo_id: &str) {
-        if self.repo_delete_blocked_by_cleanup(repo_id) {
+    /// Drop repo `repo_id` and its rows once their worktrees are gone, with
+    /// their UI leftovers, persisting with ONE merge-aware save. The cursor
+    /// stays on its item; only a highlight on one of the repo's rows goes.
+    fn forget_repo(&mut self, repo_id: &str) {
+        let was_in_repo = self.selected_workspace().is_some_and(|w| w.repo_id == repo_id);
+        self.unmark_repo(repo_id);
+        let Some((_, rows)) = self.state.take_repo(repo_id) else {
             return;
-        }
-        let ws_ids: Vec<String> = self
-            .state
-            .workspaces
-            .iter()
-            .filter(|w| w.repo_id == repo_id)
-            .map(|w| w.id.clone())
-            .collect();
-        for ws_id in &ws_ids {
-            self.embedded.remove(ws_id);
-            self.expanded_icon_rows.remove(ws_id);
-            self.cleanup_result.remove(ws_id);
-        }
-        if self.state.remove_repo(repo_id).is_none() {
-            return;
+        };
+        for w in &rows {
+            self.expanded_icon_rows.remove(&w.id);
+            self.cleanup_result.remove(&w.id);
         }
         self.repo_cleanup_result.remove(repo_id);
         if self.repo_cleanup_pending.as_ref().is_some_and(|(id, _)| id == repo_id) {
@@ -4054,31 +4687,52 @@ impl App {
         self.expanded.remove(repo_id);
         self.repos = self.state.repos.clone();
         self.workspaces = self.state.workspaces.clone();
-        self.rebuild_tree();
-        self.clamp_selection();
-        self.pane_selection = None;
+        self.rebuild_tree_keeping_selection();
+        if was_in_repo {
+            self.pane_selection = None;
+        }
+    }
+
+    /// Clear a repo delete's marks: the repo's and its rows'.
+    fn unmark_repo(&mut self, repo_id: &str) {
+        self.delete_inflight.remove(repo_id);
+        for w in self.state.workspaces.iter().filter(|w| w.repo_id == repo_id) {
+            self.delete_inflight.remove(&w.id);
+        }
     }
 
     /// A workspace cleanup landed: a removal drops the row, a followed worktree
     /// re-points it, a refusal shows in its pane.
     fn on_cleanup_done(&mut self, ws_id: String, result: Result<Cleaned, String>) {
         self.cleanup_inflight.remove(&ws_id);
+        self.status_checked.remove(&ws_id);
         match result {
             Ok(Cleaned::Removed) => {
-                // The worktree + branch are gone; drop the workspace too.
-                self.delete_workspace(&ws_id);
+                // The worktree + branch are gone; drop the workspace too. No
+                // git here: a late reply must not touch a dir another create
+                // reused meanwhile. Only an empty parent goes:
+                // `worktrees/<repo-id>/`, or `worktrees/` for a legacy flat row.
+                let ws = self.state.workspaces.iter().find(|w| w.id == ws_id);
+                if let Some(wt) = ws.and_then(|w| w.worktree_path.as_deref()) {
+                    kommand0_core::remove_empty_parent(wt);
+                }
+                self.forget_workspace(&ws_id);
             }
             Ok(Cleaned::Followed { branch }) => {
                 // The dir is `branch`'s checkout and stays; the row tracks it
                 // from now on.
+                let was_selected = self.selected_workspace().is_some_and(|w| w.id == ws_id);
                 if let Some(ws) = self.state.workspaces.iter_mut().find(|w| w.id == ws_id) {
                     let was = ws.branch_name.replace(branch.clone()).unwrap_or_default();
                     self.workspaces = self.state.workspaces.clone();
-                    self.rebuild_tree();
-                    self.clamp_selection(); // a branch filter may have hidden the row
-                    // Rows may have shifted under the selection, as after a
-                    // removal: a highlight (or live drag) must not carry over.
-                    self.pane_selection = None;
+                    // The cursor stays on its item, unless a branch filter now
+                    // hides the row.
+                    self.rebuild_tree_keeping_selection();
+                    // That row's pane may no longer be the one shown: a
+                    // highlight (or live drag) on it must not carry over.
+                    if was_selected {
+                        self.pane_selection = None;
+                    }
                     self.save_state();
                     // The old branch's PR must not linger on the row; a refresh
                     // already in flight may still land it, so run one more.
@@ -4098,7 +4752,6 @@ impl App {
                 self.cleanup_result.insert(ws_id, (msg, true));
             }
         }
-        self.request_branch_status_refresh();
     }
 
     /// Resolve an issue reference to its linked branch off the render loop (up
@@ -4112,22 +4765,10 @@ impl App {
         // "has 2 linked branches", with no way back from inside kommand0.
         // `start_cleanup` and `start_profile_delete` guard the same way.
         // The latch is global, not per-repo, so the message must not claim
-        // otherwise. It expires so a worker that never replies can't wedge the
-        // feature for the session: every bounded call on the path has landed
-        // well inside this.
-        const ISSUE_WORKER_MAX: Duration = Duration::from_secs(180);
-        if self.issue_worker_started.is_some_and(|t| t.elapsed() < ISSUE_WORKER_MAX) {
+        // otherwise. The lookup ends in a create, so it waits as one would.
+        if let Some(reason) = self.create_refusal(&repo.id) {
             let (repo_id, repo_name) = (repo.id.clone(), repo.name.clone());
-            self.finish_add_workspace(
-                Err(anyhow::anyhow!(
-                    "an issue lookup is still running; \
-                     wait for it to finish before starting another"
-                )),
-                repo_id,
-                repo_name,
-                issue,
-                String::new(),
-            );
+            self.reopen_add_workspace(repo_id, repo_name, issue, String::new(), reason.to_string());
             return;
         }
         self.issue_seq += 1;
@@ -4196,30 +4837,24 @@ impl App {
                 return;
             }
         };
-        // The workspace name comes from the branch; `finish_add_workspace`
-        // reopens Add Workspace with the typed ref + the error on failure, so
-        // gh's own message is what the user sees.
-        let created = result.as_ref().ok().map(|b| (b.branch.clone(), b.reused));
-        let result = result
-            .map_err(anyhow::Error::msg)
-            .and_then(|b| self.state.create_workspace_from_branch(None, &repo_id, &b.branch));
-        let ok = result.is_ok();
-        self.finish_add_workspace(result, repo_id, repo_name, issue, String::new());
-        // The resolving modal is gone by now, and its "may create a new linked
-        // branch" warning with it. On the create path this notice is the user's
-        // only record that kommand0 just wrote to their remote (the CLI prints
-        // the same thing on stderr).
-        if let Some((branch, reused)) = created
-            && ok
-        {
-            self.profile_notice = Some((
-                if reused {
-                    format!("Using existing linked branch {branch}")
+        // The workspace name comes from the branch. A failure reopens Add
+        // Workspace with the typed ref and the error, so gh's own message is
+        // what the user sees.
+        match result {
+            Ok(b) => {
+                // The resolving modal is gone by now, and its "may create a new
+                // linked branch" warning with it. Once the workspace lands this
+                // notice is the user's only record that kommand0 just wrote to
+                // their remote (the CLI prints the same thing on stderr).
+                let notice = Some(if b.reused {
+                    format!("Using existing linked branch {}", b.branch)
                 } else {
-                    format!("Created linked branch {branch} on origin")
-                },
-                false,
-            ));
+                    format!("Created linked branch {} on origin", b.branch)
+                });
+                let from = Some(b.branch);
+                self.start_create(repo_id, issue, String::new(), None, from, notice);
+            }
+            Err(e) => self.reopen_add_workspace(repo_id, repo_name, issue, String::new(), e),
         }
     }
 
@@ -4712,8 +5347,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             }
             modal::ModalResult::SubmitRepo(path) => match app.state.add_repo(&path) {
                 Ok(repo) => {
-                    // The add plain-saved the whole state: re-baseline, as
-                    // `finish_add_workspace` does.
+                    // The add plain-saved the whole state: re-baseline.
                     app.state_baseline = app.state.clone();
                     // Expand the just-added repo so its "(no workspaces — press w)"
                     // hint shows immediately, pointing the user at the next step.
@@ -4756,13 +5390,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // An explicitly-filled Branch field checks out that branch as
                     // today — the detect-and-offer flow is only for a blank one.
                     // A blank name means derive a path-safe one from the branch.
-                    let repo_name = repo.map(|r| r.name).unwrap_or_default();
-                    let result = app.state.create_workspace_from_branch(
-                        (!name.is_empty()).then_some(name.as_str()),
-                        &repo_id,
-                        &branch,
-                    );
-                    app.finish_add_workspace(result, repo_id, repo_name, name, branch);
+                    let ws_name = (!name.is_empty()).then(|| name.clone());
+                    let from = Some(branch.clone());
+                    app.start_create(repo_id, name, branch, ws_name, from, None);
                 } else if let Some(repo) = repo {
                     // An issue reference (123, #123, or an issue URL) in the Name
                     // field means "the branch GitHub links to that issue".
@@ -4778,9 +5408,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     // workspace name derived by core. A missing branch surfaces
                     // core's error, with the typed name preserved for a retry.
                     else if name.contains('/') {
-                        let result =
-                            app.state.create_workspace_from_branch(None, &repo_id, &name);
-                        app.finish_add_workspace(result, repo_id, repo.name, name, String::new());
+                        let from = Some(name.clone());
+                        app.start_create(repo_id, name, String::new(), None, from, None);
                     }
                     // Blank branch: offer the checkout only for a valid, unused
                     // name whose bare branch already exists — otherwise fall
@@ -4795,32 +5424,21 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                             name,
                         };
                     } else {
-                        let result = app.state.create_workspace(Some(&name), &repo_id);
-                        app.finish_add_workspace(result, repo_id, repo.name, name, String::new());
+                        let ws_name = Some(name.clone());
+                        app.start_create(repo_id, name, String::new(), ws_name, None, None);
                     }
                 } else {
                     // Repo not found: fall through to create so its resolve error
                     // surfaces (don't call the detector with an empty path).
-                    let result = app.state.create_workspace(Some(&name), &repo_id);
-                    app.finish_add_workspace(result, repo_id, String::new(), name, String::new());
+                    let ws_name = Some(name.clone());
+                    app.start_create(repo_id, name, String::new(), ws_name, None, None);
                 }
             }
             modal::ModalResult::BranchCheckoutChoice { repo_id, name, checkout } => {
                 // Route directly — never back through SubmitWorkspace, or a fork
-                // would re-trigger detection and loop. repo_name is only needed
-                // for the Err-reopen text.
-                let repo_name = app
-                    .repos
-                    .iter()
-                    .find(|r| r.id == repo_id)
-                    .map(|r| r.name.clone())
-                    .unwrap_or_default();
-                let result = if checkout {
-                    app.state.create_workspace_from_branch(Some(&name), &repo_id, &name)
-                } else {
-                    app.state.create_workspace(Some(&name), &repo_id)
-                };
-                app.finish_add_workspace(result, repo_id, repo_name, name, String::new());
+                // would re-trigger detection and loop.
+                let (ws_name, from) = (Some(name.clone()), checkout.then(|| name.clone()));
+                app.start_create(repo_id, name, String::new(), ws_name, from, None);
             }
             modal::ModalResult::SubmitRename(ws_id, session_id, title) => {
                 // Only title a session that's still live — reap can heal/drop the
@@ -5025,7 +5643,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 Action::AddWorkspace => app.open_add_workspace_modal_for_selection(),
                 Action::Delete => match app.tree_items.get(app.selected_index).cloned() {
                     Some(TreeNode::Workspace { ws, repo_name })
-                        if !app.workspace_delete_blocked_by_cleanup(&ws.id) =>
+                        if !app.workspace_delete_blocked(&ws.id) =>
                     {
                         app.modal = modal::ModalState::ConfirmDelete {
                             target: modal::DeleteTarget::Workspace {
@@ -5036,7 +5654,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         };
                     }
                     Some(TreeNode::Repo { id, name, .. })
-                        if !app.repo_delete_blocked_by_cleanup(&id) =>
+                        if !app.repo_delete_blocked(&id) =>
                     {
                         let ws_count =
                             app.workspaces.iter().filter(|w| w.repo_id == id).count();
@@ -5212,7 +5830,8 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-#[tokio::main]
+// One event loop task and no spawned tasks: worker threads would only idle.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     // Answer `--version`/`--help` before entering the alt-screen, where stdout
     // would be swallowed. (Kept first so `kommand0 --profile --help` prints
@@ -5337,6 +5956,82 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+/// The shortest gap between two redraws that visible pane output causes
+/// (~66fps).
+const WAKE_REDRAW_CAP: Duration = Duration::from_millis(15);
+/// How long a synchronized-output frame may hold visible output back before
+/// the tick draws it anyway (a child that never closes its frame).
+const SYNC_STALL_REDRAW: Duration = Duration::from_millis(100);
+
+/// The event loop's redraw decisions, pulled out of `run` so they are
+/// unit-tested: `seq` is the visible pane's output seq, `mid` whether it is
+/// inside a synchronized-output frame.
+#[derive(Default)]
+struct Pacer {
+    last_drawn_seq: Option<u64>,
+    /// The last draw a wake caused: paces visible output. Input draws never
+    /// count, so a key's echo is not held back.
+    last_wake_draw: Option<Instant>,
+    /// A deferred visible-output draw (the deadline arm).
+    wake_draw_at: Option<Instant>,
+    /// Since when visible output has been withheld for a frame in progress.
+    withheld_since: Option<Instant>,
+}
+
+impl Pacer {
+    /// After every draw, with the seq sampled before it.
+    fn drew(&mut self, seq: Option<u64>) {
+        self.last_drawn_seq = seq;
+        self.withheld_since = None;
+    }
+
+    /// A pane produced output: draw now, at `wake_draw_at`, or not at all.
+    fn on_wake(&mut self, now: Instant, seq: Option<u64>, mid: bool) -> bool {
+        // Background-only output: the visible frame would be unchanged (a
+        // resume storm in other workspaces must not peg the UI thread). Checked
+        // first, so it never starts the stall timer.
+        if seq == self.last_drawn_seq {
+            return false;
+        }
+        if mid {
+            self.withheld_since.get_or_insert(now);
+            return false;
+        }
+        match self.last_wake_draw {
+            // Defer rather than drop, so the burst's tail still shows.
+            Some(t) if now < t + WAKE_REDRAW_CAP => {
+                self.wake_draw_at.get_or_insert(t + WAKE_REDRAW_CAP);
+                false
+            }
+            _ => {
+                self.last_wake_draw = Some(now);
+                self.wake_draw_at = None;
+                true
+            }
+        }
+    }
+
+    /// The deferred draw is due. A mid-frame one is dropped: the frame's
+    /// closing wake comes after the cap, so it draws at once.
+    fn on_deadline(&mut self, now: Instant, seq: Option<u64>, mid: bool) -> bool {
+        self.wake_draw_at = None;
+        if mid || seq == self.last_drawn_seq {
+            return false;
+        }
+        self.last_wake_draw = Some(now);
+        true
+    }
+
+    /// The tick draws what it `changed`, and visible output still undrawn:
+    /// outside a frame, or held back by one for `SYNC_STALL_REDRAW`.
+    fn on_tick(&self, now: Instant, seq: Option<u64>, mid: bool, changed: bool) -> bool {
+        let stalled = self
+            .withheld_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= SYNC_STALL_REDRAW);
+        changed || (seq != self.last_drawn_seq && (!mid || stalled))
+    }
+}
+
 async fn run(
     terminal: &mut DefaultTerminal,
     profile: String,
@@ -5420,14 +6115,11 @@ async fn run(
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     app.embedded_wake = Some(wake_tx);
 
-    // Off-loop git-status worker → event loop. Seed one refresh up front, then
-    // refresh periodically (and on demand) so branch/diff status stays current
-    // without ever blocking the render loop on a git call.
-    let (status_tx, mut status_rx) =
-        tokio::sync::mpsc::unbounded_channel::<HashMap<String, kommand0_core::BranchStatus>>();
+    // Off-loop git-status worker → event loop. The tick dispatches the rows
+    // that are due (every row starts unchecked), so branch/diff status stays
+    // current without ever blocking the render loop on a git call.
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<StatusMsg>();
     app.status_tx = Some(status_tx);
-    app.request_branch_status_refresh();
-    app.last_status_refresh = Some(Instant::now());
 
     // Off-loop PR/CI-status worker → event loop. Seeded once, then refreshed on a
     // slow interval (one `gh pr list` per repo is a network call).
@@ -5456,18 +6148,31 @@ async fn run(
     let (issue_tx, mut issue_rx) = tokio::sync::mpsc::unbounded_channel::<IssueMsg>();
     app.issue_tx = Some(issue_tx);
 
+    // Review-diff worker → event loop, carrying `(request id, files)`.
+    let (diff_tx, mut diff_rx) = tokio::sync::mpsc::unbounded_channel::<DiffMsg>();
+    app.diff_tx = Some(diff_tx);
+
+    // Delete worker → event loop, carrying `(what was deleted, outcome)`.
+    let (delete_tx, mut delete_rx) = tokio::sync::mpsc::unbounded_channel::<DeleteMsg>();
+    app.delete_tx = Some(delete_tx);
+
+    // Create worker → event loop, carrying the made workspace or why not.
+    let (create_tx, mut create_rx) = tokio::sync::mpsc::unbounded_channel::<CreateMsg>();
+    app.create_tx = Some(create_tx);
+
     // Codex early-capture pollers → event loop, carrying the captured entry
     // as `(workspace_id, tab_id, "codex:<uuid>", spawn generation)`.
     let (codex_capture_tx, mut codex_capture_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, String, String, Instant)>();
     app.codex_capture_tx = Some(codex_capture_tx);
 
-    // Redraw coalescing for the wake arm: the visible pane's `output_seq` as of
-    // the last draw, when that draw happened, and whether the wake arm proved
-    // the next frame would be identical (background-only output: skip it).
-    let mut last_drawn_seq: Option<u64> = None;
-    let mut last_draw_at = Instant::now();
+    // When the visible pane's output is drawn (see Pacer), and whether the arm
+    // that just ran proved the next frame would be identical.
+    let mut pacer = Pacer::default();
     let mut skip_draw = false;
+    // A draw or key error ends the loop like a quit, so the teardown below
+    // still runs; `run` returns the error after it.
+    let mut loop_error: Option<anyhow::Error> = None;
 
     loop {
         if !skip_draw {
@@ -5481,9 +6186,11 @@ async fn run(
             // Sample BEFORE drawing: a read after could record a seq whose chunk
             // is not in the frame just drawn, silently skipping that output.
             let seq = app.visible_pane_seq();
-            terminal.draw(|frame| render::ui(frame, &mut app))?;
-            last_drawn_seq = seq;
-            last_draw_at = Instant::now();
+            if let Err(e) = terminal.draw(|frame| render::ui(frame, &mut app)) {
+                loop_error = Some(e.into());
+                break;
+            }
+            pacer.drew(seq);
         }
         skip_draw = false;
 
@@ -5492,36 +6199,25 @@ async fn run(
                 // Drain any backlog so we coalesce into a single redraw.
                 while wake_rx.try_recv().is_ok() {}
                 // Invariant: this arm stays mutation-free beyond draining and
-                // pacing. Any state change belongs in an always-draw arm; the
-                // seq-only comparison below relies on visible-pane identity
-                // changes (tab/workspace switches, opens, reaps) flowing
-                // through arms that always repaint.
-                if app.visible_pane_seq() == last_drawn_seq {
-                    // Background-only output: the visible pane's frame would be
-                    // unchanged, so skip the repaint (a resume storm in other
-                    // workspaces must not peg the UI thread).
-                    skip_draw = true;
-                } else {
-                    // Visible-pane output storm: pace repaints to ~66fps. Defer
-                    // rather than drop: dropping would regress keystroke echo to
-                    // the 50ms tick (the input-arm draw resets the clock and the
-                    // echo lands within the cap). Read elapsed() ONCE and subtract
-                    // from that value; a guard and subtraction on two separate
-                    // reads can underflow, and Duration subtraction panics.
-                    const WAKE_REDRAW_CAP: Duration = Duration::from_millis(15);
-                    let e = last_draw_at.elapsed();
-                    if e < WAKE_REDRAW_CAP {
-                        tokio::time::sleep(WAKE_REDRAW_CAP - e).await;
-                        // Pick up chunks that arrived during the pause so they
-                        // land in this draw, not a queued extra wake iteration.
-                        while wake_rx.try_recv().is_ok() {}
-                    }
-                }
+                // pacing. The seq-only comparison in the pacer relies on every
+                // visible-pane identity change (tab/workspace switches, opens,
+                // reaps) repainting: input always does, and the tick does
+                // whenever its TickView changed.
+                let (seq, mid) = (app.visible_pane_seq(), app.visible_pane_mid_frame());
+                skip_draw = !pacer.on_wake(Instant::now(), seq, mid);
             }
-            Some(status) = status_rx.recv() => {
-                // A status refresh finished: replace the cache wholesale (drops
-                // entries for deleted workspaces) and allow the next refresh.
-                app.branch_status = status;
+            // A visible-output draw the wake arm deferred (a disabled branch's
+            // sleep is built but never polled).
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                pacer.wake_draw_at.unwrap_or_else(Instant::now),
+            )), if pacer.wake_draw_at.is_some() => {
+                let (seq, mid) = (app.visible_pane_seq(), app.visible_pane_mid_frame());
+                skip_draw = !pacer.on_deadline(Instant::now(), seq, mid);
+            }
+            Some(results) = status_rx.recv() => {
+                // A status pass finished: merge it (an unchanged cache needs no
+                // redraw) and allow the next pass.
+                skip_draw = !app.apply_branch_status(results);
                 app.status_inflight = false;
             }
             Some(pr_status) = pr_status_rx.recv() => {
@@ -5536,8 +6232,17 @@ async fn run(
             Some((req, result)) = issue_rx.recv() => {
                 app.finish_issue_resolve(req, result);
             }
+            Some((req, files)) = diff_rx.recv() => {
+                app.finish_diff(req, files);
+            }
             Some((ws_id, result)) = cleanup_rx.recv() => {
                 app.on_cleanup_done(ws_id, result);
+            }
+            Some((target, outcome)) = delete_rx.recv() => {
+                app.on_delete_done(target, outcome);
+            }
+            Some(result) = create_rx.recv() => {
+                app.finish_create(result);
             }
             Some(msg) = repo_cleanup_rx.recv() => {
                 app.repo_cleanup_inflight = None;
@@ -5570,8 +6275,13 @@ async fn run(
                 let Some(event) = maybe_event else { break; }; // reader thread ended
                 match event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if handle_key(&mut app, key).await? == KeyOutcome::Quit {
-                            break;
+                        match handle_key(&mut app, key).await {
+                            Ok(KeyOutcome::Quit) => break,
+                            Ok(KeyOutcome::Continue) => {}
+                            Err(e) => {
+                                loop_error = Some(e);
+                                break;
+                            }
                         }
                     }
                     Event::Resize(_, _) => {
@@ -5629,6 +6339,9 @@ async fn run(
                         }
                     }
                     Event::Mouse(mouse_event) => {
+                        // A pointer move changes the screen only through the
+                        // hover, or by dropping a selection under an overlay.
+                        let before = (app.hovered_region(), app.pane_selection.is_some());
                         if app.show_diff {
                             mouse::handle_diff_mouse(&mut app, mouse_event);
                         } else if app.overlay_active() {
@@ -5657,6 +6370,8 @@ async fn run(
                         } else {
                             mouse::handle_mouse(&mut app, mouse_event);
                         }
+                        skip_draw = matches!(mouse_event.kind, MouseEventKind::Moved)
+                            && (app.hovered_region(), app.pane_selection.is_some()) == before;
                     }
                     _ => {}
                 }
@@ -5691,7 +6406,7 @@ async fn run(
                             // The mouse twin of detach: entries survive, so give
                             // the capture-kind panes their exit-hint capture too.
                             app.capture_panes_on_teardown(Some(&workspace_id));
-                            app.embedded.remove(&workspace_id);
+                            app.drop_panes(&workspace_id);
                             if let Some(session_id) = app.state.find_session_by_workspace(&workspace_id)
                                 .filter(|s| s.status == SessionStatus::Running)
                                 .map(|s| s.id.clone())
@@ -5699,6 +6414,7 @@ async fn run(
                                 let _ = app.state.update_session_status(&session_id, SessionStatus::Stopped);
                                 app.update_active_session();
                             }
+                            app.status_checked.remove(&workspace_id);
                         }
                         buttons::HitAction::FocusComposerFor { workspace_id } => {
                             // Focus the embedded claude for the given workspace.
@@ -5735,43 +6451,22 @@ async fn run(
             }
             _ = tick_interval.tick() => {
                 let now = Instant::now();
-                // Reap embedded panes whose claude exited (leaves Embedded focus).
-                app.reap_embedded(now);
-                // Refresh per-pane activity so the tree spinner reflects which
-                // sessions are currently producing output.
-                app.update_pane_activity(now);
-                // Advance spinner animation (every 5th tick = ~250ms at 50ms interval)
-                app.tick_counter = app.tick_counter.wrapping_add(1);
-                if app.tick_counter.is_multiple_of(5) {
-                    app.spinner_tick = (app.spinner_tick + 1) % 10;
-                }
-                // Periodic git-status refresh (off-loop). Time-based so it doesn't
-                // depend on the wrapping tick counter; interval is configurable.
-                let status_interval = app
-                    .config
-                    .status_refresh_secs
-                    // Floor at 1s so a mis-set 0 can't thrash a git subprocess
-                    // every tick.
-                    .map(|s| Duration::from_secs(s.max(1)))
-                    .unwrap_or(STATUS_REFRESH_INTERVAL);
-                if app
-                    .last_status_refresh
-                    .is_none_or(|t| now.duration_since(t) >= status_interval)
-                {
-                    app.last_status_refresh = Some(now);
-                    app.request_branch_status_refresh();
-                }
-                // Periodic PR/CI-status refresh (off-loop, slow interval — it's a
-                // network call per repo).
-                if app
-                    .last_pr_status_refresh
-                    .is_none_or(|t| now.duration_since(t) >= PR_STATUS_REFRESH_INTERVAL)
-                {
-                    app.last_pr_status_refresh = Some(now);
-                    app.request_pr_status_refresh();
-                }
+                let changed = app.tick(now);
+                let (seq, mid) = (app.visible_pane_seq(), app.visible_pane_mid_frame());
+                skip_draw = !pacer.on_tick(now, seq, mid, changed);
             }
         }
+    }
+
+    // Every loop exit lands here. Quitting may wait below (live panes, kill
+    // threads, a profile delete, a create): say so on screen first.
+    let waits = !app.embedded.is_empty()
+        || app.teardowns.iter().any(|(_, h)| !h.is_finished())
+        || app.profile_delete_join.as_ref().is_some_and(|h| !h.is_finished())
+        || app.create.is_some();
+    if waits {
+        app.profile_notice = Some(("Finishing background work…".to_string(), false));
+        let _ = terminal.draw(|frame| render::ui(frame, &mut app));
     }
 
     // A profile delete still in flight (the quit guard covers key-driven
@@ -5796,6 +6491,29 @@ async fn run(
     }
     // Tear down all embedded panes in one shared grace period (not N×250ms).
     app.shutdown_panes();
+    // Closed tabs and detaches may still be in their grace: a child that
+    // ignores SIGHUP would outlive us.
+    app.join_teardowns();
+    // A follow must not start `gh` now.
+    app.pr_status_tx = None;
+    // A create still making its worktree gets a bounded wait, then is adopted
+    // and saved; past it, its dir and branch are left behind unregistered.
+    if let Some(c) = &app.create {
+        let what = format!("{:?} (branch {:?}) in {}", c.input, c.branch, c.repo_name);
+        match tokio::time::timeout(CREATE_QUIT_WAIT, create_rx.recv()).await {
+            Ok(Some(result)) => app.finish_create(result),
+            _ => tracing::warn!("quit: abandoned creating workspace {what}"),
+        }
+    }
+    // Cleanup and delete replies already in get saved; one still running is
+    // abandoned (its row stays in state, and deleting it again finishes the
+    // job).
+    while let Ok((ws_id, result)) = cleanup_rx.try_recv() {
+        app.on_cleanup_done(ws_id, result);
+    }
+    while let Ok((target, outcome)) = delete_rx.try_recv() {
+        app.on_delete_done(target, outcome);
+    }
     // The teardown window: shutdown_panes itself takes up to ~1.75s (the
     // SIGTERM capture grace plus the SIGHUP grace), and a poller event or a
     // rollout landing DURING it would be lost with the sentinel kept
@@ -5808,7 +6526,7 @@ async fn run(
     if let Some(store) = kommand0_core::codex_sessions_dir() {
         app.sweep_codex_captures(&store);
     }
-    Ok(())
+    loop_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -6979,6 +7697,219 @@ mod key_tests {
             }
             _ => panic!("expected AddWorkspace reopened with an error"),
         }
+    }
+
+    /// A create into `repo_id` in flight, as `start_create` leaves it.
+    fn creating(repo_id: &str) -> Creating {
+        Creating {
+            repo_id: repo_id.into(),
+            repo_name: "real".into(),
+            input: "busy".into(),
+            branch: String::new(),
+            notice: None,
+        }
+    }
+
+    /// The error Add Workspace was reopened with, and what it kept typed.
+    fn reopened(app: &App) -> (String, String) {
+        match &app.modal {
+            modal::ModalState::AddWorkspace { error: Some(e), input, .. } => (e.clone(), input.clone()),
+            _ => panic!("expected AddWorkspace reopened with an error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_submit_shows_creating_and_the_worker_reply_adopts() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "adoptme");
+        press(&mut app, KeyCode::Enter).await;
+        assert!(matches!(app.modal, modal::ModalState::CreatingWorkspace { .. }), "the note is up");
+        assert!(!app.workspaces.iter().any(|w| w.name == "adoptme"), "not listed yet");
+
+        let result = recv(&mut rx).await;
+        app.finish_create(result);
+
+        assert!(!app.modal.is_active(), "the note closes");
+        assert!(app.create.is_none(), "no create is running");
+        let ws = app.workspaces.iter().find(|w| w.name == "adoptme").expect("adopted");
+        assert_eq!(ws.branch_name.as_deref(), Some("adoptme"), "on its own worktree");
+        assert!(
+            app.state_baseline.workspaces.iter().any(|w| w.name == "adoptme"),
+            "persisted: the baseline moves only after a successful save"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_while_creating_still_adopts_and_keeps_the_notice() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "escissue");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "1");
+        press(&mut app, KeyCode::Enter).await;
+        let req = app.issue_req.unwrap();
+        app.finish_issue_resolve(
+            req,
+            Ok(kommand0_core::IssueBranch { branch: "escissue".into(), reused: true }),
+        );
+        press(&mut app, KeyCode::Esc).await;
+        assert!(!app.modal.is_active(), "Esc hides the note");
+        app.open_add_repo_modal();
+
+        let result = recv(&mut rx).await;
+        app.finish_create(result);
+
+        assert!(matches!(app.modal, modal::ModalState::AddRepo { .. }), "the other modal stays up");
+        assert!(app.workspaces.iter().any(|w| w.name == "escissue"), "still adopted");
+        let (msg, is_error) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("Using existing linked branch escissue"), "{msg}");
+        assert!(!is_error);
+    }
+
+    #[tokio::test]
+    async fn a_create_failing_after_esc_leaves_an_error_notice() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            input: "failme".into(),
+            cursor: 6,
+            branch: "ghost".into(),
+            branch_cursor: 5,
+            field: modal::AddWorkspaceField::Name,
+            error: None,
+        };
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Esc).await;
+        app.open_add_repo_modal();
+
+        let result = recv(&mut rx).await;
+        app.finish_create(result);
+
+        assert!(matches!(app.modal, modal::ModalState::AddRepo { .. }), "the other modal stays up");
+        let (msg, is_error) = app.profile_notice.clone().expect("notice set");
+        assert!(msg.contains("couldn't check out branch"), "{msg}");
+        assert!(is_error);
+        assert!(!app.workspaces.iter().any(|w| w.name == "failme"), "nothing created");
+    }
+
+    #[tokio::test]
+    async fn a_second_create_while_one_runs_is_refused() {
+        let mut app = test_app();
+        app.create = Some(creating("r1"));
+        app.modal = add_workspace_modal_for("r1", "second");
+        press(&mut app, KeyCode::Enter).await;
+
+        let (e, input) = reopened(&app);
+        assert!(e.contains("still being created"), "{e}");
+        assert_eq!(input, "second", "the typed name is kept");
+        assert_eq!(app.create.as_ref().map(|c| c.input.as_str()), Some("busy"), "the first runs on");
+    }
+
+    #[tokio::test]
+    async fn an_issue_resolve_while_a_create_runs_is_refused() {
+        let mut app = test_app();
+        app.create = Some(creating("r1"));
+        app.modal = add_workspace_modal_for("r1", "123");
+        press(&mut app, KeyCode::Enter).await;
+
+        let (e, input) = reopened(&app);
+        assert!(e.contains("still being created"), "{e}");
+        assert_eq!(input, "123");
+        assert!(app.issue_req.is_none(), "no lookup started");
+    }
+
+    #[tokio::test]
+    async fn a_create_while_an_issue_resolve_runs_is_refused() {
+        let mut app = test_app();
+        app.issue_worker_started = Some(Instant::now());
+        app.modal = add_workspace_modal_for("r1", "plain");
+        press(&mut app, KeyCode::Enter).await;
+
+        let (e, input) = reopened(&app);
+        assert!(e.contains("issue lookup is still running"), "{e}");
+        assert_eq!(input, "plain");
+        assert!(app.create.is_none(), "no create started");
+    }
+
+    #[tokio::test]
+    async fn a_create_into_a_repo_being_deleted_is_refused() {
+        // A plain name and an issue ref: both end in a create.
+        for name in ["late", "123"] {
+            let mut app = test_app();
+            app.delete_inflight.insert("r1".into());
+            app.modal = add_workspace_modal_for("r1", name);
+            press(&mut app, KeyCode::Enter).await;
+
+            let (e, _) = reopened(&app);
+            assert!(e.contains("being deleted"), "{name}: {e}");
+            assert!(app.create.is_none() && app.issue_req.is_none(), "{name}: nothing started");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_adopt_names_the_leftover_path() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "dupe");
+        press(&mut app, KeyCode::Enter).await;
+        // The name is taken by the time the worker reports.
+        app.state.workspaces.push(mk_ws("other", "dupe", "real", None));
+
+        let result = recv(&mut rx).await;
+        let path = result.as_ref().unwrap().0.worktree_path.clone().unwrap();
+        app.finish_create(result);
+
+        let (e, input) = reopened(&app);
+        assert!(e.contains(&path) && e.contains("already exists"), "{e}");
+        assert_eq!(input, "dupe");
+        assert!(std::path::Path::new(&path).exists(), "the worktree is left there");
+    }
+
+    #[tokio::test]
+    async fn a_create_whose_save_fails_says_so() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = add_workspace_modal_for("real", "unsaved");
+        press(&mut app, KeyCode::Enter).await;
+        app.fail_saves = true;
+
+        let result = recv(&mut rx).await;
+        let path = result.as_ref().unwrap().0.worktree_path.clone().unwrap();
+        app.finish_create(result);
+
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert!(msg.contains(&path) && msg.contains("couldn't save"), "{msg}");
+        assert!(is_error);
+        assert!(app.workspaces.iter().any(|w| w.name == "unsaved"), "the row stays listed");
+    }
+
+    #[test]
+    fn a_failed_post_checkout_hook_is_named_in_the_create_notice() {
+        let mut app = test_app();
+        let notice = Some("Created linked branch ws-nine on origin".to_string());
+        app.create = Some(Creating { notice, ..creating("r1") });
+
+        app.finish_create(Ok((mk_ws("w9", "ws-nine", "r1", None), Some("hook says no".into()))));
+
+        assert!(app.workspaces.iter().any(|w| w.id == "w9"), "the workspace is adopted");
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert_eq!(
+            msg,
+            "Created linked branch ws-nine on origin; \
+             created ws-nine, but its post-checkout hook failed: hook says no"
+        );
+        assert!(!is_error, "the workspace is usable");
     }
 
     #[tokio::test]
@@ -8282,6 +9213,59 @@ mod key_tests {
         assert_eq!(app.focus, Focus::Tree, "detach lands back on the tree");
     }
 
+    #[test]
+    fn closing_a_hup_ignoring_tab_does_not_wait_for_it() {
+        let mut app = app_with_pane(HUP_IGNORING);
+        let pid = pane::tests::wait_for_pid(&app.embedded["w1"].tabs[0].pane);
+        app.focus = Focus::Embedded;
+
+        app.close_active_session();
+        let left = !app.embedded.contains_key("w1");
+        let queued = queued_teardowns(&app);
+        let alive_after_close = alive(pid);
+        app.join_teardowns();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
+
+        assert!(left, "the tab left at once");
+        assert_eq!(queued, [vec!["w1".to_string()]], "its kill runs in the background");
+        assert!(alive_after_close, "close returned before the process died");
+        assert!(died, "the join waited for the kill");
+    }
+
+    #[tokio::test]
+    async fn detaching_returns_before_its_panes_die() {
+        let mut app = app_with_pane(HUP_IGNORING);
+        app.embedded.get_mut("w1").unwrap().tabs.push(tab("b", &["-c", HUP_IGNORING]));
+        let pids: Vec<i32> =
+            app.embedded["w1"].tabs.iter().map(|t| pane::tests::wait_for_pid(&t.pane)).collect();
+        app.focus = Focus::Embedded;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        press(&mut app, KeyCode::Char('d')).await;
+        let left = !app.embedded.contains_key("w1");
+        let queued = queued_teardowns(&app);
+        let alive_after_detach = pids.iter().all(|&p| alive(p));
+        app.join_teardowns();
+        let survivors: Vec<i32> = pids
+            .iter()
+            .copied()
+            .filter(|&p| !pane::tests::wait_for_death(p, Duration::from_secs(5)))
+            .collect();
+        for &p in &survivors {
+            pane::tests::kill_leftovers(p);
+        }
+
+        assert!(left, "the tabs left at once");
+        assert_eq!(queued, [vec!["w1".to_string()]], "one background kill for the workspace");
+        assert!(alive_after_detach, "detach returned before the processes died");
+        assert!(survivors.is_empty(), "the join waited for the kill");
+    }
+
     #[tokio::test]
     async fn reopen_shell_spawn_failure_forgets_the_entry() {
         // KOMMAND0_SHELL would override config.shell and mask the failure path.
@@ -8512,6 +9496,65 @@ mod key_tests {
         assert_eq!(app.diff_title, "ws-one");
         assert!(app.diff_rows.is_empty());
         assert!(app.diff_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reopening_the_diff_shows_loading_not_the_old_rows() {
+        let (mut app, _repo, _tmp, wt) = app_with_a_real_worktree();
+        std::fs::write(wt.join("work.txt"), "work").unwrap();
+        git_ok(&wt, &["add", "."]);
+        git_ok(&wt, &["commit", "-m", "work"]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.diff_tx = Some(tx);
+
+        press(&mut app, KeyCode::Char('v')).await;
+        let (req, files) = recv(&mut rx).await;
+        app.finish_diff(req, files);
+        assert_eq!(row_labels(&app), ["F:work.txt"], "the first open lists the branch's file");
+
+        // Reopened, its reply not in yet: the old rows must not render
+        // against the cleared files.
+        press(&mut app, KeyCode::Esc).await;
+        press(&mut app, KeyCode::Char('v')).await;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Loading diff"), "{text}");
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Char('l')).await;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Loading diff"), "{text}");
+    }
+
+    #[test]
+    fn a_diff_reply_for_a_closed_or_newer_request_is_dropped() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/nonexistent/wt".into());
+        let files = || Some(vec![file_diff("a.txt", "@@ -0,0 +1 @@\n+x\n")]);
+
+        app.open_diff("w1");
+        let first = app.diff_seq;
+        app.show_diff = false;
+        app.finish_diff(first, files());
+        assert!(app.diff_rows.is_empty(), "a closed dialog takes no reply");
+
+        app.open_diff("w1");
+        app.finish_diff(first, files());
+        assert!(app.diff_rows.is_empty(), "the earlier request's reply is dropped");
+        assert_eq!(app.diff_note, "Loading diff…");
+
+        app.finish_diff(app.diff_seq, files());
+        assert_eq!(row_labels(&app), ["F:a.txt"], "the newest request's reply lands");
+    }
+
+    #[test]
+    fn a_failed_diff_says_so() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/nonexistent/wt".into());
+        app.open_diff("w1");
+        app.finish_diff(app.diff_seq, None);
+        assert!(app.diff_rows.is_empty());
+        assert_eq!(app.diff_note, "Couldn't compute a diff: not a git repo.");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Couldn't compute"), "{text}");
     }
 
     #[tokio::test]
@@ -9632,6 +10675,37 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn the_creating_modal_keeps_its_footer_and_never_names_the_branch() {
+        // The issue e2e waits for the branch name to appear in the tree, so
+        // the note must not show it first.
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "linked-77");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = modal::ModalState::AddWorkspace {
+            repo_id: "real".into(),
+            repo_name: "real".into(),
+            input: String::new(),
+            cursor: 0,
+            branch: "linked-77".into(),
+            branch_cursor: 9,
+            field: modal::AddWorkspaceField::Branch,
+            error: None,
+        };
+        press(&mut app, KeyCode::Enter).await;
+
+        for (w, h) in [(80u16, 30u16), (80, 24), (100, 30)] {
+            let text = render_to_string(&mut app, w, h);
+            let at = format!("at {w}x{h}");
+            assert!(text.contains("Add Workspace to real"), "{at}: names the repo:\n{text}");
+            assert!(text.contains("Making the git worktree"), "{at}: says what runs:\n{text}");
+            assert!(text.contains("Esc hide; it still gets created"), "{at}: footer survives:\n{text}");
+            assert!(!text.contains("linked-77"), "{at}: never names the branch:\n{text}");
+        }
+        let _ = recv(&mut rx).await;
+    }
+
+    #[tokio::test]
     async fn add_workspace_label_fits_80_columns() {
         // The modal is 55% wide, so 80 columns is the floor: the label has no
         // wrap and would clip.
@@ -10089,6 +11163,231 @@ mod key_tests {
     }
 
     #[test]
+    fn an_idle_tick_asks_for_no_redraw() {
+        let mut app = test_app();
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        let t0 = Instant::now();
+        // Six ticks cover a spinner advance (every fifth) with nothing spinning.
+        for i in 1..=6 {
+            assert!(!app.tick(t0 + Duration::from_millis(50 * i)), "tick {i}");
+        }
+    }
+
+    #[test]
+    fn a_visible_spinner_redraws_once_per_frame() {
+        let t0 = Instant::now();
+        let redraws = |app: &mut App| {
+            (1..=10).filter(|&i| app.tick(t0 + Duration::from_millis(50 * i))).count()
+        };
+        let mut app = test_app();
+        app.cleanup_inflight.insert("w1".into());
+        assert_eq!(redraws(&mut app), 2, "a workspace cleanup spinner");
+        let mut app = test_app();
+        app.repo_cleanup_inflight = Some("r1".into());
+        assert_eq!(redraws(&mut app), 2, "a repo cleanup spinner");
+        let mut app = test_app();
+        app.delete_inflight.insert("w1".into());
+        assert_eq!(redraws(&mut app), 2, "a delete spinner");
+    }
+
+    #[test]
+    fn a_reaped_tab_asks_for_a_redraw() {
+        let mut app = test_app();
+        let mut s = WorkspaceSessions {
+            tabs: vec![tab("a", &["-c", "exit 0"])],
+            active: 0,
+            last_active: None,
+        };
+        wait_exit(&mut s.tabs[0].pane);
+        app.embedded.insert("w1".to_string(), s);
+        let t0 = Instant::now();
+        assert!(app.tick(t0), "the reap drops the tab");
+        assert!(!app.embedded.contains_key("w1"));
+        assert!(!app.tick(t0 + Duration::from_millis(50)), "nothing left to change");
+    }
+
+    #[test]
+    fn a_reap_that_only_moves_focus_asks_for_a_redraw() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.focus = Focus::Embedded; // w1 has no live pane
+        assert!(app.tick(Instant::now()));
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn activity_changes_ask_for_a_redraw() {
+        let mut app = test_app();
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "while :; do echo x; sleep 0.02; done"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+            let redraw = app.tick(Instant::now());
+            if app.waiting_response.contains("a") {
+                assert!(redraw, "the tick that starts the spinner redraws");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the pane never armed the spinner");
+        }
+    }
+
+    #[test]
+    fn a_quiet_session_raises_attention_on_the_tick() {
+        let mut app = test_app(); // focus Tree: nobody is viewing the session
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "echo hi; sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.embedded["w1"].tabs[0].pane.output_seq() == 0 {
+            assert!(Instant::now() < deadline, "pane never produced output");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let t0 = Instant::now();
+        app.tick(t0);
+        assert!(app.tick(t0 + Duration::from_millis(3100)), "the attention dot redraws");
+        assert!(app.attention.contains("a"));
+    }
+
+    #[test]
+    fn a_pointer_move_repaints_only_on_a_hover_change() {
+        let mut app = test_app();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut draw = |app: &mut App| {
+            terminal.draw(|frame| render::ui(frame, app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        draw(&mut app);
+        let i = app
+            .hit_regions
+            .iter()
+            .position(|r| r.action == buttons::HitAction::StartSession)
+            .expect("[Open Claude] is drawn");
+        let area = app.hit_regions[i].area;
+
+        app.mouse_pos = Some((area.x, area.y));
+        assert_eq!(app.hovered_region(), Some(i));
+        let hovered = draw(&mut app);
+        app.mouse_pos = Some((area.right() - 1, area.y));
+        assert_eq!(app.hovered_region(), Some(i));
+        assert!(draw(&mut app) == hovered, "a move inside the button changes nothing");
+
+        app.mouse_pos = Some((area.right() + 2, area.y));
+        assert_eq!(app.hovered_region(), None);
+        assert!(draw(&mut app) != hovered, "leaving the button drops its hover style");
+    }
+
+    #[test]
+    fn a_wake_with_nothing_new_does_nothing() {
+        let mut p = Pacer::default();
+        p.drew(Some(3));
+        assert!(!p.on_wake(Instant::now(), Some(3), false));
+        assert_eq!((p.wake_draw_at, p.withheld_since), (None, None));
+    }
+
+    #[test]
+    fn background_output_during_an_open_frame_does_not_start_the_stall_timer() {
+        let mut p = Pacer::default();
+        p.drew(Some(3));
+        // The visible pane is mid-frame; the output came from another pane.
+        assert!(!p.on_wake(Instant::now(), Some(3), true));
+        assert_eq!(p.withheld_since, None);
+    }
+
+    #[test]
+    fn a_mid_frame_wake_waits_for_the_closing_wake() {
+        let t0 = Instant::now();
+        let mut p = Pacer::default();
+        p.drew(Some(1));
+        assert!(!p.on_wake(t0, Some(2), true), "the frame is still open");
+        assert!(p.on_wake(t0 + Duration::from_millis(5), Some(3), false), "its close draws");
+    }
+
+    #[test]
+    fn a_deferred_wake_draws_at_its_deadline() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut p = Pacer::default();
+        assert!(p.on_wake(t0, Some(1), false));
+        p.drew(Some(1));
+        assert!(!p.on_wake(ms(5), Some(2), false), "inside the cap");
+        assert_eq!(p.wake_draw_at, Some(ms(15)));
+        assert!(p.on_deadline(ms(15), Some(3), false));
+    }
+
+    #[test]
+    fn a_withheld_frame_redraws_on_the_tick_only_after_100_ms() {
+        let base = Instant::now();
+        let mut p = Pacer::default();
+        assert!(p.on_wake(base, Some(1), false));
+        p.drew(Some(1));
+        let t0 = base + Duration::from_secs(1);
+        let ms = |n| t0 + Duration::from_millis(n);
+        assert!(!p.on_wake(t0, Some(2), true));
+        assert!(!p.on_tick(ms(10), Some(2), true, false));
+        assert!(!p.on_tick(ms(50), Some(2), true, false));
+        // More output into the same frame doesn't restart the clock.
+        assert!(!p.on_wake(ms(60), Some(3), true));
+        assert!(p.on_tick(ms(100), Some(3), true, false), "a frame that never closes still shows");
+    }
+
+    #[test]
+    fn undrawn_output_outside_a_frame_is_drawn_by_the_next_tick() {
+        let t0 = Instant::now();
+        let mut p = Pacer::default();
+        assert!(p.on_wake(t0, Some(1), false));
+        p.drew(Some(1));
+        // Deferred inside the cap, and the tick comes before the deadline.
+        assert!(!p.on_wake(t0 + Duration::from_millis(5), Some(2), false));
+        assert!(p.on_tick(t0 + Duration::from_millis(6), Some(2), false, false));
+        p.drew(Some(2));
+        // Its deadline then finds nothing new, and disarms.
+        assert!(!p.on_deadline(t0 + Duration::from_millis(15), Some(2), false));
+        assert_eq!(p.wake_draw_at, None);
+        assert!(!p.on_tick(t0 + Duration::from_millis(56), Some(2), false, false), "all drawn");
+    }
+
+    #[test]
+    fn back_to_back_frames_cannot_starve() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut p = Pacer::default();
+        assert!(p.on_wake(t0, Some(1), false));
+        p.drew(Some(1));
+        assert!(!p.on_wake(ms(10), Some(2), true), "a frame opens");
+        assert!(!p.on_wake(ms(11), Some(3), false), "it closes inside the cap");
+        assert_eq!(p.wake_draw_at, Some(ms(15)));
+        assert!(!p.on_wake(ms(14), Some(4), true), "the next frame opens");
+        assert!(!p.on_deadline(ms(15), Some(4), true), "the deadline lands mid-frame");
+        assert_eq!(p.wake_draw_at, None, "and is spent");
+        let close = ms(15) + Duration::from_micros(500);
+        assert!(p.on_wake(close, Some(5), false), "the next close draws at once");
+    }
+
+    #[test]
     fn user_caused_output_keeps_seen_session_seen_but_not_unseen() {
         // Hover-scroll provokes child redraws while the tree keeps focus, so
         // mark_active_viewed (Embedded-only) never runs; without the advance
@@ -10201,6 +11500,221 @@ mod key_tests {
                 "a render sizes background tabs to the pane, not just the active one"
             );
         }
+    }
+
+    #[test]
+    fn status_due_schedules_by_activity_selection_and_age() {
+        let s = Duration::from_secs;
+        // (age since the last check, active, selected) -> due
+        let cases = [
+            (None, false, false, Some(1)),
+            (None, false, true, Some(0)),
+            (Some(s(2)), true, false, Some(0)),
+            (Some(s(1)), true, false, None),
+            (Some(s(9)), false, true, None),
+            (Some(s(10)), false, true, Some(0)),
+            (Some(s(240)), false, false, None),
+            (Some(s(300)), false, false, Some(1)),
+        ];
+        for (age, active, selected, want) in cases {
+            assert_eq!(
+                status_due(age, s(2), active, selected),
+                want,
+                "age {age:?}, active {active}, selected {selected}"
+            );
+        }
+    }
+
+    /// `test_app` with worktree rows `w1`..`wn` under an expanded r1. Their
+    /// dirs don't exist, so a check finds no status.
+    fn worktree_rows_app(n: usize) -> App {
+        let mut app = test_app();
+        app.workspaces = (1..=n)
+            .map(|i| {
+                let dir = format!("/nonexistent/kommand0-w{i}");
+                Workspace {
+                    worktree_path: Some(dir.clone()),
+                    working_dir: dir,
+                    ..mk_ws(&format!("w{i}"), &format!("ws-{i}"), "r1", None)
+                }
+            })
+            .collect();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app
+    }
+
+    #[test]
+    fn apply_branch_status_merges_and_prunes() {
+        let mut app = worktree_rows_app(1);
+        let on = |branch: &str| kommand0_core::BranchStatus {
+            branch: Some(branch.into()),
+            ..Default::default()
+        };
+        assert!(app.apply_branch_status(vec![("w1".into(), Some(on("a")))]), "a new status");
+        assert_eq!(app.branch_status["w1"], on("a"));
+
+        // "gone" was deleted while its check ran.
+        app.status_checked.insert("gone".into(), Instant::now());
+        let changed = app.apply_branch_status(vec![
+            ("w1".into(), Some(on("a"))),
+            ("gone".into(), Some(on("b"))),
+        ]);
+        assert!(!changed, "the same status plus a deleted row is no change");
+        assert!(!app.branch_status.contains_key("gone"), "a deleted row is not re-inserted");
+        assert!(!app.status_checked.contains_key("gone"), "nor is its stamp kept");
+
+        assert!(app.apply_branch_status(vec![("w1".into(), None)]), "a failed check clears w1");
+        assert!(app.branch_status.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pass_takes_every_urgent_row_and_at_most_four_background_ones() {
+        let mut app = worktree_rows_app(10);
+        app.select_workspace_row("w9");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+
+        let now = Instant::now();
+        app.dispatch_branch_status(now);
+        let mut stamped: Vec<&str> = app.status_checked.keys().map(String::as_str).collect();
+        stamped.sort();
+        assert_eq!(stamped, ["w1", "w2", "w3", "w4", "w9"]);
+        app.dispatch_branch_status(now);
+        assert_eq!(app.status_checked.len(), 5, "a pass in flight blocks the next");
+
+        let results = recv(&mut rx).await;
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["w9", "w1", "w2", "w3", "w4"]);
+        assert!(results.iter().all(|(_, s)| s.is_none()), "no status for a missing dir");
+    }
+
+    #[tokio::test]
+    async fn back_to_back_passes_only_take_what_is_due() {
+        let mut app = worktree_rows_app(3);
+        app.select_workspace_row("w3");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+
+        let now = Instant::now();
+        app.dispatch_branch_status(now);
+        let first = recv(&mut rx).await;
+        assert_eq!(first.len(), 3, "every row starts unchecked");
+        app.apply_branch_status(first);
+        app.status_inflight = false;
+
+        app.status_checked.remove("w2");
+        app.dispatch_branch_status(now + Duration::from_secs(30));
+        let ids: Vec<String> = recv(&mut rx).await.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["w3", "w2"]);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_refresh_survives_a_pass_in_flight() {
+        let mut app = worktree_rows_app(1);
+        app.select_workspace_row("w1");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        app.dispatch_branch_status(Instant::now());
+
+        app.detach_selected_workspace();
+        let results = recv(&mut rx).await;
+        app.apply_branch_status(results);
+        app.status_inflight = false;
+        assert!(!app.status_checked.contains_key("w1"), "the landed pass doesn't re-stamp w1");
+
+        app.dispatch_branch_status(Instant::now());
+        assert!(app.status_inflight, "w1 is due at once");
+        assert_eq!(recv(&mut rx).await[0].0, "w1");
+    }
+
+    #[tokio::test]
+    async fn typing_into_a_pane_makes_its_workspace_due() {
+        let mut app = worktree_rows_app(1);
+        app.select_repo_row("r1");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        let now = Instant::now();
+        app.status_checked.insert("w1".into(), now - Duration::from_secs(3));
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+
+        app.dispatch_branch_status(now);
+        assert!(!app.status_inflight, "an idle row checked 3s ago isn't due");
+
+        app.embedded.get_mut("w1").unwrap().tabs[0].pane.send(b"x").unwrap();
+        app.dispatch_branch_status(now);
+        assert!(app.status_inflight, "typed into since the check: due");
+        assert_eq!(recv(&mut rx).await[0].0, "w1");
+    }
+
+    #[tokio::test]
+    async fn a_session_busy_during_a_pass_is_checked_after_it_goes_quiet() {
+        let mut app = worktree_rows_app(1);
+        app.select_repo_row("r1");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+        // A pass checked w1 at t0 and is still running while the session works.
+        let t0 = Instant::now();
+        app.status_checked.insert("w1".into(), t0);
+        app.status_inflight = true;
+        app.pane_active_until.insert("a".into(), t0 + Duration::from_secs(1));
+        app.tick(t0);
+        assert!(app.waiting_response.contains("a"), "the session is busy");
+
+        // The pass lands after the spinner is gone.
+        app.status_inflight = false;
+        app.tick(t0 + Duration::from_secs(3));
+        assert!(app.waiting_response.is_empty(), "the session went quiet");
+        assert!(app.status_inflight, "w1 was busy since its check: due");
+        assert_eq!(recv(&mut rx).await[0].0, "w1");
+
+        // Quiet since that check, it waits for its idle interval again.
+        app.status_inflight = false;
+        app.tick(t0 + Duration::from_secs(6));
+        assert!(!app.status_inflight, "taken once");
+    }
+
+    #[test]
+    fn a_finished_teardown_makes_its_workspace_due_again() {
+        let mut app = worktree_rows_app(1);
+        app.select_workspace_row("w1");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions {
+                tabs: vec![tab("a", &["-c", "sleep 30"])],
+                active: 0,
+                last_active: None,
+            },
+        );
+
+        app.close_active_session();
+        // A pass checks w1 while its session is still dying, and runs on.
+        app.dispatch_branch_status(Instant::now());
+        assert!(app.status_checked.contains_key("w1"), "checked during the kill");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.teardowns.iter().all(|(_, h)| h.is_finished()) {
+            assert!(Instant::now() < deadline, "the kill never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.tick(Instant::now());
+        assert!(!app.status_checked.contains_key("w1"), "due again once the session is gone");
     }
 
     #[tokio::test]
@@ -11006,18 +12520,113 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn a_cleanup_kills_its_panes_off_the_loop() {
+        let (mut app, repo, _tmp, wt) = app_with_a_real_worktree();
+        std::fs::write(wt.join("work.txt"), "work").unwrap();
+        git_ok(&wt, &["add", "."]);
+        git_ok(&wt, &["commit", "-m", "work"]);
+        git_ok(repo.path(), &["merge", "--squash", "--ff", "feat"]);
+        git_ok(repo.path(), &["commit", "-m", "squash feat"]);
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cleanup_tx = Some(cleanup_tx);
+        // Until it dies the child keeps recreating a dir under its cwd, so a
+        // removal that ran first would be undone.
+        let script = "trap '' HUP; echo UP $$ OK; while :; do mkdir -p \"$PWD/x\"; sleep 0.02; done";
+        let t = tab_in("a", &wt, &["-c", script]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![t], active: 0, last_active: None },
+        );
+
+        app.start_cleanup("w1");
+        let left = !app.embedded.contains_key("w1");
+        let queued = queued_teardowns(&app);
+        let alive_after_start = alive(pid);
+        let (ws_id, result) = recv(&mut cleanup_rx).await;
+        app.join_teardowns();
+        let removed = !wt.exists();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
+
+        assert!(left, "the tab left at once");
+        assert_eq!(queued, [vec!["w1".to_string()]], "its kill runs in the background");
+        assert!(alive_after_start, "the cleanup started before the process died");
+        assert_eq!((ws_id.as_str(), result), ("w1", Ok(Cleaned::Removed)));
+        assert!(removed, "nothing recreated the worktree after its removal");
+        assert!(died, "the join waited for the kill");
+    }
+
+    #[test]
+    fn the_follow_up_runs_once_the_workspaces_panes_are_dead() {
+        // A real cleanup's git checks outlast the kill's grace, which hides a
+        // wrong order; this follow-up looks at once. The panes are its own, or
+        // an earlier teardown's (a detach, then a cleanup with no tabs left).
+        for earlier in [false, true] {
+            let mut app = test_app();
+            let t = tab("a", &["-c", HUP_IGNORING]);
+            let pid = pane::tests::wait_for_pid(&t.pane);
+            let mut tabs = vec![t];
+            if earlier {
+                app.spawn_teardown(vec!["w1".to_string()], std::mem::take(&mut tabs), None);
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let follow_up = move || {
+                let _ = tx.send(alive(pid));
+            };
+            app.spawn_teardown(vec!["w1".to_string()], tabs, Some(Box::new(follow_up)));
+            let seen_alive = rx.recv_timeout(Duration::from_secs(5));
+            app.join_teardowns();
+            if seen_alive != Ok(false) {
+                pane::tests::kill_leftovers(pid);
+            }
+            assert_eq!(seen_alive, Ok(false), "earlier teardown: {earlier}");
+        }
+    }
+
+    #[test]
+    fn a_teardown_waits_for_the_kills_an_earlier_one_joined() {
+        // A repo delete kills w1's and w2's panes; a w2 teardown joins that
+        // kill, and a w1 follow-up after it must still wait for it.
+        let mut app = test_app();
+        let t = tab("a", &["-c", HUP_IGNORING]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.spawn_teardown(vec!["w1".to_string(), "w2".to_string()], vec![t], None);
+        app.spawn_teardown(vec!["w2".to_string()], Vec::new(), Some(Box::new(|| {})));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follow_up = move || {
+            let _ = tx.send(alive(pid));
+        };
+        app.spawn_teardown(vec!["w1".to_string()], Vec::new(), Some(Box::new(follow_up)));
+        let seen_alive = rx.recv_timeout(Duration::from_secs(5));
+        app.join_teardowns();
+        // A reaped pid may be reused: kill only one not seen dead.
+        if seen_alive != Ok(false) {
+            pane::tests::kill_leftovers(pid);
+        }
+        assert_eq!(seen_alive, Ok(false), "w1's pane was dead first");
+    }
+
+    #[tokio::test]
     async fn a_removed_cleanup_drops_the_row_and_its_leftovers() {
         let mut app = test_app();
-        // Under a TempDir: the delete's `remove_worktree` clears an absent
-        // path's empty parent, which for `/tmp/alpha/gone` is the developer's
-        // `/tmp/alpha`.
-        let wt = tempfile::TempDir::new().unwrap();
+        // Under a TempDir: the arm clears the absent path's empty parent,
+        // which for `/tmp/alpha/gone` is the developer's `/tmp/alpha`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parent = tmp.path().join("worktrees").join("r1");
+        std::fs::create_dir_all(&parent).unwrap();
         app.workspaces[0].worktree_path =
-            Some(wt.path().join("gone").to_string_lossy().into_owned());
+            Some(parent.join("gone").to_string_lossy().into_owned());
         app.workspaces[0].branch_name = Some("ws-one".into());
         app.state.workspaces = app.workspaces.clone();
         app.cleanup_result.insert("w1".to_string(), ("stale refusal".to_string(), true));
         app.expanded_icon_rows.insert("w1".to_string());
+        // Selected, so the highlight on its pane goes with the row.
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
         app.pane_selection =
             Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
         // In flight, as when the worker's message lands: the arm must clear it
@@ -11036,20 +12645,20 @@ mod key_tests {
             app.state_baseline.workspaces.iter().all(|w| w.id != "w1"),
             "persisted with a merge-save: the baseline moves only after a successful save"
         );
+        assert!(!parent.exists(), "the emptied worktrees/<repo-id>/ is gone");
     }
 
     #[test]
     fn deleting_a_workspace_created_this_session_drops_it_from_disk() {
-        // The create plain-saves without moving the baseline, so a later
-        // merge-save would read the new row as a concurrent add and keep it.
+        // A baseline without the new row would make a later merge-save read
+        // it as a concurrent add and keep it.
         let mut app = test_app();
-        let row = mk_ws("w9", "ws-nine", "r1", None);
-        app.state.workspaces.push(row.clone()); // what the create does in memory
+        app.create = Some(creating("r1"));
 
-        app.finish_add_workspace(Ok(row), "r1".into(), "alpha".into(), "ws-nine".into(), String::new());
+        app.finish_create(Ok((mk_ws("w9", "ws-nine", "r1", None), None)));
         assert!(
             app.state_baseline.workspaces.iter().any(|w| w.id == "w9"),
-            "the baseline tracks the plain-saved row"
+            "the baseline tracks the saved row"
         );
 
         // The merge the delete's save performs: disk holds what the create
@@ -11214,56 +12823,739 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn repo_delete_is_ignored_while_one_of_its_rows_cleans_up() {
+    async fn repo_delete_is_ignored_while_a_row_is_busy() {
+        for deleting in [false, true] {
+            let busy = if deleting { "delete" } else { "cleanup" };
+            let mark = |app: &mut App, on: bool| {
+                let set =
+                    if deleting { &mut app.delete_inflight } else { &mut app.cleanup_inflight };
+                if on {
+                    set.insert("w1".to_string());
+                } else {
+                    set.remove("w1");
+                }
+            };
+            let mut app = test_app();
+            mark(&mut app, true);
+            app.select_repo_row("r1");
+
+            // Refused while a row's cleanup or delete owns its worktree: `d`
+            // opens nothing, `D` and a confirmed modal change nothing.
+            press(&mut app, KeyCode::Char('d')).await;
+            assert!(matches!(app.modal, modal::ModalState::None), "{busy}: d opens no modal");
+            press(&mut app, KeyCode::Char('D')).await;
+            assert_eq!(app.repos.len(), 2, "{busy}: D is ignored");
+            assert_eq!(app.workspaces.len(), 1);
+            app.modal = modal::ModalState::ConfirmDelete {
+                target: modal::DeleteTarget::Repo {
+                    id: "r1".into(),
+                    name: "alpha".into(),
+                    workspace_count: 1,
+                },
+            };
+            press(&mut app, KeyCode::Char('y')).await;
+            assert_eq!(app.repos.len(), 2, "{busy}: a confirmed delete is ignored");
+            assert!(app.workspaces.iter().any(|w| w.id == "w1"));
+
+            // Per repo: another repo still deletes.
+            app.select_repo_row("r2");
+            press(&mut app, KeyCode::Char('D')).await;
+            assert!(app.repos.iter().all(|r| r.id != "r2"), "{busy}: r2 is gone");
+            assert!(app.repos.iter().any(|r| r.id == "r1"), "{busy}: r1 stays");
+            assert!(app.workspaces.iter().any(|w| w.id == "w1"), "{busy}: w1 stays");
+
+            // The repo's own branch-delete phase owns its branches: refused too.
+            mark(&mut app, false);
+            app.repo_cleanup_inflight = Some("r1".into());
+            app.select_repo_row("r1");
+            press(&mut app, KeyCode::Char('D')).await;
+            assert_eq!(app.repos.len(), 1, "{busy}: D is ignored while the branch delete runs");
+            app.repo_cleanup_inflight = None;
+
+            // And a delete of the repo already running.
+            app.delete_inflight.insert("r1".into());
+            press(&mut app, KeyCode::Char('D')).await;
+            assert_eq!(app.repos.len(), 1, "{busy}: D is ignored while the repo's delete runs");
+            app.delete_inflight.remove("r1");
+
+            // Once the cleanups are done the same keys delete.
+            app.select_repo_row("r1");
+            press(&mut app, KeyCode::Char('d')).await;
+            assert!(matches!(
+                &app.modal,
+                modal::ModalState::ConfirmDelete {
+                    target: modal::DeleteTarget::Repo { id, workspace_count: 1, .. }
+                } if id == "r1"
+            ));
+            press(&mut app, KeyCode::Char('y')).await;
+            assert!(app.repos.is_empty());
+            assert!(app.workspaces.is_empty());
+        }
+    }
+
+    /// Run git in `dir`, failing the test on an error.
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// w1 on a real worktree (`feat`) of the real repo, selected, in the
+    /// state and its baseline. Returns the app, the repo and worktree-parent
+    /// guards, and the worktree.
+    fn app_with_a_real_worktree(
+    ) -> (App, tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
         let mut app = test_app();
+        let repo = add_real_repo(&mut app, "feat");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wt = tmp.path().join("wt");
+        git_ok(repo.path(), &["worktree", "add", wt.to_str().unwrap(), "feat"]);
+        route_w1_to_real(&mut app, &wt, "feat");
+        app.state.workspaces = app.workspaces.clone();
+        app.state_baseline = app.state.clone();
+        app.expanded.insert("real".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        (app, repo, tmp, wt)
+    }
+
+    /// Keeps recreating a dir under its cwd until it dies, and appends to
+    /// `mark` whenever it finds that cwd gone (it outlived a removal).
+    fn cwd_keeper(mark: &std::path::Path) -> String {
+        format!(
+            "trap '' HUP; echo UP $$ OK; while :; do [ -d \"$PWD\" ] || echo gone >> '{}'; \
+             mkdir -p \"$PWD/x\"; sleep 0.02; done",
+            mark.display()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_delete_keeps_the_row_until_its_worktree_is_gone() {
+        let (mut app, _repo, _tmp, wt) = app_with_a_real_worktree();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.workspaces.iter().any(|w| w.id == "w1"), "still listed");
+        assert!(app.state.workspaces.iter().any(|w| w.id == "w1"), "still in state");
+        assert!(app.delete_inflight.contains("w1"), "in flight");
+
+        let (target, outcome) = recv(&mut rx).await;
+        assert_eq!(outcome, DeleteOutcome::Done);
+        assert!(!wt.exists(), "the worktree is gone");
+        app.on_delete_done(target, outcome);
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "the row is gone");
+        assert!(app.state.workspaces.iter().all(|w| w.id != "w1"), "from the state too");
+        assert!(
+            app.state_baseline.workspaces.iter().all(|w| w.id != "w1"),
+            "persisted: the baseline moves only after a successful save"
+        );
+        assert!(app.profile_notice.is_none(), "a clean delete needs no notice");
+    }
+
+    #[tokio::test]
+    async fn a_late_delete_report_keeps_the_cursor_and_focus() {
+        // A cursor kept by index would slide off w2 when the deleted rows go:
+        // w2 sits under w1 and above beta's row, or above w3 in beta when all
+        // of alpha goes.
+        let cases = [
+            (Deleted::Workspace("w1".into()), vec![mk_ws("w2", "ws-two", "r1", None)]),
+            (
+                Deleted::Repo("r1".into()),
+                vec![mk_ws("w2", "aa-two", "r2", None), mk_ws("w3", "zz-three", "r2", None)],
+            ),
+        ];
+        for (target, rows) in cases {
+            let mut app = test_app();
+            app.workspaces.extend(rows);
+            app.state.workspaces = app.workspaces.clone();
+            app.expanded.extend(["r1".to_string(), "r2".to_string()]);
+            app.rebuild_tree();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            app.delete_tx = Some(tx);
+
+            match &target {
+                Deleted::Workspace(id) => app.delete_workspace(id), // the row's ✕
+                Deleted::Repo(id) => app.delete_repo(id),
+            }
+            app.select_workspace_row("w2");
+            app.embedded.insert(
+                "w2".to_string(),
+                WorkspaceSessions {
+                    tabs: vec![tab("a", &["-c", "sleep 30"])],
+                    active: 0,
+                    last_active: None,
+                },
+            );
+            app.focus = Focus::Embedded;
+            app.pane_selection =
+                Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+            let (done, outcome) = recv(&mut rx).await;
+            app.on_delete_done(done, outcome);
+
+            assert!(app.workspaces.iter().all(|w| w.id != "w1"), "{target:?}: w1 is gone");
+            let selected = app.selected_workspace().map(|w| w.id.as_str());
+            assert_eq!(selected, Some("w2"), "{target:?}: the cursor stays");
+            assert_eq!(app.focus, Focus::Embedded, "{target:?}: so does the focus");
+            assert!(app.pane_selection.is_some(), "{target:?}: and w2's highlight");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removed_cleanup_keeps_the_cursor_on_its_row() {
+        let mut app = test_app();
+        let wt = tempfile::TempDir::new().unwrap();
+        app.workspaces[0].worktree_path =
+            Some(wt.path().join("gone").to_string_lossy().into_owned());
+        app.workspaces[0].branch_name = Some("ws-one".into());
+        // As in the late delete report: w2 under w1, above beta's row.
+        app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w2");
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
         app.cleanup_inflight.insert("w1".into());
+
+        app.on_cleanup_done("w1".into(), Ok(Cleaned::Removed));
+
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "w1 is gone");
+        let selected = app.selected_workspace().map(|w| w.id.as_str());
+        assert_eq!(selected, Some("w2"), "the cursor stays");
+        assert!(app.pane_selection.is_some(), "and w2's highlight");
+    }
+
+    #[tokio::test]
+    async fn a_removed_cleanup_leaves_other_dirs_alone() {
+        // w1's dir is back (a create reused it before this late reply), and a
+        // sibling shares its parent.
+        let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
+        let sibling = tmp.path().join("sibling");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(sibling.join("keep.txt"), "mine").unwrap();
+        app.cleanup_inflight.insert("w1".into());
+
+        app.on_cleanup_done("w1".into(), Ok(Cleaned::Removed));
+
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "the row is gone");
+        let kept = std::fs::read_to_string(sibling.join("keep.txt"));
+        assert_eq!(kept.ok().as_deref(), Some("mine"), "the sibling's file is intact");
+        assert!(wt.exists(), "no git ran on the reused dir");
+    }
+
+    #[tokio::test]
+    async fn a_followed_cleanup_keeps_another_rows_highlight() {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/nonexistent/kommand0-w1".into());
+        app.workspaces[0].branch_name = Some("feat".into());
+        app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w2");
+        app.pane_selection =
+            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+        app.cleanup_inflight.insert("w1".into());
+
+        app.on_cleanup_done("w1".into(), Ok(Cleaned::Followed { branch: "elsewhere".into() }));
+
+        assert_eq!(app.workspaces[0].branch_name.as_deref(), Some("elsewhere"), "w1 follows");
+        let selected = app.selected_workspace().map(|w| w.id.as_str());
+        assert_eq!(selected, Some("w2"), "the cursor stays");
+        assert!(app.pane_selection.is_some(), "and w2's highlight");
+    }
+
+    #[tokio::test]
+    async fn a_busy_row_ignores_delete_open_new_tab_diff_archive_and_cleanup() {
+        for deleting in [false, true] {
+            let busy = if deleting { "delete" } else { "cleanup" };
+            let mut app = test_app();
+            app.config.claude_bin = Some("sh".to_string());
+            // Openable and own-branch, so each refusal below is the guard's.
+            app.workspaces[0].working_dir = "/tmp".into();
+            app.workspaces[0].worktree_path = Some("/nonexistent/kommand0-w1".into());
+            app.workspaces[0].branch_name = Some("feat".into());
+            app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+            app.state.workspaces = app.workspaces.clone();
+            app.expanded.insert("r1".to_string());
+            app.rebuild_tree();
+            app.select_workspace_row("w1");
+            if deleting {
+                app.delete_inflight.insert("w1".into());
+            } else {
+                app.cleanup_inflight.insert("w1".into());
+            }
+
+            press(&mut app, KeyCode::Char('d')).await;
+            assert!(matches!(app.modal, modal::ModalState::None), "{busy}: d opens no modal");
+            press(&mut app, KeyCode::Char('D')).await;
+            assert!(app.workspaces.iter().any(|w| w.id == "w1"), "{busy}: D leaves the row");
+            press(&mut app, KeyCode::Enter).await;
+            assert!(!app.embedded.contains_key("w1"), "{busy}: Enter spawns nothing");
+            app.new_tab(TabKind::Claude, "w1");
+            assert!(!app.embedded.contains_key("w1"), "{busy}: no new tab");
+            press(&mut app, KeyCode::Char('v')).await;
+            assert!(!app.show_diff, "{busy}: v opens no diff");
+            press(&mut app, KeyCode::Char('A')).await;
+            let active = app.workspaces.iter().any(|w| w.id == "w1" && w.active);
+            assert!(active, "{busy}: A doesn't archive it");
+            press(&mut app, KeyCode::Char('c')).await;
+            assert!(matches!(app.modal, modal::ModalState::None), "{busy}: c opens nothing");
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.cleanup_tx = Some(tx);
+            // A cleanup that starts clears the row's last result.
+            app.cleanup_result.insert("w1".into(), ("earlier".into(), false));
+            app.start_cleanups(&["w1"]);
+            assert!(app.cleanup_result.contains_key("w1"), "{busy}: no cleanup starts");
+
+            app.select_workspace_row("w2");
+            press(&mut app, KeyCode::Enter).await;
+            assert!(app.embedded.contains_key("w2"), "{busy}: the sibling still opens");
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_delete_keeps_its_rows_until_every_worktree_is_gone() {
+        let (mut app, repo, tmp, wt1) = app_with_a_real_worktree();
+        let wt2 = tmp.path().join("wt2");
+        git_ok(repo.path(), &["branch", "feat2"]);
+        git_ok(repo.path(), &["worktree", "add", wt2.to_str().unwrap(), "feat2"]);
+        app.workspaces.push(Workspace {
+            working_dir: wt2.to_string_lossy().into_owned(),
+            worktree_path: Some(wt2.to_string_lossy().into_owned()),
+            ..mk_ws("w2", "ws-two", "real", Some("feat2"))
+        });
+        app.state.workspaces = app.workspaces.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+        app.select_repo_row("real");
+
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.repos.iter().any(|r| r.id == "real"), "the repo stays listed");
+        let rows = app.workspaces.iter().filter(|w| w.repo_id == "real").count();
+        assert_eq!(rows, 2, "with its rows");
+        let mut marked: Vec<&str> = app.delete_inflight.iter().map(String::as_str).collect();
+        marked.sort();
+        assert_eq!(marked, ["real", "w1", "w2"]);
+
+        let (target, outcome) = recv(&mut rx).await;
+        assert_eq!((&target, &outcome), (&Deleted::Repo("real".into()), &DeleteOutcome::Done));
+        app.on_delete_done(target, outcome);
+        assert!(app.repos.iter().all(|r| r.id != "real"), "the repo is gone");
+        assert!(app.workspaces.iter().all(|w| w.repo_id != "real"), "with its rows");
+        assert!(app.delete_inflight.is_empty(), "nothing left in flight");
+        assert!(!app.spinner_visible(), "no spinner left behind");
+        assert!(!wt1.exists() && !wt2.exists(), "both worktrees are gone");
+    }
+
+    #[tokio::test]
+    async fn a_live_pane_dies_before_its_worktree_goes() {
+        let (mut app, _repo, _tmp, wt) = app_with_a_real_worktree();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+        // Outside the worktree's parent, which the removal may rmdir.
+        let marks = tempfile::TempDir::new().unwrap();
+        let mark = marks.path().join("outlived");
+        let t = tab_in("a", &wt, &["-c", &cwd_keeper(&mark)]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![t], active: 0, last_active: None },
+        );
+
+        press(&mut app, KeyCode::Char('D')).await;
+        let left = !app.embedded.contains_key("w1");
+        let queued = queued_teardowns(&app);
+        let alive_after_delete = alive(pid);
+        let (_, outcome) = recv(&mut rx).await;
+        app.join_teardowns();
+        let removed = !wt.exists();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
+
+        assert!(left, "the tab left at once");
+        assert_eq!(queued, [vec!["w1".to_string()]], "its kill runs in the background");
+        assert!(alive_after_delete, "the delete returned before the process died");
+        assert_eq!(outcome, DeleteOutcome::Done);
+        assert!(!mark.exists(), "the process was dead before its cwd went");
+        assert!(removed, "nothing recreated the worktree after its removal");
+        assert!(died, "the join waited for the kill");
+    }
+
+    #[tokio::test]
+    async fn a_detach_then_delete_waits_for_the_detach_kill() {
+        let (mut app, _repo, _tmp, wt) = app_with_a_real_worktree();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+        let marks = tempfile::TempDir::new().unwrap();
+        let mark = marks.path().join("outlived");
+        let t = tab_in("a", &wt, &["-c", &cwd_keeper(&mark)]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![t], active: 0, last_active: None },
+        );
+
+        app.detach_selected_workspace();
+        press(&mut app, KeyCode::Char('D')).await;
+        let alive_after_delete = alive(pid);
+        let (_, outcome) = recv(&mut rx).await;
+        app.join_teardowns();
+        let removed = !wt.exists();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
+
+        assert!(alive_after_delete, "the delete returned before the detach's kill ended");
+        assert_eq!(outcome, DeleteOutcome::Done);
+        assert!(!mark.exists(), "the removal waited for the detach's kill");
+        assert!(removed, "nothing recreated the worktree after its removal");
+        assert!(died, "the join waited for the kill");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_delete_keeps_the_row() {
+        for target in [Deleted::Workspace("w1".into()), Deleted::Repo("r1".into())] {
+            let mut app = test_app();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.delete_tx = Some(tx);
+            match &target {
+                Deleted::Workspace(id) => app.delete_workspace(id),
+                Deleted::Repo(id) => app.delete_repo(id),
+            }
+            assert!(app.delete_inflight.contains("w1"), "{target:?}: marked");
+
+            app.on_delete_done(target.clone(), DeleteOutcome::Interrupted);
+
+            assert!(app.workspaces.iter().any(|w| w.id == "w1"), "{target:?}: the row stays");
+            assert!(app.repos.iter().any(|r| r.id == "r1"), "{target:?}: under its repo");
+            assert!(app.delete_inflight.is_empty(), "{target:?}: no longer in flight");
+            assert!(!app.spinner_visible(), "{target:?}: no spinner left behind");
+            let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+            assert!(msg.contains("still listed"), "{target:?}: {msg}");
+            assert!(is_error, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn a_delete_note_never_replaces_an_unread_delete_error() {
+        // w2's removal failed (a locked worktree) and w1's kept the same dir as
+        // w2's: whichever lands second, the actionable error is what stays up.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let failed = || DeleteOutcome::Notes(vec![LeftWorktree::Failed { path: path.clone() }]);
+        let kept = || {
+            let owner = "ws-two".to_string();
+            DeleteOutcome::Notes(vec![LeftWorktree::Alias { path: path.clone(), owner }])
+        };
+        let ws = |id: &str| Deleted::Workspace(id.into());
+        for error_first in [true, false] {
+            let mut app = test_app();
+            app.state.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+            app.workspaces = app.state.workspaces.clone();
+            if error_first {
+                app.on_delete_done(ws("w2"), failed());
+                app.on_delete_done(ws("w1"), kept());
+            } else {
+                app.on_delete_done(ws("w1"), kept());
+                let shown = app.profile_notice.as_ref().map(|(_, is_error)| *is_error);
+                assert_eq!(shown, Some(false), "the note is up first");
+                app.on_delete_done(ws("w2"), failed());
+            }
+            let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+            assert!(is_error && msg.contains("by hand"), "error first: {error_first}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_delete_leaving_files_names_them() {
+        let mut app = test_app();
+        app.delete_inflight.insert("w1".into());
+        let left = vec![LeftWorktree::Failed { path: "/x/y".into() }];
+
+        app.on_delete_done(Deleted::Workspace("w1".into()), DeleteOutcome::Notes(left));
+
+        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "the row is gone");
+        assert!(app.delete_inflight.is_empty(), "no longer in flight");
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert!(msg.contains("/x/y") && msg.contains("by hand"), "{msg}");
+        assert!(is_error, "a failed removal is an error");
+    }
+
+    #[test]
+    fn only_a_failed_removal_asks_for_a_hand_delete() {
+        let path = || "/x/y".to_string();
+        let cases = [
+            (LeftWorktree::Alias { path: path(), owner: "ws-two".into() }, false),
+            (LeftWorktree::Unverified { path: path() }, false),
+            (LeftWorktree::Failed { path: path() }, true),
+        ];
+        for (left, by_hand) in cases {
+            let note = left_worktree_note(&left);
+            assert!(note.contains("/x/y"), "{note}");
+            assert_eq!(note.contains("by hand"), by_hand, "{note}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_row_aliasing_a_live_worktree_names_the_owner() {
+        let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
+        std::fs::write(wt.join("keep.txt"), "mine").unwrap();
+        // w2's dir is a symlink to w1's live worktree.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&wt, &alias).unwrap();
+        app.workspaces.push(Workspace {
+            working_dir: alias.to_string_lossy().into_owned(),
+            worktree_path: Some(alias.to_string_lossy().into_owned()),
+            ..mk_ws("w2", "ws-two", "real", Some("feat2"))
+        });
+        app.state.workspaces = app.workspaces.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+
+        app.delete_workspace("w2");
+        let (target, outcome) = recv(&mut rx).await;
+        app.on_delete_done(target, outcome);
+
+        assert!(app.workspaces.iter().all(|w| w.id != "w2"), "the row is gone");
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert!(msg.contains("ws-one"), "names the owner: {msg}");
+        assert!(!msg.contains("by hand"), "never asks to delete a live worktree: {msg}");
+        assert!(!is_error, "kept on purpose, not a failure");
+        let kept = std::fs::read_to_string(wt.join("keep.txt")).unwrap();
+        assert_eq!(kept, "mine", "w1's worktree is intact");
+    }
+
+    #[tokio::test]
+    async fn deleting_two_aliased_rows_removes_the_worktree() {
+        let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
+        // w2's dir is a symlink to w1's worktree, and both rows go.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&wt, &alias).unwrap();
+        app.workspaces.push(Workspace {
+            working_dir: alias.to_string_lossy().into_owned(),
+            worktree_path: Some(alias.to_string_lossy().into_owned()),
+            ..mk_ws("w2", "ws-two", "real", Some("feat2"))
+        });
+        app.state.workspaces = app.workspaces.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+
+        app.delete_workspace("w2");
+        app.delete_workspace("w1");
+        for _ in 0..2 {
+            let (target, outcome) = recv(&mut rx).await;
+            app.on_delete_done(target, outcome);
+            let notice = app.profile_notice.take().map(|(msg, _)| msg).unwrap_or_default();
+            assert!(!notice.contains("ws-two's worktree"), "{notice}");
+        }
+        assert!(!wt.exists(), "w1's worktree is gone");
+    }
+
+    #[tokio::test]
+    async fn a_kept_note_never_names_an_owner_being_deleted_too() {
+        // w1's removal keeps its dir as w2's (a symlink to it), then w2's
+        // delete removes it. w1's report lands while w2's delete runs, or
+        // after it removed the dir: neither says "kept".
+        for owner_reports_first in [false, true] {
+            let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
+            let alias = tmp.path().join("alias");
+            std::os::unix::fs::symlink(&wt, &alias).unwrap();
+            app.workspaces.push(Workspace {
+                working_dir: alias.to_string_lossy().into_owned(),
+                worktree_path: Some(alias.to_string_lossy().into_owned()),
+                ..mk_ws("w2", "ws-two", "real", Some("feat2"))
+            });
+            app.state.workspaces = app.workspaces.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            app.delete_tx = Some(tx);
+            let deliver = |app: &mut App, (target, outcome): DeleteMsg| {
+                app.on_delete_done(target, outcome);
+                let notice = app.profile_notice.take().map(|(msg, _)| msg).unwrap_or_default();
+                assert!(!notice.contains("kept"), "owner first: {owner_reports_first}: {notice}");
+            };
+
+            app.delete_workspace("w1");
+            let first = recv(&mut rx).await;
+            let path = wt.to_string_lossy().into_owned();
+            let kept = LeftWorktree::Alias { path, owner: "ws-two".into() };
+            assert_eq!(first.1, DeleteOutcome::Notes(vec![kept]), "w1's dir was kept as w2's");
+            app.delete_workspace("w2");
+            if owner_reports_first {
+                let second = recv(&mut rx).await;
+                deliver(&mut app, second);
+            }
+            // Otherwise delivered at once: w2's removal has not run yet.
+            deliver(&mut app, first);
+            if !owner_reports_first {
+                let second = recv(&mut rx).await;
+                deliver(&mut app, second);
+            }
+            assert!(!wt.exists(), "w2's delete removed the dir");
+            let gone = app.workspaces.iter().all(|w| w.id != "w1" && w.id != "w2");
+            assert!(gone, "owner first: {owner_reports_first}: both rows are forgotten");
+        }
+    }
+
+    #[test]
+    fn a_kept_note_stays_when_nothing_deletes_its_owner() {
+        // The dir still stands and no delete here owns it: a workspace kmd
+        // saved after this TUI loaded, or one in another repo named like the
+        // deleted row (which is itself being deleted).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        for owner in ["from-kmd", "ws-one"] {
+            let mut app = test_app();
+            app.state.workspaces.push(mk_ws("w9", "ws-one", "r2", None));
+            app.workspaces = app.state.workspaces.clone();
+            app.delete_inflight.insert("w1".into());
+            let kept = LeftWorktree::Alias { path: path.clone(), owner: owner.into() };
+
+            app.on_delete_done(Deleted::Workspace("w1".into()), DeleteOutcome::Notes(vec![kept]));
+
+            let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+            assert!(msg.contains(&format!("kept {path}: it is {owner}'s worktree")), "{msg}");
+            assert!(!is_error, "{owner}: kept on purpose, not a failure");
+            assert!(app.workspaces.iter().all(|w| w.id != "w1"), "{owner}: the row is gone");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_an_alias_waits_for_the_other_rows_panes() {
+        let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
+        // w2's dir is a symlink to w1's worktree, where w1 has a live pane.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&wt, &alias).unwrap();
+        app.workspaces.push(Workspace {
+            working_dir: alias.to_string_lossy().into_owned(),
+            worktree_path: Some(alias.to_string_lossy().into_owned()),
+            ..mk_ws("w2", "ws-two", "real", Some("feat2"))
+        });
+        app.state.workspaces = app.workspaces.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+        let marks = tempfile::TempDir::new().unwrap();
+        let mark = marks.path().join("outlived");
+        let t = tab_in("a", &wt, &["-c", &cwd_keeper(&mark)]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![t], active: 0, last_active: None },
+        );
+
+        app.delete_workspace("w1");
+        app.delete_workspace("w2");
+        for _ in 0..2 {
+            let (target, outcome) = recv(&mut rx).await;
+            app.on_delete_done(target, outcome);
+        }
+        app.join_teardowns();
+        let removed = !wt.exists();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
+
+        assert!(!mark.exists(), "w1's process was dead before the shared dir went");
+        assert!(removed, "nothing recreated the worktree after its removal");
+        assert!(app.workspaces.iter().all(|w| w.id != "w1" && w.id != "w2"), "both rows are gone");
+        assert!(died, "the join waited for the kill");
+    }
+
+    #[tokio::test]
+    async fn a_deleting_row_shows_deleting_in_its_detail_pane() {
+        let mut app = test_app();
+        app.workspaces.push(Workspace {
+            worktree_path: Some("/nonexistent/kommand0-w2".into()),
+            ..mk_ws("w2", "ws-two", "r1", Some("feat"))
+        });
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.delete_inflight.extend(["w1".to_string(), "w2".to_string(), "r2".to_string()]);
+
+        // w1 is a fallback row: no branch, still says so.
+        app.select_workspace_row("w1");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Deleting…"), "a fallback row:\n{text}");
+        app.select_workspace_row("w2");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Deleting…"), "an own-branch row:\n{text}");
+        assert!(!text.contains("[Clean up]"), "the button yields to it:\n{text}");
+        app.select_repo_row("r2");
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Deleting…"), "a repo:\n{text}");
+        assert!(!text.contains("[Clean up branches]"), "the button yields to it:\n{text}");
+    }
+
+    #[test]
+    fn a_deleting_row_gets_no_status_check() {
+        let mut app = worktree_rows_app(2);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.status_tx = Some(tx);
+        app.delete_inflight.insert("w1".into());
+
+        app.dispatch_branch_status(Instant::now());
+
+        assert!(!app.status_checked.contains_key("w1"), "its worktree is going");
+        assert!(app.status_checked.contains_key("w2"), "the other row is checked");
+    }
+
+    #[tokio::test]
+    async fn a_repo_being_deleted_starts_no_branch_cleanup() {
+        let mut app = test_app();
+        let tmp = tempfile::TempDir::new().unwrap();
+        app.repos[0].path = tmp.path().join("missing").to_string_lossy().into_owned();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.repo_cleanup_tx = Some(tx);
+        app.delete_inflight.insert("r1".into());
         app.select_repo_row("r1");
 
-        // Refused while a row's cleanup owns its worktree: `d` opens nothing,
-        // `D` and a confirmed modal change nothing.
+        press(&mut app, KeyCode::Char('c')).await;
+
+        assert!(app.repo_cleanup_inflight.is_none(), "no scan of a repo being deleted");
+    }
+
+    #[tokio::test]
+    async fn a_delete_is_ignored_while_a_create_runs_in_its_repo() {
+        let mut app = test_app();
+        app.workspaces.push(mk_ws("w2", "ws-two", "r2", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.expanded.extend(["r1".to_string(), "r2".to_string()]);
+        app.rebuild_tree();
+        app.create = Some(creating("r1"));
+        app.select_workspace_row("w1");
+
         press(&mut app, KeyCode::Char('d')).await;
-        assert!(matches!(app.modal, modal::ModalState::None), "d opens no modal");
+        assert!(!app.modal.is_active(), "d opens no modal");
         press(&mut app, KeyCode::Char('D')).await;
-        assert_eq!(app.repos.len(), 2, "D is ignored");
-        assert_eq!(app.workspaces.len(), 1);
-        app.modal = modal::ModalState::ConfirmDelete {
-            target: modal::DeleteTarget::Repo {
-                id: "r1".into(),
-                name: "alpha".into(),
-                workspace_count: 1,
-            },
-        };
-        press(&mut app, KeyCode::Char('y')).await;
-        assert_eq!(app.repos.len(), 2, "a confirmed delete is ignored");
-        assert!(app.workspaces.iter().any(|w| w.id == "w1"));
+        assert!(app.workspaces.iter().any(|w| w.id == "w1"), "D leaves the row");
+        assert!(app.delete_inflight.is_empty(), "nothing is being deleted");
+
+        // Per repo: a row in another repo still deletes.
+        app.select_workspace_row("w2");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.workspaces.iter().all(|w| w.id != "w2"), "w2 is gone");
+    }
+
+    #[tokio::test]
+    async fn a_repo_delete_is_ignored_while_a_create_runs_in_it() {
+        let mut app = test_app();
+        app.create = Some(creating("r1"));
+        app.select_repo_row("r1");
+
+        press(&mut app, KeyCode::Char('d')).await;
+        assert!(!app.modal.is_active(), "d opens no modal");
+        press(&mut app, KeyCode::Char('D')).await;
+        assert!(app.repos.iter().any(|r| r.id == "r1"), "D leaves the repo");
+        assert!(app.delete_inflight.is_empty(), "nothing is being deleted");
 
         // Per repo: another repo still deletes.
         app.select_repo_row("r2");
         press(&mut app, KeyCode::Char('D')).await;
         assert!(app.repos.iter().all(|r| r.id != "r2"), "r2 is gone");
-        assert!(app.repos.iter().any(|r| r.id == "r1"), "r1 stays");
-        assert!(app.workspaces.iter().any(|w| w.id == "w1"), "w1 stays");
-
-        // The repo's own branch-delete phase owns its branches: refused too.
-        app.cleanup_inflight.remove("w1");
-        app.repo_cleanup_inflight = Some("r1".into());
-        app.select_repo_row("r1");
-        press(&mut app, KeyCode::Char('D')).await;
-        assert_eq!(app.repos.len(), 1, "D is ignored while the branch delete runs");
-        app.repo_cleanup_inflight = None;
-
-        // Once the cleanups are done the same keys delete.
-        app.select_repo_row("r1");
-        press(&mut app, KeyCode::Char('d')).await;
-        assert!(matches!(
-            &app.modal,
-            modal::ModalState::ConfirmDelete {
-                target: modal::DeleteTarget::Repo { id, workspace_count: 1, .. }
-            } if id == "r1"
-        ));
-        press(&mut app, KeyCode::Char('y')).await;
-        assert!(app.repos.is_empty());
-        assert!(app.workspaces.is_empty());
     }
 
     #[tokio::test]
@@ -11310,6 +13602,7 @@ mod key_tests {
         assert!(elapsed < 2 * TEARDOWN_CAPTURE_GRACE, "paid once, not per workspace ({elapsed:?})");
         assert!(app.cleanup_inflight.contains("w1") && app.cleanup_inflight.contains("w2"));
         assert!(!app.repo_cleanup_result.contains_key("real"), "nothing skipped, no line");
+        app.join_teardowns();
     }
 
     #[tokio::test]
@@ -11849,15 +14142,32 @@ mod key_tests {
     }
 
     fn tab(id: &str, args: &[&str]) -> SessionTab {
+        tab_in(id, std::path::Path::new("/tmp"), args)
+    }
+
+    fn tab_in(id: &str, dir: &std::path::Path, args: &[&str]) -> SessionTab {
         SessionTab {
             id: id.to_string(),
-            pane: pane::Pane::spawn("sh", args, std::path::Path::new("/tmp"), 24, 80).unwrap(),
+            pane: pane::Pane::spawn("sh", args, dir, 24, 80).unwrap(),
             was_resume: false,
             spawned: Instant::now(),
             capture_since: None,
             exit_seen: None,
             kind: TabKind::Claude,
         }
+    }
+
+    /// Ignores SIGHUP like a Node `claude`, so only the SIGKILL after the grace
+    /// ends it; prints its pid for `pane::tests::wait_for_pid`.
+    const HUP_IGNORING: &str = "trap '' HUP; echo UP $$ OK; sleep 300";
+
+    fn alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    /// The workspace ids of each queued teardown.
+    fn queued_teardowns(app: &App) -> Vec<Vec<String>> {
+        app.teardowns.iter().map(|(ids, _)| ids.clone()).collect()
     }
 
     fn ids(s: &WorkspaceSessions) -> Vec<&str> {
@@ -11923,16 +14233,18 @@ mod key_tests {
 
         // Close a tab BELOW the active one: the active tab stays the same one.
         // [a,b,c] active=1(b); remove 0(a) -> [b,c] active=0(b).
-        assert!(!s.remove_tab(0));
+        assert_eq!(s.remove_tab(0).map(|t| t.id), Some("a".to_string()));
         assert_eq!(ids(&s), vec!["b", "c"]);
         assert_eq!(s.active, 0);
         // Close the active (last) tab: clamp back onto the remaining one.
         s.active = 1;
-        assert!(!s.remove_tab(1));
+        assert_eq!(s.remove_tab(1).map(|t| t.id), Some("c".to_string()));
         assert_eq!(ids(&s), vec!["b"]);
         assert_eq!(s.active, 0);
         // Close the final tab -> empty.
-        assert!(s.remove_tab(0));
+        assert_eq!(s.remove_tab(0).map(|t| t.id), Some("b".to_string()));
+        assert!(s.tabs.is_empty());
+        assert!(s.remove_tab(0).is_none(), "nothing left to remove");
     }
 
     #[test]
@@ -11997,7 +14309,7 @@ mod key_tests {
         // Close the remembered tab: the dangling id degrades to a no-op.
         s.select(2); // now on c; last_active = b
         let b_idx = s.tabs.iter().position(|t| t.id == "b").unwrap();
-        assert!(!s.remove_tab(b_idx));
+        assert_eq!(s.remove_tab(b_idx).map(|t| t.id), Some("b".to_string()));
         s.select_last_active();
         assert_eq!(s.tabs[s.active].id, "c", "closed last-active tab: no-op");
     }
@@ -12492,24 +14804,27 @@ mod key_tests {
 
     #[test]
     fn reap_drops_exited_tab_and_keeps_active_by_identity() {
-        let mut app = test_app(); // has workspace "w1"
-        let mut s = WorkspaceSessions {
-            tabs: vec![
-                tab("a", &["-c", "sleep 30"]),
-                tab("b", &["-c", "sleep 30"]),
-                tab("c", &["-c", "sleep 30"]),
-            ],
-            active: 2, // active on "c"
-            last_active: None,
-        };
-        s.tabs[0].pane.kill(); // a non-active tab exits
-        wait_exit(&mut s.tabs[0].pane);
-        app.embedded.insert("w1".to_string(), s);
+        // On "b" the index alone would slide onto "c" once "a" is gone.
+        for (active, active_id) in [(2, "c"), (1, "b")] {
+            let mut app = test_app(); // has workspace "w1"
+            let mut s = WorkspaceSessions {
+                tabs: vec![
+                    tab("a", &["-c", "sleep 30"]),
+                    tab("b", &["-c", "sleep 30"]),
+                    tab("c", &["-c", "sleep 30"]),
+                ],
+                active,
+                last_active: None,
+            };
+            s.tabs[0].pane.kill(); // a non-active tab exits
+            wait_exit(&mut s.tabs[0].pane);
+            app.embedded.insert("w1".to_string(), s);
 
-        app.reap_embedded(Instant::now());
-        let s = &app.embedded["w1"];
-        assert_eq!(ids(s), vec!["b", "c"], "exited tab a dropped");
-        assert_eq!(s.tabs[s.active].id, "c", "active stays on c by identity");
+            app.reap_embedded(Instant::now());
+            let s = &app.embedded["w1"];
+            assert_eq!(ids(s), vec!["b", "c"], "exited tab a dropped");
+            assert_eq!(s.tabs[s.active].id, active_id, "active stays on {active_id} by identity");
+        }
     }
 
     #[tokio::test]
@@ -12619,6 +14934,11 @@ mod key_tests {
         assert!(
             app.heal_resume(TabKind::Claude, "w1", "b", "/tmp", Instant::now()),
             "fresh spawn succeeded"
+        );
+        assert_eq!(
+            queued_teardowns(&app),
+            [vec!["w1".to_string()]],
+            "the replaced tab dies off the loop"
         );
 
         let persisted = app.state.embedded_session_ids("w1").to_vec();
@@ -12776,6 +15096,11 @@ mod key_tests {
         app.reap_embedded(t + RESUME_MISS_SCAN_EVERY);
         let gone = app.embedded.get("w1").map(|s| !ids(s).contains(&"a")).unwrap_or(true);
         assert!(gone, "past the stride the scan heals/drops the missed resume");
+        assert_eq!(
+            queued_teardowns(&app),
+            [vec!["w1".to_string()]],
+            "the live missed tab dies off the loop"
+        );
     }
 
     #[tokio::test]

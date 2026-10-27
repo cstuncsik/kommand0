@@ -1,4 +1,4 @@
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Result;
@@ -11,6 +11,9 @@ pub enum WorktreeResult {
     Created {
         worktree_path: String,
         branch_name: String,
+        /// The post-checkout hook's last stderr line when it failed, or "the
+        /// hook printed nothing" (the worktree is still made).
+        hook_error: Option<String>,
     },
     /// Worktree creation failed; caller should fall back to repo root.
     Fallback {
@@ -55,19 +58,18 @@ pub fn branch_exists_bare(repo_path: &str, name: &str) -> bool {
         || verify_ref(repo_path, &format!("refs/remotes/origin/{name}"))
 }
 
-/// Resolve `<base_dir>/worktrees/<repo_id>/<workspace_name>` to an absolute
-/// path string, clearing a stale worktree already there. `Err(reason)` if the
-/// repo id is unsafe as a path segment or a dir still blocks the path.
+/// `<base_dir>/worktrees/<repo_id>/<workspace_name>` as an absolute path.
+/// `Err(reason)` if the repo id is unsafe as a path segment or the parent is a
+/// checked-out worktree.
 ///
 /// Coexistence invariant: `worktrees/` may contain legacy flat `<name>` dirs
 /// (pre-nesting layout) alongside `<repo-id>/` dirs. Paths are read from
 /// state, never re-derived from names; never sweep `worktrees/` by pattern.
-fn prepare_worktree_dir(
-    repo_path: &str,
+pub(crate) fn worktree_dir(
     repo_id: &str,
     workspace_name: &str,
     base_dir: &Path,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<PathBuf, String> {
     // state.json is hand-editable: the id must be exactly one normal path
     // segment (rejects `.`/`..`, separators, and a Windows drive prefix like
     // `C:x`, any of which would make `join` escape `worktrees/`). A leading
@@ -91,11 +93,22 @@ fn prepare_worktree_dir(
     }
     let worktree_dir = parent.join(workspace_name);
     // The worktree dir doesn't exist yet; make the path absolute so git is happy.
-    let worktree_dir = if worktree_dir.is_relative() {
+    Ok(if worktree_dir.is_relative() {
         std::env::current_dir().unwrap_or_default().join(&worktree_dir)
     } else {
         worktree_dir
-    };
+    })
+}
+
+/// [`worktree_dir`] as a string, clearing a stale worktree already there.
+/// `Err(reason)` if the dir can't be built or a dir still blocks the path.
+fn prepare_worktree_dir(
+    repo_path: &str,
+    repo_id: &str,
+    workspace_name: &str,
+    base_dir: &Path,
+) -> std::result::Result<String, String> {
+    let worktree_dir = worktree_dir(repo_id, workspace_name, base_dir)?;
     let worktree_path = worktree_dir.to_string_lossy().to_string();
 
     if worktree_dir.exists() {
@@ -173,14 +186,30 @@ pub fn create_worktree(
     let branch = unique_branch_name(repo_path, &strip_accents(workspace_name));
 
     // Create the worktree on a fresh branch.
-    let output = Command::new("git")
-        .args(["-C", repo_path, "worktree", "add", &worktree_path, "-b", &branch])
+    let output = git_no_prompt(repo_path)
+        .args(["worktree", "add", &worktree_path, "-b", &branch])
         .output();
     finish_worktree_add(repo_path, output, worktree_path, branch)
 }
 
+/// `git -C <repo_path>` for a `worktree add` that can't prompt: a hook or an
+/// LFS smudge reaching the network would otherwise ask on the terminal, reading
+/// keys meant for the TUI. The rest of [`crate::git::fetch_origin_branch`]'s
+/// recipe is left out: its 20 s `wait_bounded` cap would abandon a big healthy
+/// checkout, and its gc flags only matter for a fetch.
+fn git_no_prompt(repo_path: &str) -> Command {
+    let mut git = Command::new("git");
+    git.args(["-C", repo_path])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("GIT_SSH_COMMAND", crate::git::batch_ssh_command(repo_path))
+        .envs(crate::git::http_stall(repo_path));
+    git
+}
+
 /// Map the `git worktree add` result to a [`WorktreeResult`], copying the repo's
-/// `.worktree-copy` files into a freshly-created worktree.
+/// `.worktree-copy` files into a freshly-created worktree. A failed add that
+/// left its own worktree (a failed post-checkout hook) counts as created.
 ///
 /// `repo_path` is the source repo root (where `.worktree-copy` lives). The copy
 /// runs only on the success arm — a `Fallback` worktree never exists to copy
@@ -195,7 +224,27 @@ fn finish_worktree_add(
     match output {
         Ok(result) if result.status.success() => {
             copy_worktree_files(repo_path, &worktree_path);
-            WorktreeResult::Created { worktree_path, branch_name }
+            WorktreeResult::Created { worktree_path, branch_name, hook_error: None }
+        }
+        // git keeps a worktree whose post-checkout hook failed, and removes
+        // one it gave up on; the dir didn't exist before the add.
+        Ok(result) if made_by_this_add(repo_path, &worktree_path, &branch_name) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!(
+                worktree = worktree_path,
+                "git worktree add failed but kept the worktree: {}",
+                stderr.trim()
+            );
+            copy_worktree_files(repo_path, &worktree_path);
+            // The hook's last line, past what git prints around the checkout.
+            let git_own = ["Preparing worktree", "HEAD is now at", "Updating files"];
+            let hook_line = stderr
+                .lines()
+                .map(str::trim)
+                .rev()
+                .find(|l| !l.is_empty() && !git_own.iter().any(|p| l.starts_with(p)));
+            let hook_error = Some(hook_line.unwrap_or("the hook printed nothing").to_string());
+            WorktreeResult::Created { worktree_path, branch_name, hook_error }
         }
         Ok(result) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -205,6 +254,19 @@ fn finish_worktree_add(
         }
         Err(e) => WorktreeResult::Fallback { reason: format!("failed to run git: {e}") },
     }
+}
+
+/// Whether the worktree at `worktree_path` is the one a failed add of `branch`
+/// made: this repo's, on `branch`, and unlocked. A concurrent create or another
+/// repository can fill the path too, and an add still running, or killed, holds
+/// the lock.
+fn made_by_this_add(repo_path: &str, worktree_path: &str, branch: &str) -> bool {
+    let admin = || {
+        crate::cleanup::check_git_stdout(worktree_path, &["rev-parse", "--absolute-git-dir"], &[])
+    };
+    Path::new(worktree_path).join(".git").exists()
+        && crate::cleanup::worktree_head(repo_path, worktree_path, branch).as_deref() == Ok(branch)
+        && admin().is_some_and(|dir| !Path::new(&dir).join("locked").exists())
 }
 
 /// Copy the repo's configured files into a freshly-created worktree, mirroring
@@ -425,7 +487,7 @@ pub fn create_worktree_from_branch(
             return WorktreeResult::Fallback { reason: format!("branch not found: {branch_ref}") };
         };
 
-    let output = Command::new("git").args(["-C", repo_path]).args(&args).output();
+    let output = git_no_prompt(repo_path).args(&args).output();
     finish_worktree_add(repo_path, output, worktree_path, branch_name)
 }
 
@@ -434,7 +496,7 @@ pub fn create_worktree_from_branch(
 /// EMPTY dir, so a sibling worktree keeps it alive; for a legacy flat
 /// worktree the parent is `worktrees/` itself, removed only when empty and
 /// recreated on demand, a harmless no-op.
-fn remove_empty_parent(worktree_path: &str) {
+pub fn remove_empty_parent(worktree_path: &str) {
     if let Some(parent) = Path::new(worktree_path).parent() {
         let _ = std::fs::remove_dir(parent);
     }
@@ -562,6 +624,7 @@ mod tests {
             WorktreeResult::Created {
                 worktree_path,
                 branch_name,
+                ..
             } => {
                 assert!(Path::new(&worktree_path).exists());
                 assert_eq!(branch_name, "my-feature", "branch is named after the workspace");
@@ -750,7 +813,7 @@ mod tests {
         let base = TempDir::new().unwrap();
         init_git_repo(repo.path());
         match create_worktree(repo.path().to_str().unwrap(), "r1", "ajándék-tálcás-ő-ű", base.path()) {
-            WorktreeResult::Created { worktree_path, branch_name } => {
+            WorktreeResult::Created { worktree_path, branch_name, .. } => {
                 assert_eq!(branch_name, "ajandek-talcas-o-u");
                 assert!(
                     worktree_path.ends_with("ajándék-tálcás-ő-ű"),
@@ -773,7 +836,7 @@ mod tests {
         Command::new("git").args(["-C", rp, "branch", "feat"]).output().unwrap();
 
         match create_worktree_from_branch(rp, "r1", "ws", base.path(), "feat") {
-            WorktreeResult::Created { worktree_path, branch_name } => {
+            WorktreeResult::Created { worktree_path, branch_name, .. } => {
                 assert!(Path::new(&worktree_path).exists());
                 assert_eq!(branch_name, "feat", "existing branch checked out as-is (no fork)");
                 let head = Command::new("git")
@@ -783,6 +846,48 @@ mod tests {
                 assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "feat");
             }
             WorktreeResult::Fallback { reason } => panic!("expected Created, got: {reason}"),
+        }
+    }
+
+    #[test]
+    fn from_the_branch_the_repo_has_checked_out_is_a_fallback() {
+        // git refuses before making anything, so there is nothing to adopt.
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+
+        match create_worktree_from_branch(repo.path().to_str().unwrap(), "r1", "ws", base.path(), "main") {
+            WorktreeResult::Fallback { reason } => assert!(reason.contains("already"), "{reason}"),
+            WorktreeResult::Created { .. } => panic!("main is the repo's own checkout"),
+        }
+        assert!(!base.path().join("worktrees").join("r1").join("ws").exists(), "nothing at the path");
+    }
+
+    #[test]
+    fn a_failed_add_adopts_only_a_worktree_it_made() {
+        // The add fails on a path someone else filled: another repository on a
+        // branch named like ours, a concurrent create on its own branch, an add
+        // killed while it held the lock.
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        let at = |name: &str| base.path().join(name).to_string_lossy().into_owned();
+        let git = crate::git::tests::git;
+        std::fs::create_dir(at("foreign")).unwrap();
+        init_git_repo(Path::new(&at("foreign")));
+        git(Path::new(&at("foreign")), &["branch", "-m", "ws"]);
+        git(repo.path(), &["worktree", "add", &at("other"), "-b", "other"]);
+        git(repo.path(), &["worktree", "add", &at("locked"), "-b", "ws"]);
+        git(repo.path(), &["worktree", "lock", &at("locked")]);
+
+        for name in ["foreign", "other", "locked"] {
+            let output = git_no_prompt(rp).args(["worktree", "add", &at(name), "-b", "ws"]).output();
+            assert!(!output.as_ref().unwrap().status.success(), "{name}: the add fails");
+            match finish_worktree_add(rp, output, at(name), "ws".to_string()) {
+                WorktreeResult::Fallback { .. } => {}
+                WorktreeResult::Created { .. } => panic!("{name}: adopted a worktree it didn't make"),
+            }
         }
     }
 
@@ -902,7 +1007,7 @@ mod tests {
         let base = TempDir::new().unwrap();
 
         match create_worktree_from_branch(clone.to_str().unwrap(), "r1", "ws", base.path(), "feat") {
-            WorktreeResult::Created { worktree_path, branch_name } => {
+            WorktreeResult::Created { worktree_path, branch_name, .. } => {
                 assert_eq!(branch_name, "feat", "a local branch is created for the remote ref");
                 let up = Command::new("git")
                     .args(["-C", &worktree_path, "rev-parse", "--abbrev-ref", "feat@{upstream}"])
@@ -911,6 +1016,53 @@ mod tests {
                 assert_eq!(String::from_utf8_lossy(&up.stdout).trim(), "origin/feat", "tracks the remote");
             }
             WorktreeResult::Fallback { reason } => panic!("expected Created (tracking), got: {reason}"),
+        }
+    }
+
+    #[test]
+    fn worktree_add_runs_git_non_interactively() {
+        // A checkout that reaches the network (a hook, an LFS smudge) must not
+        // prompt on the terminal the TUI owns.
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        let hooks = repo.path().join("hooks");
+        let log = repo.path().join("env.log");
+        let hook = format!(
+            "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"${{GIT_TERMINAL_PROMPT-UNSET}}\" \
+             \"${{GIT_ASKPASS-UNSET}}\" \"${{GIT_SSH_COMMAND-UNSET}}\" \
+             \"${{GIT_HTTP_LOW_SPEED_TIME-UNSET}}\" >> {}\n",
+            crate::git::shell_quote(log.to_str().unwrap())
+        );
+        write_file(&hooks, "post-checkout", &hook);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hooks.join("post-checkout"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        // Local, so it beats a hooksPath in the global config the tests inherit.
+        Command::new("git").args(["-C", rp, "config", "core.hooksPath", hooks.to_str().unwrap()]).output().unwrap();
+        Command::new("git").args(["-C", rp, "branch", "feat"]).output().unwrap();
+
+        assert!(matches!(create_worktree(rp, "r1", "a", base.path()), WorktreeResult::Created { .. }));
+        let from_branch = create_worktree_from_branch(rp, "r1", "b", base.path(), "feat");
+        assert!(matches!(from_branch, WorktreeResult::Created { .. }));
+
+        // A low-speed time the user configured wins over kommand0's.
+        let user_time = Command::new("git")
+            .args(["-C", rp, "config", "--get-regexp", r"^http\..*lowspeedtime$"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        let env = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(env.lines().count(), 2, "one line per worktree add: {env}");
+        for line in env.lines() {
+            assert!(line.starts_with("0||"), "no terminal prompt and no askpass helper: {line}");
+            let fields: Vec<&str> = line.split('|').collect();
+            assert!(fields[2].contains("BatchMode=yes"), "ssh can't prompt: {line}");
+            if !user_time {
+                assert_ne!(fields[3], "UNSET", "a stalled https transfer gives up: {line}");
+            }
         }
     }
 

@@ -7,6 +7,7 @@
 //! `KOMMAND0_CLAUDE_BIN` env var (see the embedded-pane tests).
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,8 @@ struct Tui {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     master: Box<dyn portable_pty::MasterPty + Send>, // kept for resize()
+    /// Bytes the app has written to its terminal so far.
+    written: Arc<AtomicUsize>,
     /// The isolated state dir, doubling as the child's cwd (in the
     /// legacy-layout variant it's the cwd root CONTAINING `.kommand0-dev`,
     /// not the state dir itself). Kept alive for the duration of the test.
@@ -155,6 +158,8 @@ impl Tui {
             HostCallbacks::default(),
         )));
         let parser_clone = parser.clone();
+        let written = Arc::new(AtomicUsize::new(0));
+        let written_clone = written.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
@@ -162,6 +167,7 @@ impl Tui {
                     break;
                 }
                 parser_clone.lock().unwrap().process(&buf[..n]);
+                written_clone.fetch_add(n, Ordering::Relaxed);
             }
         });
 
@@ -171,6 +177,7 @@ impl Tui {
             child,
             killer,
             master,
+            written,
             state_dir,
         }
     }
@@ -268,6 +275,27 @@ impl Tui {
                 );
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Wait until the app has written nothing to its terminal for 1 s,
+    /// panicking after 10 s.
+    fn wait_for_quiet(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = self.written.load(Ordering::Relaxed);
+        let mut quiet_since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let now = self.written.load(Ordering::Relaxed);
+            if now != last {
+                last = now;
+                quiet_since = Instant::now();
+            } else if quiet_since.elapsed() >= Duration::from_secs(1) {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!("the app kept writing to its terminal; screen:\n{}", self.screen());
+            }
         }
     }
 
@@ -413,7 +441,8 @@ fn survives_a_resize_drag_without_wedging_input() {
         std::thread::sleep(Duration::from_millis(10));
     }
     // Re-rendered at the final size (a panic on any resize would have killed the
-    // process and timed this out instead).
+    // process and timed this out instead): the status bar sits on its last row.
+    tui.wait_for_row(39, "q quit");
     tui.wait_for("demo");
     // Input still flows after the drag — the wedge symptom was `q` being ignored.
     tui.send("q");
@@ -480,6 +509,47 @@ fn review_diff_overlay_opens_and_closes() {
 }
 
 #[test]
+fn review_diff_shows_a_real_worktrees_files() {
+    // The diff is computed on a worker; its reply must reach the open dialog.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let wt = dir.path().join("wt");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "user.name", "t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+    run_git(&repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "feat"]);
+    std::fs::write(wt.join("diff-me.txt"), "1").unwrap();
+    run_git(&wt, &["add", "."]);
+    run_git(&wt, &["commit", "-m", "work"]);
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
+        "workspaces": [{
+            "id": "w1", "name": "demo-ws", "repo_id": "r1",
+            "working_dir": wt.to_str().unwrap(), "active": true, "created_at": 0,
+            "worktree_path": wt.to_str().unwrap(), "branch_name": "feat"
+        }],
+        "sessions": []
+    })
+    .to_string();
+
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "false")]);
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.wait_for("no upstream"); // a status pass landed too
+    tui.send("v");
+    tui.wait_for("diff-me.txt");
+
+    tui.send_esc();
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn tree_navigation_expands_repo_with_l() {
     let dir = tempfile::tempdir().unwrap();
     let state = seeded_state(dir.path().to_str().unwrap());
@@ -523,6 +593,52 @@ fn embedded_pane_renders_real_terminal_and_forwards_keys() {
 
     tui.send("\x1d"); // Ctrl+] leaves the embedded pane (back to the tree)
     tui.send("q"); // quit (kills the embedded child on teardown)
+    tui.wait_exit();
+}
+
+#[test]
+fn an_idle_screen_writes_nothing() {
+    // A session that went quiet, no spinner, no input: nothing on screen
+    // changes, so nothing is written (it used to repaint every 50 ms tick).
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+    tui.wait_for_quiet();
+
+    tui.send("\x1d");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn synchronized_frames_render_and_an_unclosed_one_still_shows() {
+    // embed-stub-sync echoes each key inside a synchronized-output frame;
+    // `!` opens one it never closes, which still shows once it has stalled.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub-sync")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    tui.wait_for("EMBED-STUB-READY");
+
+    tui.send("zq7");
+    tui.wait_for("zq7");
+    tui.send("!");
+    tui.wait_for("SYNCSTALL");
+
+    tui.send("\x1d");
+    tui.send("q");
     tui.wait_exit();
 }
 
@@ -1246,6 +1362,61 @@ fn closing_the_last_tab_returns_to_tree_and_reopens_fresh() {
 }
 
 #[test]
+fn quitting_right_after_closing_a_tab_kills_its_process() {
+    // A closed tab's process dies on a background thread; quitting must wait
+    // for it, or a child that ignores SIGHUP outlives kommand0.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_CLAUDE_BIN", "embed-stub-hup")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.send("e");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid = loop {
+        let screen = tui.screen();
+        let pid = screen.split("UP ").skip(1).find_map(|rest| {
+            let (pid, tail) = rest.split_once(' ')?;
+            tail.starts_with("OK").then(|| pid.parse::<i32>().ok()).flatten()
+        });
+        if let Some(pid) = pid {
+            break nix::unistd::Pid::from_raw(pid);
+        }
+        assert!(Instant::now() < deadline, "the stub never printed its pid; screen:\n{screen}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Whatever fails from here on, the stub's `sleep 1000` must not outlive the test.
+    struct KillOnDrop(Option<nix::unistd::Pid>);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+    }
+    let mut stub = KillOnDrop(Some(pid));
+
+    tui.send("\x01");
+    tui.send("x");
+    tui.send("q");
+    tui.wait_exit();
+
+    // Polled: a dead child can linger a moment as a zombie.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut alive = nix::sys::signal::kill(pid, None).is_ok();
+    while alive && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        alive = nix::sys::signal::kill(pid, None).is_ok();
+    }
+    if !alive {
+        stub.0 = None; // dead: its pid may be reused
+    }
+    assert!(!alive, "the closed tab's process outlived kommand0");
+}
+
+#[test]
 fn stale_resume_auto_heals_to_a_fresh_session() {
     // The real bug: `claude --resume <gone-id>` prints "No conversation found"
     // and STAYS ALIVE, so the exit-code net never fires and the dead id is never
@@ -1536,6 +1707,60 @@ fn w_with_an_issue_ref_resolves_it_and_creates_the_workspace() {
 
     tui.send("q");
     tui.wait_exit();
+}
+
+#[test]
+fn quitting_during_a_create_still_adds_the_workspace() {
+    // The checkout hook holds `git worktree add` until the test opens a gate,
+    // which it does only once the quit says it is finishing up: the workspace
+    // can only land in state.json if the quit waited for the create.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let hooks = dir.path().join("hooks");
+    let gate = dir.path().join("gate");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&hooks).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "t@t"]);
+    run_git(&repo, &["config", "user.name", "t"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+    // Bounded, so a gate never opened can't hang git past the quit wait.
+    let hook = format!(
+        "#!/bin/sh\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n",
+        gate.display()
+    );
+    let hook_path = hooks.join("post-checkout");
+    std::fs::write(&hook_path, hook).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Local, so it beats a hooksPath in the global config the tests inherit.
+    run_git(&repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+
+    let state = serde_json::json!({
+        "repos": [{ "id": "r1", "name": "demo", "path": repo.to_str().unwrap() }],
+        "workspaces": [],
+        "sessions": []
+    })
+    .to_string();
+
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_GH_BIN", "false")]);
+    tui.wait_for("demo");
+    tui.send("w");
+    tui.wait_for("Add Workspace");
+    tui.send("slowws");
+    tui.send("\r");
+    tui.wait_for("Making the git worktree");
+    tui.send_esc();
+    tui.send("q");
+    tui.wait_for("Finishing background work");
+    std::fs::write(&gate, "").unwrap();
+    tui.wait_exit();
+
+    let st = tui.read_state();
+    assert_eq!(st["workspaces"][0]["name"], "slowws", "state: {st}");
+    // A failed worktree add silently yields a row on the repo root.
+    assert!(st["workspaces"][0]["worktree_path"].is_string(), "a real worktree: {st}");
 }
 
 #[test]
