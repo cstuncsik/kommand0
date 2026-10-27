@@ -12566,19 +12566,23 @@ mod key_tests {
         app.spawn_teardown(vec!["w1".to_string()], Vec::new(), Some(Box::new(follow_up)));
         let seen_alive = rx.recv_timeout(Duration::from_secs(5));
         app.join_teardowns();
-        pane::tests::kill_leftovers(pid);
+        // A reaped pid may be reused: kill only one not seen dead.
+        if seen_alive != Ok(false) {
+            pane::tests::kill_leftovers(pid);
+        }
         assert_eq!(seen_alive, Ok(false), "w1's pane was dead first");
     }
 
     #[tokio::test]
     async fn a_removed_cleanup_drops_the_row_and_its_leftovers() {
         let mut app = test_app();
-        // Under a TempDir: the delete's `remove_worktree` clears an absent
-        // path's empty parent, which for `/tmp/alpha/gone` is the developer's
-        // `/tmp/alpha`.
-        let wt = tempfile::TempDir::new().unwrap();
+        // Under a TempDir: the arm clears the absent path's empty parent,
+        // which for `/tmp/alpha/gone` is the developer's `/tmp/alpha`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parent = tmp.path().join("worktrees").join("r1");
+        std::fs::create_dir_all(&parent).unwrap();
         app.workspaces[0].worktree_path =
-            Some(wt.path().join("gone").to_string_lossy().into_owned());
+            Some(parent.join("gone").to_string_lossy().into_owned());
         app.workspaces[0].branch_name = Some("ws-one".into());
         app.state.workspaces = app.workspaces.clone();
         app.cleanup_result.insert("w1".to_string(), ("stale refusal".to_string(), true));
@@ -12605,6 +12609,7 @@ mod key_tests {
             app.state_baseline.workspaces.iter().all(|w| w.id != "w1"),
             "persisted with a merge-save: the baseline moves only after a successful save"
         );
+        assert!(!parent.exists(), "the emptied worktrees/<repo-id>/ is gone");
     }
 
     #[test]
@@ -12913,73 +12918,50 @@ mod key_tests {
 
     #[tokio::test]
     async fn a_late_delete_report_keeps_the_cursor_and_focus() {
-        let mut app = test_app();
-        // w2 sits under w1 and above beta's row: a cursor kept by index would
-        // slide off it when w1 goes.
-        app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
-        app.state.workspaces = app.workspaces.clone();
-        app.expanded.insert("r1".to_string());
-        app.rebuild_tree();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        app.delete_tx = Some(tx);
+        // A cursor kept by index would slide off w2 when the deleted rows go:
+        // w2 sits under w1 and above beta's row, or above w3 in beta when all
+        // of alpha goes.
+        let cases = [
+            (Deleted::Workspace("w1".into()), vec![mk_ws("w2", "ws-two", "r1", None)]),
+            (
+                Deleted::Repo("r1".into()),
+                vec![mk_ws("w2", "aa-two", "r2", None), mk_ws("w3", "zz-three", "r2", None)],
+            ),
+        ];
+        for (target, rows) in cases {
+            let mut app = test_app();
+            app.workspaces.extend(rows);
+            app.state.workspaces = app.workspaces.clone();
+            app.expanded.extend(["r1".to_string(), "r2".to_string()]);
+            app.rebuild_tree();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            app.delete_tx = Some(tx);
 
-        app.delete_workspace("w1"); // the row's ✕
-        app.select_workspace_row("w2");
-        app.embedded.insert(
-            "w2".to_string(),
-            WorkspaceSessions {
-                tabs: vec![tab("a", &["-c", "sleep 30"])],
-                active: 0,
-                last_active: None,
-            },
-        );
-        app.focus = Focus::Embedded;
-        app.pane_selection =
-            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
-        let (target, outcome) = recv(&mut rx).await;
-        app.on_delete_done(target, outcome);
+            match &target {
+                Deleted::Workspace(id) => app.delete_workspace(id), // the row's ✕
+                Deleted::Repo(id) => app.delete_repo(id),
+            }
+            app.select_workspace_row("w2");
+            app.embedded.insert(
+                "w2".to_string(),
+                WorkspaceSessions {
+                    tabs: vec![tab("a", &["-c", "sleep 30"])],
+                    active: 0,
+                    last_active: None,
+                },
+            );
+            app.focus = Focus::Embedded;
+            app.pane_selection =
+                Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
+            let (done, outcome) = recv(&mut rx).await;
+            app.on_delete_done(done, outcome);
 
-        assert!(app.workspaces.iter().all(|w| w.id != "w1"), "w1 is gone");
-        let selected = app.selected_workspace().map(|w| w.id.as_str());
-        assert_eq!(selected, Some("w2"), "the cursor stays");
-        assert_eq!(app.focus, Focus::Embedded, "so does the focus");
-        assert!(app.pane_selection.is_some(), "and w2's highlight");
-    }
-
-    #[tokio::test]
-    async fn a_late_repo_delete_report_keeps_the_cursor_and_focus() {
-        let mut app = test_app();
-        // w2 sits above w3 in beta: a cursor kept by index would slide off it
-        // when alpha and its row go.
-        app.workspaces.push(mk_ws("w2", "aa-two", "r2", None));
-        app.workspaces.push(mk_ws("w3", "zz-three", "r2", None));
-        app.state.workspaces = app.workspaces.clone();
-        app.expanded.extend(["r1".to_string(), "r2".to_string()]);
-        app.rebuild_tree();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        app.delete_tx = Some(tx);
-
-        app.delete_repo("r1");
-        app.select_workspace_row("w2");
-        app.embedded.insert(
-            "w2".to_string(),
-            WorkspaceSessions {
-                tabs: vec![tab("a", &["-c", "sleep 30"])],
-                active: 0,
-                last_active: None,
-            },
-        );
-        app.focus = Focus::Embedded;
-        app.pane_selection =
-            Some(mouse::PaneSelection { anchor: (0, 0), head: (1, 1), dragging: false });
-        let (target, outcome) = recv(&mut rx).await;
-        app.on_delete_done(target, outcome);
-
-        assert!(app.repos.iter().all(|r| r.id != "r1"), "alpha is gone");
-        let selected = app.selected_workspace().map(|w| w.id.as_str());
-        assert_eq!(selected, Some("w2"), "the cursor stays");
-        assert_eq!(app.focus, Focus::Embedded, "so does the focus");
-        assert!(app.pane_selection.is_some(), "and w2's highlight");
+            assert!(app.workspaces.iter().all(|w| w.id != "w1"), "{target:?}: w1 is gone");
+            let selected = app.selected_workspace().map(|w| w.id.as_str());
+            assert_eq!(selected, Some("w2"), "{target:?}: the cursor stays");
+            assert_eq!(app.focus, Focus::Embedded, "{target:?}: so does the focus");
+            assert!(app.pane_selection.is_some(), "{target:?}: and w2's highlight");
+        }
     }
 
     #[tokio::test]
@@ -13278,7 +13260,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn a_row_being_deleted_does_not_keep_another_deletes_worktree() {
+    async fn deleting_two_aliased_rows_removes_the_worktree() {
         let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
         // w2's dir is a symlink to w1's worktree, and both rows go.
         let alias = tmp.path().join("alias");

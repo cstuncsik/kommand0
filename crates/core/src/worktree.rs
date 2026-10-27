@@ -1040,9 +1040,9 @@ mod tests {
         let from_branch = create_worktree_from_branch(rp, "r1", "b", base.path(), "feat");
         assert!(matches!(from_branch, WorktreeResult::Created { .. }));
 
-        // A low-speed limit the user configured wins over kommand0's.
-        let user_limit = Command::new("git")
-            .args(["-C", rp, "config", "--get-regexp", r"^http\..*lowspeed"])
+        // A low-speed time the user configured wins over kommand0's.
+        let user_time = Command::new("git")
+            .args(["-C", rp, "config", "--get-regexp", r"^http\..*lowspeedtime$"])
             .output()
             .unwrap()
             .status
@@ -1053,7 +1053,7 @@ mod tests {
             assert!(line.starts_with("0||"), "no terminal prompt and no askpass helper: {line}");
             let fields: Vec<&str> = line.split('|').collect();
             assert!(fields[2].contains("BatchMode=yes"), "ssh can't prompt: {line}");
-            if !user_limit {
+            if !user_time {
                 assert_ne!(fields[3], "UNSET", "a stalled https transfer gives up: {line}");
             }
         }
