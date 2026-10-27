@@ -1711,7 +1711,12 @@ impl AppState {
         let (repo, ws_name, taken) = self.resolve_new_workspace(name, repo_ref, from_branch)?;
         // A failed post-checkout hook is already logged (on stderr under kmd).
         let (ws, _) = Self::make_workspace(&repo, &ws_name, base, from_branch, use_worktree, &taken)?;
-        self.insert_workspace(ws.clone(), base)?;
+        // The worktree exists by now: a refused insert (the name was saved
+        // elsewhere meanwhile) must say where it was left, like the TUI does.
+        self.insert_workspace(ws.clone(), base).map_err(|e| match &ws.worktree_path {
+            Some(p) => anyhow::anyhow!("{e}; the worktree was made at {p} and left there"),
+            None => e,
+        })?;
         self.save_to(base)?;
         Ok(ws)
     }
