@@ -4570,8 +4570,8 @@ impl App {
 
     /// A delete's worker reported. Interrupted: the rows stay listed (deleting
     /// them again finishes the job). Otherwise they are forgotten, and what a
-    /// removal kept or left on disk is named in the notice, unless it was kept
-    /// for a row that is being deleted too.
+    /// removal kept or left on disk is named in the notice, unless a kept dir
+    /// is gone by now or its owner is being deleted too.
     fn on_delete_done(&mut self, target: Deleted, outcome: DeleteOutcome) {
         // Read while the rows are still here; a row already gone shows its id.
         let name = match &target {
@@ -4600,18 +4600,27 @@ impl App {
                 return;
             }
         };
-        // A dir kept as a sibling's worktree goes with that sibling's own
-        // delete, running or done: saying it was kept would be stale.
-        if let Deleted::Workspace(id) = &target
-            && let Some(ws) = self.state.workspaces.iter().find(|w| w.id == *id)
-        {
-            left.retain(|l| match l {
-                LeftWorktree::Alias { owner, .. } => self.state.workspaces.iter().any(|w| {
-                    w.repo_id == ws.repo_id && w.name == *owner && !self.delete_inflight.contains(&w.id)
-                }),
-                _ => true,
-            });
-        }
+        // Drop a kept-dir note only on evidence it is stale: the dir is gone
+        // (its owner's delete removed it), or the owner is a sibling row being
+        // deleted now. An owner this state doesn't hold may well be live.
+        let deleted = match &target {
+            Deleted::Workspace(id) => self.state.workspaces.iter().find(|w| w.id == *id),
+            Deleted::Repo(_) => None,
+        };
+        left.retain(|l| match l {
+            LeftWorktree::Alias { path, owner } => {
+                let owner_deleting = deleted.is_some_and(|d| {
+                    self.state.workspaces.iter().any(|w| {
+                        w.repo_id == d.repo_id
+                            && w.name == *owner
+                            && w.id != d.id
+                            && self.delete_inflight.contains(&w.id)
+                    })
+                });
+                std::path::Path::new(path).exists() && !owner_deleting
+            }
+            _ => true,
+        });
         match &target {
             Deleted::Workspace(id) => self.forget_workspace(id),
             Deleted::Repo(id) => self.forget_repo(id),
@@ -13355,7 +13364,8 @@ mod key_tests {
     #[tokio::test]
     async fn a_kept_note_never_names_an_owner_being_deleted_too() {
         // w1's removal keeps its dir as w2's (a symlink to it), then w2's
-        // delete removes it. Whichever report lands first, none says "kept".
+        // delete removes it. w1's report lands while w2's delete runs, or
+        // after it removed the dir: neither says "kept".
         for owner_reports_first in [false, true] {
             let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
             let alias = tmp.path().join("alias");
@@ -13368,6 +13378,11 @@ mod key_tests {
             app.state.workspaces = app.workspaces.clone();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             app.delete_tx = Some(tx);
+            let deliver = |app: &mut App, (target, outcome): DeleteMsg| {
+                app.on_delete_done(target, outcome);
+                let notice = app.profile_notice.take().map(|(msg, _)| msg).unwrap_or_default();
+                assert!(!notice.contains("kept"), "owner first: {owner_reports_first}: {notice}");
+            };
 
             app.delete_workspace("w1");
             let first = recv(&mut rx).await;
@@ -13375,16 +13390,42 @@ mod key_tests {
             let kept = LeftWorktree::Alias { path, owner: "ws-two".into() };
             assert_eq!(first.1, DeleteOutcome::Notes(vec![kept]), "w1's dir was kept as w2's");
             app.delete_workspace("w2");
-            let second = recv(&mut rx).await;
-            let reports = if owner_reports_first { [second, first] } else { [first, second] };
-            for (target, outcome) in reports {
-                app.on_delete_done(target, outcome);
-                let notice = app.profile_notice.take().map(|(msg, _)| msg).unwrap_or_default();
-                assert!(!notice.contains("kept"), "owner first: {owner_reports_first}: {notice}");
+            if owner_reports_first {
+                let second = recv(&mut rx).await;
+                deliver(&mut app, second);
+            }
+            // Otherwise delivered at once: w2's removal has not run yet.
+            deliver(&mut app, first);
+            if !owner_reports_first {
+                let second = recv(&mut rx).await;
+                deliver(&mut app, second);
             }
             assert!(!wt.exists(), "w2's delete removed the dir");
             let gone = app.workspaces.iter().all(|w| w.id != "w1" && w.id != "w2");
             assert!(gone, "owner first: {owner_reports_first}: both rows are forgotten");
+        }
+    }
+
+    #[test]
+    fn a_kept_note_stays_when_nothing_deletes_its_owner() {
+        // The dir still stands and no delete here owns it: a workspace kmd
+        // saved after this TUI loaded, or one in another repo named like the
+        // deleted row (which is itself being deleted).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        for owner in ["from-kmd", "ws-one"] {
+            let mut app = test_app();
+            app.state.workspaces.push(mk_ws("w9", "ws-one", "r2", None));
+            app.workspaces = app.state.workspaces.clone();
+            app.delete_inflight.insert("w1".into());
+            let kept = LeftWorktree::Alias { path: path.clone(), owner: owner.into() };
+
+            app.on_delete_done(Deleted::Workspace("w1".into()), DeleteOutcome::Notes(vec![kept]));
+
+            let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+            assert!(msg.contains(&format!("kept {path}: it is {owner}'s worktree")), "{msg}");
+            assert!(!is_error, "{owner}: kept on purpose, not a failure");
+            assert!(app.workspaces.iter().all(|w| w.id != "w1"), "{owner}: the row is gone");
         }
     }
 
