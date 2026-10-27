@@ -981,8 +981,9 @@ pub(crate) struct App {
     // into the right pane.
     pub(crate) embedded: HashMap<String, WorkspaceSessions>,
     /// Kill threads still tearing down session panes (see
-    /// [`Self::spawn_teardown`]), each with the workspace ids whose panes it
-    /// kills. Joined at quit.
+    /// [`Self::spawn_teardown`]), each with the workspace ids whose panes are
+    /// dead once it ends: its own and those of the teardowns it joined.
+    /// Joined at quit.
     teardowns: Vec<(Vec<String>, std::thread::JoinHandle<()>)>,
     /// Reader-thread → event-loop repaint signal (set in `main` before the loop).
     pub(crate) embedded_wake: Option<tokio::sync::mpsc::UnboundedSender<()>>,
@@ -4516,8 +4517,10 @@ impl App {
     /// worker still reports), or inline when it isn't wired (unit tests).
     fn spawn_delete(&mut self, target: Deleted, rows: Vec<Workspace>, tabs: Vec<SessionTab>) {
         let ids: Vec<String> = rows.iter().map(|w| w.id.clone()).collect();
-        // A row another running delete is removing can't claim a dir either.
+        // A row another running delete is removing can't claim a dir either,
+        // and may share it: the removal waits for that delete's kill too.
         let skip: Vec<String> = ids.iter().chain(&self.delete_inflight).cloned().collect();
+        let waits_for = skip.clone();
         let held = self.state.worktree_rows_except(&skip);
         let base = AppState::state_dir();
         // The worker can't read state, so each row goes with its repo's path.
@@ -4553,7 +4556,7 @@ impl App {
             let mut guard = guard;
             guard.payload = Some((target, remove()));
         };
-        self.spawn_teardown(ids, tabs, Some(Box::new(then)));
+        self.spawn_teardown(waits_for, tabs, Some(Box::new(then)));
     }
 
     /// A delete's worker reported. Interrupted: the rows stay listed (deleting
@@ -13272,6 +13275,48 @@ mod key_tests {
             assert!(!notice.contains("ws-two's worktree"), "{notice}");
         }
         assert!(!wt.exists(), "w1's worktree is gone");
+    }
+
+    #[tokio::test]
+    async fn deleting_an_alias_waits_for_the_other_rows_panes() {
+        let (mut app, _repo, tmp, wt) = app_with_a_real_worktree();
+        // w2's dir is a symlink to w1's worktree, where w1 has a live pane.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&wt, &alias).unwrap();
+        app.workspaces.push(Workspace {
+            working_dir: alias.to_string_lossy().into_owned(),
+            worktree_path: Some(alias.to_string_lossy().into_owned()),
+            ..mk_ws("w2", "ws-two", "real", Some("feat2"))
+        });
+        app.state.workspaces = app.workspaces.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.delete_tx = Some(tx);
+        let marks = tempfile::TempDir::new().unwrap();
+        let mark = marks.path().join("outlived");
+        let t = tab_in("a", &wt, &["-c", &cwd_keeper(&mark)]);
+        let pid = pane::tests::wait_for_pid(&t.pane);
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![t], active: 0, last_active: None },
+        );
+
+        app.delete_workspace("w1");
+        app.delete_workspace("w2");
+        for _ in 0..2 {
+            let (target, outcome) = recv(&mut rx).await;
+            app.on_delete_done(target, outcome);
+        }
+        app.join_teardowns();
+        let removed = !wt.exists();
+        let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
+
+        assert!(!mark.exists(), "w1's process was dead before the shared dir went");
+        assert!(removed, "nothing recreated the worktree after its removal");
+        assert!(app.workspaces.iter().all(|w| w.id != "w1" && w.id != "w2"), "both rows are gone");
+        assert!(died, "the join waited for the kill");
     }
 
     #[tokio::test]
