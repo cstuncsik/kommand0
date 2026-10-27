@@ -2835,11 +2835,15 @@ mod tests {
         // Local, so it beats a hooksPath in the global config the tests inherit.
         let hooks = hook.parent().unwrap().to_str().unwrap();
         git(Path::new(&r.path), &["config", "core.hooksPath", hooks]);
+        std::fs::write(Path::new(&r.path).join(".worktree-copy"), "notes.txt\n").unwrap();
+        std::fs::write(Path::new(&r.path).join("notes.txt"), "local").unwrap();
 
         let ws = state.create_workspace_with_base(Some("hooked"), &r.id, &base).unwrap();
         let dir = base.join("worktrees").join(&r.id).join("hooked");
         assert_eq!(ws.worktree_path.as_deref(), dir.to_str(), "its own worktree, not the repo root");
         assert_eq!(ws.branch_name.as_deref(), Some("hooked"));
+        let copied = std::fs::read_to_string(dir.join("notes.txt")).ok();
+        assert_eq!(copied.as_deref(), Some("local"), "the .worktree-copy files are copied");
     }
 
     #[test]

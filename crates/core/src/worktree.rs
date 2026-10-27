@@ -206,7 +206,7 @@ fn git_no_prompt(repo_path: &str) -> Command {
 
 /// Map the `git worktree add` result to a [`WorktreeResult`], copying the repo's
 /// `.worktree-copy` files into a freshly-created worktree. A failed add that
-/// left its worktree (a failed post-checkout hook) counts as created.
+/// left its own worktree (a failed post-checkout hook) counts as created.
 ///
 /// `repo_path` is the source repo root (where `.worktree-copy` lives). The copy
 /// runs only on the success arm — a `Fallback` worktree never exists to copy
@@ -225,7 +225,7 @@ fn finish_worktree_add(
         }
         // git keeps a worktree whose post-checkout hook failed, and removes
         // one it gave up on; the dir didn't exist before the add.
-        Ok(result) if Path::new(&worktree_path).join(".git").exists() => {
+        Ok(result) if made_by_this_add(repo_path, &worktree_path, &branch_name) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
             tracing::warn!(
                 worktree = worktree_path,
@@ -243,6 +243,19 @@ fn finish_worktree_add(
         }
         Err(e) => WorktreeResult::Fallback { reason: format!("failed to run git: {e}") },
     }
+}
+
+/// Whether the worktree at `worktree_path` is the one a failed add of `branch`
+/// made: this repo's, on `branch`, and unlocked. A concurrent create or another
+/// repository can fill the path too, and an add still running, or killed, holds
+/// the lock.
+fn made_by_this_add(repo_path: &str, worktree_path: &str, branch: &str) -> bool {
+    let admin = || {
+        crate::cleanup::check_git_stdout(worktree_path, &["rev-parse", "--absolute-git-dir"], &[])
+    };
+    Path::new(worktree_path).join(".git").exists()
+        && crate::cleanup::worktree_head(repo_path, worktree_path, branch).as_deref() == Ok(branch)
+        && admin().is_some_and(|dir| !Path::new(&dir).join("locked").exists())
 }
 
 /// Copy the repo's configured files into a freshly-created worktree, mirroring
@@ -821,6 +834,48 @@ mod tests {
                 assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "feat");
             }
             WorktreeResult::Fallback { reason } => panic!("expected Created, got: {reason}"),
+        }
+    }
+
+    #[test]
+    fn from_the_branch_the_repo_has_checked_out_is_a_fallback() {
+        // git refuses before making anything, so there is nothing to adopt.
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+
+        match create_worktree_from_branch(repo.path().to_str().unwrap(), "r1", "ws", base.path(), "main") {
+            WorktreeResult::Fallback { reason } => assert!(reason.contains("already"), "{reason}"),
+            WorktreeResult::Created { .. } => panic!("main is the repo's own checkout"),
+        }
+        assert!(!base.path().join("worktrees").join("r1").join("ws").exists(), "nothing at the path");
+    }
+
+    #[test]
+    fn a_failed_add_adopts_only_a_worktree_it_made() {
+        // The add fails on a path someone else filled: another repository on a
+        // branch named like ours, a concurrent create on its own branch, an add
+        // killed while it held the lock.
+        let repo = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let rp = repo.path().to_str().unwrap();
+        let at = |name: &str| base.path().join(name).to_string_lossy().into_owned();
+        let git = crate::git::tests::git;
+        std::fs::create_dir(at("foreign")).unwrap();
+        init_git_repo(Path::new(&at("foreign")));
+        git(Path::new(&at("foreign")), &["branch", "-m", "ws"]);
+        git(repo.path(), &["worktree", "add", &at("other"), "-b", "other"]);
+        git(repo.path(), &["worktree", "add", &at("locked"), "-b", "ws"]);
+        git(repo.path(), &["worktree", "lock", &at("locked")]);
+
+        for name in ["foreign", "other", "locked"] {
+            let output = git_no_prompt(rp).args(["worktree", "add", &at(name), "-b", "ws"]).output();
+            assert!(!output.as_ref().unwrap().status.success(), "{name}: the add fails");
+            match finish_worktree_add(rp, output, at(name), "ws".to_string()) {
+                WorktreeResult::Fallback { .. } => {}
+                WorktreeResult::Created { .. } => panic!("{name}: adopted a worktree it didn't make"),
+            }
         }
     }
 

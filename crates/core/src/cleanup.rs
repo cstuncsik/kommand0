@@ -96,7 +96,7 @@ const CHECK_ENV: [(&str, &str); 5] = [
 /// stdout, or None when git can't run or exits non-zero. A failure is logged
 /// with the args and git's first stderr line: debug for a plain "no" (exit 1),
 /// warn from exit 128 up, where git broke rather than answered.
-fn check_git_stdout(repo_path: &str, args: &[&str], envs: &[(&str, &str)]) -> Option<String> {
+pub(crate) fn check_git_stdout(repo_path: &str, args: &[&str], envs: &[(&str, &str)]) -> Option<String> {
     let out = match Command::new("git")
         .args(["-C", repo_path])
         .args(args)
@@ -737,7 +737,7 @@ fn common_dir(dir: &str) -> Option<std::path::PathBuf> {
 /// fails), "a detached HEAD" (also when git failed), "an unborn branch <b>",
 /// the full ref outside refs/heads/, or the invalid name. Full ref, not
 /// `--short` (a same-named tag makes `--short` print `heads/<b>`).
-fn worktree_head(repo_path: &str, worktree_path: &str, branch: &str) -> Result<String, String> {
+pub(crate) fn worktree_head(repo_path: &str, worktree_path: &str, branch: &str) -> Result<String, String> {
     // A dir replaced by an independent repository is live to git and may sit
     // on a branch name this repo also has (`git init` lands on main, and the
     // foreign repo can even be on a branch NAMED like the workspace's): the
