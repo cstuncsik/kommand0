@@ -9252,7 +9252,9 @@ mod key_tests {
         let alive_after_close = alive(pid);
         app.join_teardowns();
         let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
-        pane::tests::kill_leftovers(pid);
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
 
         assert!(left, "the tab left at once");
         assert_eq!(queued, [vec!["w1".to_string()]], "its kill runs in the background");
@@ -9276,15 +9278,19 @@ mod key_tests {
         let queued = queued_teardowns(&app);
         let alive_after_detach = pids.iter().all(|&p| alive(p));
         app.join_teardowns();
-        let died = pids.iter().all(|&p| pane::tests::wait_for_death(p, Duration::from_secs(5)));
-        for &p in &pids {
+        let survivors: Vec<i32> = pids
+            .iter()
+            .copied()
+            .filter(|&p| !pane::tests::wait_for_death(p, Duration::from_secs(5)))
+            .collect();
+        for &p in &survivors {
             pane::tests::kill_leftovers(p);
         }
 
         assert!(left, "the tabs left at once");
         assert_eq!(queued, [vec!["w1".to_string()]], "one background kill for the workspace");
         assert!(alive_after_detach, "detach returned before the processes died");
-        assert!(died, "the join waited for the kill");
+        assert!(survivors.is_empty(), "the join waited for the kill");
     }
 
     #[tokio::test]
@@ -12568,7 +12574,9 @@ mod key_tests {
         app.join_teardowns();
         let removed = !wt.exists();
         let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
-        pane::tests::kill_leftovers(pid);
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
 
         assert!(left, "the tab left at once");
         assert_eq!(queued, [vec!["w1".to_string()]], "its kill runs in the background");
@@ -12598,7 +12606,9 @@ mod key_tests {
             app.spawn_teardown(vec!["w1".to_string()], tabs, Some(Box::new(follow_up)));
             let seen_alive = rx.recv_timeout(Duration::from_secs(5));
             app.join_teardowns();
-            pane::tests::kill_leftovers(pid);
+            if seen_alive != Ok(false) {
+                pane::tests::kill_leftovers(pid);
+            }
             assert_eq!(seen_alive, Ok(false), "earlier teardown: {earlier}");
         }
     }
@@ -13188,7 +13198,9 @@ mod key_tests {
         app.join_teardowns();
         let removed = !wt.exists();
         let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
-        pane::tests::kill_leftovers(pid);
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
 
         assert!(left, "the tab left at once");
         assert_eq!(queued, [vec!["w1".to_string()]], "its kill runs in the background");
@@ -13220,7 +13232,9 @@ mod key_tests {
         app.join_teardowns();
         let removed = !wt.exists();
         let died = pane::tests::wait_for_death(pid, Duration::from_secs(5));
-        pane::tests::kill_leftovers(pid);
+        if !died {
+            pane::tests::kill_leftovers(pid);
+        }
 
         assert!(alive_after_delete, "the delete returned before the detach's kill ended");
         assert_eq!(outcome, DeleteOutcome::Done);
