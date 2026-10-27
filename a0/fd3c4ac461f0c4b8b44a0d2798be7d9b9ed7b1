@@ -1,0 +1,27 @@
+crates/core/src/worktree.rs
+  s_4488bcd771c902::t_a77868ec912d39 228
+  s_4488bcd771c902::t_8c595c8309b8aa 209
+  s_4488bcd771c902::t_d0fb3b69a0fa1d 840-881
+  s_4488bcd771c902::t_be38f550905558 248-260
+crates/core/src/lib.rs
+  s_4488bcd771c902::t_2512d70bb78703 2838-2839,2845-2846
+crates/core/src/cleanup.rs
+  s_4488bcd771c902::t_afa98cb0cb1389 740
+  s_4488bcd771c902::t_2c167c60e737a9 99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a0fd3c4ac461f0c4b8b44a0d2798be7d9b9ed7b1",
+  "prompts": {},
+  "sessions": {
+    "s_4488bcd771c902": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "30ca474e-9d38-471d-a1a8-32843766b0eb",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
