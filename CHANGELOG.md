@@ -61,6 +61,11 @@ All notable changes to kommand0 are documented here. The format is based on
   worktree** (about 10 s on a big repo): the worktree is made in the
   background behind a "Making the git worktree" note. Esc hides the note and
   the workspace still appears; quitting waits up to 15 s for it.
+- **A create no longer adds a second workspace of the same name** when another
+  kommand0 or `kmd` saved that name in the repo while the worktree was being
+  made: the create is refused, and the TUI names the worktree it left. Two
+  workspaces of one name left `kmd` refusing that name as ambiguous. Applies to
+  `kmd` too.
 
 ## [0.32.1] - 2026-10-23
 

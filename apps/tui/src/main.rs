@@ -3710,7 +3710,8 @@ impl App {
             let hook_note = hook_error.map(|line| {
                 format!("created {}, but its post-checkout hook failed: {line}", ws.name)
             });
-            self.state.insert_workspace(ws).map(|()| (made, hook_note)).map_err(|e| match made_at {
+            let base = AppState::state_dir();
+            self.state.insert_workspace(ws, &base).map(|()| (made, hook_note)).map_err(|e| match made_at {
                 Some(p) => format!(
                     "the worktree was made at {p}, but the workspace couldn't be added: {e}; \
                      the worktree was left there"
@@ -7846,6 +7847,45 @@ mod key_tests {
         assert!(e.contains(&path) && e.contains("already exists"), "{e}");
         assert_eq!(input, "dupe");
         assert!(std::path::Path::new(&path).exists(), "the worktree is left there");
+    }
+
+    #[tokio::test]
+    async fn a_name_saved_elsewhere_during_the_make_is_not_adopted() {
+        let mut app = test_app();
+        let _repo = add_real_repo(&mut app, "feat");
+        // A repo id of its own: the suite shares one state.json, and no other
+        // test may drop or reuse this test's row there.
+        app.state.repos.last_mut().unwrap().id = "elsewhere".into();
+        app.repos = app.state.repos.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.create_tx = Some(tx);
+        app.modal = add_workspace_modal_for("elsewhere", "twice");
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Esc).await;
+        let result = recv(&mut rx).await;
+        // Another instance (a `kmd workspace create`) saves the name before the
+        // reply is read.
+        let base = AppState::state_dir();
+        let mut other = AppState::default();
+        other.repos.push(app.state.repos.last().unwrap().clone());
+        other.workspaces.push(mk_ws("theirs", "twice", "elsewhere", None));
+        other.merge_save_to(&AppState::default(), &base).unwrap();
+
+        let path = result.as_ref().unwrap().0.worktree_path.clone().unwrap();
+        app.finish_create(result);
+
+        assert!(app.workspaces.iter().all(|w| w.name != "twice"), "not adopted");
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert!(msg.contains(&path) && msg.contains("already exists"), "{msg}");
+        assert!(is_error);
+        let disk = AppState::load_from(&base).unwrap();
+        let rows: Vec<&str> = disk
+            .workspaces
+            .iter()
+            .filter(|w| w.repo_id == "elsewhere" && w.name == "twice")
+            .map(|w| w.id.as_str())
+            .collect();
+        assert_eq!(rows, ["theirs"], "one row of that name on disk, theirs");
     }
 
     #[tokio::test]

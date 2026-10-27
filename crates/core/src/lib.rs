@@ -1711,7 +1711,7 @@ impl AppState {
         let (repo, ws_name, taken) = self.resolve_new_workspace(name, repo_ref, from_branch)?;
         // A failed post-checkout hook is already logged (on stderr under kmd).
         let (ws, _) = Self::make_workspace(&repo, &ws_name, base, from_branch, use_worktree, &taken)?;
-        self.insert_workspace(ws.clone())?;
+        self.insert_workspace(ws.clone(), base)?;
         self.save_to(base)?;
         Ok(ws)
     }
@@ -1816,12 +1816,21 @@ impl AppState {
     }
 
     /// Add a made workspace ([`Self::make_workspace`]), unless its repo is
-    /// gone or its name was taken meanwhile. No save.
-    pub fn insert_workspace(&mut self, ws: Workspace) -> anyhow::Result<()> {
+    /// gone or its name was taken meanwhile: here, or in `base`'s state.json
+    /// by another kommand0 or `kmd` since this state was loaded. No save.
+    pub fn insert_workspace(&mut self, ws: Workspace, base: &Path) -> anyhow::Result<()> {
         if !self.repos.iter().any(|r| r.id == ws.repo_id) {
             bail!("its repo is no longer tracked");
         }
         self.validate_new_workspace_name(&ws.name, &ws.repo_id)?;
+        // An unreadable state.json leaves just the check above: a duplicate
+        // name is an ambiguity, not data loss, so it never blocks the create.
+        let saved = Self::load_from(base).is_ok_and(|disk| {
+            disk.workspaces.iter().any(|w| w.repo_id == ws.repo_id && w.name == ws.name && w.id != ws.id)
+        });
+        if saved {
+            bail!("workspace already exists: {} (another kommand0 or kmd saved it meanwhile)", ws.name);
+        }
         self.workspaces.push(ws);
         Ok(())
     }
@@ -3041,14 +3050,32 @@ mod tests {
 
     #[test]
     fn insert_workspace_refuses_a_gone_repo_or_a_taken_name() {
+        // A state.json it can't read never blocks an insert.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(AppState::STATE_FILE), "{ not json").unwrap();
+        let base = tmp.path();
         let mut state = under_r(vec![]);
-        state.insert_workspace(ws("w1", "a")).unwrap();
+        state.insert_workspace(ws("w1", "a"), base).unwrap();
 
-        let err = state.insert_workspace(ws("w2", "a")).unwrap_err().to_string();
+        let err = state.insert_workspace(ws("w2", "a"), base).unwrap_err().to_string();
         assert!(err.contains("already exists"), "{err}");
         let gone = Workspace { repo_id: "gone".into(), ..ws("w3", "b") };
-        assert!(state.insert_workspace(gone).is_err(), "its repo is gone");
+        assert!(state.insert_workspace(gone, base).is_err(), "its repo is gone");
         assert_eq!(state.workspaces.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["w1"]);
+    }
+
+    #[test]
+    fn insert_workspace_refuses_a_name_another_instance_saved() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        under_r(vec![]).save_to(base).unwrap();
+        let mut stale = AppState::load_from(base).unwrap();
+        let mut other = AppState::load_from(base).unwrap();
+        other.create_workspace_with_options(Some("foo"), "r", base, false).unwrap();
+
+        let err = stale.insert_workspace(ws("w2", "foo"), base).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(stale.workspaces.is_empty(), "nothing was added");
     }
 
     #[test]
