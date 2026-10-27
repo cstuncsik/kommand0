@@ -4630,7 +4630,10 @@ impl App {
             let failed = left.iter().any(|l| matches!(l, LeftWorktree::Failed { .. }));
             let notes: Vec<String> = left.iter().map(left_worktree_note).collect();
             let msg = format!("Deleted {name}, but {}", notes.join("; "));
-            self.profile_notice = Some((msg, failed));
+            // A note never hides an unread error, such as another delete's failure.
+            if failed || !self.profile_notice.as_ref().is_some_and(|(_, is_error)| *is_error) {
+                self.profile_notice = Some((msg, failed));
+            }
         }
     }
 
@@ -13234,6 +13237,36 @@ mod key_tests {
             let (msg, is_error) = app.profile_notice.clone().expect("a notice");
             assert!(msg.contains("still listed"), "{target:?}: {msg}");
             assert!(is_error, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn a_delete_note_never_replaces_an_unread_delete_error() {
+        // w2's removal failed (a locked worktree) and w1's kept the same dir as
+        // w2's: whichever lands second, the actionable error is what stays up.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let failed = || DeleteOutcome::Notes(vec![LeftWorktree::Failed { path: path.clone() }]);
+        let kept = || {
+            let owner = "ws-two".to_string();
+            DeleteOutcome::Notes(vec![LeftWorktree::Alias { path: path.clone(), owner }])
+        };
+        let ws = |id: &str| Deleted::Workspace(id.into());
+        for error_first in [true, false] {
+            let mut app = test_app();
+            app.state.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+            app.workspaces = app.state.workspaces.clone();
+            if error_first {
+                app.on_delete_done(ws("w2"), failed());
+                app.on_delete_done(ws("w1"), kept());
+            } else {
+                app.on_delete_done(ws("w1"), kept());
+                let shown = app.profile_notice.as_ref().map(|(_, is_error)| *is_error);
+                assert_eq!(shown, Some(false), "the note is up first");
+                app.on_delete_done(ws("w2"), failed());
+            }
+            let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+            assert!(is_error && msg.contains("by hand"), "error first: {error_first}: {msg}");
         }
     }
 
