@@ -51,9 +51,10 @@ All notable changes to kommand0 are documented here. The format is based on
 - **A workspace whose post-checkout hook fails still gets its worktree**: git
   reports the hook's failure but keeps the worktree, which kommand0 used to
   leave behind for a row on the shared checkout (or, checking out a branch, an
-  error). The failure is now reported: the TUI's notice quotes git's last line
-  of output, and `kmd` prints git's output as a warning. The reason for any
-  fallback to the shared checkout is logged. Applies to `kmd` too.
+  error). The failure is now reported: the TUI's notice quotes the hook's last
+  line of output (or says it printed nothing), and `kmd` prints git's output as
+  a warning. The reason for any fallback to the shared checkout is logged.
+  Applies to `kmd` too.
 - **Deleting a workspace or repo no longer freezes the UI while git removes
   worktrees** (#129): the detail pane shows "Deleting…" until its directory is
   gone, and anything kept or left behind is named.

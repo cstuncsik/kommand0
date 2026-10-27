@@ -11,8 +11,8 @@ pub enum WorktreeResult {
     Created {
         worktree_path: String,
         branch_name: String,
-        /// git's last stderr line when the post-checkout hook failed (the
-        /// worktree is still made).
+        /// The post-checkout hook's last stderr line when it failed, or "the
+        /// hook printed nothing" (the worktree is still made).
         hook_error: Option<String>,
     },
     /// Worktree creation failed; caller should fall back to repo root.
@@ -236,7 +236,14 @@ fn finish_worktree_add(
                 stderr.trim()
             );
             copy_worktree_files(repo_path, &worktree_path);
-            let hook_error = Some(crate::git::last_line(&result.stderr));
+            // The hook's last line, past what git prints around the checkout.
+            let git_own = ["Preparing worktree", "HEAD is now at", "Updating files"];
+            let hook_line = stderr
+                .lines()
+                .map(str::trim)
+                .rev()
+                .find(|l| !l.is_empty() && !git_own.iter().any(|p| l.starts_with(p)));
+            let hook_error = Some(hook_line.unwrap_or("the hook printed nothing").to_string());
             WorktreeResult::Created { worktree_path, branch_name, hook_error }
         }
         Ok(result) => {

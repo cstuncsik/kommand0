@@ -177,8 +177,8 @@ fn repo_cleanup_counts(items: &[RepoCleanupItem]) -> (usize, usize, usize) {
 /// wins) and the branch GitHub links to the issue.
 type IssueMsg = (u64, Result<kommand0_core::IssueBranch, String>);
 
-/// What the create worker sends back: the workspace it made, with git's last
-/// line when its post-checkout hook failed, or why not.
+/// What the create worker sends back: the workspace it made, with the hook's
+/// last line when its post-checkout hook failed, or why not.
 type CreateMsg = Result<(Workspace, Option<String>), String>;
 
 /// The one workspace create running; cleared only by its reply, which

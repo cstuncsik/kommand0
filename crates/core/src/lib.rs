@@ -1744,8 +1744,8 @@ impl AppState {
 
     /// Make the workspace [`Self::resolve_new_workspace`] resolved: its git
     /// worktree, or a row on the repo root when none is wanted or git can't
-    /// make one, with git's last line when the worktree's post-checkout hook
-    /// failed. Touches no state, so it can run off the UI thread;
+    /// make one, with the hook's last line when the worktree's post-checkout
+    /// hook failed. Touches no state, so it can run off the UI thread;
     /// [`Self::insert_workspace`] adds the result.
     pub fn make_workspace(
         repo: &RepoEntry,
@@ -2834,19 +2834,24 @@ mod tests {
         assert_eq!(ws.worktree_path.as_deref(), orphan.to_str(), "a real worktree, not a fallback row");
     }
 
+    /// Give the repo at `repo` a post-checkout hook that runs `body`.
+    fn post_checkout_hook(tmp: &TempDir, repo: &str, body: &str) {
+        let hook = tmp.path().join("hooks").join("post-checkout");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Local, so it beats a hooksPath in the global config the tests inherit.
+        let hooks = hook.parent().unwrap().to_str().unwrap();
+        git(Path::new(repo), &["config", "core.hooksPath", hooks]);
+    }
+
     #[test]
     fn a_worktree_whose_post_checkout_hook_failed_is_still_used() {
         // git fails the add but keeps the worktree.
         let tmp = TempDir::new().unwrap();
         let (state, base, r) = state_with_repo(&tmp);
-        let hook = tmp.path().join("hooks").join("post-checkout");
-        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-        std::fs::write(&hook, "#!/bin/sh\necho 'hook says no' >&2\nexit 1\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Local, so it beats a hooksPath in the global config the tests inherit.
-        let hooks = hook.parent().unwrap().to_str().unwrap();
-        git(Path::new(&r.path), &["config", "core.hooksPath", hooks]);
+        post_checkout_hook(&tmp, &r.path, "echo 'hook says no' >&2\nexit 1");
         std::fs::write(Path::new(&r.path).join(".worktree-copy"), "notes.txt\n").unwrap();
         std::fs::write(Path::new(&r.path).join("notes.txt"), "local").unwrap();
 
@@ -2858,6 +2863,18 @@ mod tests {
         let copied = std::fs::read_to_string(dir.join("notes.txt")).ok();
         assert_eq!(copied.as_deref(), Some("local"), "the .worktree-copy files are copied");
         assert_eq!(hook_error.as_deref(), Some("hook says no"), "the caller hears why");
+    }
+
+    #[test]
+    fn a_silently_failing_hook_says_it_printed_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let (state, base, r) = state_with_repo(&tmp);
+        post_checkout_hook(&tmp, &r.path, "exit 1");
+
+        let (repo, name, taken) = state.resolve_new_workspace(Some("quiet"), &r.id, None).unwrap();
+        let (ws, hook_error) = AppState::make_workspace(&repo, &name, &base, None, true, &taken).unwrap();
+        assert!(ws.worktree_path.is_some(), "the worktree is still used");
+        assert_eq!(hook_error.as_deref(), Some("the hook printed nothing"), "not git's own line");
     }
 
     #[test]
