@@ -531,6 +531,7 @@ impl KeyMap {
             // Replace this action's keys: drop its current chords first (an
             // action only ever sits in its own layers).
             keymap.map.retain(|_, a| *a != action);
+            let mut bound = false;
             for spec in specs {
                 let Some(chord) = parse_chord(spec) else {
                     warnings.push(format!("invalid key '{spec}' for '{name}'"));
@@ -544,6 +545,7 @@ impl KeyMap {
                     warnings.push(format!("key '{spec}' is reserved for {reason}; ignored for '{name}'"));
                     continue;
                 }
+                bound = true;
                 for &layer in action.layers() {
                     if let Some(prev) = keymap.map.insert((layer, chord), action)
                         && prev != action
@@ -554,6 +556,12 @@ impl KeyMap {
                         );
                     }
                 }
+            }
+            // Every listed key rejected: the defaults are already gone, so say
+            // so (an empty list is a deliberate unbind). The two actions that
+            // can't be unbound get their own warning below.
+            if !specs.is_empty() && !bound && !matches!(action, Action::BackToTree | Action::Quit) {
+                warnings.push(format!("no usable key for '{name}'; it is unbound"));
             }
         }
         // `back-to-tree` is the keyboard's way out of the embedded pane and
@@ -851,6 +859,13 @@ mod tests {
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::BackToTree));
         assert_eq!(km.resolve_pane(&ev(KeyCode::Esc, KeyModifiers::NONE)), Some(Action::BackToTree));
 
+        // Every listed key rejected: restored, so never warned as unbound.
+        let mut cfg = HashMap::new();
+        cfg.insert("back-to-tree".to_string(), vec!["ctrl+a".to_string()]);
+        let (_, warns) = KeyMap::build(&cfg);
+        assert!(warns.iter().any(|w| w.contains("'back-to-tree' cannot be unbound")), "{warns:?}");
+        assert!(!warns.iter().any(|w| w.contains("it is unbound")), "{warns:?}");
+
         let mut cfg = HashMap::new();
         cfg.insert("detach".to_string(), vec![]);
         let (km, warns) = KeyMap::build(&cfg);
@@ -1095,7 +1110,25 @@ mod tests {
             "{warns:?}"
         );
         assert!(!warns.iter().any(|w| w.contains("ctrl+b")), "{warns:?}");
+        assert!(!warns.iter().any(|w| w.contains("unbound")), "ctrl+b still binds it: {warns:?}");
         assert_eq!(km.resolve(&ev(KeyCode::Char('a'), KeyModifiers::CONTROL)), None);
         assert_eq!(km.resolve(&ev(KeyCode::Char('b'), KeyModifiers::CONTROL)), Some(Action::ArchiveToggle));
+
+        // Only the reserved key listed: the action is left with no key, and
+        // the warning says so.
+        let mut cfg = HashMap::new();
+        cfg.insert("archive".to_string(), vec!["ctrl+a".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.iter().any(|w| w == "no usable key for 'archive'; it is unbound"), "{warns:?}");
+        assert!(km.first_key(Layer::Tree, Action::ArchiveToggle).is_none());
+
+        // `quit` can't end up unbound: its defaults come back, so only the
+        // restore warning shows, never the unbound one.
+        let mut cfg = HashMap::new();
+        cfg.insert("quit".to_string(), vec!["ctrl+a".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(!warns.iter().any(|w| w.contains("it is unbound")), "{warns:?}");
+        assert!(warns.iter().any(|w| w.contains("'quit' cannot be unbound")), "{warns:?}");
+        assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
     }
 }

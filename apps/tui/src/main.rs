@@ -992,9 +992,12 @@ pub(crate) struct App {
     /// size (a resize-after-spawn makes claude drop its first screen, e.g. the
     /// trust prompt).
     pub(crate) right_pane_area: ratatui::layout::Rect,
-    /// True when the embedded-pane prefix (Ctrl+A) was pressed and the next key
-    /// is a kommand0 command rather than forwarded to claude.
-    pub(crate) embedded_prefix: bool,
+    /// True when the Ctrl+A prefix was pressed (from the tree or the embedded
+    /// pane) and the next key is a kommand0 command for the selected
+    /// workspace. A click, scroll or paste, and anything that changes the
+    /// selected workspace or its tabs, drop it, so it never fires at another
+    /// target.
+    pub(crate) prefix_armed: bool,
     /// Whether kommand0's own terminal window has focus (crossterm
     /// `FocusGained`/`FocusLost`, mode 1004). One dimension of the composite
     /// focus synthesized for embedded children in [`App::sync_focus_states`].
@@ -1199,7 +1202,7 @@ impl App {
             teardowns: Vec::new(),
             embedded_wake: None,
             right_pane_area: ratatui::layout::Rect::default(),
-            embedded_prefix: false,
+            prefix_armed: false,
             terminal_focused: true,
             embed_error: None,
             branch_status: HashMap::new(),
@@ -1708,7 +1711,7 @@ impl App {
     /// not fire against whatever is selected next.
     fn leave_to_tree(&mut self) {
         self.focus = Focus::Tree;
-        self.embedded_prefix = false;
+        self.prefix_armed = false;
     }
 
     /// Enter (spawning if needed) the embedded interactive `claude` pane for the
@@ -1746,7 +1749,7 @@ impl App {
             self.embed_error = None;
         }
         self.focus = Focus::Embedded;
-        self.embedded_prefix = false;
+        self.prefix_armed = false;
     }
 
     /// Restore every persisted entry of a workspace as a tab of its kind, up
@@ -2189,7 +2192,7 @@ impl App {
     /// (click-to-focus and drag-selection) go through here.
     pub(crate) fn focus_embedded_by_click(&mut self) {
         self.focus = Focus::Embedded;
-        self.embedded_prefix = false;
+        self.prefix_armed = false;
     }
 
     /// Synthesize terminal focus for embedded children. A child is "focused"
@@ -2528,7 +2531,7 @@ impl App {
         if let Some(sessions) = self.embedded.get_mut(ws_id) {
             sessions.select(index);
             self.focus = Focus::Embedded;
-            self.embedded_prefix = false;
+            self.prefix_armed = false;
         }
     }
 
@@ -2592,7 +2595,7 @@ impl App {
         // clears the prefix in select_session_tab; the wheel route gets
         // neither, so both happen here.
         self.pane_selection = None;
-        self.embedded_prefix = false;
+        self.prefix_armed = false;
         true
     }
 
@@ -2675,7 +2678,7 @@ impl App {
             .unwrap_or("")
             .to_string();
         let cursor = current.len();
-        self.embedded_prefix = false;
+        self.prefix_armed = false;
         self.modal = modal::ModalState::RenameSession {
             ws_id,
             session_id,
@@ -2691,11 +2694,11 @@ impl App {
         }
     }
 
-    /// Open an additional tab of `kind` for a workspace (up to the shared cap)
-    /// and focus it. A detached workspace gets its persisted tabs back first,
-    /// so the new tab doesn't hide them.
+    /// Open an additional tab of `kind` for a workspace (up to the shared cap,
+    /// which counts a detached workspace's saved tabs) and focus it. A
+    /// detached workspace gets its persisted tabs back first, so the new tab
+    /// doesn't hide them.
     fn new_tab(&mut self, kind: TabKind, ws_id: &str) {
-        self.embedded_prefix = false;
         if self.refuse_busy(ws_id, "new tab") {
             return;
         }
@@ -2703,19 +2706,27 @@ impl App {
         let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
             return;
         };
+        // The cap counts the tabs a detached workspace would reopen, checked
+        // before reopening them: a refused tab must not start them all in the
+        // background. ponytail: counts saved entries, so one that would fail
+        // to reopen still takes a slot; Enter reopens (dropping it) and frees
+        // the room.
+        let live = self.embedded.get(ws_id).map(|s| s.tabs.len());
+        let count = live.unwrap_or_else(|| self.state.embedded_session_ids(ws_id).len());
+        if count >= MAX_SESSION_TABS {
+            let msg = if live.is_some() {
+                format!("Maximum {MAX_SESSION_TABS} session tabs reached.")
+            } else {
+                format!("Maximum {MAX_SESSION_TABS} session tabs saved: open the workspace and close one first.")
+            };
+            self.embed_error = Some((ws_id.to_string(), msg));
+            return;
+        }
         // Cleared BEFORE the spawns so opening a tab drops a stale error without
         // swallowing a reopen or persist-failure warning a spawn may set.
         self.embed_error = None;
-        if !self.embedded.contains_key(ws_id) {
+        if live.is_none() {
             self.reopen_persisted_tabs(ws_id, &ws.working_dir, &ws.name);
-        }
-        let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
-        if count >= MAX_SESSION_TABS {
-            self.embed_error = Some((
-                ws_id.to_string(),
-                format!("Maximum {MAX_SESSION_TABS} session tabs reached."),
-            ));
-            return;
         }
         if self.spawn_tab(kind, ws_id, &ws.working_dir, &ws.name, None) {
             self.focus = Focus::Embedded;
@@ -3133,12 +3144,20 @@ impl App {
             self.spawn_teardown(vec![ws_id], tabs, None);
         }
         // Dropped tabs/workspaces shift what renders where — a stale highlight
-        // must not land on the neighbor tab, nor an armed prefix on a sibling.
-        // Any death counts, not just the selected workspace's: the prefix
-        // arms from the tree too, where a background pane is the target.
+        // must not land on the neighbor tab.
         if !dead.is_empty() || !remove_ws.is_empty() {
             self.pane_selection = None;
-            self.embedded_prefix = false;
+        }
+        // Nor an armed prefix on a sibling tab: in the pane, `x` would close
+        // whichever tab took the dead one's place. Only the selected
+        // workspace's tabs matter (every prefix action targets it), and only
+        // in the pane: from the tree `x` does nothing and the tab keys that do
+        // act (`r`, the switches) show their target and are undone easily,
+        // while dropping the prefix there would run the next key as a tree
+        // command (`x` detaching the workspace, `d` deleting it).
+        let sel = self.selected_workspace().map(|w| w.id.clone());
+        if self.focus == Focus::Embedded && sel.is_some_and(|s| dead.iter().any(|(w, _)| *w == s)) {
+            self.prefix_armed = false;
         }
         if self.focus == Focus::Embedded {
             let gone = self
@@ -4689,7 +4708,7 @@ impl App {
         // goes with it.
         if was_selected {
             self.pane_selection = None;
-            self.embedded_prefix = false;
+            self.prefix_armed = false;
         }
     }
 
@@ -4717,7 +4736,7 @@ impl App {
         self.rebuild_tree_keeping_selection();
         if was_in_repo {
             self.pane_selection = None;
-            self.embedded_prefix = false;
+            self.prefix_armed = false;
         }
     }
 
@@ -4760,7 +4779,7 @@ impl App {
                     // highlight (or live drag) on it must not carry over.
                     if was_selected {
                         self.pane_selection = None;
-                        self.embedded_prefix = false;
+                        self.prefix_armed = false;
                     }
                     self.save_state();
                     // The old branch's PR must not linger on the row; a refresh
@@ -5104,7 +5123,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     // the keymap's pane layer, rebindable except for the tab digits and the
     // literal prefix). Any key consumes the prefix; under an overlay that key
     // goes to the overlay instead.
-    if std::mem::take(&mut app.embedded_prefix) && !app.overlay_active() {
+    if std::mem::take(&mut app.prefix_armed) && !app.overlay_active() {
         use keymap::Action;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Fixed (non-rebindable) prefix keys: the tab digits and the
@@ -5187,7 +5206,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     if app.focus == Focus::Embedded && !app.modal.is_active() {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('a') {
-            app.embedded_prefix = true; // start a prefix sequence
+            app.prefix_armed = true; // start a prefix sequence
             return Ok(KeyOutcome::Continue);
         }
         // Direct leave alias: Ctrl+] (Kitty CSI-u reports Char(']')+CTRL, a legacy
@@ -5595,7 +5614,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 return Ok(KeyOutcome::Continue);
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.embedded_prefix = true;
+                app.prefix_armed = true;
                 return Ok(KeyOutcome::Continue);
             }
             _ => {}
@@ -6344,7 +6363,7 @@ async fn run(
                     Event::FocusGained => app.terminal_focused = true,
                     Event::FocusLost => app.terminal_focused = false,
                     Event::Paste(text) => {
-                        app.embedded_prefix = false;
+                        app.prefix_armed = false;
                         // Bracketed paste arrives as one event (not Char keys).
                         // Route it with the SAME precedence handle_key uses: the
                         // embedded pane wins unless a modal is up, then modal →
@@ -6424,10 +6443,11 @@ async fn run(
                 }
 
                 // Process pending button actions (from mouse clicks)
+                // No prefix clear here: every click that queues one went
+                // through handle_selection's mouse-down clear first.
                 if let Some(action) = app.pending_button_action.take() {
-                    app.embedded_prefix = false;
                     match action {
-                        // Detail-pane [Claude] button (uses selected workspace)
+                        // Detail-pane first button, [Claude] or [Open] (uses selected workspace)
                         buttons::HitAction::StartSession => {
                             app.toggle_embedded();
                         }
@@ -8195,17 +8215,29 @@ mod key_tests {
         assert_eq!(app.embedded["w1"].tabs.len(), MAX_SESSION_TABS);
         assert_eq!(app.focus, Focus::Embedded);
 
+        // At the cap: refused before anything reopens, so no pane starts in
+        // the background and every saved id stays.
         let mut app = app_with_pinned_bins();
         for i in 0..MAX_SESSION_TABS {
             app.state.add_embedded_session("w1", &format!("shell:s{i}"));
         }
-        app.embedded_prefix = true;
+        let saved = app.state.embedded_session_ids("w1").to_vec();
+        app.new_tab(TabKind::Shell, "w1");
+        assert!(!app.embedded.contains_key("w1"), "nothing reopened");
+        assert_eq!(app.state.embedded_session_ids("w1"), saved);
+        let (_, err) = app.embed_error.clone().expect("cap error shown");
+        assert!(err.contains(&format!("Maximum {MAX_SESSION_TABS}")), "{err}");
+        assert!(err.contains("saved"), "the detached message: {err}");
+        assert_eq!(app.focus, Focus::Tree);
+
+        // Live and full: refused, the tab count stays at the cap.
+        let mut app = app_with_pinned_bins();
+        let tabs = (0..MAX_SESSION_TABS).map(|i| tab(&format!("t{i}"), &["-c", "sleep 30"])).collect();
+        app.embedded.insert("w1".to_string(), WorkspaceSessions { tabs, active: 0, last_active: None });
         app.new_tab(TabKind::Shell, "w1");
         assert_eq!(app.embedded["w1"].tabs.len(), MAX_SESSION_TABS);
         let (_, err) = app.embed_error.clone().expect("cap error shown");
-        assert!(err.contains("Maximum 9"), "{err}");
-        assert_eq!(app.focus, Focus::Tree);
-        assert!(!app.embedded_prefix);
+        assert!(err.contains("reached"), "the live message: {err}");
     }
 
     #[tokio::test]
@@ -8309,18 +8341,7 @@ mod key_tests {
 
     #[tokio::test]
     async fn palette_new_tab_actions_carry_their_kind() {
-        let mut app = test_app();
-        // Pinned bins: never launch the real CLIs (see pick_bin's fallback).
-        app.config.codex_bin = Some("sh".to_string());
-        app.config.gemini_bin = Some("sh".to_string());
-        app.config.opencode_bin = Some("sh".to_string());
-        app.config.pi_bin = Some("sh".to_string());
-        app.config.shell = Some("sh".to_string());
-        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
-            w.working_dir = "/tmp".into();
-        }
-        app.expanded.insert("r1".to_string());
-        app.rebuild_tree();
+        let mut app = app_with_pinned_bins();
 
         // Pull each agent entry out of the live candidate list and run it
         // through the real dispatch: the tab kind and persisted prefix must
@@ -8352,23 +8373,11 @@ mod key_tests {
 
     #[tokio::test]
     async fn toggle_embedded_restores_mixed_tabs_in_order() {
-        let mut app = test_app();
         // Every kind's bin pinned to `sh` so a restore can never launch the
         // real CLIs (present on dev machines, absent on CI); the children may
         // exit at once, but tabs live until a reap runs, so the assertions
         // right after the call are deterministic.
-        app.config.claude_bin = Some("sh".to_string());
-        app.config.shell = Some("sh".to_string());
-        app.config.codex_bin = Some("sh".to_string());
-        app.config.gemini_bin = Some("sh".to_string());
-        app.config.opencode_bin = Some("sh".to_string());
-        app.config.pi_bin = Some("sh".to_string());
-        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
-            w.working_dir = "/tmp".into();
-        }
-        app.expanded.insert("r1".to_string());
-        app.rebuild_tree();
-        app.select_workspace_row("w1");
+        let mut app = app_with_pinned_bins();
         // Ten interleaved entries of every kind: one past MAX_SESSION_TABS, so
         // the cap shows too. The gemini and pi entries and one claude entry
         // carry real uuids (only kommand0-minted uuids resume, see
@@ -9331,7 +9340,7 @@ mod key_tests {
             app.embedded.contains_key("w2"),
             "detach is scoped to the selected workspace"
         );
-        assert!(!app.embedded_prefix, "the prefix is consumed");
+        assert!(!app.prefix_armed, "the prefix is consumed");
         assert_eq!(
             app.state.embedded_session_ids("w1"),
             ids,
@@ -9559,10 +9568,10 @@ mod key_tests {
             "w1".to_string(),
             WorkspaceSessions { tabs: vec![tab("claude-1", &["-c", "sleep 30"])], active: 0, last_active: None },
         );
-        app.embedded_prefix = true;
+        app.prefix_armed = true;
         click(&mut app, 2);
         assert_eq!(app.focus, Focus::Embedded);
-        assert!(!app.embedded_prefix);
+        assert!(!app.prefix_armed);
 
         // A repo row has no session: it still focuses the tree.
         click(&mut app, 1);
@@ -10593,7 +10602,7 @@ mod key_tests {
         let mut app = test_app();
         app.profile_delete_inflight = true;
         app.focus = Focus::Embedded;
-        app.embedded_prefix = true;
+        app.prefix_armed = true;
         let out = press(&mut app, KeyCode::Char('q')).await;
         assert_eq!(out, KeyOutcome::Continue, "prefix q must not quit mid-delete");
         let (msg, _) = app.profile_notice.clone().expect("notice set");
@@ -10649,7 +10658,7 @@ mod key_tests {
     async fn status_line_shows_the_armed_ctrl_a_prefix() {
         let mut app = test_app();
         app.focus = Focus::Embedded;
-        app.embedded_prefix = true;
+        app.prefix_armed = true;
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Ctrl+A …"), "armed indicator shown:\n{text}");
         assert!(text.contains("d detach"), "hint lists detach:\n{text}");
@@ -10657,17 +10666,17 @@ mod key_tests {
 
         // Disarmed (the very next key clears the prefix): back to the
         // resting hint, no armed marker.
-        app.embedded_prefix = false;
+        app.prefix_armed = false;
         let text = render_to_string(&mut app, 100, 30);
         assert!(!text.contains("Ctrl+A …"), "indicator gone when disarmed:\n{text}");
         assert!(text.contains("Ctrl+] tree"), "resting hint back:\n{text}");
 
         app.focus = Focus::Tree;
-        app.embedded_prefix = true;
+        app.prefix_armed = true;
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Ctrl+A …"), "armed indicator shown from the tree:\n{text}");
         assert!(!text.contains("x close"), "close is pane only, not offered from the tree:\n{text}");
-        app.embedded_prefix = false;
+        app.prefix_armed = false;
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Enter open"), "resting tree hint back:\n{text}");
     }
@@ -10693,7 +10702,7 @@ mod key_tests {
         let sorts = (app.state.repo_sort, app.state.workspace_sort);
 
         ctrl_a(&mut app).await;
-        assert!(app.embedded_prefix, "Ctrl+A arms the prefix in the tree");
+        assert!(app.prefix_armed, "Ctrl+A arms the prefix in the tree");
         press(&mut app, KeyCode::Char('s')).await;
 
         let s = app.embedded.get("w1").expect("a tab was opened");
@@ -10701,7 +10710,7 @@ mod key_tests {
         assert_eq!(s.tabs[0].kind, TabKind::Shell);
         assert_eq!(app.focus, Focus::Embedded);
         assert_eq!((app.state.repo_sort, app.state.workspace_sort), sorts, "no sort");
-        assert!(!app.embedded_prefix);
+        assert!(!app.prefix_armed);
     }
 
     #[tokio::test]
@@ -10709,9 +10718,9 @@ mod key_tests {
         for c in ['a', 'w', 'q'] {
             let mut app = app_with_pinned_bins();
             ctrl_a(&mut app).await;
-            assert!(app.embedded_prefix, "{c}: Ctrl+A arms the prefix");
+            assert!(app.prefix_armed, "{c}: Ctrl+A arms the prefix");
             let out = press(&mut app, KeyCode::Char(c)).await;
-            assert!(!app.embedded_prefix, "{c}: the key consumes it");
+            assert!(!app.prefix_armed, "{c}: the key consumes it");
             let ran = match c {
                 'a' => matches!(app.modal, modal::ModalState::AddRepo { .. }),
                 'w' => matches!(&app.modal, modal::ModalState::AddWorkspace { repo_id, .. } if repo_id == "r1"),
@@ -10728,12 +10737,12 @@ mod key_tests {
         app.state.add_embedded_session("w1", "shell:keep");
         for c in ['1', '[', ']', 'l', 'r', 'x', 'd', 't'] {
             ctrl_a(&mut app).await;
-            assert!(app.embedded_prefix, "{c}: armed");
+            assert!(app.prefix_armed, "{c}: armed");
             press(&mut app, KeyCode::Char(c)).await;
             assert!(!app.modal.is_active(), "{c}: no modal");
             assert!(!app.embedded.contains_key("w1"), "{c}: no pane opened");
             assert_eq!(app.focus, Focus::Tree, "{c}");
-            assert!(!app.embedded_prefix, "{c}: prefix consumed");
+            assert!(!app.prefix_armed, "{c}: prefix consumed");
             assert_eq!(app.state.embedded_session_ids("w1"), ["shell:keep"], "{c}");
         }
     }
@@ -10755,11 +10764,11 @@ mod key_tests {
         press(&mut app, KeyCode::Char('x')).await;
         assert_eq!(ids(&app.embedded["w1"]), ["a", "b"]);
         assert_eq!(app.state.embedded_session_ids("w1"), ["a", "b"], "resume ids kept");
-        assert!(!app.embedded_prefix);
+        assert!(!app.prefix_armed);
     }
 
     #[tokio::test]
-    async fn tree_ctrl_a_d_detaches_like_x() {
+    async fn tree_ctrl_a_d_detaches_background_tabs_and_keeps_ids() {
         let mut app = app_with_two_background_tabs();
         ctrl_a(&mut app).await;
         press(&mut app, KeyCode::Char('d')).await;
@@ -10775,7 +10784,7 @@ mod key_tests {
         ctrl_a(&mut app).await;
         let s = &app.embedded["w1"];
         assert!(s.tabs.iter().all(|t| t.pane.last_input_at().is_none()), "nothing typed");
-        assert!(!app.embedded_prefix);
+        assert!(!app.prefix_armed);
     }
 
     #[tokio::test]
@@ -10790,12 +10799,13 @@ mod key_tests {
             let mut app = app_with_pinned_bins();
             let sorts = (app.state.repo_sort, app.state.workspace_sort);
             ctrl_a(&mut app).await;
-            assert!(app.embedded_prefix, "overlay {i}: armed");
+            assert!(app.prefix_armed, "overlay {i}: armed");
             open(&mut app);
             press(&mut app, KeyCode::Char('s')).await;
             assert!(!app.embedded.contains_key("w1"), "overlay {i}: no tab");
             assert_eq!((app.state.repo_sort, app.state.workspace_sort), sorts, "overlay {i}");
-            assert!(!app.embedded_prefix, "overlay {i}: prefix dropped");
+            assert!(!app.prefix_armed, "overlay {i}: prefix dropped");
+            assert!(app.overlay_active(), "overlay {i}: still up, the key was its own");
             if let modal::ModalState::AddRepo { input, .. } = &app.modal {
                 assert_eq!(input, "s", "the modal got the key");
             }
@@ -10808,38 +10818,48 @@ mod key_tests {
     #[tokio::test]
     async fn a_mouse_down_drops_a_tree_prefix() {
         use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let mut app = app_with_pinned_bins();
-        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 20);
-        app.right_pane_area = ratatui::layout::Rect::new(30, 0, 70, 20);
-        let sort = app.state.workspace_sort;
-        ctrl_a(&mut app).await;
-        // A click on the empty detail pane: no button, no tree row.
-        let down = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 60,
-            row: 15,
-            modifiers: KeyModifiers::NONE,
-        };
-        if !mouse::handle_selection(&mut app, down, &mut Vec::new()) {
-            mouse::handle_mouse(&mut app, down);
+        for button in [MouseButton::Left, MouseButton::Right] {
+            let mut app = app_with_pinned_bins();
+            app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 20);
+            app.right_pane_area = ratatui::layout::Rect::new(30, 0, 70, 20);
+            let sort = app.state.workspace_sort;
+            ctrl_a(&mut app).await;
+            // A click on the empty detail pane: no button, no tree row.
+            let down = MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column: 60,
+                row: 15,
+                modifiers: KeyModifiers::NONE,
+            };
+            if !mouse::handle_selection(&mut app, down, &mut Vec::new()) {
+                mouse::handle_mouse(&mut app, down);
+            }
+            assert!(!app.prefix_armed, "{button:?}: the click drops the prefix");
+            press(&mut app, KeyCode::Char('s')).await;
+            assert_ne!(app.state.workspace_sort, sort, "{button:?}: s is the tree's sort again");
+            assert!(!app.embedded.contains_key("w1"), "{button:?}: no tab opened");
         }
-        assert!(!app.embedded_prefix, "the click drops the prefix");
-        press(&mut app, KeyCode::Char('s')).await;
-        assert_ne!(app.state.workspace_sort, sort, "s is the tree's sort again");
-        assert!(!app.embedded.contains_key("w1"), "no tab opened");
     }
 
     #[tokio::test]
     async fn a_tree_scroll_drops_the_prefix() {
         use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+        // Workspace row to workspace row, so nothing but the scroll's own
+        // clear can drop the prefix.
         let mut app = app_with_pinned_bins();
+        app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
         app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 20);
         ctrl_a(&mut app).await;
+        assert!(app.prefix_armed);
         mouse::handle_mouse(
             &mut app,
-            MouseEvent { kind: MouseEventKind::ScrollUp, column: 5, row: 2, modifiers: KeyModifiers::NONE },
+            MouseEvent { kind: MouseEventKind::ScrollDown, column: 5, row: 2, modifiers: KeyModifiers::NONE },
         );
-        assert!(!app.embedded_prefix);
+        assert_eq!(app.selected_workspace().map(|w| w.id.as_str()), Some("w2"));
+        assert!(!app.prefix_armed, "the prefix must not retarget to w2");
     }
 
     #[tokio::test]
@@ -10855,18 +10875,45 @@ mod key_tests {
             modifiers: KeyModifiers::NONE,
         };
         assert!(mouse::handle_divider_drag(&mut app, grab), "the grab starts a drag");
-        assert!(!app.embedded_prefix);
+        assert!(!app.prefix_armed);
     }
 
     #[tokio::test]
-    async fn reaping_a_dead_pane_drops_the_prefix() {
-        let mut app = app_with_pane("exit 0");
+    async fn a_reap_in_another_workspace_keeps_the_prefix() {
+        // Every prefix action targets the selected workspace (w1), so w2's
+        // tab dying retargets nothing: the next key is still a command.
+        let mut app = app_with_pane("sleep 30");
+        app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+        app.state.workspaces = app.workspaces.clone();
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app.embedded.insert(
+            "w2".to_string(),
+            WorkspaceSessions { tabs: vec![tab("z", &["-c", "exit 0"])], active: 0, last_active: None },
+        );
         app.focus = Focus::Embedded;
-        wait_exit(&mut app.embedded.get_mut("w1").unwrap().tabs[0].pane);
-        app.embedded_prefix = true;
+        ctrl_a(&mut app).await;
+        wait_exit(&mut app.embedded.get_mut("w2").unwrap().tabs[0].pane);
         app.reap_embedded(Instant::now());
-        assert_eq!(app.focus, Focus::Tree);
-        assert!(!app.embedded_prefix);
+        assert!(!app.embedded.contains_key("w2"), "w2's tab was reaped");
+        assert!(app.prefix_armed, "w1's prefix survives");
+        press(&mut app, KeyCode::Char('t')).await;
+        assert_eq!(app.focus, Focus::Tree, "t ran as the command, not typed into the pane");
+    }
+
+    #[tokio::test]
+    async fn a_tree_prefix_survives_a_reap_in_the_selected_workspace() {
+        // From the tree `x` closes nothing, so a sibling dying keeps the
+        // prefix: dropping it would run `x` as the tree's close, detaching
+        // every pane.
+        let mut app = app_with_two_background_tabs();
+        app.embedded.get_mut("w1").unwrap().push(tab("c", &["-c", "exit 0"]));
+        ctrl_a(&mut app).await;
+        wait_exit(&mut app.embedded.get_mut("w1").unwrap().tabs[2].pane);
+        app.reap_embedded(Instant::now());
+        assert!(app.prefix_armed, "still armed");
+        press(&mut app, KeyCode::Char('x')).await;
+        assert_eq!(ids(&app.embedded["w1"]), ["a", "b"], "nothing closed, nothing detached");
     }
 
     #[tokio::test]
@@ -10882,18 +10929,33 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn embedded_prefix_with_a_modal_up_goes_to_the_modal() {
-        let mut app = app_with_pane("sleep 30");
-        app.focus = Focus::Embedded;
-        app.open_add_repo_modal();
-        app.embedded_prefix = true;
-        press(&mut app, KeyCode::Char('s')).await;
-        let modal::ModalState::AddRepo { input, .. } = &app.modal else {
-            panic!("the modal stays up");
+    async fn forgetting_or_following_the_selected_row_drops_the_prefix() {
+        // Each changes what the selection (and so the prefix) points at.
+        let forget_ws: fn(&mut App) = |app| app.forget_workspace("w1");
+        let forget_repo: fn(&mut App) = |app| app.forget_repo("r1");
+        let follow: fn(&mut App) = |app| {
+            app.cleanup_inflight.insert("w1".into());
+            app.on_cleanup_done("w1".into(), Ok(Cleaned::Followed { branch: "elsewhere".into() }));
         };
-        assert_eq!(input, "s");
-        assert_eq!(app.embedded["w1"].tabs.len(), 1, "no tab opened");
-        assert!(!app.embedded_prefix);
+        for (what, run) in [("forget workspace", forget_ws), ("forget repo", forget_repo), ("follow", follow)] {
+            // Other workspaces to land on, so the selection stays on a
+            // workspace row and only the method's own clear drops the prefix.
+            let mut app = test_app();
+            app.workspaces[0].worktree_path = Some("/nonexistent/kommand0-w1".into());
+            app.workspaces[0].branch_name = Some("feat".into());
+            app.workspaces.push(mk_ws("w2", "ws-two", "r1", None));
+            app.workspaces.push(mk_ws("w3", "ws-three", "r2", None));
+            app.state.workspaces = app.workspaces.clone();
+            app.expanded.insert("r1".to_string());
+            app.expanded.insert("r2".to_string());
+            app.rebuild_tree();
+            app.select_workspace_row("w1");
+            ctrl_a(&mut app).await;
+            assert!(app.prefix_armed, "{what}: armed");
+            run(&mut app);
+            assert!(app.selected_workspace().is_some(), "{what}: still on a workspace row");
+            assert!(!app.prefix_armed, "{what}: dropped");
+        }
     }
 
     // Golden full-screen snapshots of key layouts (geometry/position/borders that
@@ -11646,7 +11708,7 @@ mod key_tests {
             .hit_regions
             .iter()
             .position(|r| r.action == buttons::HitAction::StartSession)
-            .expect("[Claude] is drawn");
+            .expect("the first detail button is drawn");
         let area = app.hit_regions[i].area;
 
         app.mouse_pos = Some((area.x, area.y));
@@ -14152,6 +14214,24 @@ mod key_tests {
     }
 
     #[tokio::test]
+    async fn detail_pane_open_button_names_saved_tabs_open() {
+        // With saved tabs the first button restores them, whatever their
+        // kinds, so it can't promise a Claude tab.
+        let mut app = app_with_own_branch_ws();
+        app.state.add_embedded_session("w1", "codex:tab-x");
+        let text = render_to_string(&mut app, 100, 30);
+        let r = app
+            .hit_regions
+            .iter()
+            .find(|r| r.action == buttons::HitAction::StartSession)
+            .expect("the open button is drawn");
+        let row = text.lines().nth(r.area.y as usize).unwrap_or_default();
+        let cells: String = row.chars().skip(r.area.x as usize).take(r.area.width as usize).collect();
+        assert_eq!(cells, "[Open]", "{row}");
+        assert!(!text.contains("[Claude]"), "{text}");
+    }
+
+    #[tokio::test]
     async fn detail_pane_kind_buttons_queue_their_kinds() {
         use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = app_with_own_branch_ws();
@@ -14216,13 +14296,13 @@ mod key_tests {
             width_for.entry(app.right_pane_area.width).or_insert(w);
         }
         // Inside the borders, Claude..Gemini plus " [Opencode]" span 44 cells.
-        let fit = width_for[&46];
+        let fit = *width_for.get(&46).expect("some terminal width gives a 46-wide right pane");
         render_to_string(&mut app, fit, 30);
         let inner_right = app.right_pane_area.right() - 1;
         let region = app.hit_regions.iter().find(|r| r.action == opencode).expect("[Opencode] fits");
         assert_eq!(region.area.right(), inner_right, "an exact fit");
 
-        render_to_string(&mut app, width_for[&45], 30);
+        render_to_string(&mut app, *width_for.get(&45).expect("and a 45-wide one"), 30);
         assert!(!app.hit_regions.iter().any(|r| r.action == opencode), "one column short: dropped");
     }
 
@@ -15219,7 +15299,7 @@ mod key_tests {
         wait_wants_mouse(&app);
         app.embedded.get_mut("w1").unwrap().tabs.push(tab("b", &["-c", "sleep 30"]));
         app.focus = Focus::Embedded;
-        app.embedded_prefix = true; // a half-typed Ctrl+A, mid-gesture
+        app.prefix_armed = true; // a half-typed Ctrl+A, mid-gesture
         // (50, 10) is a CONTENT cell (row >= y+2): a forwarded event would
         // pass translate_mouse, so a None below proves interception, not
         // strip/border rejection.
@@ -15229,7 +15309,7 @@ mod key_tests {
             app.embedded["w1"].tabs[0].pane.last_input_at().is_none(),
             "the tilt was intercepted before the mouse-mode child"
         );
-        assert!(!app.embedded_prefix, "a tab switch drops the half-typed prefix");
+        assert!(!app.prefix_armed, "a tab switch drops the half-typed prefix");
         expire_wheel_windows(&mut app);
         app.handle_embedded_mouse(ms(MouseEventKind::ScrollDown, 50, 10));
         assert_eq!(app.embedded["w1"].active, 0, "focused shift+down = next, wrapping");
@@ -15820,7 +15900,7 @@ mod key_tests {
             assert_eq!(out, KeyOutcome::Continue, "Ctrl+{c} after the prefix neither quits nor leaves");
             assert_eq!(app.embedded["w1"].active, 1, "Ctrl+{c} after the prefix must not switch tabs");
             assert_eq!(app.focus, Focus::Embedded, "Ctrl+{c} after the prefix is swallowed");
-            assert!(!app.embedded_prefix, "the prefix is consumed");
+            assert!(!app.prefix_armed, "the prefix is consumed");
         }
     }
 
@@ -15840,7 +15920,7 @@ mod key_tests {
             });
             if from_pane {
                 app.focus = Focus::Embedded;
-                app.embedded_prefix = true;
+                app.prefix_armed = true;
             }
             assert_eq!(press(&mut app, KeyCode::Char('q')).await, KeyOutcome::Quit, "from_pane={from_pane}");
             assert_eq!(app.state.sessions[0].status, SessionStatus::Stopped, "from_pane={from_pane}");

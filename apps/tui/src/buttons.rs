@@ -5,7 +5,8 @@ use super::TabKind;
 /// An action triggered by clicking a button.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum HitAction {
-    /// The detail-pane `[Claude]` (opens the selected workspace, like Enter).
+    /// The detail-pane first button, `[Claude]` or `[Open]` with saved tabs
+    /// (opens the selected workspace, like Enter).
     StartSession,
     StartSessionFor { workspace_id: String },
     StopSessionFor { workspace_id: String },

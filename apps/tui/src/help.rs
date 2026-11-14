@@ -49,7 +49,7 @@ const EMBEDDED_FIXED_HEAD: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Ctrl+A then …",
-        description: "Also from the tree (not close tab)",
+        description: "Tree too (not close tab or Ctrl+A)",
     },
 ];
 

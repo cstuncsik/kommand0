@@ -323,10 +323,10 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         // the resting hint, the border title or the help overlay. These are
         // the defaults: a rebind shows in the help overlay, not here. Close
         // is pane only, so the tree's armed hint leaves it out.
-        Focus::Tree if app.embedded_prefix => {
+        Focus::Tree if app.prefix_armed => {
             "Ctrl+A … c claude · e codex · g gemini · o opencode · p pi · s shell · r rename · d detach · [ ] tabs · l last · 1-9 · a repo · w ws"
         }
-        Focus::Embedded if app.embedded_prefix => {
+        Focus::Embedded if app.prefix_armed => {
             "Ctrl+A … c claude · e codex · g gemini · o opencode · p pi · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9 · a repo · w ws"
         }
         Focus::Tree => "Enter open · a repo · w ws · ? help · q quit",
@@ -1207,11 +1207,14 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 lines.push(Line::from(vec![Span::styled("Changes: ", label_style), changes]));
             }
 
-            // Hint + one button per tab kind. [Claude] opens the workspace
-            // like Enter (restoring its tabs); the rest add a tab of a kind.
+            // Hint + one button per tab kind. The first opens the workspace
+            // like Enter: a Claude tab when nothing is saved, else the saved
+            // tabs (whatever their kinds, hence `[Open]`). The rest add a tab
+            // of a kind.
             lines.push(Line::raw(""));
             lines.push(Line::styled(detail_open_hint(&app.keymap), Style::default().fg(th.muted)));
             let tab = |kind| HitAction::NewSessionTab { workspace_id: ws.id.clone(), kind };
+            let open = if app.state.embedded_session_ids(&ws.id).is_empty() { "Claude" } else { "Open" };
             push_button(
                 &mut lines,
                 &mut app.hit_regions,
@@ -1219,7 +1222,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 inner,
                 th,
                 &[
-                    ("Claude", th.accent, HitAction::StartSession),
+                    (open, th.accent, HitAction::StartSession),
                     ("Shell", th.accent, tab(super::TabKind::Shell)),
                     ("Codex", th.accent, tab(super::TabKind::Codex)),
                     ("Gemini", th.accent, tab(super::TabKind::Gemini)),

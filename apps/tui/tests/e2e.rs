@@ -857,9 +857,37 @@ fn tree_ctrl_a_s_opens_a_shell_tab() {
     tui.send("\x01");
     tui.send("s");
     tui.wait_for_row(1, "1$"); // the tab strip: one shell-marked tab
+    tui.wait_for("EMBED-STUB-READY"); // the shell itself started
     tui.wait_for("1 live");
 
     tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn a_paste_drops_a_tree_prefix() {
+    // Ctrl+A from the tree, then a paste: the next key is a tree key again.
+    // `?` proves it: armed, the pane layer swallows it (unbound there); with
+    // the prefix dropped it opens the help overlay.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.wait_for("[Opencode]");
+
+    tui.send("\x01");
+    tui.wait_for("Ctrl+A …");
+    tui.send("\x1b[200~pasted\x1b[201~");
+    tui.wait_gone("Ctrl+A …");
+    tui.send("?");
+    tui.wait_for("Tree Pane");
+
+    tui.send_esc();
     tui.send("q");
     tui.wait_exit();
 }
