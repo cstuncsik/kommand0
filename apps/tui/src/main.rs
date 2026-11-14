@@ -2138,6 +2138,11 @@ impl App {
                 PaletteAction::NewSession { ws_id: w.id.clone(), kind: TabKind::Claude },
             ));
             out.push(mk(
+                "new shell",
+                format!("New shell — {}", w.name),
+                PaletteAction::NewSession { ws_id: w.id.clone(), kind: TabKind::Shell },
+            ));
+            out.push(mk(
                 "new codex",
                 format!("New codex — {}", w.name),
                 PaletteAction::NewSession { ws_id: w.id.clone(), kind: TabKind::Codex },
@@ -7317,6 +7322,7 @@ mod key_tests {
         app.config.gemini_bin = Some("sh".to_string());
         app.config.opencode_bin = Some("sh".to_string());
         app.config.pi_bin = Some("sh".to_string());
+        app.config.shell = Some("sh".to_string());
         if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
             w.working_dir = "/tmp".into();
         }
@@ -7328,6 +7334,7 @@ mod key_tests {
         // follow the label (the snapshot pins labels only, so a copy-pasted
         // Claude kind would otherwise ship green).
         for (label, kind, prefix) in [
+            ("New shell — ws-one", TabKind::Shell, "shell:"),
             ("New codex — ws-one", TabKind::Codex, "codex:"),
             ("New gemini — ws-one", TabKind::Gemini, "gemini:"),
             ("New opencode — ws-one", TabKind::Opencode, "opencode:"),
