@@ -1,13 +1,14 @@
-//! Rebindable key bindings: the tree pane, and the embedded pane's post-prefix
-//! layer (`Ctrl+A` then a key).
+//! Rebindable key bindings: the tree pane, and the post-prefix pane layer
+//! (`Ctrl+A` then a key, reachable from either pane).
 //!
 //! A [`KeyMap`] maps a normalized [`KeyChord`] to an [`Action`] per [`Layer`];
 //! `handle_key` resolves a press to an action and dispatches it. Defaults match
 //! the built-in bindings; a user's `config.json` `keybindings` (action name → key
 //! specs) replace an action's keys in every layer it lives in. Fixed (not
-//! rebindable): the `gg` motion and `Esc` (clears the filter) in the tree; the
-//! `Ctrl+A` prefix key itself, `Ctrl+A 1`-`9` and `Ctrl+A Ctrl+A` in the pane;
-//! and the prefix-less `Ctrl+]` (back to tree), handled before either layer.
+//! rebindable): the `gg` motion, `Esc` (clears the filter) and `Ctrl+A` in the
+//! tree; the `Ctrl+A` prefix key itself, `Ctrl+A 1`-`9` and `Ctrl+A Ctrl+A` in
+//! the pane; and the prefix-less `Ctrl+]` (back to tree), handled before either
+//! layer.
 //! `back-to-tree` and `quit` can be rebound but never unbound: a layer left
 //! with no key for one of them gets that action's defaults back there.
 
@@ -314,14 +315,16 @@ fn push_unique(warnings: &mut Vec<String>, msg: String) {
 /// Chords handled by fixed (non-rebindable) pre-checks in `handle_key` for a
 /// layer, with a reason for the warning. Binding an action to one of these
 /// would never fire. The pane predicates mirror the prefix arms in `handle_key`
-/// (any non-Ctrl digit jumps to a tab, any Ctrl+A is the literal); keep them
-/// identical, or a chord those arms eat is accepted here and dead.
+/// (any non-Ctrl digit jumps to a tab, any Ctrl+A is the literal), and the
+/// tree's Ctrl+A arms the prefix; keep them identical, or a chord those arms
+/// eat is accepted here and dead.
 fn reserved_reason(layer: Layer, chord: &KeyChord) -> Option<&'static str> {
     let plain = chord.mods.is_empty();
     let ctrl = chord.mods.contains(KeyModifiers::CONTROL);
     match layer {
         Layer::Tree if chord.code == KeyCode::Char('g') && plain => Some("the gg motion"),
         Layer::Tree if chord.code == KeyCode::Esc => Some("clearing the filter"),
+        Layer::Tree if chord.code == KeyCode::Char('a') && ctrl => Some("the Ctrl+A prefix"),
         Layer::Pane if matches!(chord.code, KeyCode::Char('1'..='9')) && !ctrl => {
             Some("jumping to tab N")
         }
@@ -1074,5 +1077,19 @@ mod tests {
         assert_eq!(km.resolve(&ev(KeyCode::Char('g'), KeyModifiers::NONE)), None);
         // The pane's own `g` (new gemini tab) is untouched.
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('g'), KeyModifiers::NONE)), Some(Action::NewGeminiTab));
+    }
+
+    #[test]
+    fn tree_layer_reserves_ctrl_a() {
+        let mut cfg = HashMap::new();
+        cfg.insert("archive".to_string(), vec!["ctrl+a".to_string(), "ctrl+b".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(
+            warns.iter().any(|w| w.contains("'ctrl+a' is reserved for the Ctrl+A prefix")),
+            "{warns:?}"
+        );
+        assert!(!warns.iter().any(|w| w.contains("ctrl+b")), "{warns:?}");
+        assert_eq!(km.resolve(&ev(KeyCode::Char('a'), KeyModifiers::CONTROL)), None);
+        assert_eq!(km.resolve(&ev(KeyCode::Char('b'), KeyModifiers::CONTROL)), Some(Action::ArchiveToggle));
     }
 }

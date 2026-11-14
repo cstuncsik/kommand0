@@ -4252,82 +4252,88 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
     if app.focus == Focus::Tree {
         app.profile_notice = None;
     }
+    // kommand0's pane commands sit behind a tmux-style prefix (Ctrl+A), armed
+    // from either focus: Ctrl+A then q = quit · t = back to tree · s = new
+    // shell tab · Ctrl+A = literal Ctrl+A (defaults: the post-prefix keys are
+    // the keymap's pane layer, rebindable except for the tab digits and the
+    // literal prefix). Any key consumes the prefix; under an overlay that key
+    // goes to the overlay instead.
+    if std::mem::take(&mut app.embedded_prefix) && !app.overlay_active() {
+        use keymap::Action;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Fixed (non-rebindable) prefix keys: the tab digits and the
+        // literal prefix. Everything else is the keymap's pane layer.
+        // `keymap::reserved_reason` mirrors these two guards (any non-Ctrl
+        // digit, any Ctrl+A); change them together.
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') if !ctrl => {
+                let idx = (c as u8 - b'1') as usize;
+                if let Some(s) = app.selected_sessions_mut() {
+                    s.select(idx);
+                }
+                return Ok(KeyOutcome::Continue);
+            }
+            KeyCode::Char('a') if ctrl => {
+                // Literal Ctrl+A to the pane; from the tree, nothing (a
+                // background pane must not get typed into).
+                if app.focus == Focus::Embedded {
+                    app.forward_to_embedded(key);
+                }
+                return Ok(KeyOutcome::Continue);
+            }
+            _ => {}
+        }
+        // `Ctrl+]` arrives as Char(']') or Char('5') with CTRL: the digit
+        // arm above skips Ctrl-modified digits, and a chord carries its
+        // modifiers, so neither reads as the `]` tab command here.
+        match app.keymap.resolve_pane(&key) {
+            Some(Action::Quit) => return Ok(app.request_quit()),
+            Some(Action::BackToTree) => app.focus = Focus::Tree,
+            Some(Action::NewClaudeTab) => app.new_tab_for_selected(TabKind::Claude),
+            Some(Action::NewShellTab) => app.new_tab_for_selected(TabKind::Shell),
+            Some(Action::NewCodexTab) => app.new_tab_for_selected(TabKind::Codex),
+            Some(Action::NewGeminiTab) => app.new_tab_for_selected(TabKind::Gemini),
+            Some(Action::NewOpencodeTab) => app.new_tab_for_selected(TabKind::Opencode),
+            Some(Action::NewPiTab) => app.new_tab_for_selected(TabKind::Pi),
+            Some(Action::PrevTab) => {
+                if let Some(s) = app.selected_sessions_mut() {
+                    s.prev();
+                }
+            }
+            Some(Action::NextTab) => {
+                if let Some(s) = app.selected_sessions_mut() {
+                    s.next();
+                }
+            }
+            Some(Action::LastTab) => {
+                // Last-active tab (tmux prefix-l); no-op with no history.
+                if let Some(s) = app.selected_sessions_mut() {
+                    s.select_last_active();
+                }
+            }
+            Some(Action::RenameTab) => app.open_rename_active_session(),
+            Some(Action::CloseTab) => app.close_active_session(),
+            Some(Action::Detach) => app.detach_selected_workspace(),
+            // Same modals as the tree's `a` / `w`, opened over the pane.
+            Some(Action::AddRepo) => app.open_add_repo_modal(),
+            Some(Action::AddWorkspace) => app.open_add_workspace_modal_for_selection(),
+            // An unbound key is swallowed, never forwarded. Tree-only
+            // actions never land in the pane layer, so a resolved action
+            // without an arm above is a new pane action missing one: the
+            // compiler can't flag that, the log does.
+            Some(action) => tracing::warn!("pane action {action:?} has no dispatch arm"),
+            None => {}
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
     // Embedded pane owns the keyboard: every key forwards to the real claude
-    // (incl. Ctrl+C, Tab, q, slash commands). kommand0 commands are reached via a
-    // tmux-style prefix (Ctrl+A) so there's always a reliable way out:
-    //   Ctrl+A then  q = quit · t/Tab/Esc = back to tree · Ctrl+A = literal Ctrl+A
-    // (defaults: the post-prefix keys are the keymap's pane layer, rebindable
-    // except for the tab digits and the literal prefix).
-    // A modal (e.g. Rename Session) opens over the embedded pane without leaving
-    // Embedded focus, so it must intercept keys before this block forwards them
-    // to claude. The modal block below (and the paste/mouse paths) is gated the
-    // same way.
+    // (incl. Ctrl+C, Tab, q, slash commands). A modal (e.g. Rename Session)
+    // opens over the embedded pane without leaving Embedded focus, so it must
+    // intercept keys before this block forwards them to claude. The modal
+    // block below (and the paste/mouse paths) is gated the same way.
     if app.focus == Focus::Embedded && !app.modal.is_active() {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if app.embedded_prefix {
-            use keymap::Action;
-            app.embedded_prefix = false;
-            // Fixed (non-rebindable) prefix keys: the tab digits and the
-            // literal prefix. Everything else is the keymap's pane layer.
-            // `keymap::reserved_reason` mirrors these two guards (any non-Ctrl
-            // digit, any Ctrl+A); change them together.
-            match key.code {
-                KeyCode::Char(c @ '1'..='9') if !ctrl => {
-                    let idx = (c as u8 - b'1') as usize;
-                    if let Some(s) = app.selected_sessions_mut() {
-                        s.select(idx);
-                    }
-                    return Ok(KeyOutcome::Continue);
-                }
-                KeyCode::Char('a') if ctrl => {
-                    app.forward_to_embedded(key); // literal Ctrl+A to claude
-                    return Ok(KeyOutcome::Continue);
-                }
-                _ => {}
-            }
-            // `Ctrl+]` arrives as Char(']') or Char('5') with CTRL: the digit
-            // arm above skips Ctrl-modified digits, and a chord carries its
-            // modifiers, so neither reads as the `]` tab command here.
-            match app.keymap.resolve_pane(&key) {
-                Some(Action::Quit) => return Ok(app.request_quit()),
-                Some(Action::BackToTree) => app.focus = Focus::Tree,
-                Some(Action::NewClaudeTab) => app.new_tab_for_selected(TabKind::Claude),
-                Some(Action::NewShellTab) => app.new_tab_for_selected(TabKind::Shell),
-                Some(Action::NewCodexTab) => app.new_tab_for_selected(TabKind::Codex),
-                Some(Action::NewGeminiTab) => app.new_tab_for_selected(TabKind::Gemini),
-                Some(Action::NewOpencodeTab) => app.new_tab_for_selected(TabKind::Opencode),
-                Some(Action::NewPiTab) => app.new_tab_for_selected(TabKind::Pi),
-                Some(Action::PrevTab) => {
-                    if let Some(s) = app.selected_sessions_mut() {
-                        s.prev();
-                    }
-                }
-                Some(Action::NextTab) => {
-                    if let Some(s) = app.selected_sessions_mut() {
-                        s.next();
-                    }
-                }
-                Some(Action::LastTab) => {
-                    // Last-active tab (tmux prefix-l); no-op with no history.
-                    if let Some(s) = app.selected_sessions_mut() {
-                        s.select_last_active();
-                    }
-                }
-                Some(Action::RenameTab) => app.open_rename_active_session(),
-                Some(Action::CloseTab) => app.close_active_session(),
-                Some(Action::Detach) => app.detach_selected_workspace(),
-                // Same modals as the tree's `a` / `w`, opened over the pane.
-                Some(Action::AddRepo) => app.open_add_repo_modal(),
-                Some(Action::AddWorkspace) => app.open_add_workspace_modal_for_selection(),
-                // An unbound key is swallowed, never forwarded. Tree-only
-                // actions never land in the pane layer, so a resolved action
-                // without an arm above is a new pane action missing one: the
-                // compiler can't flag that, the log does.
-                Some(action) => tracing::warn!("pane action {action:?} has no dispatch arm"),
-                None => {}
-            }
-            return Ok(KeyOutcome::Continue);
-        }
         if ctrl && key.code == KeyCode::Char('a') {
             app.embedded_prefix = true; // start a prefix sequence
             return Ok(KeyOutcome::Continue);
@@ -4773,7 +4779,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
 
     // Tree-pane keys. (Embedded focus is intercepted at the top of handle_key.)
     if app.focus == Focus::Tree {
-        // Fixed (non-rebindable) keys: the `gg` motion and Esc-clears-filter.
+        // Fixed (non-rebindable) keys: the `gg` motion, Esc-clears-filter and
+        // the Ctrl+A prefix (`keymap::reserved_reason` mirrors all three).
         match key.code {
             KeyCode::Char('g') if key.modifiers.is_empty() => {
                 if g_was_pending {
@@ -4788,6 +4795,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                     app.filter_query.clear();
                     app.apply_filter();
                 }
+                return Ok(KeyOutcome::Continue);
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.embedded_prefix = true;
                 return Ok(KeyOutcome::Continue);
             }
             _ => {}
@@ -9525,6 +9536,168 @@ mod key_tests {
         let text = render_to_string(&mut app, 100, 30);
         assert!(!text.contains("Ctrl+A …"), "indicator gone when disarmed:\n{text}");
         assert!(text.contains("Ctrl+] tree"), "resting hint back:\n{text}");
+
+        app.focus = Focus::Tree;
+        app.embedded_prefix = true;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Ctrl+A …"), "armed indicator shown from the tree:\n{text}");
+        app.embedded_prefix = false;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Enter open"), "resting tree hint back:\n{text}");
+    }
+
+    async fn ctrl_a(app: &mut App) -> KeyOutcome {
+        handle_key(app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)).await.unwrap()
+    }
+
+    /// w1 selected in tree focus with two live tabs `a` and `b` (both
+    /// persisted), `b` active.
+    fn app_with_two_background_tabs() -> App {
+        let mut app = app_with_pane("sleep 30");
+        app.embedded.get_mut("w1").unwrap().push(tab("b", &["-c", "sleep 30"]));
+        app.state.add_embedded_session("w1", "a");
+        app.state.add_embedded_session("w1", "b");
+        app.focus = Focus::Tree;
+        app
+    }
+
+    #[tokio::test]
+    async fn tree_ctrl_a_s_opens_a_shell_tab_not_a_sort() {
+        let mut app = app_with_pinned_bins();
+        let sorts = (app.state.repo_sort, app.state.workspace_sort);
+
+        ctrl_a(&mut app).await;
+        assert!(app.embedded_prefix, "Ctrl+A arms the prefix in the tree");
+        press(&mut app, KeyCode::Char('s')).await;
+
+        let s = app.embedded.get("w1").expect("a tab was opened");
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(s.tabs[0].kind, TabKind::Shell);
+        assert_eq!(app.focus, Focus::Embedded);
+        assert_eq!((app.state.repo_sort, app.state.workspace_sort), sorts, "no sort");
+        assert!(!app.embedded_prefix);
+    }
+
+    #[tokio::test]
+    async fn tree_ctrl_a_a_opens_add_repo() {
+        let mut app = app_with_pinned_bins();
+        ctrl_a(&mut app).await;
+        press(&mut app, KeyCode::Char('a')).await;
+        assert!(matches!(app.modal, modal::ModalState::AddRepo { .. }));
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[tokio::test]
+    async fn tree_ctrl_a_w_opens_add_workspace() {
+        let mut app = app_with_pinned_bins();
+        ctrl_a(&mut app).await;
+        press(&mut app, KeyCode::Char('w')).await;
+        assert!(
+            matches!(&app.modal, modal::ModalState::AddWorkspace { repo_id, .. } if repo_id == "r1"),
+            "AddWorkspace for the selected repo"
+        );
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[tokio::test]
+    async fn tree_ctrl_a_q_quits() {
+        let mut app = app_with_pinned_bins();
+        ctrl_a(&mut app).await;
+        assert_eq!(press(&mut app, KeyCode::Char('q')).await, KeyOutcome::Quit);
+    }
+
+    #[tokio::test]
+    async fn tree_prefix_pane_only_keys_are_noops_without_a_pane() {
+        let mut app = app_with_pinned_bins();
+        app.state.add_embedded_session("w1", "shell:keep");
+        for c in ['1', '[', ']', 'l', 'r', 'x', 'd', 't'] {
+            ctrl_a(&mut app).await;
+            press(&mut app, KeyCode::Char(c)).await;
+            assert!(!app.modal.is_active(), "{c}: no modal");
+            assert!(!app.embedded.contains_key("w1"), "{c}: no pane opened");
+            assert_eq!(app.focus, Focus::Tree, "{c}");
+            assert!(!app.embedded_prefix, "{c}: prefix consumed");
+            assert_eq!(app.state.embedded_session_ids("w1"), ["shell:keep"], "{c}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_ctrl_a_2_switches_a_background_tab() {
+        let mut app = app_with_two_background_tabs();
+        app.embedded.get_mut("w1").unwrap().switch_to(0);
+        ctrl_a(&mut app).await;
+        press(&mut app, KeyCode::Char('2')).await;
+        assert_eq!(app.embedded["w1"].active, 1);
+        assert_eq!(app.focus, Focus::Tree, "the switch stays in the background");
+    }
+
+    #[tokio::test]
+    async fn tree_ctrl_a_x_closes_only_the_active_tab() {
+        let mut app = app_with_two_background_tabs();
+        ctrl_a(&mut app).await;
+        press(&mut app, KeyCode::Char('x')).await;
+        assert_eq!(ids(&app.embedded["w1"]), ["a"]);
+        assert_eq!(app.state.embedded_session_ids("w1"), ["a"]);
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[tokio::test]
+    async fn tree_ctrl_a_d_detaches_like_x() {
+        let mut app = app_with_two_background_tabs();
+        ctrl_a(&mut app).await;
+        press(&mut app, KeyCode::Char('d')).await;
+        assert!(!app.embedded.contains_key("w1"), "the live panes are gone");
+        assert_eq!(app.state.embedded_session_ids("w1"), ["a", "b"], "ids kept");
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[tokio::test]
+    async fn tree_ctrl_a_ctrl_a_sends_nothing_to_a_background_pane() {
+        let mut app = app_with_two_background_tabs();
+        ctrl_a(&mut app).await;
+        ctrl_a(&mut app).await;
+        let s = &app.embedded["w1"];
+        assert!(s.tabs.iter().all(|t| t.pane.last_input_at().is_none()), "nothing typed");
+        assert!(!app.embedded_prefix);
+    }
+
+    #[tokio::test]
+    async fn prefix_is_dropped_when_an_overlay_takes_the_next_key() {
+        let overlays: [fn(&mut App); 4] = [
+            |app| app.open_add_repo_modal(),
+            |app| app.show_help = true,
+            |app| app.palette = Some(palette::Palette::new(app.palette_candidates())),
+            |app| app.settings = Some(settings::SettingsState::default()),
+        ];
+        for (i, open) in overlays.iter().enumerate() {
+            let mut app = app_with_pinned_bins();
+            let sorts = (app.state.repo_sort, app.state.workspace_sort);
+            ctrl_a(&mut app).await;
+            assert!(app.embedded_prefix, "overlay {i}: armed");
+            open(&mut app);
+            press(&mut app, KeyCode::Char('s')).await;
+            assert!(!app.embedded.contains_key("w1"), "overlay {i}: no tab");
+            assert_eq!((app.state.repo_sort, app.state.workspace_sort), sorts, "overlay {i}");
+            assert!(!app.embedded_prefix, "overlay {i}: prefix dropped");
+            if let modal::ModalState::AddRepo { input, .. } = &app.modal {
+                assert_eq!(input, "s", "the modal got the key");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_prefix_with_a_modal_up_goes_to_the_modal() {
+        let mut app = app_with_pane("sleep 30");
+        app.focus = Focus::Embedded;
+        app.open_add_repo_modal();
+        app.embedded_prefix = true;
+        press(&mut app, KeyCode::Char('s')).await;
+        let modal::ModalState::AddRepo { input, .. } = &app.modal else {
+            panic!("the modal stays up");
+        };
+        assert_eq!(input, "s");
+        assert_eq!(app.embedded["w1"].tabs.len(), 1, "no tab opened");
+        assert!(!app.embedded_prefix);
     }
 
     // Golden full-screen snapshots of key layouts (geometry/position/borders that
