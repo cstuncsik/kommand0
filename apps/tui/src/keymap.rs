@@ -614,7 +614,8 @@ impl KeyMap {
         chords
     }
 
-    /// The first chord bound to `action` in `layer`, formatted; `None` when unbound.
+    /// The chord bound to `action` in `layer` whose formatted name sorts lowest
+    /// (not a priority order), formatted; `None` when unbound.
     pub(crate) fn first_key(&self, layer: Layer, action: Action) -> Option<String> {
         self.chords_for(layer, action).first().map(format_chord)
     }

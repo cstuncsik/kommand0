@@ -2885,6 +2885,8 @@ impl App {
         }
         // Dropped tabs/workspaces shift what renders where — a stale highlight
         // must not land on the neighbor tab, nor an armed prefix on a sibling.
+        // Any death counts, not just the selected workspace's: the prefix
+        // arms from the tree too, where a background pane is the target.
         if !dead.is_empty() || !remove_ws.is_empty() {
             self.pane_selection = None;
             self.embedded_prefix = false;
@@ -4301,7 +4303,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
         // modifiers, so neither reads as the `]` tab command here.
         match app.keymap.resolve_pane(&key) {
             Some(Action::Quit) => return Ok(app.request_quit()),
-            Some(Action::BackToTree) => app.focus = Focus::Tree,
+            Some(Action::BackToTree) => app.leave_to_tree(),
             Some(Action::NewClaudeTab) => app.new_tab_for_selected(TabKind::Claude),
             Some(Action::NewShellTab) => app.new_tab_for_selected(TabKind::Shell),
             Some(Action::NewCodexTab) => app.new_tab_for_selected(TabKind::Codex),
@@ -4364,7 +4366,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             return Ok(KeyOutcome::Continue);
         }
         if !app.forward_to_embedded(key) {
-            app.leave_to_tree(); // pane vanished — bail to the tree
+            app.leave_to_tree(); // pane vanished: bail to the tree
         }
         return Ok(KeyOutcome::Continue);
     }
