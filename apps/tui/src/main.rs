@@ -1555,14 +1555,10 @@ impl App {
             // partial-reopen failure's message survives (a later clear would
             // swallow it).
             self.embed_error = None;
-            let persisted: Vec<String> = self.state.embedded_session_ids(&ws_id).to_vec();
-            if persisted.is_empty() {
+            if self.state.embedded_session_ids(&ws_id).is_empty() {
                 self.spawn_tab(TabKind::Claude, &ws_id, &ws_dir, &ws_name, None);
             } else {
-                for id in persisted.iter().take(MAX_SESSION_TABS) {
-                    let kind = TabKind::from_session_id(id);
-                    self.spawn_tab(kind, &ws_id, &ws_dir, &ws_name, Some(id));
-                }
+                self.reopen_persisted_tabs(&ws_id, &ws_dir, &ws_name);
             }
             // If every spawn failed, embed_error is set — stay on the tree.
             let Some(sessions) = self.embedded.get_mut(&ws_id) else {
@@ -1574,6 +1570,16 @@ impl App {
         }
         self.focus = Focus::Embedded;
         self.embedded_prefix = false;
+    }
+
+    /// Restore every persisted entry of a workspace as a tab of its kind, up
+    /// to the tab cap.
+    fn reopen_persisted_tabs(&mut self, ws_id: &str, ws_dir: &str, ws_name: &str) {
+        let persisted: Vec<String> = self.state.embedded_session_ids(ws_id).to_vec();
+        for id in persisted.iter().take(MAX_SESSION_TABS) {
+            let kind = TabKind::from_session_id(id);
+            self.spawn_tab(kind, ws_id, ws_dir, ws_name, Some(id));
+        }
     }
 
     /// Spawn a pane of `kind` (no persistence, no tab append). `prior_id`
@@ -2510,9 +2516,20 @@ impl App {
     }
 
     /// Open an additional tab of `kind` for a workspace (up to the shared cap)
-    /// and focus it.
+    /// and focus it. A detached workspace gets its persisted tabs back first,
+    /// so the new tab doesn't hide them.
     fn new_tab(&mut self, kind: TabKind, ws_id: &str) {
+        self.embedded_prefix = false;
         self.select_workspace_row(ws_id);
+        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
+            return;
+        };
+        // Cleared BEFORE the spawns so opening a tab drops a stale error without
+        // swallowing a reopen or persist-failure warning a spawn may set.
+        self.embed_error = None;
+        if !self.embedded.contains_key(ws_id) {
+            self.reopen_persisted_tabs(ws_id, &ws.working_dir, &ws.name);
+        }
         let count = self.embedded.get(ws_id).map(|s| s.tabs.len()).unwrap_or(0);
         if count >= MAX_SESSION_TABS {
             self.embed_error = Some((
@@ -2521,15 +2538,8 @@ impl App {
             ));
             return;
         }
-        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id).cloned() else {
-            return;
-        };
-        // Cleared BEFORE the spawn so opening a tab drops a stale error without
-        // swallowing a persist-failure warning the spawn itself may set.
-        self.embed_error = None;
         if self.spawn_tab(kind, ws_id, &ws.working_dir, &ws.name, None) {
             self.focus = Focus::Embedded;
-            self.embedded_prefix = false;
         }
     }
 
@@ -7098,6 +7108,83 @@ mod key_tests {
             std::slice::from_ref(&s.tabs[0].id),
             "the shell sentinel is persisted for reopen"
         );
+    }
+
+    /// test_app with every bin pinned to `sh`, w1 in /tmp and selected.
+    fn app_with_pinned_bins() -> App {
+        let mut app = test_app();
+        app.config.claude_bin = Some("sh".to_string());
+        app.config.shell = Some("sh".to_string());
+        app.config.codex_bin = Some("sh".to_string());
+        app.config.gemini_bin = Some("sh".to_string());
+        app.config.opencode_bin = Some("sh".to_string());
+        app.config.pi_bin = Some("sh".to_string());
+        if let Some(w) = app.workspaces.iter_mut().find(|w| w.id == "w1") {
+            w.working_dir = "/tmp".into();
+        }
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app
+    }
+
+    #[tokio::test]
+    async fn new_tab_reopens_persisted_tabs_before_appending() {
+        let mut app = app_with_pinned_bins();
+        app.state.add_embedded_session("w1", "shell:a");
+        app.state.add_embedded_session("w1", "codex:tab-x");
+
+        app.new_tab(TabKind::Shell, "w1");
+
+        let s = app.embedded.get("w1").expect("tabs opened");
+        assert_eq!(s.tabs.len(), 3, "both persisted tabs come back, plus the new one");
+        assert_eq!(&ids(s)[..2], ["shell:a", "codex:tab-x"]);
+        assert_eq!(s.tabs[0].kind, TabKind::Shell);
+        assert_eq!(s.tabs[1].kind, TabKind::Codex);
+        assert_eq!(s.tabs[2].kind, TabKind::Shell);
+        assert_eq!(s.active, 2, "the new tab is the active one");
+        assert_eq!(app.state.embedded_session_ids("w1").len(), 3);
+        assert_eq!(app.focus, Focus::Embedded);
+    }
+
+    #[tokio::test]
+    async fn new_tab_with_live_panes_does_not_reopen() {
+        let mut app = app_with_pinned_bins();
+        app.state.add_embedded_session("w1", "a");
+        app.state.add_embedded_session("w1", "shell:b");
+        app.embedded.insert(
+            "w1".to_string(),
+            WorkspaceSessions { tabs: vec![tab("a", &["-c", "sleep 30"])], active: 0, last_active: None },
+        );
+
+        app.new_tab(TabKind::Shell, "w1");
+
+        let s = &app.embedded["w1"];
+        assert_eq!(s.tabs.len(), 2, "the live tab plus the new one, no reopen");
+        assert_eq!(s.tabs[0].id, "a");
+    }
+
+    #[tokio::test]
+    async fn new_tab_cap_counts_reopened_tabs() {
+        let mut app = app_with_pinned_bins();
+        for i in 0..MAX_SESSION_TABS - 1 {
+            app.state.add_embedded_session("w1", &format!("shell:s{i}"));
+        }
+        app.new_tab(TabKind::Shell, "w1");
+        assert_eq!(app.embedded["w1"].tabs.len(), MAX_SESSION_TABS);
+        assert_eq!(app.focus, Focus::Embedded);
+
+        let mut app = app_with_pinned_bins();
+        for i in 0..MAX_SESSION_TABS {
+            app.state.add_embedded_session("w1", &format!("shell:s{i}"));
+        }
+        app.embedded_prefix = true;
+        app.new_tab(TabKind::Shell, "w1");
+        assert_eq!(app.embedded["w1"].tabs.len(), MAX_SESSION_TABS);
+        let (_, err) = app.embed_error.clone().expect("cap error shown");
+        assert!(err.contains("Maximum 9"), "{err}");
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(!app.embedded_prefix);
     }
 
     #[tokio::test]
