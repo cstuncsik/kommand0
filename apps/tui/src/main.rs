@@ -1533,8 +1533,15 @@ impl App {
             self.tree_items.get(self.selected_index),
             Some(TreeNode::Workspace { .. })
         ) {
-            self.focus = Focus::Tree;
+            self.leave_to_tree();
         }
+    }
+
+    /// Drop focus back to the tree without a key: a half-typed Ctrl+A must
+    /// not fire against whatever is selected next.
+    fn leave_to_tree(&mut self) {
+        self.focus = Focus::Tree;
+        self.embedded_prefix = false;
     }
 
     /// Enter (spawning if needed) the embedded interactive `claude` pane for the
@@ -2421,7 +2428,7 @@ impl App {
         self.save_state();
         if now_empty {
             self.embedded.remove(&ws_id);
-            self.focus = Focus::Tree;
+            self.leave_to_tree();
         }
         // The session likely committed; refresh this workspace's branch status.
         self.request_branch_status_refresh();
@@ -2472,7 +2479,7 @@ impl App {
         if let Some(session_id) = legacy {
             let _ = self.state.update_session_status(&session_id, SessionStatus::Stopped);
         }
-        self.focus = Focus::Tree;
+        self.leave_to_tree();
         // The sessions likely committed; refresh this workspace's branch status.
         self.request_branch_status_refresh();
     }
@@ -2872,9 +2879,10 @@ impl App {
             self.embedded.remove(ws_id);
         }
         // Dropped tabs/workspaces shift what renders where — a stale highlight
-        // must not land on the neighbor tab.
+        // must not land on the neighbor tab, nor an armed prefix on a sibling.
         if !dead.is_empty() || !remove_ws.is_empty() {
             self.pane_selection = None;
+            self.embedded_prefix = false;
         }
         if self.focus == Focus::Embedded {
             let gone = self
@@ -2882,7 +2890,7 @@ impl App {
                 .map(|w| !self.embedded.contains_key(&w.id))
                 .unwrap_or(true);
             if gone {
-                self.focus = Focus::Tree;
+                self.leave_to_tree();
             }
         }
     }
@@ -4345,7 +4353,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
             return Ok(KeyOutcome::Continue);
         }
         if !app.forward_to_embedded(key) {
-            app.focus = Focus::Tree; // pane vanished — bail to the tree
+            app.leave_to_tree(); // pane vanished — bail to the tree
         }
         return Ok(KeyOutcome::Continue);
     }
@@ -5452,10 +5460,12 @@ async fn run(
                             // Rows shifted under selected_index — a DIFFERENT
                             // workspace's pane can now be the visible one (the
                             // one pane-switch route with no key and no Down),
-                            // so a highlight (or live drag) must not carry over.
+                            // so a highlight (or live drag), or an armed prefix,
+                            // must not carry over.
                             // (Inside the select! loop — unit-unreachable;
                             // review-only coverage.)
                             app.pane_selection = None;
+                            app.embedded_prefix = false;
                         }
                     }
                     Err(msg) => {
@@ -5516,6 +5526,7 @@ async fn run(
                     Event::FocusGained => app.terminal_focused = true,
                     Event::FocusLost => app.terminal_focused = false,
                     Event::Paste(text) => {
+                        app.embedded_prefix = false;
                         // Bracketed paste arrives as one event (not Char keys).
                         // Route it with the SAME precedence handle_key uses: the
                         // embedded pane wins unless a modal is up, then modal →
@@ -5546,7 +5557,7 @@ async fn run(
                                 let _ = pane.send(&bytes);
                             });
                             if sent.is_none() {
-                                app.focus = Focus::Tree;
+                                app.leave_to_tree();
                             }
                         } else if app.modal.is_active() {
                             modal::handle_modal_paste(&mut app.modal, &text);
@@ -5591,8 +5602,9 @@ async fn run(
 
                 // Process pending button actions (from mouse clicks)
                 if let Some(action) = app.pending_button_action.take() {
+                    app.embedded_prefix = false;
                     match action {
-                        // Detail-pane [Open Claude] button (uses selected workspace)
+                        // Detail-pane [Claude] button (uses selected workspace)
                         buttons::HitAction::StartSession => {
                             app.toggle_embedded();
                         }
@@ -9683,6 +9695,66 @@ mod key_tests {
                 assert_eq!(input, "s", "the modal got the key");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_mouse_down_drops_a_tree_prefix() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = app_with_pinned_bins();
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 20);
+        app.right_pane_area = ratatui::layout::Rect::new(30, 0, 70, 20);
+        let sort = app.state.workspace_sort;
+        ctrl_a(&mut app).await;
+        // A click on the empty detail pane: no button, no tree row.
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 60,
+            row: 15,
+            modifiers: KeyModifiers::NONE,
+        };
+        if !mouse::handle_selection(&mut app, down, &mut Vec::new()) {
+            mouse::handle_mouse(&mut app, down);
+        }
+        assert!(!app.embedded_prefix, "the click drops the prefix");
+        press(&mut app, KeyCode::Char('s')).await;
+        assert_ne!(app.state.workspace_sort, sort, "s is the tree's sort again");
+        assert!(!app.embedded.contains_key("w1"), "no tab opened");
+    }
+
+    #[tokio::test]
+    async fn a_tree_scroll_drops_the_prefix() {
+        use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = app_with_pinned_bins();
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 20);
+        ctrl_a(&mut app).await;
+        mouse::handle_mouse(
+            &mut app,
+            MouseEvent { kind: MouseEventKind::ScrollUp, column: 5, row: 2, modifiers: KeyModifiers::NONE },
+        );
+        assert!(!app.embedded_prefix);
+    }
+
+    #[tokio::test]
+    async fn reaping_a_dead_pane_drops_the_prefix() {
+        let mut app = app_with_pane("exit 0");
+        app.focus = Focus::Embedded;
+        wait_exit(&mut app.embedded.get_mut("w1").unwrap().tabs[0].pane);
+        app.embedded_prefix = true;
+        app.reap_embedded(Instant::now());
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(!app.embedded_prefix);
+    }
+
+    #[tokio::test]
+    async fn an_armed_prefix_does_not_close_a_sibling_after_a_reap() {
+        let mut app = app_with_pane("sleep 30");
+        app.embedded.get_mut("w1").unwrap().push(tab("b", &["-c", "exit 0"]));
+        app.focus = Focus::Embedded;
+        ctrl_a(&mut app).await;
+        wait_exit(&mut app.embedded.get_mut("w1").unwrap().tabs[1].pane);
+        app.reap_embedded(Instant::now());
+        press(&mut app, KeyCode::Char('x')).await;
+        assert_eq!(ids(&app.embedded["w1"]), ["a"], "the surviving tab is not closed");
     }
 
     #[tokio::test]
