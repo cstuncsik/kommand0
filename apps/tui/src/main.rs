@@ -7476,8 +7476,8 @@ mod key_tests {
             active: 1,
             last_active: None,
         };
-        for i in 1..=5 {
-            wait_exit(&mut s.tabs[i].pane);
+        for t in &mut s.tabs[1..=5] {
+            wait_exit(&mut t.pane);
         }
         // The capture kinds drain-defer their reap; wait so one call reaps.
         wait_drained(&s.tabs[3].pane);
