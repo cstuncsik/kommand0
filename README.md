@@ -154,7 +154,7 @@ cargo run -p kommand0-tui   # from a checkout
 
 - **Two-pane layout**: Tree (repos/workspaces) on the left; the embedded Claude pane or workspace details on the right
 - **Embedded Claude**: opening a workspace launches a real interactive `claude` in a pseudo-terminal, composited into the right pane — full fidelity (its own input box, slash commands, `/model`, colours), not a reimplemented chat UI
-- **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9), and `Ctrl+A l` toggles back to the last-active tab (tmux-style). Open a new **Claude Code** tab with `Ctrl+A c` (or the `[+]` tab), a **codex** tab with `Ctrl+A e`, a **gemini** tab with `Ctrl+A g`, an **opencode** tab with `Ctrl+A o`, a **pi** tab with `Ctrl+A p`, or a **shell** tab with `Ctrl+A s`: a `$SHELL` session in the worktree, for running anything (lazygit, or `tmux`/`zellij` for splits inside the pane). Tabs are marked by kind (codex `>`, gemini `✦`, opencode `○`, pi `π`, shell `$`). All five agent tabs resume their conversation on reopen; shell tabs reopen as fresh shells. The `Ctrl+A` commands also work from the tree, and a workspace with no live session shows one button per tab kind in its detail pane
+- **Session tabs**: a workspace can run several sessions, shown as tabs across the top of the right pane (`1 2 3 … +`); switch with `Ctrl+A [`/`]` or a click (up to 9), and `Ctrl+A l` toggles back to the last-active tab (tmux-style). Open a new **Claude Code** tab with `Ctrl+A c` (or the `[+]` tab), a **codex** tab with `Ctrl+A e`, a **gemini** tab with `Ctrl+A g`, an **opencode** tab with `Ctrl+A o`, a **pi** tab with `Ctrl+A p`, or a **shell** tab with `Ctrl+A s`: a `$SHELL` session in the worktree, for running anything (lazygit, or `tmux`/`zellij` for splits inside the pane). Tabs are marked by kind (codex `>`, gemini `✦`, opencode `○`, pi `π`, shell `$`). All five agent tabs resume their conversation on reopen; shell tabs reopen as fresh shells. The `Ctrl+A` commands also work from the tree (except closing a tab), and a workspace with no live session shows one button per tab kind in its detail pane
 - **Session persistence**: each workspace gets a stable Claude session id, so reopening it (even after quitting kommand0) resumes the conversation via `claude --resume`; if that session was cleared from `~/.claude`, reopening starts a fresh one
 - **Mouse support**: click tree items and scroll the tree (clicking a workspace with a running session focuses that session, like Enter); inside the embedded pane, clicks and scroll are forwarded to Claude when it requests mouse input, so its own UI is fully interactive. Horizontal scroll (tilt wheel) or Shift+scroll over the content pane switches session tabs
 - **Modals**: add repos (`a`) and workspaces (`w`) directly from the TUI with path tab-completion. The add-workspace modal has an optional **Branch** field (`Tab` to switch fields) — leave it blank to fork a new branch, or enter an existing branch (local, or a remote `origin/…` ref) to check it out instead. With the Branch field blank, if the workspace **name** matches an existing branch (local or `origin`), a prompt offers to check it out instead of forking. Typing an issue reference (`123`, `#123`, or an issue URL) into the **Name** field instead creates the workspace on the branch GitHub links to that issue; for a workspace literally named `123`, use `kmd workspace create 123 --repo <repo> --fork` (the Branch field only checks out an *existing* branch)
@@ -202,16 +202,16 @@ cargo run -p kommand0-tui   # from a checkout
 | `Ctrl+A` then `o` | Tree / Embedded | New opencode session tab (marked `○`) |
 | `Ctrl+A` then `p` | Tree / Embedded | New pi session tab (marked `π`) |
 | `Ctrl+A` then `s` | Tree / Embedded | New shell tab (`$SHELL` / `shell` config; reopens fresh) |
-| `Ctrl+A` then `a` | Tree / Embedded | Add repository (the tree's `a`, as a modal over the pane) |
-| `Ctrl+A` then `w` | Tree / Embedded | Add workspace to the shown workspace's repo (the tree's `w`, as a modal over the pane) |
+| `Ctrl+A` then `a` | Tree / Embedded | Add repository (same modal as the tree's `a`) |
+| `Ctrl+A` then `w` | Tree / Embedded | Add workspace to the selected workspace's repo (same modal as the tree's `w`) |
 | `Ctrl+A` then `[` / `]` | Tree / Embedded | Previous / next tab |
 | _wheel tilt_ / Shift+scroll | Embedded | Previous / next tab (mouse, over the content pane) |
 | `Ctrl+A` then `1`–`9` | Tree / Embedded | Jump to tab N |
 | `Ctrl+A` then `l` | Tree / Embedded | Jump to the last-active tab |
 | `Ctrl+A` then `r` | Tree / Embedded | Rename the active tab |
-| `Ctrl+A` then `x` | Tree / Embedded | Close the active tab |
+| `Ctrl+A` then `x` | Embedded | Close the active tab |
 | `Ctrl+A` then `d` | Tree / Embedded | Detach: kill the panes (interrupts a running turn), sessions stay resumable |
-| `Ctrl+A` then `t` | Tree / Embedded | Back to tree (also `Tab` / `Esc`) |
+| `Ctrl+A` then `t` | Tree / Embedded | Back to tree (also `Tab` / `Esc`; nothing from the tree) |
 | `Ctrl+]` | Embedded | Back to tree, no prefix needed |
 | `Ctrl+A` then `q` | Tree / Embedded | Quit kommand0 |
 | `Ctrl+A` then `Ctrl+A` | Embedded | Send a literal `Ctrl+A` to the embedded tool |

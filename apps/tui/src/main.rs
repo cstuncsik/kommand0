@@ -4325,7 +4325,13 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                 }
             }
             Some(Action::RenameTab) => app.open_rename_active_session(),
-            Some(Action::CloseTab) => app.close_active_session(),
+            // Pane only: from the tree the user never picked the tab, and a
+            // close forgets its persisted resume id.
+            Some(Action::CloseTab) => {
+                if app.focus == Focus::Embedded {
+                    app.close_active_session();
+                }
+            }
             Some(Action::Detach) => app.detach_selected_workspace(),
             // Same modals as the tree's `a` / `w`, opened over the pane.
             Some(Action::AddRepo) => app.open_add_repo_modal(),
@@ -9651,13 +9657,13 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn tree_ctrl_a_x_closes_only_the_active_tab() {
+    async fn tree_ctrl_a_x_closes_nothing() {
         let mut app = app_with_two_background_tabs();
         ctrl_a(&mut app).await;
         press(&mut app, KeyCode::Char('x')).await;
-        assert_eq!(ids(&app.embedded["w1"]), ["a"]);
-        assert_eq!(app.state.embedded_session_ids("w1"), ["a"]);
-        assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(ids(&app.embedded["w1"]), ["a", "b"]);
+        assert_eq!(app.state.embedded_session_ids("w1"), ["a", "b"], "resume ids kept");
+        assert!(!app.embedded_prefix);
     }
 
     #[tokio::test]
