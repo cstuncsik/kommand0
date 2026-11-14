@@ -9556,6 +9556,7 @@ mod key_tests {
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Ctrl+A …"), "armed indicator shown:\n{text}");
         assert!(text.contains("d detach"), "hint lists detach:\n{text}");
+        assert!(text.contains("x close"), "the pane's hint lists close:\n{text}");
 
         // Disarmed (the very next key clears the prefix): back to the
         // resting hint, no armed marker.
@@ -9568,6 +9569,7 @@ mod key_tests {
         app.embedded_prefix = true;
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Ctrl+A …"), "armed indicator shown from the tree:\n{text}");
+        assert!(!text.contains("x close"), "close is pane only, not offered from the tree:\n{text}");
         app.embedded_prefix = false;
         let text = render_to_string(&mut app, 100, 30);
         assert!(text.contains("Enter open"), "resting tree hint back:\n{text}");

@@ -318,11 +318,15 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         // very next key, handle_key resets it first thing), show the armed
         // state and what the prefix accepts instead of the resting hint. Pure
         // render: no state lives here.
-        _ if app.embedded_prefix => {
-            // Tab-creation keys lead (per kind); the line right-truncates on
-            // narrow terminals, so the tail carries the keys that also appear
-            // in the resting hint, the border title or the help overlay. These
-            // are the defaults: a rebind shows in the help overlay, not here.
+        // Tab-creation keys lead (per kind); the line right-truncates on
+        // narrow terminals, so the tail carries the keys that also appear in
+        // the resting hint, the border title or the help overlay. These are
+        // the defaults: a rebind shows in the help overlay, not here. Close
+        // is pane only, so the tree's armed hint leaves it out.
+        Focus::Tree if app.embedded_prefix => {
+            "Ctrl+A … c claude · e codex · g gemini · o opencode · p pi · s shell · r rename · d detach · [ ] tabs · l last · 1-9 · a repo · w ws"
+        }
+        Focus::Embedded if app.embedded_prefix => {
             "Ctrl+A … c claude · e codex · g gemini · o opencode · p pi · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9 · a repo · w ws"
         }
         Focus::Tree => "Enter open · a repo · w ws · ? help · q quit",
