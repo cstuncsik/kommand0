@@ -123,8 +123,9 @@ pub fn render_diff_overlay(frame: &mut ratatui::Frame, app: &mut App) {
     app.diff_list_area = list_inner;
 
     if app.diff_rows.is_empty() {
-        // `diff_note` distinguishes no-branch / not-a-repo / empty-diff (set in
-        // open_diff). Wrap so a full sentence isn't clipped in the narrow pane.
+        // `diff_note` distinguishes no-branch / loading / not-a-repo / empty-diff
+        // (set in open_diff and finish_diff). Wrap so a full sentence isn't
+        // clipped in the narrow pane.
         let note = Paragraph::new(Line::styled(
             format!("  {}", app.diff_note),
             Style::default().fg(th.muted),

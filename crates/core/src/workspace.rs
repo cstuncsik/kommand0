@@ -14,6 +14,8 @@ pub struct Workspace {
     /// suffixed `-2`/`-3`… on collision; adopted branches keep their name; pre-
     /// existing workspaces may carry a legacy `kommand0/<name>`), captured at
     /// creation. `None` for fallback workspaces with no own worktree/branch.
+    /// Re-pointed when a cleanup follows the worktree to another branch
+    /// (`Cleaned::Followed`).
     #[serde(default)]
     pub branch_name: Option<String>,
 }

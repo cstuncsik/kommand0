@@ -482,7 +482,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         };
 
                         // Build repo line icons: ✕ (delete) + (add workspace)
-                        let icons = repo_line_icons(th, id, name, pane_inner_width);
+                        let icons = repo_line_icons(th, id, pane_inner_width);
 
                         let prefix = format!("{indicator}{name}");
                         let prefix_width = UnicodeWidthStr::width(prefix.as_str());
@@ -1065,15 +1065,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 ]),
             ];
 
-            // Repo cleanup: the button (a spinner while the scan/delete runs),
-            // then its last outcome.
+            // Repo cleanup: the button (a spinner while the scan/delete runs,
+            // or while the repo itself is being deleted), then its last outcome.
             lines.push(Line::raw(""));
-            if app.repo_cleanup_inflight.as_deref() == Some(id.as_str()) {
+            let cleaning = app.repo_cleanup_inflight.as_deref() == Some(id.as_str());
+            if cleaning || app.delete_inflight.contains(id) {
                 // ponytail: one spinner for the whole scan; a per-branch
                 // counter needs the worker to report progress.
                 let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+                let what = if cleaning { "Cleaning up" } else { "Deleting" };
                 lines.push(Line::styled(
-                    format!("{spin} Cleaning up…"),
+                    format!("{spin} {what}…"),
                     Style::default().fg(th.dirty),
                 ));
             } else {
@@ -1241,14 +1243,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 }
             }
 
-            // Clean-up affordance + last failure (own-branch workspaces).
+            // Clean-up affordance + last outcome (own-branch workspaces); a
+            // delete in flight shows here too, fallback rows included.
             let cleanup_inflight = app.cleanup_inflight.contains(&ws.id);
-            if has_branch || cleanup_inflight || app.cleanup_result.contains_key(&ws.id) {
+            let busy = cleanup_inflight || app.delete_inflight.contains(&ws.id);
+            if has_branch || busy || app.cleanup_result.contains_key(&ws.id) {
                 lines.push(Line::raw(""));
-                if cleanup_inflight {
+                if busy {
                     let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+                    let what = if cleanup_inflight { "Cleaning up" } else { "Deleting" };
                     lines.push(Line::styled(
-                        format!("{spin} Cleaning up…"),
+                        format!("{spin} {what}…"),
                         Style::default().fg(th.dirty),
                     ));
                 } else if has_branch {
@@ -1261,17 +1266,19 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         &[("Clean up", th.dirty, HitAction::CleanupWorkspaceFor { workspace_id: ws.id.clone() })],
                     );
                 }
-                if let Some(msg) = app.cleanup_result.get(&ws.id) {
+                if let Some((msg, is_error)) = app.cleanup_result.get(&ws.id) {
                     tail_from = lines.len();
+                    let (label, color) = if *is_error {
+                        ("Cleanup blocked: ", th.error)
+                    } else {
+                        ("Cleaned up: ", th.text)
+                    };
                     let mut msg_lines = msg.lines();
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            "Cleanup blocked: ",
-                            Style::default().fg(th.error).add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
                         Span::styled(
                             msg_lines.next().unwrap_or_default().to_string(),
-                            Style::default().fg(th.error),
+                            Style::default().fg(color),
                         ),
                     ]));
                     // Core's notes: warnings, as in the repo pane.
@@ -1666,7 +1673,7 @@ pub(crate) fn workspace_icon_cluster(
 }
 
 /// Build icons for a repo line: ✕ (delete repo) + (add workspace)
-fn repo_line_icons(th: Theme, repo_id: &str, repo_name: &str, pane_inner_width: usize) -> IconCluster {
+fn repo_line_icons(th: Theme, repo_id: &str, pane_inner_width: usize) -> IconCluster {
     let icon_style = Style::default().fg(th.accent);
 
     if pane_inner_width < 20 {
@@ -1691,7 +1698,7 @@ fn repo_line_icons(th: Theme, repo_id: &str, repo_name: &str, pane_inner_width: 
         hit_regions: vec![
             (
                 HitAction::DeleteRepoFor {
-                    repo_name: repo_name.to_string(),
+                    repo_id: repo_id.to_string(),
                 },
                 2,
             ),
@@ -2055,13 +2062,13 @@ mod tests {
 
     #[test]
     fn repo_line_icons_normal_width() {
-        let icons = repo_line_icons(Theme::default(), "r-1", "myrepo", 40);
+        let icons = repo_line_icons(Theme::default(), "r-1", 40);
         assert_eq!(icons.total_width, 4); // delete + add
         assert_eq!(icons.hit_regions.len(), 2);
         assert_eq!(
             icons.hit_regions[0].0,
             HitAction::DeleteRepoFor {
-                repo_name: "myrepo".to_string()
+                repo_id: "r-1".to_string()
             }
         );
         assert_eq!(
@@ -2074,7 +2081,7 @@ mod tests {
 
     #[test]
     fn repo_line_icons_narrow_hidden() {
-        let icons = repo_line_icons(Theme::default(), "r-1", "myrepo", 15);
+        let icons = repo_line_icons(Theme::default(), "r-1", 15);
         assert_eq!(icons.total_width, 0);
         assert!(icons.hit_regions.is_empty());
     }
@@ -2085,7 +2092,7 @@ mod tests {
         // chrome color comes from the theme rather than a hardcoded `Color`.
         let custom = ratatui::style::Color::Rgb(1, 2, 3);
         let theme = Theme { accent: custom, ..Theme::default() };
-        let icons = repo_line_icons(theme, "r-1", "myrepo", 40);
+        let icons = repo_line_icons(theme, "r-1", 40);
         assert!(
             icons.spans.iter().all(|s| s.style.fg == Some(custom)),
             "repo icon spans should use the theme accent color"
