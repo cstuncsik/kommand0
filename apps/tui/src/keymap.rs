@@ -614,6 +614,11 @@ impl KeyMap {
         chords
     }
 
+    /// The first chord bound to `action` in `layer`, formatted; `None` when unbound.
+    pub(crate) fn first_key(&self, layer: Layer, action: Action) -> Option<String> {
+        self.chords_for(layer, action).first().map(format_chord)
+    }
+
     /// The help-overlay keys column for an action in a layer; `None` when unbound.
     fn keys_label(&self, layer: Layer, action: Action) -> Option<String> {
         let chords = self.chords_for(layer, action);

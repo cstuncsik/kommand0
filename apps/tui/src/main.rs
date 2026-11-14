@@ -5618,8 +5618,8 @@ async fn run(
                         buttons::HitAction::SelectSessionTab { workspace_id, index } => {
                             app.select_session_tab(&workspace_id, index);
                         }
-                        buttons::HitAction::NewSessionTab { workspace_id } => {
-                            app.new_tab(TabKind::Claude, &workspace_id);
+                        buttons::HitAction::NewSessionTab { workspace_id, kind } => {
+                            app.new_tab(kind, &workspace_id);
                         }
                         buttons::HitAction::CleanupWorkspaceFor { workspace_id } => {
                             app.cleanup_workspace_prompt(&workspace_id);
@@ -11277,44 +11277,146 @@ mod key_tests {
         assert_eq!(app.pending_button_action, Some(action));
     }
 
+    /// test_app with w1 an own-branch workspace (no live session), selected.
+    fn app_with_own_branch_ws() -> App {
+        let mut app = test_app();
+        app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
+        app.workspaces[0].branch_name = Some("ws-one".into());
+        app.expanded.insert("r1".to_string());
+        app.rebuild_tree();
+        app.select_workspace_row("w1");
+        app
+    }
+
+    /// The label a detail-pane button draws for its action, `None` for any
+    /// other region.
+    fn detail_button_label(action: &buttons::HitAction) -> Option<&'static str> {
+        use buttons::HitAction::*;
+        Some(match action {
+            CleanupRepoFor { .. } => "Clean up branches",
+            CleanupWorkspaceFor { .. } => "Clean up",
+            StartSession => "Claude",
+            NewSessionTab { kind: TabKind::Shell, .. } => "Shell",
+            NewSessionTab { kind: TabKind::Codex, .. } => "Codex",
+            NewSessionTab { kind: TabKind::Gemini, .. } => "Gemini",
+            NewSessionTab { kind: TabKind::Opencode, .. } => "Opencode",
+            NewSessionTab { kind: TabKind::Pi, .. } => "Pi",
+            _ => return None,
+        })
+    }
+
+    /// Assert every detail-pane button region covers exactly its `[label]`
+    /// cells; returns the labels checked, in region order.
+    fn check_button_regions(app: &mut App, w: u16, h: u16) -> Vec<&'static str> {
+        let text = render_to_string(app, w, h);
+        let mut checked = Vec::new();
+        for region in &app.hit_regions {
+            let Some(label) = detail_button_label(&region.action) else {
+                continue;
+            };
+            let row = text.lines().nth(region.area.y as usize).unwrap_or_default();
+            let cells: String = row
+                .chars()
+                .skip(region.area.x as usize)
+                .take(region.area.width as usize)
+                .collect();
+            assert_eq!(
+                cells,
+                format!("[{label}]"),
+                "{:?} region at x={} on row {}:\n{row}",
+                region.action, region.area.x, region.area.y
+            );
+            checked.push(label);
+        }
+        checked
+    }
+
     #[tokio::test]
     async fn detail_pane_button_hit_regions_cover_their_labels() {
         // A repo row offers [Clean up branches]; an own-branch workspace with no
-        // live session offers [Open Claude] and [Clean up].
+        // live session offers one button per tab kind and [Clean up].
         let mut repo_app = test_app();
-        let mut ws_app = test_app();
-        ws_app.workspaces[0].worktree_path = Some("/tmp/alpha".into());
-        ws_app.workspaces[0].branch_name = Some("ws-one".into());
-        ws_app.expanded.insert("r1".to_string());
-        ws_app.rebuild_tree();
-        ws_app.select_workspace_row("w1");
+        let mut ws_app = app_with_own_branch_ws();
+        assert_eq!(check_button_regions(&mut repo_app, 100, 30), ["Clean up branches"]);
+        assert_eq!(
+            check_button_regions(&mut ws_app, 100, 30),
+            ["Claude", "Shell", "Codex", "Gemini", "Opencode", "Pi", "Clean up"]
+        );
+    }
 
-        let mut checked = 0;
-        for app in [&mut repo_app, &mut ws_app] {
-            let text = render_to_string(app, 100, 30);
-            for region in &app.hit_regions {
-                let label = match &region.action {
-                    buttons::HitAction::CleanupRepoFor { .. } => "Clean up branches",
-                    buttons::HitAction::CleanupWorkspaceFor { .. } => "Clean up",
-                    buttons::HitAction::StartSession => "Open Claude",
-                    _ => continue,
-                };
-                let row = text.lines().nth(region.area.y as usize).unwrap_or_default();
-                let cells: String = row
-                    .chars()
-                    .skip(region.area.x as usize)
-                    .take(region.area.width as usize)
-                    .collect();
-                assert_eq!(
-                    cells,
-                    format!("[{label}]"),
-                    "{:?} region at x={} on row {}:\n{row}",
-                    region.action, region.area.x, region.area.y
-                );
-                checked += 1;
-            }
+    #[tokio::test]
+    async fn detail_pane_kind_buttons_queue_their_kinds() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = app_with_own_branch_ws();
+        render_to_string(&mut app, 100, 30);
+        let regions: Vec<_> = app
+            .hit_regions
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.action,
+                    buttons::HitAction::StartSession | buttons::HitAction::NewSessionTab { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        let mut queued = Vec::new();
+        for r in regions {
+            mouse::handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: r.area.x + 1,
+                    row: r.area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+            queued.push(app.pending_button_action.take().expect("the click queues an action"));
         }
-        assert_eq!(checked, 3, "one repo button and two workspace buttons");
+        let tab = |kind| buttons::HitAction::NewSessionTab { workspace_id: "w1".into(), kind };
+        assert_eq!(
+            queued,
+            [
+                buttons::HitAction::StartSession,
+                tab(TabKind::Shell),
+                tab(TabKind::Codex),
+                tab(TabKind::Gemini),
+                tab(TabKind::Opencode),
+                tab(TabKind::Pi),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn detail_pane_buttons_drop_cleanly_when_narrow() {
+        let mut app = app_with_own_branch_ws();
+        let checked = check_button_regions(&mut app, 60, 30);
+        assert_eq!(checked, ["Claude", "Shell", "Codex", "Gemini", "Clean up"]);
+        let text = render_to_string(&mut app, 60, 30);
+        assert!(!text.contains("[Opencode"), "a button that doesn't fit isn't drawn:\n{text}");
+        assert!(!text.contains("[Pi]"), "nor anything after it:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn detail_pane_hint_follows_the_keymap() {
+        let mut app = app_with_own_branch_ws();
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Enter: open · Ctrl+A then c/s/e/g/o/p: new tab"), "{text}");
+
+        let mut cfg = std::collections::HashMap::new();
+        cfg.insert("new-shell".to_string(), vec!["z".to_string()]);
+        app.keymap = keymap::KeyMap::build(&cfg).0;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Ctrl+A then c/z/e/g/o/p: new tab"), "{text}");
+
+        let mut cfg = std::collections::HashMap::new();
+        for name in ["new-claude", "new-shell", "new-codex", "new-gemini", "new-opencode", "new-pi"] {
+            cfg.insert(name.to_string(), Vec::new());
+        }
+        app.keymap = keymap::KeyMap::build(&cfg).0;
+        let text = render_to_string(&mut app, 100, 30);
+        assert!(text.contains("Enter: open"), "{text}");
+        assert!(!text.contains("Ctrl+A then"), "{text}");
     }
 
     #[tokio::test]
