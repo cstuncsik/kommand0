@@ -1,8 +1,12 @@
 use ratatui::layout::Rect;
 
+use super::TabKind;
+
 /// An action triggered by clicking a button.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum HitAction {
+    /// The detail-pane first button, `[Claude]` or `[Open]` with saved tabs
+    /// (opens the selected workspace, like Enter).
     StartSession,
     StartSessionFor { workspace_id: String },
     StopSessionFor { workspace_id: String },
@@ -16,8 +20,9 @@ pub(crate) enum HitAction {
     AddRepo,
     /// Select session tab `index` of a workspace (click on the tab strip).
     SelectSessionTab { workspace_id: String, index: usize },
-    /// Open a new session tab for a workspace (click on the `[+]` tab).
-    NewSessionTab { workspace_id: String },
+    /// Open a new session tab of `kind` for a workspace (the `[+]` tab, or a
+    /// detail-pane kind button).
+    NewSessionTab { workspace_id: String, kind: TabKind },
     /// Clean up a merged workspace (the detail-pane `[Clean up]`).
     CleanupWorkspaceFor { workspace_id: String },
     /// Clean up a repo's merged branches (the detail-pane `[Clean up branches]`).

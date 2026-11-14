@@ -841,6 +841,58 @@ fn ctrl_a_s_opens_a_shell_tab() {
 }
 
 #[test]
+fn tree_ctrl_a_s_opens_a_shell_tab() {
+    // From the tree, with no live pane: Ctrl+A s opens a shell tab instead of
+    // sorting the workspaces.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[("KOMMAND0_SHELL", "embed-stub")]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.wait_for("[Opencode]"); // the workspace detail pane, tree focus
+
+    tui.send("\x01");
+    tui.send("s");
+    tui.wait_for_row(1, "1$"); // the tab strip: one shell-marked tab
+    tui.wait_for("EMBED-STUB-READY"); // the shell itself started
+    tui.wait_for("1 live");
+
+    tui.send("\x01");
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
+fn a_paste_drops_a_tree_prefix() {
+    // Ctrl+A from the tree, then a paste: the next key is a tree key again.
+    // `?` proves it: armed, the pane layer swallows it (unbound there); with
+    // the prefix dropped it opens the help overlay.
+    let dir = tempfile::tempdir().unwrap();
+    let state = seeded_state(dir.path().to_str().unwrap());
+    let mut tui = Tui::launch_with(Some(state), &[]);
+
+    tui.wait_for("demo");
+    tui.send("l");
+    tui.wait_for("demo-ws");
+    tui.send("j");
+    tui.wait_for("[Opencode]");
+
+    tui.send("\x01");
+    tui.wait_for("Ctrl+A …");
+    tui.send("\x1b[200~pasted\x1b[201~");
+    tui.wait_gone("Ctrl+A …");
+    tui.send("?");
+    tui.wait_for("Tree Pane");
+
+    tui.send_esc();
+    tui.send("q");
+    tui.wait_exit();
+}
+
+#[test]
 fn ctrl_a_e_g_o_p_open_agent_tabs() {
     // All four agent binaries are the embed-stub, so each prefix key opens a
     // deterministic tab; the strip marks codex `>`, gemini `✦`, opencode `○`,
@@ -1349,7 +1401,7 @@ fn closing_the_last_tab_returns_to_tree_and_reopens_fresh() {
     tui.send("\x01");
     tui.send("x");
     tui.wait_for("no live sessions");
-    tui.wait_for("Press Enter to open Claude"); // detail view, back on the tree
+    tui.wait_for("[Opencode]"); // detail view, back on the tree
 
     // Reopening starts a fresh session (the closed id was forgotten).
     tui.send("\r");

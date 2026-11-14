@@ -1,13 +1,14 @@
-//! Rebindable key bindings: the tree pane, and the embedded pane's post-prefix
-//! layer (`Ctrl+A` then a key).
+//! Rebindable key bindings: the tree pane, and the post-prefix pane layer
+//! (`Ctrl+A` then a key, reachable from either pane).
 //!
 //! A [`KeyMap`] maps a normalized [`KeyChord`] to an [`Action`] per [`Layer`];
 //! `handle_key` resolves a press to an action and dispatches it. Defaults match
 //! the built-in bindings; a user's `config.json` `keybindings` (action name → key
 //! specs) replace an action's keys in every layer it lives in. Fixed (not
-//! rebindable): the `gg` motion and `Esc` (clears the filter) in the tree; the
-//! `Ctrl+A` prefix key itself, `Ctrl+A 1`-`9` and `Ctrl+A Ctrl+A` in the pane;
-//! and the prefix-less `Ctrl+]` (back to tree), handled before either layer.
+//! rebindable): the `gg` motion, `Esc` (clears the filter) and `Ctrl+A` in the
+//! tree; the `Ctrl+A` prefix key itself, `Ctrl+A 1`-`9` and `Ctrl+A Ctrl+A` in
+//! the pane; and the prefix-less `Ctrl+]` (back to tree), handled before either
+//! layer.
 //! `back-to-tree` and `quit` can be rebound but never unbound: a layer left
 //! with no key for one of them gets that action's defaults back there.
 
@@ -314,14 +315,16 @@ fn push_unique(warnings: &mut Vec<String>, msg: String) {
 /// Chords handled by fixed (non-rebindable) pre-checks in `handle_key` for a
 /// layer, with a reason for the warning. Binding an action to one of these
 /// would never fire. The pane predicates mirror the prefix arms in `handle_key`
-/// (any non-Ctrl digit jumps to a tab, any Ctrl+A is the literal); keep them
-/// identical, or a chord those arms eat is accepted here and dead.
+/// (any non-Ctrl digit jumps to a tab, any Ctrl+A is the literal), and the
+/// tree's Ctrl+A arms the prefix; keep them identical, or a chord those arms
+/// eat is accepted here and dead.
 fn reserved_reason(layer: Layer, chord: &KeyChord) -> Option<&'static str> {
     let plain = chord.mods.is_empty();
     let ctrl = chord.mods.contains(KeyModifiers::CONTROL);
     match layer {
         Layer::Tree if chord.code == KeyCode::Char('g') && plain => Some("the gg motion"),
         Layer::Tree if chord.code == KeyCode::Esc => Some("clearing the filter"),
+        Layer::Tree if chord.code == KeyCode::Char('a') && ctrl => Some("the Ctrl+A prefix"),
         Layer::Pane if matches!(chord.code, KeyCode::Char('1'..='9')) && !ctrl => {
             Some("jumping to tab N")
         }
@@ -528,6 +531,7 @@ impl KeyMap {
             // Replace this action's keys: drop its current chords first (an
             // action only ever sits in its own layers).
             keymap.map.retain(|_, a| *a != action);
+            let mut bound = false;
             for spec in specs {
                 let Some(chord) = parse_chord(spec) else {
                     warnings.push(format!("invalid key '{spec}' for '{name}'"));
@@ -541,6 +545,7 @@ impl KeyMap {
                     warnings.push(format!("key '{spec}' is reserved for {reason}; ignored for '{name}'"));
                     continue;
                 }
+                bound = true;
                 for &layer in action.layers() {
                     if let Some(prev) = keymap.map.insert((layer, chord), action)
                         && prev != action
@@ -551,6 +556,12 @@ impl KeyMap {
                         );
                     }
                 }
+            }
+            // Every listed key rejected: the defaults are already gone, so say
+            // so (an empty list is a deliberate unbind). The two actions that
+            // can't be unbound get their own warning below.
+            if !specs.is_empty() && !bound && !matches!(action, Action::BackToTree | Action::Quit) {
+                warnings.push(format!("no usable key for '{name}'; it is unbound"));
             }
         }
         // `back-to-tree` is the keyboard's way out of the embedded pane and
@@ -609,6 +620,12 @@ impl KeyMap {
             .collect();
         chords.sort_by_key(format_chord);
         chords
+    }
+
+    /// The chord bound to `action` in `layer` whose formatted name sorts lowest
+    /// (not a priority order), formatted; `None` when unbound.
+    pub(crate) fn first_key(&self, layer: Layer, action: Action) -> Option<String> {
+        self.chords_for(layer, action).first().map(format_chord)
     }
 
     /// The help-overlay keys column for an action in a layer; `None` when unbound.
@@ -842,6 +859,13 @@ mod tests {
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('t'), KeyModifiers::NONE)), Some(Action::BackToTree));
         assert_eq!(km.resolve_pane(&ev(KeyCode::Esc, KeyModifiers::NONE)), Some(Action::BackToTree));
 
+        // Every listed key rejected: restored, so never warned as unbound.
+        let mut cfg = HashMap::new();
+        cfg.insert("back-to-tree".to_string(), vec!["ctrl+a".to_string()]);
+        let (_, warns) = KeyMap::build(&cfg);
+        assert!(warns.iter().any(|w| w.contains("'back-to-tree' cannot be unbound")), "{warns:?}");
+        assert!(!warns.iter().any(|w| w.contains("it is unbound")), "{warns:?}");
+
         let mut cfg = HashMap::new();
         cfg.insert("detach".to_string(), vec![]);
         let (km, warns) = KeyMap::build(&cfg);
@@ -1074,5 +1098,37 @@ mod tests {
         assert_eq!(km.resolve(&ev(KeyCode::Char('g'), KeyModifiers::NONE)), None);
         // The pane's own `g` (new gemini tab) is untouched.
         assert_eq!(km.resolve_pane(&ev(KeyCode::Char('g'), KeyModifiers::NONE)), Some(Action::NewGeminiTab));
+    }
+
+    #[test]
+    fn tree_layer_reserves_ctrl_a() {
+        let mut cfg = HashMap::new();
+        cfg.insert("archive".to_string(), vec!["ctrl+a".to_string(), "ctrl+b".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(
+            warns.iter().any(|w| w.contains("'ctrl+a' is reserved for the Ctrl+A prefix")),
+            "{warns:?}"
+        );
+        assert!(!warns.iter().any(|w| w.contains("ctrl+b")), "{warns:?}");
+        assert!(!warns.iter().any(|w| w.contains("unbound")), "ctrl+b still binds it: {warns:?}");
+        assert_eq!(km.resolve(&ev(KeyCode::Char('a'), KeyModifiers::CONTROL)), None);
+        assert_eq!(km.resolve(&ev(KeyCode::Char('b'), KeyModifiers::CONTROL)), Some(Action::ArchiveToggle));
+
+        // Only the reserved key listed: the action is left with no key, and
+        // the warning says so.
+        let mut cfg = HashMap::new();
+        cfg.insert("archive".to_string(), vec!["ctrl+a".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(warns.iter().any(|w| w == "no usable key for 'archive'; it is unbound"), "{warns:?}");
+        assert!(km.first_key(Layer::Tree, Action::ArchiveToggle).is_none());
+
+        // `quit` can't end up unbound: its defaults come back, so only the
+        // restore warning shows, never the unbound one.
+        let mut cfg = HashMap::new();
+        cfg.insert("quit".to_string(), vec!["ctrl+a".to_string()]);
+        let (km, warns) = KeyMap::build(&cfg);
+        assert!(!warns.iter().any(|w| w.contains("it is unbound")), "{warns:?}");
+        assert!(warns.iter().any(|w| w.contains("'quit' cannot be unbound")), "{warns:?}");
+        assert_eq!(km.resolve(&ev(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
     }
 }

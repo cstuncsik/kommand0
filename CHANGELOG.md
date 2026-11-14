@@ -5,6 +5,38 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Start any tab kind from the workspace detail pane.** A workspace with no
+  live session shows `[Claude] [Shell] [Codex] [Gemini] [Opencode] [Pi]` in
+  place of `[Open Claude]`. `[Claude]` opens the workspace like `Enter` (it
+  reads `[Open]` when the workspace has saved tabs, since those come back
+  whatever their kind); the others add a tab of their kind. The hint above
+  them follows your keybindings. On a narrow pane, buttons that don't fit are
+  left out (their keys and the palette still work).
+- **`Ctrl+A` works from the tree.** The prefix and the `Ctrl+A` commands now
+  work with the tree focused too, acting on the selected workspace. Two stay
+  pane only and do nothing from the tree: `Ctrl+A` then `x` (closing a tab you
+  can't see would forget its resume id) and `Ctrl+A` then `Ctrl+A`.
+- **"New shell" palette entry**, next to the other new-tab entries.
+
+### Changed
+
+- A `keybindings` entry binding `ctrl+a` to a tree action is now warned about
+  and ignored (the tree reserves it for the prefix).
+- A `keybindings` entry whose every key is rejected now warns that the action
+  is left unbound.
+- The README key table and the help overlay say which `Ctrl+A` commands also
+  work from the tree.
+
+### Fixed
+
+- Opening a new tab on a detached workspace (palette, `Ctrl+A`, buttons) restores
+  its persisted tabs first instead of hiding them until the next reopen.
+- A half-typed `Ctrl+A` no longer survives a click, a scroll, a paste or (in
+  the pane) a sibling tab exiting, so it can't fire against a different
+  workspace or tab.
+
 ## [0.32.2] - 2026-10-27
 
 ### Changed
