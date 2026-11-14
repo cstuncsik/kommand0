@@ -9606,31 +9606,21 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn tree_ctrl_a_a_opens_add_repo() {
-        let mut app = app_with_pinned_bins();
-        ctrl_a(&mut app).await;
-        press(&mut app, KeyCode::Char('a')).await;
-        assert!(matches!(app.modal, modal::ModalState::AddRepo { .. }));
-        assert_eq!(app.focus, Focus::Tree);
-    }
-
-    #[tokio::test]
-    async fn tree_ctrl_a_w_opens_add_workspace() {
-        let mut app = app_with_pinned_bins();
-        ctrl_a(&mut app).await;
-        press(&mut app, KeyCode::Char('w')).await;
-        assert!(
-            matches!(&app.modal, modal::ModalState::AddWorkspace { repo_id, .. } if repo_id == "r1"),
-            "AddWorkspace for the selected repo"
-        );
-        assert_eq!(app.focus, Focus::Tree);
-    }
-
-    #[tokio::test]
-    async fn tree_ctrl_a_q_quits() {
-        let mut app = app_with_pinned_bins();
-        ctrl_a(&mut app).await;
-        assert_eq!(press(&mut app, KeyCode::Char('q')).await, KeyOutcome::Quit);
+    async fn tree_ctrl_a_runs_the_shared_actions() {
+        for c in ['a', 'w', 'q'] {
+            let mut app = app_with_pinned_bins();
+            ctrl_a(&mut app).await;
+            assert!(app.embedded_prefix, "{c}: Ctrl+A arms the prefix");
+            let out = press(&mut app, KeyCode::Char(c)).await;
+            assert!(!app.embedded_prefix, "{c}: the key consumes it");
+            let ran = match c {
+                'a' => matches!(app.modal, modal::ModalState::AddRepo { .. }),
+                'w' => matches!(&app.modal, modal::ModalState::AddWorkspace { repo_id, .. } if repo_id == "r1"),
+                _ => out == KeyOutcome::Quit,
+            };
+            assert!(ran, "{c}: its action ran");
+            assert_eq!(app.focus, Focus::Tree, "{c}");
+        }
     }
 
     #[tokio::test]
@@ -9639,6 +9629,7 @@ mod key_tests {
         app.state.add_embedded_session("w1", "shell:keep");
         for c in ['1', '[', ']', 'l', 'r', 'x', 'd', 't'] {
             ctrl_a(&mut app).await;
+            assert!(app.embedded_prefix, "{c}: armed");
             press(&mut app, KeyCode::Char(c)).await;
             assert!(!app.modal.is_active(), "{c}: no modal");
             assert!(!app.embedded.contains_key("w1"), "{c}: no pane opened");
@@ -9709,6 +9700,9 @@ mod key_tests {
             if let modal::ModalState::AddRepo { input, .. } = &app.modal {
                 assert_eq!(input, "s", "the modal got the key");
             }
+            if let Some(p) = &app.palette {
+                assert_eq!(p.query, "s", "the palette got the key");
+            }
         }
     }
 
@@ -9746,6 +9740,22 @@ mod key_tests {
             &mut app,
             MouseEvent { kind: MouseEventKind::ScrollUp, column: 5, row: 2, modifiers: KeyModifiers::NONE },
         );
+        assert!(!app.embedded_prefix);
+    }
+
+    #[tokio::test]
+    async fn a_divider_grab_drops_the_prefix() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = app_with_pinned_bins();
+        app.pane_areas.tree = ratatui::layout::Rect::new(0, 0, 30, 20);
+        ctrl_a(&mut app).await;
+        let grab = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 29, // the tree's right border
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(mouse::handle_divider_drag(&mut app, grab), "the grab starts a drag");
         assert!(!app.embedded_prefix);
     }
 
@@ -11410,6 +11420,28 @@ mod key_tests {
         let text = render_to_string(&mut app, 60, 30);
         assert!(!text.contains("[Opencode"), "a button that doesn't fit isn't drawn:\n{text}");
         assert!(!text.contains("[Pi]"), "nor anything after it:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn detail_pane_opencode_button_drops_one_column_short() {
+        let mut app = app_with_own_branch_ws();
+        let opencode = buttons::HitAction::NewSessionTab { workspace_id: "w1".into(), kind: TabKind::Opencode };
+        // Terminal widths whose right pane is exactly `right_w` wide (the tree
+        // takes a percentage, so search the real layout rather than guess).
+        let mut width_for = std::collections::HashMap::new();
+        for w in 40..120u16 {
+            render_to_string(&mut app, w, 30);
+            width_for.entry(app.right_pane_area.width).or_insert(w);
+        }
+        // Inside the borders, Claude..Gemini plus " [Opencode]" span 44 cells.
+        let fit = width_for[&46];
+        render_to_string(&mut app, fit, 30);
+        let inner_right = app.right_pane_area.right() - 1;
+        let region = app.hit_regions.iter().find(|r| r.action == opencode).expect("[Opencode] fits");
+        assert_eq!(region.area.right(), inner_right, "an exact fit");
+
+        render_to_string(&mut app, width_for[&45], 30);
+        assert!(!app.hit_regions.iter().any(|r| r.action == opencode), "one column short: dropped");
     }
 
     #[tokio::test]

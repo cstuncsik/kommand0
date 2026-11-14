@@ -740,7 +740,7 @@ fn tree_ctrl_a_s_opens_a_shell_tab() {
 
     tui.send("\x01");
     tui.send("s");
-    tui.wait_for("1$"); // one shell-marked tab
+    tui.wait_for_row(1, "1$"); // the tab strip: one shell-marked tab
     tui.wait_for("1 live");
 
     tui.send("\x01");
