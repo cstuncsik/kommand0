@@ -5,6 +5,15 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`p` (open PR in browser) no longer does nothing when the PR isn't in the
+  cached PR status**: it asks gh for the checked-out branch's PR
+  (`gh pr view`), which finds it however busy the repo is, whoever opened it
+  and whatever the branch is called on the remote. When there is no PR, the
+  tree's bottom line says why (gh's reason, or a workspace without a branch of
+  its own).
+
 ## [0.33.1] - 2026-11-24
 
 ### Fixed
