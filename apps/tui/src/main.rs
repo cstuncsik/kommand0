@@ -2889,10 +2889,20 @@ impl App {
         self.reap_teardowns();
         self.dispatch_branch_status(now);
         // Periodic PR/CI-status refresh (off-loop, slow interval: it's a
-        // network call per repo).
-        if self
-            .last_pr_status_refresh
-            .is_none_or(|t| now.duration_since(t) >= PR_STATUS_REFRESH_INTERVAL)
+        // network call per repo). It looks PRs up by each worktree's live HEAD
+        // branch, so it waits out an in-flight status pass, and the first one
+        // waits until every worktree row has had its status checked.
+        let first_ready = self.last_pr_status_refresh.is_some()
+            || self
+                .workspaces
+                .iter()
+                .filter(|w| w.worktree_path.is_some() && !self.delete_inflight.contains(&w.id))
+                .all(|w| self.status_checked.contains_key(&w.id));
+        if !self.status_inflight
+            && first_ready
+            && self
+                .last_pr_status_refresh
+                .is_none_or(|t| now.duration_since(t) >= PR_STATUS_REFRESH_INTERVAL)
         {
             self.last_pr_status_refresh = Some(now);
             self.request_pr_status_refresh();
@@ -3601,12 +3611,17 @@ impl App {
         };
         // Group workspaces by their repo's path (one `gh pr list` per repo).
         // Only own-branch workspaces have a PR to look up.
-        let mut by_repo: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        // Look the PR up by the worktree's live HEAD branch first (a session may
+        // have switched branches inside the worktree), then the stored one.
+        let mut by_repo: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
         for w in &self.workspaces {
-            let Some(branch) = &w.branch_name else {
-                continue;
-            };
             if w.worktree_path.is_none() {
+                continue;
+            }
+            let live = self.branch_status.get(&w.id).and_then(|s| s.branch.clone());
+            let mut branches: Vec<String> = live.into_iter().chain(w.branch_name.clone()).collect();
+            branches.dedup();
+            if branches.is_empty() {
                 continue;
             }
             let Some(repo) = self.repos.iter().find(|r| r.id == w.repo_id) else {
@@ -3615,7 +3630,7 @@ impl App {
             by_repo
                 .entry(repo.path.clone())
                 .or_default()
-                .push((w.id.clone(), branch.clone()));
+                .push((w.id.clone(), branches));
         }
         if by_repo.is_empty() {
             // No own-branch workspaces to query — drop any stale entries (e.g.
@@ -3634,8 +3649,8 @@ impl App {
             let map = guard.payload.as_mut().expect("payload present until drop");
             for (repo_path, workspaces) in by_repo {
                 let prs = kommand0_core::pr_statuses(&repo_path);
-                for (ws_id, branch) in workspaces {
-                    if let Some(status) = prs.get(&branch) {
+                for (ws_id, branches) in workspaces {
+                    if let Some(status) = branches.iter().find_map(|b| prs.get(b)) {
                         map.insert(ws_id, status.clone());
                     }
                 }
@@ -6186,13 +6201,12 @@ async fn run(
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<StatusMsg>();
     app.status_tx = Some(status_tx);
 
-    // Off-loop PR/CI-status worker → event loop. Seeded once, then refreshed on a
-    // slow interval (one `gh pr list` per repo is a network call).
+    // Off-loop PR/CI-status worker → event loop. The tick seeds it once the
+    // first branch status lands (the PR lookup keys on the live HEAD branch),
+    // then refreshes on a slow interval (one `gh pr list` per repo).
     let (pr_status_tx, mut pr_status_rx) =
         tokio::sync::mpsc::unbounded_channel::<HashMap<String, kommand0_core::PrStatus>>();
     app.pr_status_tx = Some(pr_status_tx);
-    app.request_pr_status_refresh();
-    app.last_pr_status_refresh = Some(Instant::now());
 
     // Cleanup worker → event loop, carrying `(workspace_id, Ok(Cleaned) | Err(msg))`.
     let (cleanup_tx, mut cleanup_rx) =
