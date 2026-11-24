@@ -3208,12 +3208,17 @@ impl App {
         };
         // Group workspaces by their repo's path (one `gh pr list` per repo).
         // Only own-branch workspaces have a PR to look up.
-        let mut by_repo: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        // Look the PR up by the worktree's live HEAD branch first (a session may
+        // have switched branches inside the worktree), then the stored one.
+        let mut by_repo: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
         for w in &self.workspaces {
-            let Some(branch) = &w.branch_name else {
-                continue;
-            };
             if w.worktree_path.is_none() {
+                continue;
+            }
+            let live = self.branch_status.get(&w.id).and_then(|s| s.branch.clone());
+            let mut branches: Vec<String> = live.into_iter().chain(w.branch_name.clone()).collect();
+            branches.dedup();
+            if branches.is_empty() {
                 continue;
             }
             let Some(repo) = self.repos.iter().find(|r| r.id == w.repo_id) else {
@@ -3222,7 +3227,7 @@ impl App {
             by_repo
                 .entry(repo.path.clone())
                 .or_default()
-                .push((w.id.clone(), branch.clone()));
+                .push((w.id.clone(), branches));
         }
         if by_repo.is_empty() {
             // No own-branch workspaces to query — drop any stale entries (e.g.
@@ -3241,8 +3246,8 @@ impl App {
             let map = guard.payload.as_mut().expect("payload present until drop");
             for (repo_path, workspaces) in by_repo {
                 let prs = kommand0_core::pr_statuses(&repo_path);
-                for (ws_id, branch) in workspaces {
-                    if let Some(status) = prs.get(&branch) {
+                for (ws_id, branches) in workspaces {
+                    if let Some(status) = branches.iter().find_map(|b| prs.get(b)) {
                         map.insert(ws_id, status.clone());
                     }
                 }
@@ -5308,13 +5313,12 @@ async fn run(
     app.request_branch_status_refresh();
     app.last_status_refresh = Some(Instant::now());
 
-    // Off-loop PR/CI-status worker → event loop. Seeded once, then refreshed on a
-    // slow interval (one `gh pr list` per repo is a network call).
+    // Off-loop PR/CI-status worker → event loop. The tick seeds it once the
+    // first branch status lands (the PR lookup keys on the live HEAD branch),
+    // then refreshes on a slow interval (one `gh pr list` per repo).
     let (pr_status_tx, mut pr_status_rx) =
         tokio::sync::mpsc::unbounded_channel::<HashMap<String, kommand0_core::PrStatus>>();
     app.pr_status_tx = Some(pr_status_tx);
-    app.request_pr_status_refresh();
-    app.last_pr_status_refresh = Some(Instant::now());
 
     // Cleanup worker → event loop, carrying `(workspace_id, Ok(()) | Err(msg))`.
     let (cleanup_tx, mut cleanup_rx) =
@@ -5710,10 +5714,12 @@ async fn run(
                     app.request_branch_status_refresh();
                 }
                 // Periodic PR/CI-status refresh (off-loop, slow interval — it's a
-                // network call per repo).
-                if app
-                    .last_pr_status_refresh
-                    .is_none_or(|t| now.duration_since(t) >= PR_STATUS_REFRESH_INTERVAL)
+                // network call per repo). Waits out an in-flight branch refresh so
+                // it sees each worktree's live HEAD branch.
+                if !app.status_inflight
+                    && app
+                        .last_pr_status_refresh
+                        .is_none_or(|t| now.duration_since(t) >= PR_STATUS_REFRESH_INTERVAL)
                 {
                     app.last_pr_status_refresh = Some(now);
                     app.request_pr_status_refresh();
@@ -7359,8 +7365,8 @@ mod key_tests {
             active: 1,
             last_active: None,
         };
-        for i in 1..=5 {
-            wait_exit(&mut s.tabs[i].pane);
+        for tab in &mut s.tabs[1..=5] {
+            wait_exit(&mut tab.pane);
         }
         // The capture kinds drain-defer their reap; wait so one call reaps.
         wait_drained(&s.tabs[3].pane);

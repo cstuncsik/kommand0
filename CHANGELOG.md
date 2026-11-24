@@ -5,6 +5,14 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`p` (open PR in browser) did nothing when a session had switched the
+  worktree to another branch**: the PR lookup keyed on the workspace's stored
+  branch, so the PR was never found. It now tries the worktree's live HEAD
+  branch first, then the stored one, and the first lookup waits for the first
+  branch status.
+
 ## [0.32.0] - 2026-10-21
 
 ### Added
