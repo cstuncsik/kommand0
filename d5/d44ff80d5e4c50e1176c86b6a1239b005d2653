@@ -1,0 +1,23 @@
+crates/core/src/git.rs
+  s_bf99b493ef6dcd::t_6bec9172926425 553-559,612-616,618-644,646,649,689,1671,1726,1741,1745-1764,1768,1778
+apps/tui/src/main.rs
+  s_bf99b493ef6dcd::t_6bec9172926425 3651-3652
+CHANGELOG.md
+  s_bf99b493ef6dcd::t_8ee5487893aa20 8-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d5d44ff80d5e4c50e1176c86b6a1239b005d2653",
+  "prompts": {},
+  "sessions": {
+    "s_bf99b493ef6dcd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0a0039f-3e71-4516-852c-c85bc886ef93",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Csaba Tuncsik <csaba.tuncsik@gmail.com>"
+    }
+  }
+}
