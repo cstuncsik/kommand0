@@ -47,6 +47,10 @@ const EMBEDDED_FIXED_HEAD: &[KeyBinding] = &[
         keys: "Ctrl+]",
         description: "Back to tree, no prefix needed",
     },
+    KeyBinding {
+        keys: "Ctrl+A then …",
+        description: "Tree too (not close tab or Ctrl+A)",
+    },
 ];
 
 const EMBEDDED_FIXED_TAIL: &[KeyBinding] = &[
@@ -60,7 +64,7 @@ const EMBEDDED_FIXED_TAIL: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Ctrl+A then Ctrl+A",
-        description: "Send a literal Ctrl+A",
+        description: "Send a literal Ctrl+A (pane only)",
     },
 ];
 

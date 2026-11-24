@@ -314,18 +314,22 @@ fn render_status_line(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let left = Line::from(left_spans);
 
     let hints = match app.focus {
-        Focus::Tree => "Enter open · a repo · w ws · ? help · q quit",
-        // While the Ctrl+A prefix is armed (it clears on the very next key —
-        // handle_key resets it first thing), show the armed state and what
-        // the prefix accepts instead of the resting hint. Pure render: no
-        // state lives here.
-        Focus::Embedded if app.embedded_prefix => {
-            // Tab-creation keys lead (per kind); the line right-truncates on
-            // narrow terminals, so the tail carries the keys that also appear
-            // in the resting hint, the border title or the help overlay. These
-            // are the defaults: a rebind shows in the help overlay, not here.
+        // While the Ctrl+A prefix is armed (in either focus; it clears on the
+        // very next key, handle_key resets it first thing), show the armed
+        // state and what the prefix accepts instead of the resting hint. Pure
+        // render: no state lives here.
+        // Tab-creation keys lead (per kind); the line right-truncates on
+        // narrow terminals, so the tail carries the keys that also appear in
+        // the resting hint, the border title or the help overlay. These are
+        // the defaults: a rebind shows in the help overlay, not here. Close
+        // is pane only, so the tree's armed hint leaves it out.
+        Focus::Tree if app.prefix_armed => {
+            "Ctrl+A … c claude · e codex · g gemini · o opencode · p pi · s shell · r rename · d detach · [ ] tabs · l last · 1-9 · a repo · w ws"
+        }
+        Focus::Embedded if app.prefix_armed => {
             "Ctrl+A … c claude · e codex · g gemini · o opencode · p pi · s shell · r rename · x close · d detach · t tree · [ ] tabs · l last · 1-9 · a repo · w ws"
         }
+        Focus::Tree => "Enter open · a repo · w ws · ? help · q quit",
         Focus::Embedded => "Ctrl+A t / Ctrl+] tree · Ctrl+A q quit",
     };
 
@@ -478,7 +482,7 @@ fn render_tree(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         };
 
                         // Build repo line icons: ✕ (delete) + (add workspace)
-                        let icons = repo_line_icons(th, id, name, pane_inner_width);
+                        let icons = repo_line_icons(th, id, pane_inner_width);
 
                         let prefix = format!("{indicator}{name}");
                         let prefix_width = UnicodeWidthStr::width(prefix.as_str());
@@ -856,6 +860,7 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
             Rect::new(x, strip.y, 3, 1),
             HitAction::NewSessionTab {
                 workspace_id: ws_id.to_string(),
+                kind: super::TabKind::Claude,
             },
         ));
     }
@@ -866,30 +871,68 @@ fn render_session_tabs(frame: &mut ratatui::Frame, app: &mut App, ws_id: &str, s
     }
 }
 
-/// Append a `[label]` button line and register its hit region from the
-/// paragraph's inner rect, so the clickable cells are exactly the glyphs.
-#[allow(clippy::too_many_arguments)] // positional render inputs; a struct adds more noise than it removes
+/// Append one line of `[label]` buttons (one space apart) and register their
+/// hit regions from the paragraph's inner rect, so the clickable cells are
+/// exactly the glyphs. A button that doesn't fit the width is neither drawn
+/// nor registered, and neither is anything after it.
 fn push_button(
     lines: &mut Vec<Line<'_>>,
     hit_regions: &mut Vec<buttons::HitRegion>,
     mouse_pos: Option<(u16, u16)>,
     inner: Rect,
     th: Theme,
-    label: &str,
-    color: Color,
-    action: HitAction,
+    items: &[(&str, Color, HitAction)],
 ) {
-    let rect = Rect::new(inner.x, inner.y + lines.len() as u16, (label.len() + 2) as u16, 1);
-    let style = if buttons::is_hovered(mouse_pos, rect) {
-        Style::default().fg(th.inverse).bg(color).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
-    };
-    lines.push(Line::styled(format!("[{label}]"), style));
-    // Not clickable where it isn't drawn (a pane too short to show it).
-    if rect.y < inner.bottom() {
-        hit_regions.push(buttons::HitRegion { area: rect, action });
+    let y = inner.y + lines.len() as u16;
+    let mut x = inner.x;
+    let mut spans = Vec::new();
+    for (label, color, action) in items {
+        let w = (label.len() + 2) as u16;
+        if x + w > inner.right() {
+            break;
+        }
+        let rect = Rect::new(x, y, w, 1);
+        let style = if buttons::is_hovered(mouse_pos, rect) {
+            Style::default().fg(th.inverse).bg(*color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(*color).add_modifier(Modifier::BOLD)
+        };
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(format!("[{label}]"), style));
+        // Not clickable where it isn't drawn (a pane too short to show it).
+        if y < inner.bottom() {
+            hit_regions.push(buttons::HitRegion { area: rect, action: action.clone() });
+        }
+        x += w + 1;
     }
+    lines.push(Line::from(spans));
+}
+
+/// The workspace detail hint, from the live keymap: `Enter: open · Ctrl+A then
+/// c/s/e/g/o/p: new tab` by default. Unbound keys drop out.
+fn detail_open_hint(km: &super::keymap::KeyMap) -> String {
+    use super::keymap::{Action, Layer};
+    let mut parts = Vec::new();
+    if let Some(enter) = km.first_key(Layer::Tree, Action::ActivateSelection) {
+        parts.push(format!("{enter}: open"));
+    }
+    let keys: Vec<String> = [
+        Action::NewClaudeTab,
+        Action::NewShellTab,
+        Action::NewCodexTab,
+        Action::NewGeminiTab,
+        Action::NewOpencodeTab,
+        Action::NewPiTab,
+    ]
+    .into_iter()
+    .filter_map(|a| km.first_key(Layer::Pane, a))
+    .collect();
+    if !keys.is_empty() {
+        parts.push(format!("Ctrl+A then {}: new tab", keys.join("/")));
+    }
+    parts.join(" · ")
 }
 
 fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -1022,15 +1065,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 ]),
             ];
 
-            // Repo cleanup: the button (a spinner while the scan/delete runs),
-            // then its last outcome.
+            // Repo cleanup: the button (a spinner while the scan/delete runs,
+            // or while the repo itself is being deleted), then its last outcome.
             lines.push(Line::raw(""));
-            if app.repo_cleanup_inflight.as_deref() == Some(id.as_str()) {
+            let cleaning = app.repo_cleanup_inflight.as_deref() == Some(id.as_str());
+            if cleaning || app.delete_inflight.contains(id) {
                 // ponytail: one spinner for the whole scan; a per-branch
                 // counter needs the worker to report progress.
                 let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+                let what = if cleaning { "Cleaning up" } else { "Deleting" };
                 lines.push(Line::styled(
-                    format!("{spin} Cleaning up…"),
+                    format!("{spin} {what}…"),
                     Style::default().fg(th.dirty),
                 ));
             } else {
@@ -1040,9 +1085,7 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     app.mouse_pos,
                     inner,
                     th,
-                    "Clean up branches",
-                    th.dirty,
-                    HitAction::CleanupRepoFor { repo_id: id.clone() },
+                    &[("Clean up branches", th.dirty, HitAction::CleanupRepoFor { repo_id: id.clone() })],
                 );
             }
             let tail_from = lines.len();
@@ -1164,21 +1207,28 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 lines.push(Line::from(vec![Span::styled("Changes: ", label_style), changes]));
             }
 
-            // Hint + button to open the embedded interactive claude.
+            // Hint + one button per tab kind. The first opens the workspace
+            // like Enter: a Claude tab when nothing is saved, else the saved
+            // tabs (whatever their kinds, hence `[Open]`). The rest add a tab
+            // of a kind.
             lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Press Enter to open Claude here",
-                Style::default().fg(th.muted),
-            ));
+            lines.push(Line::styled(detail_open_hint(&app.keymap), Style::default().fg(th.muted)));
+            let tab = |kind| HitAction::NewSessionTab { workspace_id: ws.id.clone(), kind };
+            let open = if app.state.embedded_session_ids(&ws.id).is_empty() { "Claude" } else { "Open" };
             push_button(
                 &mut lines,
                 &mut app.hit_regions,
                 app.mouse_pos,
                 inner,
                 th,
-                "Open Claude",
-                th.accent,
-                HitAction::StartSession,
+                &[
+                    (open, th.accent, HitAction::StartSession),
+                    ("Shell", th.accent, tab(super::TabKind::Shell)),
+                    ("Codex", th.accent, tab(super::TabKind::Codex)),
+                    ("Gemini", th.accent, tab(super::TabKind::Gemini)),
+                    ("Opencode", th.accent, tab(super::TabKind::Opencode)),
+                    ("Pi", th.accent, tab(super::TabKind::Pi)),
+                ],
             );
 
             let has_branch = ws.worktree_path.is_some() && ws.branch_name.is_some();
@@ -1196,14 +1246,17 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 }
             }
 
-            // Clean-up affordance + last failure (own-branch workspaces).
+            // Clean-up affordance + last outcome (own-branch workspaces); a
+            // delete in flight shows here too, fallback rows included.
             let cleanup_inflight = app.cleanup_inflight.contains(&ws.id);
-            if has_branch || cleanup_inflight || app.cleanup_result.contains_key(&ws.id) {
+            let busy = cleanup_inflight || app.delete_inflight.contains(&ws.id);
+            if has_branch || busy || app.cleanup_result.contains_key(&ws.id) {
                 lines.push(Line::raw(""));
-                if cleanup_inflight {
+                if busy {
                     let spin = SPINNER_FRAMES[app.spinner_tick as usize % SPINNER_FRAMES.len()];
+                    let what = if cleanup_inflight { "Cleaning up" } else { "Deleting" };
                     lines.push(Line::styled(
-                        format!("{spin} Cleaning up…"),
+                        format!("{spin} {what}…"),
                         Style::default().fg(th.dirty),
                     ));
                 } else if has_branch {
@@ -1213,22 +1266,22 @@ fn render_right_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         app.mouse_pos,
                         inner,
                         th,
-                        "Clean up",
-                        th.dirty,
-                        HitAction::CleanupWorkspaceFor { workspace_id: ws.id.clone() },
+                        &[("Clean up", th.dirty, HitAction::CleanupWorkspaceFor { workspace_id: ws.id.clone() })],
                     );
                 }
-                if let Some(msg) = app.cleanup_result.get(&ws.id) {
+                if let Some((msg, is_error)) = app.cleanup_result.get(&ws.id) {
                     tail_from = lines.len();
+                    let (label, color) = if *is_error {
+                        ("Cleanup blocked: ", th.error)
+                    } else {
+                        ("Cleaned up: ", th.text)
+                    };
                     let mut msg_lines = msg.lines();
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            "Cleanup blocked: ",
-                            Style::default().fg(th.error).add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
                         Span::styled(
                             msg_lines.next().unwrap_or_default().to_string(),
-                            Style::default().fg(th.error),
+                            Style::default().fg(color),
                         ),
                     ]));
                     // Core's notes: warnings, as in the repo pane.
@@ -1623,7 +1676,7 @@ pub(crate) fn workspace_icon_cluster(
 }
 
 /// Build icons for a repo line: ✕ (delete repo) + (add workspace)
-fn repo_line_icons(th: Theme, repo_id: &str, repo_name: &str, pane_inner_width: usize) -> IconCluster {
+fn repo_line_icons(th: Theme, repo_id: &str, pane_inner_width: usize) -> IconCluster {
     let icon_style = Style::default().fg(th.accent);
 
     if pane_inner_width < 20 {
@@ -1648,7 +1701,7 @@ fn repo_line_icons(th: Theme, repo_id: &str, repo_name: &str, pane_inner_width: 
         hit_regions: vec![
             (
                 HitAction::DeleteRepoFor {
-                    repo_name: repo_name.to_string(),
+                    repo_id: repo_id.to_string(),
                 },
                 2,
             ),
@@ -2012,13 +2065,13 @@ mod tests {
 
     #[test]
     fn repo_line_icons_normal_width() {
-        let icons = repo_line_icons(Theme::default(), "r-1", "myrepo", 40);
+        let icons = repo_line_icons(Theme::default(), "r-1", 40);
         assert_eq!(icons.total_width, 4); // delete + add
         assert_eq!(icons.hit_regions.len(), 2);
         assert_eq!(
             icons.hit_regions[0].0,
             HitAction::DeleteRepoFor {
-                repo_name: "myrepo".to_string()
+                repo_id: "r-1".to_string()
             }
         );
         assert_eq!(
@@ -2031,7 +2084,7 @@ mod tests {
 
     #[test]
     fn repo_line_icons_narrow_hidden() {
-        let icons = repo_line_icons(Theme::default(), "r-1", "myrepo", 15);
+        let icons = repo_line_icons(Theme::default(), "r-1", 15);
         assert_eq!(icons.total_width, 0);
         assert!(icons.hit_regions.is_empty());
     }
@@ -2042,7 +2095,7 @@ mod tests {
         // chrome color comes from the theme rather than a hardcoded `Color`.
         let custom = ratatui::style::Color::Rgb(1, 2, 3);
         let theme = Theme { accent: custom, ..Theme::default() };
-        let icons = repo_line_icons(theme, "r-1", "myrepo", 40);
+        let icons = repo_line_icons(theme, "r-1", 40);
         assert!(
             icons.spans.iter().all(|s| s.style.fg == Some(custom)),
             "repo icon spans should use the theme accent color"

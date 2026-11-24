@@ -86,7 +86,7 @@ fn handle_click(app: &mut App, col: u16, row: u16) -> bool {
         app.focus = super::Focus::Tree;
         // Leaving the embedded pane by click must not carry a half-typed Ctrl+A
         // prefix into the next session (it would mis-fire the next keystroke).
-        app.embedded_prefix = false;
+        app.prefix_armed = false;
 
         // Map the clicked viewport row to a tree_items index. The click row is
         // relative to the visible top, but the list scrolls, so add the offset
@@ -124,6 +124,9 @@ fn handle_click(app: &mut App, col: u16, row: u16) -> bool {
 /// guards (no pane = no-op; borders/tab strip rejected by translate), so no
 /// pre-checks here.
 fn handle_scroll(app: &mut App, mouse: MouseEvent) {
+    // Any wheel tick drops an armed prefix, like a click: over the tree it
+    // moves the selection, and the prefix must not retarget.
+    app.prefix_armed = false;
     if contains(app.pane_areas.tree, mouse.column, mouse.row) {
         // Navigate tree
         if matches!(mouse.kind, MouseEventKind::ScrollUp) {
@@ -168,6 +171,7 @@ pub(crate) fn handle_divider_drag(app: &mut App, mouse: MouseEvent) -> bool {
         && on_divider(app.pane_areas.tree, mouse.column, mouse.row)
     {
         app.dragging_divider = true;
+        app.prefix_armed = false;
         return true; // grab the divider; width unchanged until the drag
     }
     if app.dragging_divider {
@@ -238,8 +242,10 @@ pub(crate) fn handle_selection(app: &mut App, mouse: MouseEvent, out: &mut impl 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // Clear-on-mouse-down, unconditional — a lingering highlight dies
-            // on the next press wherever it lands.
+            // on the next press wherever it lands, and so does a half-typed
+            // Ctrl+A.
             app.pane_selection = None;
+            app.prefix_armed = false;
             // COORDINATE SWAP: translate_mouse returns (col, row); the
             // selection stores (row, col). Both are (u16, u16) — a
             // transposition compiles silently, so swap exactly here.
@@ -257,6 +263,7 @@ pub(crate) fn handle_selection(app: &mut App, mouse: MouseEvent, out: &mut impl 
         }
         MouseEventKind::Down(_) => {
             app.pane_selection = None;
+            app.prefix_armed = false;
             false
         }
         _ => {

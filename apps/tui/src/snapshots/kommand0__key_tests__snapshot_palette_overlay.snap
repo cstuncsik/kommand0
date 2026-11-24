@@ -14,6 +14,7 @@ expression: "render_to_string(&mut app, 100, 30)"
 │                   │   Clean up — ws-one  —  alpha                            │                   │
 │                   │   Archive — ws-one  —  alpha                             │                   │
 │                   │   New session — ws-one  —  alpha                         │                   │
+│                   │   New shell — ws-one  —  alpha                           │                   │
 │                   │   New codex — ws-one  —  alpha                           │                   │
 │                   │   New gemini — ws-one  —  alpha                          │                   │
 │                   │   New opencode — ws-one  —  alpha                        │                   │
@@ -23,7 +24,6 @@ expression: "render_to_string(&mut app, 100, 30)"
 │                   │   Sort repos by manual order  —  order                   │                   │
 │                   │   Sort repos by name (A→Z)  —  order                     │                   │
 │                   │   Sort repos by name (Z→A)  —  order                     │                   │
-│                   │   Sort repos by date added (oldest first)  —  order      │                   │
 │                   │ Enter run  ↑↓ move  Esc cancel                           │                   │
 │                   └──────────────────────────────────────────────────────────┘                   │
 │                            ││                                                                    │

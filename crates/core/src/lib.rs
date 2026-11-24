@@ -11,8 +11,8 @@ pub mod workspace;
 pub mod worktree;
 
 pub use cleanup::{
-    Base, BranchResults, BranchVerdict, Scan, Verdict, cleanup_merged_workspace, delete_branches,
-    scan_merged_branches,
+    Base, BranchResults, BranchVerdict, Cleaned, Scan, Verdict, cleanup_merged_workspace,
+    delete_branches, scan_merged_branches,
 };
 pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
@@ -25,6 +25,7 @@ pub use repo::{RepoEntry, run_git_status};
 pub use session::{Session, SessionStatus};
 pub use sort::{SortMode, sort_repos, sort_workspaces};
 pub use workspace::Workspace;
+pub use worktree::remove_empty_parent;
 
 use std::collections::HashMap;
 use std::fs;
@@ -177,6 +178,52 @@ enum TargetState {
     State(AppState),
     /// Unparseable state.json; the error carries the `--force` hint.
     Corrupt(anyhow::Error),
+}
+
+/// What a guarded worktree removal left on disk ([`AppState::remove_worktree_of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeftWorktree {
+    /// Another live workspace's worktree (case variant, symlink, any alias): kept on purpose.
+    Alias { path: String, owner: String },
+    /// Ownership couldn't be checked (state.json unreadable): kept, fail closed.
+    Unverified { path: String },
+    /// git failed on the row's own directory; it is still there.
+    Failed { path: String },
+}
+
+/// The name of the workspace whose live worktree `dir` is, if any: same device
+/// and inode as the worktree of a row in `rows` (the caller's) or in `base`'s
+/// state.json (a `kmd` write since the caller loaded), skipping rows whose id
+/// is in `skip` (the ones being removed). A case variant on a case-insensitive
+/// volume, a symlink, any alias counts. `Ok(None)` when `dir` doesn't exist;
+/// `Err` when state.json can't be read while it does, so callers fail closed.
+fn live_alias(
+    dir: &Path,
+    base: &Path,
+    rows: &[Workspace],
+    skip: &[String],
+) -> Result<Option<String>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(target) = fs::metadata(dir) else {
+        return Ok(None);
+    };
+    let owner = |among: &[Workspace]| {
+        among
+            .iter()
+            .filter(|w| !skip.contains(&w.id))
+            .find(|w| {
+                let meta = w.worktree_path.as_ref().and_then(|p| fs::metadata(p).ok());
+                meta.is_some_and(|m| (m.dev(), m.ino()) == (target.dev(), target.ino()))
+            })
+            .map(|w| w.name.clone())
+    };
+    if let Some(name) = owner(rows) {
+        return Ok(Some(name));
+    }
+    let disk = AppState::load_from(base).map_err(|e| {
+        format!("couldn't check whether another workspace uses {}: {e:#}", dir.display())
+    })?;
+    Ok(owner(&disk.workspaces))
 }
 
 impl AppState {
@@ -898,23 +945,14 @@ impl AppState {
         prune_repos.sort();
         prune_repos.dedup();
         for repo_path in &prune_repos {
-            let out = std::process::Command::new("git")
-                .args(["-C", repo_path, "worktree", "prune"])
-                .output();
-            match out {
-                Ok(out) if out.status.success() => {}
-                // git's stderr can echo arbitrary path bytes: never raw.
-                Ok(out) => warnings.push(format!(
+            // git's stderr can echo arbitrary path bytes: never raw.
+            if let Err(e) = worktree::prune_worktrees(repo_path) {
+                warnings.push(format!(
                     "couldn't prune worktrees in {}: {} (run `git worktree prune` \
                      there by hand)",
                     repo_path.escape_debug(),
-                    String::from_utf8_lossy(&out.stderr).trim().escape_debug()
-                )),
-                Err(e) => warnings.push(format!(
-                    "couldn't prune worktrees in {}: {e} (run `git worktree prune` \
-                     there by hand)",
-                    repo_path.escape_debug()
-                )),
+                    e.escape_debug()
+                ));
             }
         }
         Ok((summary, warnings))
@@ -1162,6 +1200,13 @@ impl AppState {
     /// Scope: this protects concurrent CLI *adds* and *deletes*. A CLI *in-place
     /// edit* to a row the TUI also holds is still lost on the TUI's next save —
     /// there's no per-field/version comparison, and "mine wins" overwrites it.
+    ///
+    /// The result is referentially consistent for what came from disk: a row
+    /// another process added under a parent the merge no longer has (a
+    /// workspace created under a repo we deleted meanwhile) is dropped too,
+    /// its worktree dir and session log, if any, left on disk like every
+    /// mine-wins loss. Rows we hold are written back as they are, so a legacy
+    /// orphan we loaded does not flip-flop between merge-saves and plain saves.
     pub fn merged_over(&self, baseline: &AppState, disk: AppState) -> AppState {
         use std::collections::HashSet;
 
@@ -1204,7 +1249,7 @@ impl AppState {
             out
         }
 
-        AppState {
+        let mut merged = AppState {
             version: Self::STATE_VERSION,
             repos: merge_vec(&self.repos, &baseline.repos, disk.repos, |r| r.id.as_str()),
             workspaces: merge_vec(&self.workspaces, &baseline.workspaces, disk.workspaces, |w| {
@@ -1225,7 +1270,26 @@ impl AppState {
             // rather than a stale on-disk value clobbering the live tree.
             repo_sort: self.repo_sort,
             workspace_sort: self.workspace_sort,
-        }
+        };
+        // Children of a parent the merge dropped would persist as orphans.
+        // Only disk-only rows are checked: what we hold is written back as is.
+        let mine_ws: HashSet<&str> = self.workspaces.iter().map(|w| w.id.as_str()).collect();
+        let repo_ids: HashSet<&str> = merged.repos.iter().map(|r| r.id.as_str()).collect();
+        merged.workspaces.retain(|w| {
+            mine_ws.contains(w.id.as_str()) || repo_ids.contains(w.repo_id.as_str())
+        });
+        let mine_sessions: HashSet<&str> = self.sessions.iter().map(|s| s.id.as_str()).collect();
+        let ws_ids: HashSet<&str> = merged.workspaces.iter().map(|w| w.id.as_str()).collect();
+        merged.sessions.retain(|s| {
+            mine_sessions.contains(s.id.as_str()) || ws_ids.contains(s.workspace_id.as_str())
+        });
+        merged
+            .embedded_sessions
+            .retain(|k, _| self.embedded_sessions.contains_key(k) || ws_ids.contains(k.as_str()));
+        merged
+            .embedded_titles
+            .retain(|k, _| self.embedded_titles.contains_key(k) || ws_ids.contains(k.as_str()));
+        merged
     }
 
     /// Mint a persisted embedded-session entry: `prefix` + a fresh UUID v4.
@@ -1460,7 +1524,38 @@ impl AppState {
         repo_ref: &str,
         base: &Path,
     ) -> anyhow::Result<RepoEntry> {
-        let repo = self.resolve_repo(repo_ref)?.clone();
+        let id = self.resolve_repo(repo_ref)?.id.clone();
+        let repo = self.remove_repo_in(&id, base).ok_or_else(|| anyhow::anyhow!("repo not found: {id}"))?;
+        self.save_to(base)?;
+        Ok(repo)
+    }
+
+    /// Delete a repo, saving state to the default state directory.
+    pub fn delete_repo(&mut self, repo_ref: &str) -> anyhow::Result<RepoEntry> {
+        self.delete_repo_with_base(repo_ref, Self::state_dir().as_path())
+    }
+
+    /// [`Self::take_repo`], then each row's worktree, guarded against `base`'s
+    /// rows ([`Self::remove_worktree_of`]): the repo's own rows all go, so
+    /// only the rows that stay can claim a dir.
+    fn remove_repo_in(&mut self, id: &str, base: &Path) -> Option<RepoEntry> {
+        let (repo, rows) = self.take_repo(id)?;
+        let skip: Vec<String> = rows.iter().map(|w| w.id.clone()).collect();
+        let held = self.worktree_rows_except(&skip);
+        for w in &rows {
+            let _ = Self::remove_worktree_of(&repo.path, w, base, &held, &skip);
+        }
+        Some(repo)
+    }
+
+    /// Take the repo with EXACTLY this id and everything under it out of the
+    /// in-memory state: its sessions (and their log files), its rows (as
+    /// [`Self::take_workspace`]), then the repo. The rows come back with their
+    /// worktrees still on disk, for the caller to remove
+    /// ([`Self::remove_worktree_of`]). No git, no save; `None` when no repo
+    /// has that id.
+    pub fn take_repo(&mut self, id: &str) -> Option<(RepoEntry, Vec<Workspace>)> {
+        let repo = self.repos.iter().find(|r| r.id == id)?.clone();
 
         // Collect workspace IDs for this repo
         let ws_ids: Vec<String> = self
@@ -1483,35 +1578,14 @@ impl AppState {
             }
         });
 
-        // Remove workspaces and their worktrees
-        self.workspaces.retain(|w| {
-            if w.repo_id == repo.id {
-                if let Some(wt_path) = &w.worktree_path {
-                    let _ = worktree::remove_worktree(&repo.path, wt_path);
-                }
-                false
-            } else {
-                true
-            }
-        });
-
-        // Forget any embedded Claude session ids (and titles) for the removed
-        // workspaces.
-        for id in &ws_ids {
-            self.embedded_sessions.remove(id);
-            self.embedded_titles.remove(id);
+        let mut rows = Vec::new();
+        while let Some(idx) = self.workspaces.iter().position(|w| w.repo_id == repo.id) {
+            rows.push(self.remove_workspace_at(idx));
         }
 
         // Remove the repo itself
         self.repos.retain(|r| r.id != repo.id);
-
-        self.save_to(base)?;
-        Ok(repo)
-    }
-
-    /// Delete a repo, saving state to the default state directory.
-    pub fn delete_repo(&mut self, repo_ref: &str) -> anyhow::Result<RepoEntry> {
-        self.delete_repo_with_base(repo_ref, Self::state_dir().as_path())
+        Some((repo, rows))
     }
 
     // --- Workspace methods ---
@@ -1634,6 +1708,28 @@ impl AppState {
         use_worktree: bool,
         from_branch: Option<&str>,
     ) -> anyhow::Result<Workspace> {
+        let (repo, ws_name, taken) = self.resolve_new_workspace(name, repo_ref, from_branch)?;
+        // A failed post-checkout hook is already logged (on stderr under kmd).
+        let (ws, _) = Self::make_workspace(&repo, &ws_name, base, from_branch, use_worktree, &taken)?;
+        // The worktree exists by now: a refused insert (the name was saved
+        // elsewhere meanwhile) must say where it was left, like the TUI does.
+        self.insert_workspace(ws.clone(), base).map_err(|e| match &ws.worktree_path {
+            Some(p) => anyhow::anyhow!("{e}; the worktree was made at {p} and left there"),
+            None => e,
+        })?;
+        self.save_to(base)?;
+        Ok(ws)
+    }
+
+    /// A create's first step: the repo, the workspace name (defaulted and
+    /// validated) and `taken`, the rows [`Self::make_workspace`] checks the
+    /// new worktree dir against.
+    pub fn resolve_new_workspace(
+        &self,
+        name: Option<&str>,
+        repo_ref: &str,
+        from_branch: Option<&str>,
+    ) -> anyhow::Result<(RepoEntry, String, Vec<Workspace>)> {
         let repo = self.resolve_repo(repo_ref)?.clone();
 
         let ws_name = match name {
@@ -1647,6 +1743,37 @@ impl AppState {
         };
 
         self.validate_new_workspace_name(&ws_name, &repo.id)?;
+        let taken = self.worktree_rows_except(&[]);
+        Ok((repo, ws_name, taken))
+    }
+
+    /// Make the workspace [`Self::resolve_new_workspace`] resolved: its git
+    /// worktree, or a row on the repo root when none is wanted or git can't
+    /// make one, with the hook's last line when the worktree's post-checkout
+    /// hook failed. Touches no state, so it can run off the UI thread;
+    /// [`Self::insert_workspace`] adds the result.
+    pub fn make_workspace(
+        repo: &RepoEntry,
+        ws_name: &str,
+        base: &Path,
+        from_branch: Option<&str>,
+        use_worktree: bool,
+        taken: &[Workspace],
+    ) -> anyhow::Result<(Workspace, Option<String>)> {
+        // The worktree create force-removes whatever is at its dir, so refuse a
+        // dir that is another workspace's worktree. A dir that can't be built
+        // gets the fallback row below, as before.
+        if use_worktree && let Ok(dir) = worktree::worktree_dir(&repo.id, ws_name, base) {
+            match live_alias(&dir, base, taken, &[]) {
+                Ok(None) => {}
+                Ok(Some(owner)) => bail!(
+                    "{} is already workspace {owner}'s worktree (on a case-insensitive volume, \
+                     names that differ only in case share a directory)",
+                    dir.display()
+                ),
+                Err(e) => bail!(e),
+            }
+        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1655,12 +1782,12 @@ impl AppState {
 
         // Create a git worktree: on an existing branch if one was requested, else
         // on a fresh branch named after the workspace.
-        let (working_dir, worktree_path, branch_name) = if !use_worktree {
-            (repo.path.clone(), None, None)
+        let (working_dir, worktree_path, branch_name, hook_error) = if !use_worktree {
+            (repo.path.clone(), None, None, None)
         } else if let Some(branch_ref) = from_branch {
-            match worktree::create_worktree_from_branch(&repo.path, &repo.id, &ws_name, base, branch_ref) {
-                worktree::WorktreeResult::Created { worktree_path, branch_name } => {
-                    (worktree_path.clone(), Some(worktree_path), Some(branch_name))
+            match worktree::create_worktree_from_branch(&repo.path, &repo.id, ws_name, base, branch_ref) {
+                worktree::WorktreeResult::Created { worktree_path, branch_name, hook_error } => {
+                    (worktree_path.clone(), Some(worktree_path), Some(branch_name), hook_error)
                 }
                 // An explicit branch request that can't be satisfied is an error,
                 // not a silent fall back to the repo root.
@@ -1669,17 +1796,20 @@ impl AppState {
                 }
             }
         } else {
-            match worktree::create_worktree(&repo.path, &repo.id, &ws_name, base) {
-                worktree::WorktreeResult::Created { worktree_path, branch_name } => {
-                    (worktree_path.clone(), Some(worktree_path), Some(branch_name))
+            match worktree::create_worktree(&repo.path, &repo.id, ws_name, base) {
+                worktree::WorktreeResult::Created { worktree_path, branch_name, hook_error } => {
+                    (worktree_path.clone(), Some(worktree_path), Some(branch_name), hook_error)
                 }
-                worktree::WorktreeResult::Fallback { reason: _ } => (repo.path.clone(), None, None),
+                worktree::WorktreeResult::Fallback { reason } => {
+                    tracing::warn!("no worktree for {ws_name}, using the repo root: {reason}");
+                    (repo.path.clone(), None, None, None)
+                }
             }
         };
 
         let ws = Workspace {
             id: generate_id(),
-            name: ws_name,
+            name: ws_name.to_string(),
             repo_id: repo.id.clone(),
             working_dir,
             active: true,
@@ -1687,10 +1817,27 @@ impl AppState {
             worktree_path,
             branch_name,
         };
+        Ok((ws, hook_error))
+    }
 
-        self.workspaces.push(ws.clone());
-        self.save_to(base)?;
-        Ok(ws)
+    /// Add a made workspace ([`Self::make_workspace`]), unless its repo is
+    /// gone or its name was taken meanwhile: here, or in `base`'s state.json
+    /// by another kommand0 or `kmd` since this state was loaded. No save.
+    pub fn insert_workspace(&mut self, ws: Workspace, base: &Path) -> anyhow::Result<()> {
+        if !self.repos.iter().any(|r| r.id == ws.repo_id) {
+            bail!("its repo is no longer tracked");
+        }
+        self.validate_new_workspace_name(&ws.name, &ws.repo_id)?;
+        // An unreadable state.json leaves just the check above: a duplicate
+        // name is an ambiguity, not data loss, so it never blocks the create.
+        let saved = Self::load_from(base).is_ok_and(|disk| {
+            disk.workspaces.iter().any(|w| w.repo_id == ws.repo_id && w.name == ws.name && w.id != ws.id)
+        });
+        if saved {
+            bail!("workspace already exists: {} (another kommand0 or kmd saved it meanwhile)", ws.name);
+        }
+        self.workspaces.push(ws);
+        Ok(())
     }
 
     /// Create a workspace, saving state to the default state directory.
@@ -1739,8 +1886,8 @@ impl AppState {
     /// workspace is named with another workspace's id-shaped string).
     /// Trade-off: in that shadow state the TUI's by-id archive/activate
     /// calls hit the error and silently no-op until the shadowing row is
-    /// deleted by its own id; destructive deletes are immune, they use the
-    /// exact-id [`Self::delete_workspace_by_id`] path instead.
+    /// deleted by its own id; destructive deletes are immune, they take the
+    /// row by exact id ([`Self::take_workspace`]) instead.
     fn workspace_index(&self, ws_ref: &str) -> anyhow::Result<usize> {
         let matches: Vec<usize> = self
             .workspaces
@@ -1781,23 +1928,76 @@ impl AppState {
         Ok(&self.workspaces[self.workspace_index(ws_ref)?])
     }
 
-    /// Shared removal body once a delete entry point has resolved the row
-    /// index: drop the row, its embedded-session bookkeeping, and its
-    /// worktree, then save.
-    fn remove_workspace_at(&mut self, idx: usize, base: &Path) -> anyhow::Result<Workspace> {
+    /// Remove `ws`'s worktree from repo `repo_path`, unless it is another live
+    /// workspace's too: same device and inode as the worktree of a row in
+    /// `rows` (see [`Self::worktree_rows_except`]) or in `base`'s state.json,
+    /// skipping rows whose id is in `skip` (the ones being removed). `Ok(())`
+    /// when nothing is left: removed, already gone (the empty-parent rmdir
+    /// still runs), or a fallback row with no worktree. A kept dir is logged,
+    /// as git's own failures are. Touches no state, so it can run off the UI
+    /// thread.
+    pub fn remove_worktree_of(
+        repo_path: &str,
+        ws: &Workspace,
+        base: &Path,
+        rows: &[Workspace],
+        skip: &[String],
+    ) -> Result<(), LeftWorktree> {
+        let Some(wt) = ws.worktree_path.as_deref() else {
+            return Ok(());
+        };
+        let path = wt.to_string();
+        match live_alias(Path::new(wt), base, rows, skip) {
+            Ok(None) => {}
+            Ok(Some(owner)) => {
+                tracing::warn!(worktree = wt, "kept: it is {owner}'s worktree");
+                return Err(LeftWorktree::Alias { path, owner });
+            }
+            Err(e) => {
+                tracing::warn!(worktree = wt, "kept: {e}");
+                return Err(LeftWorktree::Unverified { path });
+            }
+        }
+        let _ = worktree::remove_worktree(repo_path, wt);
+        if Path::new(wt).exists() { Err(LeftWorktree::Failed { path }) } else { Ok(()) }
+    }
+
+    /// The rows with a worktree, minus `ids`: the `rows` a
+    /// [`Self::remove_worktree_of`] off this state checks against.
+    pub fn worktree_rows_except(&self, ids: &[String]) -> Vec<Workspace> {
+        self.workspaces
+            .iter()
+            .filter(|w| w.worktree_path.is_some() && !ids.contains(&w.id))
+            .cloned()
+            .collect()
+    }
+
+    /// [`Self::remove_worktree_of`] for a row just taken out of this state,
+    /// guarded against the rows still held. The outcome is logged there.
+    fn remove_taken_worktree(&self, ws: &Workspace, base: &Path) {
+        if let Some(repo) = self.repos.iter().find(|r| r.id == ws.repo_id) {
+            let skip = [ws.id.clone()];
+            let rows = self.worktree_rows_except(&skip);
+            let _ = Self::remove_worktree_of(&repo.path, ws, base, &rows, &skip);
+        }
+    }
+
+    /// Shared row removal once an entry point has resolved the index: the row
+    /// and its embedded-session bookkeeping. No git, no save.
+    fn remove_workspace_at(&mut self, idx: usize) -> Workspace {
         let removed = self.workspaces.remove(idx);
         self.embedded_sessions.remove(&removed.id);
         self.embedded_titles.remove(&removed.id);
+        removed
+    }
 
-        // Clean up worktree if present
-        if let Some(wt_path) = &removed.worktree_path
-            && let Some(repo) = self.repos.iter().find(|r| r.id == removed.repo_id)
-        {
-            let _ = worktree::remove_worktree(&repo.path, wt_path);
-        }
-
-        self.save_to(base)?;
-        Ok(removed)
+    /// Take the workspace with EXACTLY this id out of the in-memory state: the
+    /// row and its `embedded_sessions`/`embedded_titles` entries. Its worktree
+    /// stays on disk for the caller to remove ([`Self::remove_worktree_of`]).
+    /// No git, no save; `None` when no row has that id.
+    pub fn take_workspace(&mut self, id: &str) -> Option<Workspace> {
+        let idx = self.workspaces.iter().position(|w| w.id == id)?;
+        Some(self.remove_workspace_at(idx))
     }
 
     /// Delete a workspace by name or ID, saving to custom base directory.
@@ -1808,7 +2008,10 @@ impl AppState {
         base: &Path,
     ) -> anyhow::Result<Workspace> {
         let idx = self.workspace_index(ws_ref)?;
-        self.remove_workspace_at(idx, base)
+        let removed = self.remove_workspace_at(idx);
+        self.remove_taken_worktree(&removed, base);
+        self.save_to(base)?;
+        Ok(removed)
     }
 
     /// Delete a workspace by name or ID, saving to the default state directory.
@@ -1816,30 +2019,32 @@ impl AppState {
         self.delete_workspace_with_base(ws_ref, Self::state_dir().as_path())
     }
 
-    /// Delete a workspace by its EXACT id, never falling back to a name
-    /// match: "workspace not found" when the id is absent. For callers
-    /// holding an authentic state-held id (the TUI's tree actions, the CLI
-    /// cleanup's second step): immune to name shadowing AND to the race
-    /// where the row is deleted meanwhile and a new workspace is created
-    /// NAMED that id string, which a ws_ref lookup would mis-target.
-    /// User-facing refs stay on [`Self::delete_workspace`].
-    pub fn delete_workspace_by_id_with_base(
-        &mut self,
-        id: &str,
-        base: &Path,
-    ) -> anyhow::Result<Workspace> {
-        let idx = self
-            .workspaces
-            .iter()
-            .position(|w| w.id == id)
-            .ok_or_else(|| anyhow::anyhow!("workspace not found: {id}"))?;
-        self.remove_workspace_at(idx, base)
+    /// Remove the workspace with EXACTLY this id (never a name match) from the
+    /// in-memory state: the row, its `embedded_sessions`/`embedded_titles`
+    /// entries and its git worktree ([`Self::remove_worktree_of`] against
+    /// [`Self::state_dir`]; idempotent: a dir already gone still clears an
+    /// empty `worktrees/<repo-id>/`). No save: the caller persists (`kmd`
+    /// merge-saves), so a concurrent write is merged, not clobbered.
+    /// `None` when no row has that id, a no-op: immune to name shadowing AND to
+    /// the race where the row was deleted meanwhile and a new workspace is NAMED
+    /// that id string, which a ws_ref lookup would mis-target. For callers
+    /// holding a state-held id (`kmd`'s cleanups); user-facing refs stay on
+    /// [`Self::delete_workspace`].
+    pub fn remove_workspace(&mut self, id: &str) -> Option<Workspace> {
+        let removed = self.take_workspace(id)?;
+        self.remove_taken_worktree(&removed, &Self::state_dir());
+        Some(removed)
     }
 
-    /// [`Self::delete_workspace_by_id_with_base`] against the default state
-    /// directory.
-    pub fn delete_workspace_by_id(&mut self, id: &str) -> anyhow::Result<Workspace> {
-        self.delete_workspace_by_id_with_base(id, Self::state_dir().as_path())
+    /// Record `branch` as workspace `id`'s branch (a cleanup followed its
+    /// worktree to another branch). Exact id and no save, like
+    /// [`Self::remove_workspace`]; `false` when no row has that id.
+    pub fn set_workspace_branch(&mut self, id: &str, branch: &str) -> bool {
+        let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == id) else {
+            return false;
+        };
+        ws.branch_name = Some(branch.to_string());
+        true
     }
 
     /// Archive a workspace (set active=false) with custom base directory.
@@ -1936,22 +2141,14 @@ impl AppState {
         self.sessions.iter_mut().find(|s| s.id == session_id)
     }
 
-    /// Update session status, saving state to a custom base directory.
-    /// Sets ended_at for terminal states (Stopped, Failed, Exited).
-    pub fn update_session_status_with_base(
-        &mut self,
-        session_id: &str,
-        status: SessionStatus,
-        base: &Path,
-    ) -> anyhow::Result<()> {
-        let session = self
-            .sessions
-            .iter_mut()
-            .find(|s| s.id == session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
-
+    /// Record `status` on `session_id`, stamping `ended_at` for a terminal state
+    /// (Stopped, Failed, Exited). No save; `false` when no session has that id.
+    /// [`Self::update_session_status`] is the saving form.
+    pub fn set_session_status(&mut self, session_id: &str, status: SessionStatus) -> bool {
+        let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else {
+            return false;
+        };
         session.status = status.clone();
-
         match status {
             SessionStatus::Stopped | SessionStatus::Failed | SessionStatus::Exited => {
                 session.ended_at = Some(
@@ -1963,7 +2160,21 @@ impl AppState {
             }
             SessionStatus::Running => {}
         }
+        true
+    }
 
+    /// Update session status, saving state to a custom base directory.
+    /// Sets ended_at for terminal states (Stopped, Failed, Exited); see
+    /// [`Self::set_session_status`].
+    pub fn update_session_status_with_base(
+        &mut self,
+        session_id: &str,
+        status: SessionStatus,
+        base: &Path,
+    ) -> anyhow::Result<()> {
+        if !self.set_session_status(session_id, status) {
+            bail!("session not found: {session_id}");
+        }
         self.save_to(base)?;
         Ok(())
     }
@@ -2020,18 +2231,43 @@ impl RepoCleanupItem {
 /// the state.json row, whatever state the worktree dir or its admin entry is in
 /// (a manually deleted + pruned worktree scans as a bare Delete). Any other
 /// CheckedOut is a Skip naming the path, plus "; run git worktree prune" when the
-/// dir no longer exists. Output order: Delete, Workspace, Skip (skips sorted by
-/// reason). Routes by name only: no path comparison, so symlinked state dirs
-/// and realpath differences are irrelevant.
+/// dir no longer exists. An own-branch row whose `branch_name` matches no
+/// verdict at all (its branch is gone) becomes a Workspace item too, after the
+/// scanned ones: the workspace cleanup clears or follows it; a malformed name is
+/// a Skip ("malformed branch name"). Output order: Delete, Workspace (scanned
+/// rows, then gone-branch rows), Skip (skips sorted by reason). Routes by name
+/// only: no path comparison, so symlinked state dirs and realpath differences
+/// are irrelevant.
 pub fn plan_repo_cleanup(
     verdicts: Vec<BranchVerdict>,
     repo_id: &str,
     workspaces: &[Workspace],
 ) -> Vec<RepoCleanupItem> {
     let (mut deletes, mut routed, mut skips) = (Vec::new(), Vec::new(), Vec::new());
+    // Rows whose branch the scan never saw: it is gone (or never was). Routed
+    // like any other and with no marker: the workspace cleanup decides whether
+    // there is nothing left (Removed), a live dir on another branch (Followed)
+    // or wreckage (a refusal), so the preview must not promise "nothing left".
+    // A name `is_valid_branch_name` rejects (hand-edited state) is a Skip: it
+    // would be echoed raw by the CLI and torn down for a certain refusal.
+    let mut gone = Vec::new();
+    for w in workspaces.iter().filter(|w| w.repo_id == repo_id && w.worktree_path.is_some()) {
+        let Some(branch) = w.branch_name.as_deref() else {
+            continue;
+        };
+        if verdicts.iter().any(|v| v.branch == branch) {
+            continue;
+        }
+        if git::is_valid_branch_name(branch) {
+            gone.push(RepoCleanupItem::Workspace { ws_id: w.id.clone(), branch: branch.to_string() });
+        } else {
+            skips.push(("malformed branch name".to_string(), branch.escape_debug().to_string()));
+        }
+    }
     for v in verdicts {
-        // First match wins: names are unique per repo, and git refuses one
-        // branch in two worktrees.
+        // First match wins: two rows can share a branch after a Followed
+        // re-point; only the first is routed, and the other surfaces as a
+        // gone-branch row once the branch is gone.
         let ws = workspaces.iter().find(|w| {
             w.repo_id == repo_id
                 && w.worktree_path.is_some()
@@ -2053,6 +2289,7 @@ pub fn plan_repo_cleanup(
             }
         }
     }
+    routed.extend(gone);
     skips.sort();
     deletes.extend(routed);
     deletes.extend(
@@ -2064,6 +2301,7 @@ pub fn plan_repo_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::tests::git;
     use tempfile::TempDir;
 
     fn ws(id: &str, name: &str) -> Workspace {
@@ -2093,6 +2331,11 @@ mod tests {
                 added_at: Some(100 + i as u64),
             })
             .collect()
+    }
+
+    /// A state holding repo `r` (the parent every `ws` row points at) and `workspaces`.
+    fn under_r(workspaces: Vec<Workspace>) -> AppState {
+        AppState { repos: repos_named(&["r"]), workspaces, ..Default::default() }
     }
 
     fn repo_order(state: &AppState) -> Vec<String> {
@@ -2250,10 +2493,9 @@ mod tests {
     fn merge_preserves_cli_adds_and_respects_tui_deletes() {
         // baseline = what the TUI loaded; mine = TUI's in-memory state (deleted B,
         // added C); disk = the file now (a CLI added D; B not yet deleted on disk).
-        let baseline = AppState { workspaces: vec![ws("A", "a"), ws("B", "b")], ..Default::default() };
-        let mine = AppState { workspaces: vec![ws("A", "a"), ws("C", "c")], ..Default::default() };
-        let disk =
-            AppState { workspaces: vec![ws("A", "a"), ws("B", "b"), ws("D", "d")], ..Default::default() };
+        let baseline = under_r(vec![ws("A", "a"), ws("B", "b")]);
+        let mine = under_r(vec![ws("A", "a"), ws("C", "c")]);
+        let disk = under_r(vec![ws("A", "a"), ws("B", "b"), ws("D", "d")]);
 
         let merged = mine.merged_over(&baseline, disk);
         let ids: std::collections::HashSet<&str> =
@@ -2267,9 +2509,9 @@ mod tests {
 
     #[test]
     fn merge_lets_mine_win_on_a_conflicting_edit() {
-        let baseline = AppState { workspaces: vec![ws("A", "v1")], ..Default::default() };
-        let mine = AppState { workspaces: vec![ws("A", "mine")], ..Default::default() };
-        let disk = AppState { workspaces: vec![ws("A", "disk")], ..Default::default() };
+        let baseline = under_r(vec![ws("A", "v1")]);
+        let mine = under_r(vec![ws("A", "mine")]);
+        let disk = under_r(vec![ws("A", "disk")]);
         let merged = mine.merged_over(&baseline, disk);
         assert_eq!(merged.workspaces.len(), 1);
         assert_eq!(merged.workspaces[0].name, "mine", "in-memory copy wins for a shared id");
@@ -2280,12 +2522,14 @@ mod tests {
         let mk = |pairs: &[(&str, &str)]| -> HashMap<String, Vec<String>> {
             pairs.iter().map(|(k, v)| (k.to_string(), vec![v.to_string()])).collect()
         };
-        let baseline = AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b")]), ..Default::default() };
+        // All three hold rows A, B and C, so only the maps differ.
+        let rows = || vec![ws("A", "a"), ws("B", "b"), ws("C", "c")];
+        let baseline = AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b")]), ..under_r(rows()) };
         // TUI deleted B and re-tabbed A with a shell tab (the merge treats the
         // Vec opaquely, so a sentinel entry rides through untouched); a CLI added C.
-        let mine = AppState { embedded_sessions: mk(&[("A", "shell:a2")]), ..Default::default() };
+        let mine = AppState { embedded_sessions: mk(&[("A", "shell:a2")]), ..under_r(rows()) };
         let disk =
-            AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b"), ("C", "c")]), ..Default::default() };
+            AppState { embedded_sessions: mk(&[("A", "a"), ("B", "b"), ("C", "c")]), ..under_r(rows()) };
         let merged = mine.merged_over(&baseline, disk);
         assert_eq!(merged.embedded_sessions.get("A").unwrap(), &vec!["shell:a2".to_string()], "mine wins");
         assert!(!merged.embedded_sessions.contains_key("B"), "TUI delete respected");
@@ -2296,16 +2540,63 @@ mod tests {
     fn merge_save_reloads_and_preserves_a_concurrent_add() {
         let tmp = TempDir::new().unwrap();
         // Disk already has a workspace the TUI never saw (a CLI added it).
-        let disk = AppState { workspaces: vec![ws("cli", "from-cli")], ..Default::default() };
+        let disk = under_r(vec![ws("cli", "from-cli")]);
         disk.save_to(tmp.path()).unwrap();
-        // The TUI loaded an empty baseline, created its own workspace, and saves.
-        let baseline = AppState::default();
-        let mine = AppState { workspaces: vec![ws("tui", "from-tui")], ..Default::default() };
+        // The TUI loaded a row-less baseline, created its own workspace, and saves.
+        let baseline = under_r(vec![]);
+        let mine = under_r(vec![ws("tui", "from-tui")]);
         mine.merge_save_to(&baseline, tmp.path()).unwrap();
         let on_disk = AppState::load_from(tmp.path()).unwrap();
         let ids: std::collections::HashSet<&str> =
             on_disk.workspaces.iter().map(|w| w.id.as_str()).collect();
         assert!(ids.contains("cli") && ids.contains("tui"), "both survive the save: {ids:?}");
+    }
+
+    #[test]
+    fn merge_drops_children_of_a_deleted_parent() {
+        // We deleted repo r; a CLI added W under it meanwhile, with a session,
+        // a tab row and a title. The merge keeps our delete, so everything
+        // keyed on W must go with it rather than land orphaned in state.json.
+        let baseline = under_r(vec![]);
+        let disk = || AppState {
+            sessions: vec![Session {
+                id: "S".into(),
+                workspace_id: "W".into(),
+                claude_session_id: None,
+                pid: None,
+                status: SessionStatus::Running,
+                created_at: 0,
+                ended_at: None,
+                log_file: String::new(),
+            }],
+            embedded_sessions: HashMap::from([("W".to_string(), vec!["c".to_string()])]),
+            embedded_titles: HashMap::from([(
+                "W".to_string(),
+                HashMap::from([("c".to_string(), "title".to_string())]),
+            )]),
+            ..under_r(vec![ws("W", "w")])
+        };
+
+        let merged = AppState::default().merged_over(&baseline, disk());
+        assert!(merged.repos.is_empty(), "our delete wins");
+        assert!(merged.workspaces.is_empty(), "the row under the deleted repo goes too");
+        assert!(merged.sessions.is_empty(), "and its session");
+        assert!(merged.embedded_sessions.is_empty(), "and its tab row");
+        assert!(merged.embedded_titles.is_empty(), "and its titles");
+
+        // Control: with the repo still held, everything under it survives.
+        let merged = under_r(vec![]).merged_over(&baseline, disk());
+        assert_eq!(merged.workspaces.len(), 1, "a concurrent add under a live repo survives");
+        assert_eq!(merged.sessions.len(), 1);
+        assert!(merged.embedded_sessions.contains_key("W"));
+        assert!(merged.embedded_titles.contains_key("W"));
+
+        // A legacy orphan WE hold (its repo row missing in every copy) is written
+        // back as is: the sweep is for disk-only rows, so it cannot flip-flop
+        // between our merge-saves and the next plain save.
+        let mine = AppState { workspaces: vec![ws("orphan", "o")], ..Default::default() };
+        let merged = mine.merged_over(&AppState::default(), AppState::default());
+        assert_eq!(merged.workspaces.len(), 1, "a held orphan survives the sweep");
     }
 
     #[test]
@@ -2466,25 +2757,423 @@ mod tests {
         assert!(Path::new(&pb).exists(), "the other repo's worktree survives");
     }
 
+    /// A state saved under `tmp/state` holding `tmp/repo`, a real repo.
+    fn state_with_repo(tmp: &TempDir) -> (AppState, PathBuf, RepoEntry) {
+        let base = tmp.path().join("state");
+        let repo = init_git_repo(tmp, "repo");
+        let mut state = AppState::default();
+        let r = state.add_repo_with_base(repo.to_str().unwrap(), &base).unwrap();
+        (state, base, r)
+    }
+
+    /// Create workspace `name` and leave an unsaved file in its worktree.
+    fn live_worktree(state: &mut AppState, repo_id: &str, name: &str, base: &Path) -> PathBuf {
+        let ws = state.create_workspace_with_base(Some(name), repo_id, base).unwrap();
+        let dir = PathBuf::from(ws.worktree_path.expect("a real worktree"));
+        std::fs::write(dir.join("work.txt"), "unsaved").unwrap();
+        dir
+    }
+
+    /// Whether [`live_worktree`]'s unsaved file is still there.
+    fn intact(dir: &Path) -> bool {
+        std::fs::read_to_string(dir.join("work.txt")).is_ok_and(|s| s == "unsaved")
+    }
+
+    /// Whether `tmp` is on a volume that folds case (the macOS default).
+    fn folds_case(tmp: &TempDir) -> bool {
+        std::fs::write(tmp.path().join("probe"), "").unwrap();
+        tmp.path().join("PROBE").exists()
+    }
+
+    /// A row whose worktree is `dir`, as a stale or hand-edited state holds it.
+    fn row_at(repo_id: &str, name: &str, dir: &Path) -> Workspace {
+        let dir = dir.to_string_lossy().into_owned();
+        Workspace {
+            repo_id: repo_id.into(),
+            working_dir: dir.clone(),
+            worktree_path: Some(dir),
+            ..ws(name, name)
+        }
+    }
+
     #[test]
-    fn delete_workspace_by_id_ignores_name_shadowing() {
-        // Shadow state: workspace A is NAMED exactly workspace B's id. The
-        // exact-id delete must hit the id-matched row, never the name.
+    fn a_case_variant_create_refuses_and_keeps_the_files() {
         let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let upper = live_worktree(&mut state, &r.id, "Foo", &base);
+
+        let lower = state.create_workspace_with_base(Some("foo"), &r.id, &base);
+        assert!(intact(&upper), "Foo's worktree keeps its files");
+        if folds_case(&tmp) {
+            let err = lower.unwrap_err().to_string();
+            assert!(err.contains("Foo's worktree"), "{err}");
+        } else {
+            let lower = lower.unwrap().worktree_path.expect("a real worktree");
+            assert!(Path::new(&lower).exists(), "foo gets its own dir beside Foo");
+        }
+    }
+
+    #[test]
+    fn a_create_onto_an_alias_of_a_live_worktree_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let a = live_worktree(&mut state, &r.id, "a", &base);
+        std::os::unix::fs::symlink(&a, a.with_file_name("b")).unwrap();
+
+        let created = state.create_workspace_with_base(Some("b"), &r.id, &base);
+        assert!(intact(&a), "a's worktree keeps its files");
+        let err = created.unwrap_err().to_string();
+        assert!(err.contains("a's worktree"), "{err}");
+    }
+
+    #[test]
+    fn a_create_reclaims_a_dir_no_row_owns() {
+        // A worktree no row records (a crash between git and the save) is still
+        // reclaimed: the guard is not a plain "exists, so refuse".
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let orphan = base.join("worktrees").join(&r.id).join("orphan");
+        git(Path::new(&r.path), &["worktree", "add", "--detach", orphan.to_str().unwrap()]);
+
+        let ws = state.create_workspace_with_base(Some("orphan"), &r.id, &base).unwrap();
+        assert_eq!(ws.worktree_path.as_deref(), orphan.to_str(), "a real worktree, not a fallback row");
+    }
+
+    /// Give the repo at `repo` a post-checkout hook that runs `body`.
+    fn post_checkout_hook(tmp: &TempDir, repo: &str, body: &str) {
+        let hook = tmp.path().join("hooks").join("post-checkout");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Local, so it beats a hooksPath in the global config the tests inherit.
+        let hooks = hook.parent().unwrap().to_str().unwrap();
+        git(Path::new(repo), &["config", "core.hooksPath", hooks]);
+    }
+
+    #[test]
+    fn a_worktree_whose_post_checkout_hook_failed_is_still_used() {
+        // git fails the add but keeps the worktree.
+        let tmp = TempDir::new().unwrap();
+        let (state, base, r) = state_with_repo(&tmp);
+        post_checkout_hook(&tmp, &r.path, "echo 'hook says no' >&2\nexit 1");
+        std::fs::write(Path::new(&r.path).join(".worktree-copy"), "notes.txt\n").unwrap();
+        std::fs::write(Path::new(&r.path).join("notes.txt"), "local").unwrap();
+
+        let (repo, name, taken) = state.resolve_new_workspace(Some("hooked"), &r.id, None).unwrap();
+        let (ws, hook_error) = AppState::make_workspace(&repo, &name, &base, None, true, &taken).unwrap();
+        let dir = base.join("worktrees").join(&r.id).join("hooked");
+        assert_eq!(ws.worktree_path.as_deref(), dir.to_str(), "its own worktree, not the repo root");
+        assert_eq!(ws.branch_name.as_deref(), Some("hooked"));
+        let copied = std::fs::read_to_string(dir.join("notes.txt")).ok();
+        assert_eq!(copied.as_deref(), Some("local"), "the .worktree-copy files are copied");
+        assert_eq!(hook_error.as_deref(), Some("hook says no"), "the caller hears why");
+    }
+
+    #[test]
+    fn a_silently_failing_hook_says_it_printed_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let (state, base, r) = state_with_repo(&tmp);
+        post_checkout_hook(&tmp, &r.path, "exit 1");
+
+        let (repo, name, taken) = state.resolve_new_workspace(Some("quiet"), &r.id, None).unwrap();
+        let (ws, hook_error) = AppState::make_workspace(&repo, &name, &base, None, true, &taken).unwrap();
+        assert!(ws.worktree_path.is_some(), "the worktree is still used");
+        assert_eq!(hook_error.as_deref(), Some("the hook printed nothing"), "not git's own line");
+    }
+
+    #[test]
+    fn a_stale_instance_sees_a_row_kmd_saved() {
+        let tmp = TempDir::new().unwrap();
+        let (_, base, r) = state_with_repo(&tmp);
+        let mut stale = AppState::load_from(&base).unwrap();
+        let mut kmd = AppState::load_from(&base).unwrap();
+        let a = live_worktree(&mut kmd, &r.id, "a", &base);
+        std::os::unix::fs::symlink(&a, a.with_file_name("b")).unwrap();
+
+        let created = stale.create_workspace_with_base(Some("b"), &r.id, &base);
+        assert!(intact(&a), "a's worktree keeps its files");
+        assert!(created.is_err());
+    }
+
+    #[test]
+    fn re_deleting_a_stale_row_spares_its_case_variant() {
+        // An abandoned delete left foo's row without its worktree; Foo then took
+        // the dir, which is foo's too on a case-insensitive volume.
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let foo = state.create_workspace_with_base(Some("foo"), &r.id, &base).unwrap();
+        git(Path::new(&r.path), &["worktree", "remove", "--force", foo.worktree_path.as_deref().unwrap()]);
+        let upper = live_worktree(&mut state, &r.id, "Foo", &base);
+
+        state.delete_workspace_with_base(&foo.id, &base).unwrap();
+        assert!(intact(&upper), "Foo's worktree keeps its files");
+        assert!(state.workspaces.iter().all(|w| w.id != foo.id), "the stale row goes");
+    }
+
+    #[test]
+    fn deleting_a_row_aliasing_a_live_worktree_keeps_it() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let a = live_worktree(&mut state, &r.id, "a", &base);
+        let b = a.with_file_name("b");
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        state.workspaces.push(row_at(&r.id, "b", &b));
+
+        state.delete_workspace_with_base("b", &base).unwrap();
+        assert!(intact(&a), "a's worktree keeps its files");
+        assert!(state.workspaces.iter().all(|w| w.id != "b"), "the aliasing row goes");
+    }
+
+    #[test]
+    fn remove_worktree_of_keeps_an_alias_and_says_whose() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let a = live_worktree(&mut state, &r.id, "a", &base);
+        let b = a.with_file_name("b");
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let row = row_at(&r.id, "b", &b);
+
+        let skip = std::slice::from_ref(&row.id);
+        let left = AppState::remove_worktree_of(&r.path, &row, &base, &state.workspaces, skip);
+        assert!(intact(&a), "a's worktree keeps its files");
+        let path = b.to_string_lossy().into_owned();
+        assert_eq!(left, Err(LeftWorktree::Alias { path, owner: "a".into() }));
+    }
+
+    #[test]
+    fn a_garbage_state_file_keeps_an_alias() {
+        // A stale instance can't see a's row in a state.json it can't parse, so
+        // it must not take the dir for unowned.
+        let tmp = TempDir::new().unwrap();
+        let (_, base, r) = state_with_repo(&tmp);
+        let mut stale = AppState::load_from(&base).unwrap();
+        let mut kmd = AppState::load_from(&base).unwrap();
+        let a = live_worktree(&mut kmd, &r.id, "a", &base);
+        let b = a.with_file_name("b");
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        std::fs::write(base.join(AppState::STATE_FILE), "{ not json").unwrap();
+
+        let created = stale.create_workspace_with_base(Some("b"), &r.id, &base);
+        assert!(intact(&a), "a create keeps a's files");
+        assert!(created.unwrap_err().to_string().contains("couldn't check"));
+        let row = row_at(&r.id, "b", &b);
+        let skip = std::slice::from_ref(&row.id);
+        let left = AppState::remove_worktree_of(&r.path, &row, &base, &stale.workspaces, skip);
+        assert!(intact(&a), "a delete keeps a's files");
+        assert_eq!(left, Err(LeftWorktree::Unverified { path: b.to_string_lossy().into_owned() }));
+    }
+
+    #[test]
+    fn take_workspace_leaves_the_worktree_for_the_caller() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let a = state.create_workspace_with_base(Some("a"), &r.id, &base).unwrap();
+        state.add_embedded_session(&a.id, "s1");
+
+        assert_eq!(state.take_workspace(&a.id).map(|w| w.id), Some(a.id.clone()));
+        assert!(state.workspaces.is_empty(), "the row is out of state");
+        assert!(state.embedded_session_ids(&a.id).is_empty(), "with its tab list");
+        assert!(Path::new(a.worktree_path.as_deref().unwrap()).exists(), "the worktree stays on disk");
+        assert!(state.take_workspace(&a.id).is_none(), "a second take is a no-op");
+    }
+
+    #[test]
+    fn take_repo_returns_its_rows_and_leaves_their_worktrees() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let a = state.create_workspace_with_base(Some("a"), &r.id, &base).unwrap();
+        let b = state.create_workspace_with_base(Some("b"), &r.id, &base).unwrap();
+        state.workspaces.push(ws("elsewhere", "elsewhere"));
+
+        let (repo, rows) = state.take_repo(&r.id).unwrap();
+        assert_eq!(repo.id, r.id);
+        assert_eq!(rows.iter().map(|w| &w.id).collect::<Vec<_>>(), [&a.id, &b.id]);
+        assert!(state.repos.is_empty(), "the repo is out of state");
+        assert_eq!(state.workspaces.len(), 1, "another repo's row stays");
+        for w in &rows {
+            assert!(Path::new(w.worktree_path.as_deref().unwrap()).exists(), "{} stays on disk", w.name);
+        }
+    }
+
+    #[test]
+    fn remove_worktree_of_reports_a_dir_left_behind() {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, r) = state_with_repo(&tmp);
+        let [removed, gone, locked] = ["removed", "gone", "locked"]
+            .map(|n| state.create_workspace_with_base(Some(n), &r.id, &base).unwrap());
+        let dir = |w: &Workspace| w.worktree_path.clone().unwrap();
+        git(Path::new(&r.path), &["worktree", "remove", "--force", &dir(&gone)]);
+        git(Path::new(&r.path), &["worktree", "lock", &dir(&locked)]);
+        let fallback = Workspace { repo_id: r.id.clone(), working_dir: r.path.clone(), ..ws("fb", "fb") };
+
+        let cases = [
+            (&removed, Ok(())),
+            (&gone, Ok(())),
+            (&fallback, Ok(())),
+            (&locked, Err(LeftWorktree::Failed { path: dir(&locked) })),
+        ];
+        for (row, want) in cases {
+            // Its own id skipped, as state.json still holds the row: git decides, not the guard.
+            let skip = std::slice::from_ref(&row.id);
+            let rows = state.worktree_rows_except(skip);
+            assert_eq!(AppState::remove_worktree_of(&r.path, row, &base, &rows, skip), want, "{}", row.name);
+        }
+        assert!(!Path::new(&dir(&removed)).exists());
+        assert!(Path::new(&r.path).exists(), "a fallback row never touches the repo root");
+        assert!(Path::new(&dir(&locked)).exists(), "git kept the locked worktree");
+    }
+
+    #[test]
+    fn a_create_with_an_unusable_worktree_dir_still_falls_back() {
+        // A hand-edited repo id that is not one path segment has no dir to check:
+        // the create still gets the repo-root row it always got.
+        let tmp = TempDir::new().unwrap();
+        let (mut state, base, _) = state_with_repo(&tmp);
+        state.repos[0].id = "a/b".into();
+        let ws = state.create_workspace_with_base(Some("w"), "a/b", &base).unwrap();
+        assert_eq!(ws.worktree_path, None);
+    }
+
+    #[test]
+    fn resolve_new_workspace_defaults_and_validates_the_name() {
+        let mut state = under_r(vec![]);
+        state.repos[0].name = "repo".into();
+        state.workspaces.push(row_at("r", "a", Path::new("/tmp/kommand0-a")));
+
+        let name = |s: &AppState, n, b| s.resolve_new_workspace(n, "r", b).map(|(_, n, _)| n);
+        assert_eq!(name(&state, None, None).unwrap(), "repo", "from the repo");
+        assert_eq!(name(&state, None, Some("origin/feat/x")).unwrap(), "feat-x", "from the branch");
+        assert_eq!(name(&state, Some("mine"), Some("feat")).unwrap(), "mine", "as typed");
+        let err = name(&state, Some("a/b"), None).unwrap_err().to_string();
+        assert!(err.contains("invalid workspace name"), "{err}");
+        let err = name(&state, Some("a"), None).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(state.resolve_new_workspace(None, "ghost", None).is_err(), "an unknown repo");
+
+        let (repo, _, taken) = state.resolve_new_workspace(Some("b"), "r", None).unwrap();
+        assert_eq!(repo.id, "r");
+        assert_eq!(taken.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[test]
+    fn make_workspace_creates_the_worktree_and_writes_no_state() {
+        let tmp = TempDir::new().unwrap();
+        let (state, base, r) = state_with_repo(&tmp);
+        let (repo, name, taken) = state.resolve_new_workspace(Some("a"), &r.id, None).unwrap();
+
+        let (ws, _) = AppState::make_workspace(&repo, &name, &base, None, true, &taken).unwrap();
+        assert_eq!((ws.name.as_str(), ws.repo_id.as_str()), ("a", r.id.as_str()));
+        assert_eq!(ws.branch_name.as_deref(), Some("a"), "on a fresh branch");
+        assert!(Path::new(ws.worktree_path.as_deref().unwrap()).exists(), "the worktree is on disk");
+        assert!(state.workspaces.is_empty(), "the state holds no row");
+        assert!(AppState::load_from(&base).unwrap().workspaces.is_empty(), "nothing was saved");
+    }
+
+    #[test]
+    fn insert_workspace_refuses_a_gone_repo_or_a_taken_name() {
+        // A state.json it can't read never blocks an insert.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(AppState::STATE_FILE), "{ not json").unwrap();
+        let base = tmp.path();
+        let mut state = under_r(vec![]);
+        state.insert_workspace(ws("w1", "a"), base).unwrap();
+
+        let err = state.insert_workspace(ws("w2", "a"), base).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        let gone = Workspace { repo_id: "gone".into(), ..ws("w3", "b") };
+        assert!(state.insert_workspace(gone, base).is_err(), "its repo is gone");
+        assert_eq!(state.workspaces.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["w1"]);
+    }
+
+    #[test]
+    fn insert_workspace_refuses_a_name_another_instance_saved() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        under_r(vec![]).save_to(base).unwrap();
+        let mut stale = AppState::load_from(base).unwrap();
+        let mut other = AppState::load_from(base).unwrap();
+        other.create_workspace_with_options(Some("foo"), "r", base, false).unwrap();
+
+        let err = stale.insert_workspace(ws("w2", "foo"), base).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(stale.workspaces.is_empty(), "nothing was added");
+    }
+
+    #[test]
+    fn exact_id_mutators_ignore_name_shadowing() {
+        // Shadow state: workspace A is NAMED exactly workspace B's id. The
+        // exact-id mutators must hit the id-matched row, never the name.
         let mut state = AppState::default();
         state.workspaces.push(ws("b-id", "b-name"));
         state.workspaces.push(ws("a-id", "b-id")); // A named exactly B's id
-        let removed = state.delete_workspace_by_id_with_base("b-id", tmp.path()).unwrap();
+        let removed = state.remove_workspace("b-id").unwrap();
         assert_eq!(removed.id, "b-id", "the id match wins over the shadowing name");
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.workspaces[0].id, "a-id", "the shadowing row is untouched");
 
         // The id row is gone and a workspace NAMED that id string remains
-        // (the deleted-row-plus-name-reuse race): the by-id delete must NOT
-        // fall back to the name match. Error, nothing mutated.
-        let err = state.delete_workspace_by_id_with_base("b-id", tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("workspace not found"), "{err}");
-        assert_eq!(state.workspaces.len(), 1, "no name-match fallback delete");
+        // (the deleted-row-plus-name-reuse race): the exact-id mutators must
+        // NOT fall back to the name match. A no-op, nothing mutated.
+        assert!(state.remove_workspace("b-id").is_none(), "no name-match fallback delete");
+        assert_eq!(state.workspaces.len(), 1);
+        assert!(!state.set_workspace_branch("b-id", "x"), "the row NAMED b-id does not count");
+        assert_eq!(state.workspaces[0].branch_name, None, "the shadowing row is untouched");
+        assert!(state.set_workspace_branch("a-id", "moved"));
+        assert_eq!(state.workspaces[0].branch_name.as_deref(), Some("moved"));
+    }
+
+    /// Repos A and B, with B NAMED exactly A's id, each with one workspace.
+    fn shadowed_repos() -> AppState {
+        let mut repos = repos_named(&["a-id", "b-id"]);
+        repos[0].name = "alpha".into();
+        repos[1].name = "a-id".into();
+        AppState {
+            repos,
+            workspaces: vec![
+                Workspace { repo_id: "a-id".into(), ..ws("wa", "wa") },
+                Workspace { repo_id: "b-id".into(), ..ws("wb", "wb") },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn take_repo_ignores_name_shadowing() {
+        let mut state = shadowed_repos();
+        let (removed, _) = state.take_repo("a-id").unwrap();
+        assert_eq!(removed.id, "a-id", "the id match wins over the shadowing name");
+        assert_eq!(state.repos.len(), 1);
+        assert_eq!(state.repos[0].id, "b-id", "the shadowing repo is untouched");
+        assert_eq!(state.workspaces.len(), 1, "A's row went with it");
+        assert_eq!(state.workspaces[0].id, "wb");
+        assert!(state.take_repo("a-id").is_none(), "no name-match fallback");
+        assert_eq!(state.repos.len(), 1);
+    }
+
+    #[test]
+    fn delete_repo_still_resolves_a_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = shadowed_repos();
+        let removed = state.delete_repo_with_base("a-id", tmp.path()).unwrap();
+        assert_eq!(removed.id, "b-id", "the name match, as before");
+        assert_eq!(state.repos.len(), 1);
+        assert_eq!(state.repos[0].id, "a-id");
+        assert_eq!(AppState::load_from(tmp.path()).unwrap().repos.len(), 1, "saved");
+    }
+
+    #[test]
+    fn set_session_status_stamps_ended_at() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = AppState::default();
+        state.workspaces.push(ws("w", "w"));
+        let id = state.create_session_with_base("w", tmp.path()).unwrap().id;
+        assert_eq!(state.sessions[0].status, SessionStatus::Running);
+        assert!(state.sessions[0].ended_at.is_none());
+        assert!(state.set_session_status(&id, SessionStatus::Stopped));
+        assert_eq!(state.sessions[0].status, SessionStatus::Stopped);
+        assert!(state.sessions[0].ended_at.is_some(), "a terminal state is stamped");
+        assert!(!state.set_session_status("nope", SessionStatus::Stopped));
     }
 
     #[test]
@@ -3991,7 +4680,17 @@ mod tests {
             branch_name: Some(branch.into()),
             ..ws(id, id)
         };
-        let workspaces = [own("w1", "r", "feat"), own("w2", "r", "feat2"), own("w3", "r2", "feat3")];
+        let workspaces = [
+            own("w1", "r", "feat"),
+            own("w2", "r", "feat2"),
+            own("w3", "r2", "feat3"),
+            own("w4", "r", "gone"), // no verdict at all: its branch is gone
+            own("w7", "r", "zzz"), // zzz has a Skip verdict: matched, so not gone
+            own("w7b", "r", "bad\u{7}name"), // gone AND malformed: a Skip
+            // A fallback row (no worktree) and another repo's row: never listed.
+            Workspace { repo_id: "r".into(), branch_name: Some("gone2".into()), ..ws("w5", "w5") },
+            own("w6", "r2", "gone3"),
+        ];
         let v = |branch: &str, verdict: Verdict| BranchVerdict {
             branch: branch.into(),
             tip: "t".into(),
@@ -4017,6 +4716,7 @@ mod tests {
                 RepoCleanupItem::Delete { branch: "loose".into(), tip: "t".into() },
                 RepoCleanupItem::Workspace { ws_id: "w1".into(), branch: "feat".into() },
                 RepoCleanupItem::Workspace { ws_id: "w2".into(), branch: "feat2".into() },
+                RepoCleanupItem::Workspace { ws_id: "w4".into(), branch: "gone".into() },
                 RepoCleanupItem::Skip {
                     branch: "foreign".into(),
                     reason: format!("checked out at {existing}"),
@@ -4024,6 +4724,10 @@ mod tests {
                 RepoCleanupItem::Skip {
                     branch: "stale-foreign".into(),
                     reason: format!("checked out at {missing}; run git worktree prune"),
+                },
+                RepoCleanupItem::Skip {
+                    branch: "bad\\u{7}name".into(),
+                    reason: "malformed branch name".into(),
                 },
                 RepoCleanupItem::Skip { branch: "zzz".into(), reason: "not merged into main".into() },
             ]

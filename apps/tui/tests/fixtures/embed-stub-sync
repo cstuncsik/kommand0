@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# embed-stub that draws its echo in synchronized-output frames (DEC mode
+# 2026), for the frame-pacing e2e: each key opens a frame and its char lands
+# 50 ms later, closing it. `!` prints SYNCSTALL in a frame that never closes
+# (also 50 ms late, so the key's own redraw can't be what shows it).
+stty -echo 2>/dev/null              # a tty echo would land outside the frame
+printf '\033[?1049h\033[2J\033[H'   # alt-screen + clear
+printf 'EMBED-STUB-READY\r\n> '
+while IFS= read -r -n1 ch; do
+  printf '\033[?2026h'
+  sleep 0.05
+  if [ "$ch" = '!' ]; then
+    printf 'SYNCSTALL'
+  else
+    printf '%s\033[?2026l' "$ch"
+  fi
+done

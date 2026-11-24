@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# embed-stub that ignores SIGHUP like a Node `claude`, so only the SIGKILL
+# after the teardown grace ends it; prints its pid for the quit e2e.
+trap '' HUP
+printf 'UP %s OK\r\n' $$
+exec sleep 1000
