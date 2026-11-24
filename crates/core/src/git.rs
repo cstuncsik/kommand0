@@ -559,6 +559,32 @@ pub fn pr_statuses(repo_dir: &str, branches: &[String]) -> std::collections::Has
     pr_statuses_with(repo_dir, &gh_bin(), branches)
 }
 
+/// The URL of the PR for the branch checked out in `worktree_dir`, asked of
+/// gh directly (`gh pr view`), so it finds the PR however busy the repo is,
+/// whoever opened it, and under the branch's pushed name. `Err` is one line
+/// for the user (gh's own reason, e.g. no PR for the branch). Shells out to
+/// `gh` (a network call): run it off the UI thread.
+pub fn pr_url(worktree_dir: &str) -> Result<String, String> {
+    pr_url_with(worktree_dir, &gh_bin())
+}
+
+fn pr_url_with(worktree_dir: &str, gh_bin: &str) -> Result<String, String> {
+    let out = run_gh(gh_bin, worktree_dir, &["pr", "view", "--json", "url", "--jq", ".url"])
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "gh CLI not found".to_string(),
+            std::io::ErrorKind::TimedOut => "gh timed out: check your network".to_string(),
+            _ => format!("couldn't run gh: {e}"),
+        })?;
+    if !out.status.success() {
+        return Err(last_line(&out.stderr));
+    }
+    let url = last_line(&out.stdout);
+    if url.is_empty() {
+        return Err("gh returned no PR url".to_string());
+    }
+    Ok(url)
+}
+
 /// Classify a single `statusCheckRollup` item as (is_failure, is_pending). A
 /// CheckRun carries `conclusion` (null until it completes) + `status`; a
 /// StatusContext carries `state`.
@@ -1740,6 +1766,21 @@ pub(crate) mod tests {
         gh_list_stub(&gh, json);
         let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap(), &[]);
         assert_eq!(m["br"].checks, PrChecks::Failing);
+    }
+
+    #[test]
+    fn pr_url_returns_the_url_or_ghs_reason() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let gh = tmp.path().join("gh");
+        write_stub(&gh, "#!/bin/sh\n[ \"$1 $2\" = \"pr view\" ] && echo https://x/5\n");
+        assert_eq!(pr_url_with(dir, gh.to_str().unwrap()), Ok("https://x/5".to_string()));
+        write_stub(&gh, "#!/bin/sh\necho 'no pull requests found for branch \"b\"' >&2\nexit 1\n");
+        assert_eq!(
+            pr_url_with(dir, gh.to_str().unwrap()),
+            Err("no pull requests found for branch \"b\"".to_string())
+        );
+        assert!(pr_url_with(dir, "/nonexistent/definitely/not/gh").is_err());
     }
 
     #[test]

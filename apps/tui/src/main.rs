@@ -177,6 +177,9 @@ fn repo_cleanup_counts(items: &[RepoCleanupItem]) -> (usize, usize, usize) {
 /// wins) and the branch GitHub links to the issue.
 type IssueMsg = (u64, Result<kommand0_core::IssueBranch, String>);
 
+/// Shown while a `p` press asks gh for the PR.
+const PR_LOOKUP_NOTICE: &str = "Looking up the PR…";
+
 /// What the create worker sends back: the workspace it made, with the hook's
 /// last line when its post-checkout hook failed, or why not.
 type CreateMsg = Result<(Workspace, Option<String>), String>;
@@ -1098,6 +1101,11 @@ pub(crate) struct App {
     issue_worker_started: Option<Instant>,
     /// Issue-resolve worker → event-loop channel. `None` when not wired (unit tests).
     issue_tx: Option<tokio::sync::mpsc::UnboundedSender<IssueMsg>>,
+    /// On-demand PR lookup (`p` with no cached PR) → event loop: the url, or
+    /// why not. `None` when not wired (unit tests).
+    pr_url_tx: Option<tokio::sync::mpsc::UnboundedSender<Result<String, String>>>,
+    /// A `p` lookup is running; further presses wait for it.
+    pr_url_inflight: bool,
 
     /// The workspace create making its worktree, if any (one at a time).
     create: Option<Creating>,
@@ -1233,6 +1241,8 @@ impl App {
             issue_req: None,
             issue_worker_started: None,
             issue_tx: None,
+            pr_url_tx: None,
+            pr_url_inflight: false,
             create: None,
             create_tx: None,
             config: Config::default(),
@@ -4860,6 +4870,55 @@ impl App {
         });
     }
 
+    /// `p`: open the selected workspace's PR. A cached PR opens at once;
+    /// otherwise gh is asked for the checked-out branch's PR off the loop
+    /// ([`kommand0_core::pr_url`]), so it works whatever the cached list missed,
+    /// and the reason shows in the notice when there is none.
+    fn open_selected_pr(&mut self) {
+        let Some(ws) = self.selected_workspace() else {
+            return;
+        };
+        if let Some(url) = self.pr_status.get(&ws.id).map(|p| p.url.clone()).filter(|u| !u.is_empty()) {
+            open_url(&url);
+            return;
+        }
+        if ws.worktree_path.is_none() {
+            self.profile_notice =
+                Some(("No PR to open: this workspace has no branch of its own".to_string(), true));
+            return;
+        }
+        if self.pr_url_inflight {
+            return;
+        }
+        let Some(tx) = self.pr_url_tx.clone() else {
+            return; // not wired (unit tests)
+        };
+        let dir = ws.working_dir.clone();
+        self.pr_url_inflight = true;
+        self.profile_notice = Some((PR_LOOKUP_NOTICE.to_string(), false));
+        std::thread::spawn(move || {
+            let mut guard = SendOnDrop {
+                tx,
+                payload: Some(Err("the PR lookup was interrupted".to_string())),
+            };
+            guard.payload = Some(kommand0_core::pr_url(&dir));
+        });
+    }
+
+    /// A `p` lookup finished: open the PR, or say why there is none.
+    fn finish_pr_url(&mut self, result: Result<String, String>) {
+        self.pr_url_inflight = false;
+        match result {
+            Ok(url) => {
+                if self.profile_notice.as_ref().is_some_and(|(m, _)| m == PR_LOOKUP_NOTICE) {
+                    self.profile_notice = None;
+                }
+                open_url(&url);
+            }
+            Err(e) => self.profile_notice = Some((format!("No PR to open: {e}"), true)),
+        }
+    }
+
     /// Adopt the branch an issue resolved to (or surface the failure).
     fn finish_issue_resolve(&mut self, req: u64, result: Result<kommand0_core::IssueBranch, String>) {
         // FIRST, before any early return: the worker that produced this reply is
@@ -5678,16 +5737,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<KeyOutcome> 
                         app.open_diff(&ws_id);
                     }
                 }
-                Action::OpenPrInBrowser => {
-                    // Open the selected workspace's PR in the browser, if one is
-                    // cached with a URL; otherwise no-op (no PR to open).
-                    if let Some(ws_id) = app.selected_workspace().map(|w| w.id.clone())
-                        && let Some(url) =
-                            app.pr_status.get(&ws_id).map(|p| p.url.clone()).filter(|u| !u.is_empty())
-                    {
-                        open_url(&url);
-                    }
-                }
+                Action::OpenPrInBrowser => app.open_selected_pr(),
                 Action::Cleanup => match app.tree_items.get(app.selected_index) {
                     Some(TreeNode::Repo { id, .. }) => {
                         let id = id.clone();
@@ -6227,6 +6277,8 @@ async fn run(
     // Issue-resolve worker → event loop, carrying `(request id, result)`.
     let (issue_tx, mut issue_rx) = tokio::sync::mpsc::unbounded_channel::<IssueMsg>();
     app.issue_tx = Some(issue_tx);
+    let (pr_url_tx, mut pr_url_rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
+    app.pr_url_tx = Some(pr_url_tx);
 
     // Review-diff worker → event loop, carrying `(request id, files)`.
     let (diff_tx, mut diff_rx) = tokio::sync::mpsc::unbounded_channel::<DiffMsg>();
@@ -6311,6 +6363,9 @@ async fn run(
             }
             Some((req, result)) = issue_rx.recv() => {
                 app.finish_issue_resolve(req, result);
+            }
+            Some(result) = pr_url_rx.recv() => {
+                app.finish_pr_url(result);
             }
             Some((req, files)) = diff_rx.recv() => {
                 app.finish_diff(req, files);
@@ -9709,17 +9764,40 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn open_pr_in_browser_is_a_safe_noop_without_a_pr() {
-        // Pressing `p` on a workspace with no cached pr_status must not panic (and
-        // must not open anything). The actual browser spawn isn't unit-testable —
-        // only the no-PR guard is exercised here.
+    async fn open_pr_without_a_branch_of_its_own_says_so() {
+        // `p` on a fallback workspace (no worktree): nothing to look up, so the
+        // notice says why instead of doing nothing.
         let mut app = test_app();
         app.expanded.insert("r1".to_string());
         app.rebuild_tree();
         app.select_workspace_row("w1");
-        assert!(app.selected_workspace().is_some());
-        assert!(app.pr_status.is_empty());
+        assert!(app.selected_workspace().is_some_and(|w| w.worktree_path.is_none()));
         assert_eq!(press(&mut app, KeyCode::Char('p')).await, KeyOutcome::Continue);
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert!(msg.contains("no branch of its own"), "{msg}");
+        assert!(is_error);
+        assert!(!app.pr_url_inflight);
+    }
+
+    #[tokio::test]
+    async fn open_pr_lookup_result_shows_the_reason_or_clears_the_wait() {
+        let mut app = test_app();
+        app.pr_url_inflight = true;
+        app.finish_pr_url(Err("no pull requests found for branch \"b\"".into()));
+        assert!(!app.pr_url_inflight);
+        let (msg, is_error) = app.profile_notice.clone().expect("a notice");
+        assert_eq!(msg, "No PR to open: no pull requests found for branch \"b\"");
+        assert!(is_error);
+
+        // A found PR clears the "Looking up" notice. (A non-https url, so the
+        // test never launches a browser: open_url ignores it.)
+        app.profile_notice = Some((PR_LOOKUP_NOTICE.to_string(), false));
+        app.finish_pr_url(Ok("http://not-opened".into()));
+        assert!(app.profile_notice.is_none());
+        // ...but not a notice that replaced it meanwhile.
+        app.profile_notice = Some(("other".into(), false));
+        app.finish_pr_url(Ok("http://not-opened".into()));
+        assert_eq!(app.profile_notice, Some(("other".into(), false)));
     }
 
     // --- two-pane diff dialog ---

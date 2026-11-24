@@ -18,7 +18,7 @@ pub use codex::{codex_sessions_dir, latest_codex_rollout};
 pub use config::Config;
 pub use git::{
     BranchStatus, FileDiff, IssueBranch, PrChecks, PrReview, PrState, PrStatus, branch_status,
-    diff_files_vs_default_branch, is_issue_ref, issue_branch, pr_statuses,
+    diff_files_vs_default_branch, is_issue_ref, issue_branch, pr_statuses, pr_url,
 };
 pub use id::generate_id;
 pub use repo::{RepoEntry, run_git_status};
