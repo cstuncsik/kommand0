@@ -550,8 +550,13 @@ pub struct PrStatus {
 /// returns an empty map on any gh failure (not installed, not authenticated, not
 /// a gh-recognised repo) or parse error. Shells out to `gh` (a network call), so
 /// callers should run it off the UI thread — like [`branch_status`].
-pub fn pr_statuses(repo_dir: &str) -> std::collections::HashMap<String, PrStatus> {
-    pr_statuses_with(repo_dir, &gh_bin())
+///
+/// `branches` are the workspace branches the caller wants. One that isn't among
+/// the repo's 100 newest PRs (a busy repo's 100 can span only hours) is looked
+/// up again among the user's own PRs (`--author @me`), a second call made only
+/// when something is missing.
+pub fn pr_statuses(repo_dir: &str, branches: &[String]) -> std::collections::HashMap<String, PrStatus> {
+    pr_statuses_with(repo_dir, &gh_bin(), branches)
 }
 
 /// The URL of the PR for the branch checked out in `worktree_dir`, asked of
@@ -630,28 +635,44 @@ fn aggregate_checks(rollup: &serde_json::Value) -> PrChecks {
 
 /// [`pr_statuses`] with the `gh` binary injected, so tests can pass a stub path
 /// instead of mutating the process environment.
-fn pr_statuses_with(repo_dir: &str, gh_bin: &str) -> std::collections::HashMap<String, PrStatus> {
+fn pr_statuses_with(
+    repo_dir: &str,
+    gh_bin: &str,
+    branches: &[String],
+) -> std::collections::HashMap<String, PrStatus> {
     let mut map = std::collections::HashMap::new();
-    let out = match run_gh(
-        gh_bin,
-        repo_dir,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            "100",
-            "--json",
-            "number,headRefName,state,url,reviewDecision,statusCheckRollup",
-        ],
-    ) {
+    // A failed first call (gh missing, not authed, not a gh repo) skips the second.
+    if add_pr_list(repo_dir, gh_bin, &[], &mut map) && branches.iter().any(|b| !map.contains_key(b)) {
+        add_pr_list(repo_dir, gh_bin, &["--author", "@me"], &mut map);
+    }
+    map
+}
+
+/// One `gh pr list` (plus `extra` args) merged into `map`. Returns false when gh
+/// fails or prints something unparseable.
+fn add_pr_list(
+    repo_dir: &str,
+    gh_bin: &str,
+    extra: &[&str],
+    map: &mut std::collections::HashMap<String, PrStatus>,
+) -> bool {
+    let mut args = vec![
+        "pr",
+        "list",
+        "--state",
+        "all",
+        "--limit",
+        "100",
+        "--json",
+        "number,headRefName,state,url,reviewDecision,statusCheckRollup",
+    ];
+    args.extend_from_slice(extra);
+    let out = match run_gh(gh_bin, repo_dir, &args) {
         Ok(o) if o.status.success() => o,
-        // Any failure (gh missing, not authed, not a gh repo) → empty map.
-        _ => return map,
+        _ => return false,
     };
     let Ok(prs) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
-        return map;
+        return false;
     };
     for pr in prs {
         let Some(branch) = pr.get("headRefName").and_then(|v| v.as_str()) else {
@@ -691,7 +712,7 @@ fn pr_statuses_with(repo_dir: &str, gh_bin: &str) -> std::collections::HashMap<S
             })
             .or_insert(status);
     }
-    map
+    true
 }
 
 /// Whether `a` should replace `b` as the PR shown for a shared branch name.
@@ -1673,7 +1694,7 @@ pub(crate) mod tests {
         let tmp = TempDir::new().unwrap();
         let gh = tmp.path().join("gh");
         gh_list_stub(&gh, json);
-        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap());
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap(), &[]);
 
         assert_eq!(m.len(), 9);
 
@@ -1728,7 +1749,7 @@ pub(crate) mod tests {
         let tmp = TempDir::new().unwrap();
         let gh = tmp.path().join("gh");
         gh_list_stub(&gh, json);
-        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap());
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap(), &[]);
         assert_eq!(m["kommand0/feat"].number, 20, "the open PR wins over the merged one");
         assert_eq!(m["kommand0/feat"].state, PrState::Open);
     }
@@ -1743,7 +1764,7 @@ pub(crate) mod tests {
         let tmp = TempDir::new().unwrap();
         let gh = tmp.path().join("gh");
         gh_list_stub(&gh, json);
-        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap());
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap(), &[]);
         assert_eq!(m["br"].checks, PrChecks::Failing);
     }
 
@@ -1763,9 +1784,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pr_statuses_looks_up_missing_branches_among_own_prs() {
+        // A busy repo: `mine` isn't among the newest PRs, only in `--author @me`.
+        let tmp = TempDir::new().unwrap();
+        let gh = tmp.path().join("gh");
+        write_stub(
+            &gh,
+            "#!/bin/sh\necho \"$*\" >> \"$0.args\"\ncase \"$*\" in\n  *--author*) echo '[{\"number\":7,\"headRefName\":\"mine\",\"state\":\"OPEN\",\"url\":\"https://x/7\"}]' ;;\n  *) echo '[{\"number\":9,\"headRefName\":\"other\",\"state\":\"OPEN\",\"url\":\"https://x/9\"}]' ;;\nesac\n",
+        );
+        let dir = tmp.path().to_str().unwrap();
+        let m = pr_statuses_with(dir, gh.to_str().unwrap(), &["mine".into(), "other".into()]);
+        assert_eq!(m["mine"].url, "https://x/7");
+        assert_eq!(m["other"].number, 9);
+        // Every wanted branch found: no second call.
+        let calls = || std::fs::read_to_string(tmp.path().join("gh.args")).unwrap().lines().count();
+        assert_eq!(calls(), 2);
+        pr_statuses_with(dir, gh.to_str().unwrap(), &["other".into()]);
+        assert_eq!(calls(), 3);
+    }
+
+    #[test]
     fn pr_statuses_is_empty_when_gh_missing() {
         let tmp = TempDir::new().unwrap();
-        let m = pr_statuses_with(tmp.path().to_str().unwrap(), "/nonexistent/definitely/not/gh");
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), "/nonexistent/definitely/not/gh", &[]);
         assert!(m.is_empty(), "a missing gh yields an empty map, never a panic");
     }
 
@@ -1775,7 +1816,7 @@ pub(crate) mod tests {
         let tmp = TempDir::new().unwrap();
         let gh = tmp.path().join("gh");
         write_stub(&gh, "#!/bin/sh\nexit 1\n");
-        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap());
+        let m = pr_statuses_with(tmp.path().to_str().unwrap(), gh.to_str().unwrap(), &[]);
         assert!(m.is_empty());
     }
 

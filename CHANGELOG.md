@@ -7,6 +7,11 @@ All notable changes to kommand0 are documented here. The format is based on
 
 ### Fixed
 
+- **PR status and `p` (open PR in browser) missed PRs in busy repos**: the
+  lookup only saw a repo's 100 newest PRs, which in a repo like n8n covers a
+  few hours. A workspace branch not among them is now looked up among your own
+  PRs too (`gh pr list --author @me`). PRs opened by someone else on such a
+  repo are still only found while they are among the 100 newest.
 - **`p` (open PR in browser) no longer does nothing when the PR isn't in the
   cached PR status**: it asks gh for the checked-out branch's PR
   (`gh pr view`), which finds it however busy the repo is, whoever opened it

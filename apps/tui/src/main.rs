@@ -3658,7 +3658,8 @@ impl App {
             };
             let map = guard.payload.as_mut().expect("payload present until drop");
             for (repo_path, workspaces) in by_repo {
-                let prs = kommand0_core::pr_statuses(&repo_path);
+                let wanted: Vec<String> = workspaces.iter().flat_map(|(_, b)| b.iter().cloned()).collect();
+                let prs = kommand0_core::pr_statuses(&repo_path, &wanted);
                 for (ws_id, branches) in workspaces {
                     if let Some(status) = branches.iter().find_map(|b| prs.get(b)) {
                         map.insert(ws_id, status.clone());
